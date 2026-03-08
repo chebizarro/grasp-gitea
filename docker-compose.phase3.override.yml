@@ -1,0 +1,6 @@
+services:
+  gitea:
+    environment:
+      # Ensure public clone URLs match NIP-34 clone tags.
+      GITEA__SERVER__ROOT_URL: https://git.sharegap.net
+      GITEA__SERVICE__MAX_USERNAME_LENGTH: "70"

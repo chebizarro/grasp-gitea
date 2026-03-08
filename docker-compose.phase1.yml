@@ -1,0 +1,27 @@
+services:
+  grasp-bridge:
+    build:
+      context: .
+    image: grasp-bridge:local
+    restart: unless-stopped
+    environment:
+      GITEA_URL: http://gitea:3000
+      GITEA_ADMIN_TOKEN: ${GITEA_ADMIN_TOKEN}
+      CLONE_PREFIX: https://git.sharegap.net
+      RELAY_URLS: ws://gastown-relay:3334
+      EMBEDDED_RELAY: "false"
+      EMBEDDED_RELAY_PORT: "3334"
+      EMBEDDED_RELAY_DB: /data/relay-db
+      HOOK_RELAY_URL: ws://gastown-relay:3334
+      HOOK_BINARY_PATH: /usr/local/bin/grasp-pre-receive
+      GITEA_REPOSITORIES_PATH: /gitea-data/git/repositories
+      LISTEN: :8090
+      DB_PATH: /data/mappings.db
+      PROVISION_RATE_LIMIT: "10"
+    volumes:
+      - grasp-bridge-data:/data
+      - gitea-data:/gitea-data
+
+volumes:
+  grasp-bridge-data:
+  gitea-data:

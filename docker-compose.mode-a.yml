@@ -1,0 +1,29 @@
+services:
+  grasp-bridge:
+    build:
+      context: .
+      args:
+        BUILD_TAGS: full
+    image: grasp-bridge:local-full
+    restart: unless-stopped
+    ports:
+      - "3334:3334"
+      - "8090:8090"
+    environment:
+      GITEA_URL: http://gitea:3000
+      GITEA_ADMIN_TOKEN: ${GITEA_ADMIN_TOKEN}
+      CLONE_PREFIX: https://git.sharegap.net
+      RELAY_URLS: ""
+      EMBEDDED_RELAY: "true"
+      EMBEDDED_RELAY_PORT: "3334"
+      EMBEDDED_RELAY_DB: /data/relay-db
+      HOOK_RELAY_URL: ws://localhost:3334
+      LISTEN: :8090
+      DB_PATH: /data/mappings.db
+    volumes:
+      - grasp-bridge-data:/data
+      - gitea-data:/gitea-data
+
+volumes:
+  grasp-bridge-data:
+  gitea-data:
