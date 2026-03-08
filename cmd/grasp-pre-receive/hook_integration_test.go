@@ -1,11 +1,33 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/nbd-wtf/go-nostr/nip34"
 )
+
+// processHookInput is a test helper that replicates the main loop logic
+// using a pre-fetched state, so unit tests don't need a live relay.
+func processHookInput(input string, state *nip34.RepositoryState) error {
+	lines, err := readLines(strings.NewReader(input))
+	if err != nil {
+		return fmt.Errorf("failed to read hook input")
+	}
+	for _, line := range lines {
+		parts := strings.Fields(line)
+		if len(parts) != 3 {
+			return fmt.Errorf("invalid hook stdin format")
+		}
+		newSHA := parts[1]
+		refName := parts[2]
+		if ok, reason := evaluatePushRef(refName, newSHA, state); !ok {
+			return fmt.Errorf("%s", reason)
+		}
+	}
+	return nil
+}
 
 func TestProcessHookInputIntegration(t *testing.T) {
 	state := &nip34.RepositoryState{
@@ -50,7 +72,7 @@ func TestProcessHookInputIntegration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := processHookInput(strings.NewReader(tt.input), state)
+			err := processHookInput(tt.input, state)
 			if tt.wantError == "" && err != nil {
 				t.Fatalf("expected no error, got %v", err)
 			}
@@ -61,6 +83,37 @@ func TestProcessHookInputIntegration(t *testing.T) {
 				if err.Error() != tt.wantError {
 					t.Fatalf("expected error %q, got %q", tt.wantError, err.Error())
 				}
+			}
+		})
+	}
+}
+
+func TestRequiresStateCheck(t *testing.T) {
+	tests := []struct {
+		name  string
+		lines []string
+		want  bool
+	}{
+		{
+			name:  "refs/nostr only — no state check needed",
+			lines: []string{"aaa bbb refs/nostr/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+			want:  false,
+		},
+		{
+			name:  "refs/heads — state check needed",
+			lines: []string{"aaa bbb refs/heads/main"},
+			want:  true,
+		},
+		{
+			name:  "mixed — state check needed",
+			lines: []string{"aaa bbb refs/nostr/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "aaa bbb refs/heads/main"},
+			want:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := requiresStateCheck(tt.lines); got != tt.want {
+				t.Fatalf("requiresStateCheck = %v, want %v", got, tt.want)
 			}
 		})
 	}

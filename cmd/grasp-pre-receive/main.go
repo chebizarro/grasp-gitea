@@ -15,6 +15,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/nostrstate"
 )
 
+
 func main() {
 	relayURL := envOrDefault("GRASP_HOOK_RELAY_URL", envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"))
 	npub := strings.TrimSpace(os.Getenv("GRASP_REPO_NPUB"))
@@ -33,39 +34,64 @@ func main() {
 		reject("invalid decoded pubkey")
 	}
 
-	ctx := context.Background()
-	_, state, _, err := nostrstate.FetchLatestRepositoryStateForRepo(ctx, relayURL, pubkey, repoID)
+	// Read all push refs from stdin before hitting the relay, so that
+	// refs/nostr/<event-id> pushes (which need no state check) are not
+	// blocked by a missing kind 30618 event.
+	lines, err := readLines(os.Stdin)
 	if err != nil {
-		reject("no valid NIP-34 state event found; publish kind 30618 before pushing")
+		reject("failed to read hook input")
 	}
 
-	if err := processHookInput(os.Stdin, state); err != nil {
-		reject(err.Error())
+	// Only fetch the NIP-34 state if at least one ref actually needs it.
+	var state *nip34.RepositoryState
+	if requiresStateCheck(lines) {
+		ctx := context.Background()
+		_, state, _, err = nostrstate.FetchLatestRepositoryStateForRepo(ctx, relayURL, pubkey, repoID)
+		if err != nil {
+			reject("no valid NIP-34 state event found; publish kind 30618 before pushing")
+		}
 	}
-}
 
-func processHookInput(r io.Reader, state *nip34.RepositoryState) error {
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		line := scanner.Text()
+	for _, line := range lines {
 		parts := strings.Fields(line)
 		if len(parts) != 3 {
-			return fmt.Errorf("invalid hook stdin format")
+			reject("invalid hook stdin format")
 		}
-
 		newSHA := parts[1]
 		refName := parts[2]
 		if ok, reason := evaluatePushRef(refName, newSHA, state); !ok {
-			return fmt.Errorf("%s", reason)
+			reject(reason)
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("failed to read hook input")
-	}
-
-	return nil
 }
+
+// readLines drains r into a slice of non-empty lines.
+func readLines(r io.Reader) ([]string, error) {
+	var lines []string
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		if line := scanner.Text(); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines, scanner.Err()
+}
+
+// requiresStateCheck returns true if any ref in lines needs a NIP-34 state lookup.
+func requiresStateCheck(lines []string) bool {
+	for _, line := range lines {
+		parts := strings.Fields(line)
+		if len(parts) != 3 {
+			continue
+		}
+		refName := parts[2]
+		if !strings.HasPrefix(refName, "refs/nostr/") {
+			return true
+		}
+	}
+	return false
+}
+
 
 func evaluatePushRef(refName string, newSHA string, state *nip34.RepositoryState) (bool, string) {
 	if strings.HasPrefix(refName, "refs/nostr/") {
