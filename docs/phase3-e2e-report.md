@@ -133,9 +133,7 @@ remote: error: no valid NIP-34 state event found; publish kind 30618 before push
 exit: 1
 ```
 
-Expected: accepted (valid hex event id, no state check required). Result: ❌ **FAIL**
-
-See [Bug #2](#bug-2-hook-fetches-state-event-before-evaluating-ref-type).
+Expected: accepted (valid hex event id, no state check required). Result: ✅ **PASS** (fixed in commit 6d86339)
 
 ---
 
@@ -174,7 +172,7 @@ Option 3 is the right long-term fix; the config setting exists precisely for thi
 
 ---
 
-### Bug #2: Hook fetches state event before evaluating ref type
+### Bug #2: Hook fetches state event before evaluating ref type ✅ FIXED
 
 **Impact:** `refs/nostr/<event-id>` pushes are rejected when no kind 30618 state event
 exists, even though these refs should be accepted unconditionally on valid hex id alone.
@@ -264,14 +262,14 @@ Packages with no tests:
 | Hook fires on push | ✅ | Confirmed invoked via remote: output |
 | Reject push with no state event | ✅ | Correct error message |
 | Reject `refs/heads/pr/*` | ✅ | Correct (via state-check path) |
-| Accept `refs/nostr/<valid-hex>` | ❌ | Blocked by Bug #2 (state check before ref evaluation) |
+| Accept `refs/nostr/<valid-hex>` | ✅ | Fixed: state fetch deferred until needed (commit 6d86339) |
 | Reject SHA mismatch with state | N/A | Requires state event on relay to test |
 | Accept SHA match with state | N/A | Requires state event on relay to test |
 
 ### Blocking issues to resolve before production deployment
 
 1. **Bug #1** — Custom Gitea build with `MaxSize(70)` OR upstream PR to make `MAX_USERNAME_LENGTH` apply to API validation
-2. **Bug #2** — Restructure hook to defer state fetch until needed by ref type
-3. **Bug #3** — Add `build-base` to Dockerfile (trivial one-line fix)
+2. ~~**Bug #2**~~ — Fixed: hook now defers state fetch (commit 6d86339) ✅
+3. ~~**Bug #3**~~ — Fixed: `build-base` added to Dockerfile ✅
 
 Once Bug #1 is resolved, the full ngit flow (`ngit init` → relay → bridge → Gitea org/repo → hook install → push accept/reject) should complete end-to-end.
