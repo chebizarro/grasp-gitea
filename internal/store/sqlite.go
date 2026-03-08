@@ -146,3 +146,18 @@ func (s *SQLiteStore) ListMappings(ctx context.Context) ([]Mapping, error) {
 	}
 	return out, rows.Err()
 }
+
+func (s *SQLiteStore) GetMapping(ctx context.Context, npub string, repoID string) (Mapping, error) {
+	var m Mapping
+	var createdAt, updatedAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, source_event, created_at, updated_at
+		FROM mappings WHERE npub = ? AND repo_id = ? LIMIT 1
+	`, npub, repoID).Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.SourceEvent, &createdAt, &updatedAt)
+	if err != nil {
+		return Mapping{}, err
+	}
+	m.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	m.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+	return m, nil
+}

@@ -15,6 +15,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
+	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -145,7 +146,13 @@ func (s *Service) ManualProvision(ctx context.Context, npub string, pubkey strin
 		return Result{}, err
 	}
 
-	return Result{Npub: npub, RepoID: repoID, Owner: npub, Repo: repoID, Event: "manual"}, nil
+	// Fetch final org name from the stored mapping.
+	m, _ := s.store.GetMapping(ctx, npub, repoID)
+	orgName := m.Owner
+	if orgName == "" {
+		orgName = npub
+	}
+	return Result{Npub: npub, RepoID: repoID, Owner: orgName, Repo: repoID, Event: "manual"}, nil
 }
 
 func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pubkey string, repoID string, cloneURL string, sourceEvent string, sourceRelay string) error {
@@ -153,20 +160,51 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		return err
 	}
 
-	if err := s.gitea.EnsureOrg(ctx, npub); err != nil {
-		return fmt.Errorf("ensure org %s: %w", npub, err)
+	// Resolve a short, human-readable org name via NIP-05.
+	// Falls back to a hex prefix if no verified NIP-05 is found.
+	var orgName string
+	relayURLs := s.cfg.RelayURLs
+	if sourceRelay != "manual" && sourceRelay != "" {
+		// Try the source relay first (it just delivered this event, likely has kind 0 too).
+		relayURLs = append([]string{sourceRelay}, relayURLs...)
+	}
+	for _, relayURL := range relayURLs {
+		orgName = nip05resolve.OrgName(ctx, pubkey, relayURL)
+		hexFallback := pubkey
+		if len(pubkey) > 39 {
+			hexFallback = pubkey[:39]
+		}
+		if orgName != hexFallback {
+			break // resolved a NIP-05 name
+		}
+	}
+	if orgName == "" {
+		if len(pubkey) > 39 {
+			orgName = pubkey[:39]
+		} else {
+			orgName = pubkey
+		}
 	}
 
-	repo, err := s.gitea.EnsureRepo(ctx, npub, repoID)
+	s.logger.Info("resolved org name", "npub", npub, "org_name", orgName)
+
+	// Use orgName for the Gitea org/repo path; npub is preserved in the mapping.
+	cloneURL = fmt.Sprintf("%s/%s/%s.git", s.cfg.ClonePrefix, orgName, repoID)
+
+	if err := s.gitea.EnsureOrg(ctx, orgName); err != nil {
+		return fmt.Errorf("ensure org %s: %w", orgName, err)
+	}
+
+	repo, err := s.gitea.EnsureRepo(ctx, orgName, repoID)
 	if err != nil {
-		return fmt.Errorf("ensure repo %s/%s: %w", npub, repoID, err)
+		return fmt.Errorf("ensure repo %s/%s: %w", orgName, repoID, err)
 	}
 
 	mapping := store.Mapping{
 		Npub:        npub,
 		RepoID:      repoID,
 		Pubkey:      pubkey,
-		Owner:       npub,
+		Owner:       orgName,
 		RepoName:    repoID,
 		GiteaRepoID: repo.ID,
 		CloneURL:    cloneURL,
@@ -177,13 +215,20 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 	}
 
 	if s.installer != nil {
-		if err := s.installer.Install(npub, repoID); err != nil {
+		if err := s.installer.Install(orgName, npub, repoID); err != nil {
 			return fmt.Errorf("install pre-receive hook: %w", err)
 		}
 	}
 
-	s.logger.Info("provisioned repository", "npub", npub, "repo_id", repoID, "relay", sourceRelay, "event", sourceEvent)
+	s.logger.Info("provisioned repository", "npub", npub, "org_name", orgName, "repo_id", repoID, "relay", sourceRelay, "event", sourceEvent)
 	return nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (s *Service) validatePolicy(ctx context.Context, npub string, pubkey string) error {

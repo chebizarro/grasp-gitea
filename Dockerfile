@@ -1,5 +1,6 @@
 FROM golang:1.24-alpine AS build
 ARG BUILD_TAGS=""
+RUN apk add --no-cache build-base
 WORKDIR /src
 COPY . .
 RUN go mod tidy

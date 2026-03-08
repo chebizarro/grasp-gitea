@@ -116,17 +116,27 @@ func TestManualProvisionInstallsHookSelfContained(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	svc := New(cfg, st, giteaClient, hookInstaller, logger)
 
-	_, err = svc.ManualProvision(ctx, "npub-test-owner", "owner-pubkey-hex", "repo1")
+	result, err := svc.ManualProvision(ctx, "npub-test-owner", "owner-pubkey-hex", "repo1")
 	if err != nil {
 		t.Fatalf("manual provision failed: %v", err)
 	}
 
-	hookPath := filepath.Join(reposDir, "npub-test-owner", "repo1.git", "hooks", "pre-receive")
+	// orgName is the NIP-05 local-part or hex fallback (since no relay in test, falls back to pubkey prefix).
+	orgName := result.Owner
+	if orgName == "" {
+		orgName = "owner-pubkey-hex" // test fallback: pubkey is short enough to use as-is
+	}
+
+	hookPath := filepath.Join(reposDir, orgName, "repo1.git", "hooks", "pre-receive")
 	content, err := os.ReadFile(hookPath)
 	if err != nil {
 		t.Fatalf("expected hook file at %s: %v", hookPath, err)
 	}
 	if !strings.Contains(string(content), "GRASP_REPO_ID=\"repo1\"") {
 		t.Fatalf("hook content missing repo id env: %s", string(content))
+	}
+	// The hook script must still use the full npub for state lookups.
+	if !strings.Contains(string(content), "GRASP_REPO_NPUB=\"npub-test-owner\"") {
+		t.Fatalf("hook content missing npub env: %s", string(content))
 	}
 }

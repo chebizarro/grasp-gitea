@@ -20,8 +20,11 @@ func NewInstaller(repositoriesPath string, hookBinaryPath string, hookRelayURL s
 	}
 }
 
-func (i *Installer) Install(npub string, repoID string) error {
-	repoGitDir := filepath.Join(i.repositoriesPath, npub, repoID+".git")
+// Install writes the pre-receive hook for a repository.
+// orgName is the Gitea org (may be a NIP-05 local-part or hex prefix).
+// npub is the canonical Nostr identity passed to the hook for state lookups.
+func (i *Installer) Install(orgName string, npub string, repoID string) error {
+	repoGitDir := filepath.Join(i.repositoriesPath, orgName, repoID+".git")
 	if st, err := os.Stat(repoGitDir); err != nil || !st.IsDir() {
 		return fmt.Errorf("repository path not found: %s", repoGitDir)
 	}
