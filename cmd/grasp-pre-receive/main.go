@@ -15,6 +15,10 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/nostrstate"
 )
 
+type pushUpdate struct {
+	newSHA  string
+	refName string
+}
 
 func main() {
 	relayURL := envOrDefault("GRASP_HOOK_RELAY_URL", envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"))
@@ -34,17 +38,13 @@ func main() {
 		reject("invalid decoded pubkey")
 	}
 
-	// Read all push refs from stdin before hitting the relay, so that
-	// refs/nostr/<event-id> pushes (which need no state check) are not
-	// blocked by a missing kind 30618 event.
-	lines, err := readLines(os.Stdin)
+	updates, err := collectPushUpdates(os.Stdin)
 	if err != nil {
-		reject("failed to read hook input")
+		reject(err.Error())
 	}
 
-	// Only fetch the NIP-34 state if at least one ref actually needs it.
 	var state *nip34.RepositoryState
-	if requiresStateCheck(lines) {
+	if requiresStateCheck(updates) {
 		ctx := context.Background()
 		_, state, _, err = nostrstate.FetchLatestRepositoryStateForRepo(ctx, relayURL, pubkey, repoID)
 		if err != nil {
@@ -52,46 +52,46 @@ func main() {
 		}
 	}
 
-	for _, line := range lines {
-		parts := strings.Fields(line)
-		if len(parts) != 3 {
-			reject("invalid hook stdin format")
-		}
-		newSHA := parts[1]
-		refName := parts[2]
-		if ok, reason := evaluatePushRef(refName, newSHA, state); !ok {
-			reject(reason)
-		}
+	if err := evaluatePushUpdates(updates, state); err != nil {
+		reject(err.Error())
 	}
 }
 
-// readLines drains r into a slice of non-empty lines.
-func readLines(r io.Reader) ([]string, error) {
-	var lines []string
+func collectPushUpdates(r io.Reader) ([]pushUpdate, error) {
 	scanner := bufio.NewScanner(r)
+	updates := make([]pushUpdate, 0)
 	for scanner.Scan() {
-		if line := scanner.Text(); line != "" {
-			lines = append(lines, line)
-		}
-	}
-	return lines, scanner.Err()
-}
-
-// requiresStateCheck returns true if any ref in lines needs a NIP-34 state lookup.
-func requiresStateCheck(lines []string) bool {
-	for _, line := range lines {
+		line := scanner.Text()
 		parts := strings.Fields(line)
 		if len(parts) != 3 {
-			continue
+			return nil, fmt.Errorf("invalid hook stdin format")
 		}
-		refName := parts[2]
-		if !strings.HasPrefix(refName, "refs/nostr/") {
+		updates = append(updates, pushUpdate{newSHA: parts[1], refName: parts[2]})
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read hook input")
+	}
+	return updates, nil
+}
+
+func requiresStateCheck(updates []pushUpdate) bool {
+	for _, update := range updates {
+		if !strings.HasPrefix(update.refName, "refs/nostr/") {
 			return true
 		}
 	}
 	return false
 }
 
+func evaluatePushUpdates(updates []pushUpdate, state *nip34.RepositoryState) error {
+	for _, update := range updates {
+		if ok, reason := evaluatePushRef(update.refName, update.newSHA, state); !ok {
+			return fmt.Errorf("%s", reason)
+		}
+	}
+	return nil
+}
 
 func evaluatePushRef(refName string, newSHA string, state *nip34.RepositoryState) (bool, string) {
 	if strings.HasPrefix(refName, "refs/nostr/") {
@@ -110,6 +110,9 @@ func evaluatePushRef(refName string, newSHA string, state *nip34.RepositoryState
 }
 
 func validateRefAgainstState(refName string, newSHA string, state *nip34.RepositoryState) (bool, string) {
+	if state == nil {
+		return false, "no valid NIP-34 state event found; publish kind 30618 before pushing"
+	}
 	if strings.HasPrefix(refName, "refs/heads/") {
 		branch := strings.TrimPrefix(refName, "refs/heads/")
 		expected, ok := state.Branches[branch]

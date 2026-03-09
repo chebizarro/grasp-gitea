@@ -8,6 +8,7 @@
 {"id":"phase3-001","title":"Add gitea ROOT_URL integration config for public clone domain","status":"closed","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase3-002","title":"Add nginx routing config for git.sharegap.net to gitea:3000","status":"closed","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase3-003","title":"Run live ngit end-to-end verification in deployed stack","status":"in_progress","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
+{"id":"phase3-005","title":"Resolve Gitea API username hard-limit (40) blocking npub org auto-provision","status":"open","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase3-004","title":"Provide single-container self-contained verification runner","status":"closed","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase4-001","title":"Enforce cryptographic validation for incoming kind:30617 announcements","status":"closed","priority":1,"area":"security","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase4-002","title":"Support multi-maintainer state acceptance in pre-receive validation","status":"closed","priority":1,"area":"hooks","created_at":"2026-03-08T00:00:00Z"}
