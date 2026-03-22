@@ -16,7 +16,7 @@ func (p *Provider) HandleDiscovery(w http.ResponseWriter, r *http.Request) {
 		"userinfo_endpoint":                     base + "/auth/oauth2/userinfo",
 		"response_types_supported":              []string{"code"},
 		"subject_types_supported":               []string{"public"},
-		"id_token_signing_alg_values_supported": []string{"none"},
+		"id_token_signing_alg_values_supported": []string{"HS256"},
 		"scopes_supported":                      []string{"openid", "profile", "email"},
 		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
 		"claims_supported":                      []string{"sub", "preferred_username", "name", "email"},

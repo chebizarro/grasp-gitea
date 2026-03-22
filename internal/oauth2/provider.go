@@ -222,13 +222,31 @@ func (p *Provider) HandleToken(w http.ResponseWriter, r *http.Request) {
 
 	metrics.IncOAuth2TokenExchanges()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, map[string]any{
+	// Resolve identity for id_token claims.
+	link, found, _ := p.store.GetIdentityLinkByPubkey(r.Context(), ac.Pubkey)
+	username := ac.Npub
+	if found {
+		username = link.GiteaUsername
+	}
+	email := username + "@nostr.local"
+
+	idToken, err := mintIDToken(p.cfg, ac.Pubkey, username, email, accessTokenTTL)
+	if err != nil {
+		p.logger.Warn("mint id_token failed", "error", err)
+	}
+
+	resp := map[string]any{
 		"access_token": token,
 		"token_type":   "bearer",
 		"expires_in":   int(accessTokenTTL.Seconds()),
-	})
+	}
+	if idToken != "" {
+		resp["id_token"] = idToken
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // HandleUserInfo serves OIDC userinfo for a valid access token.
