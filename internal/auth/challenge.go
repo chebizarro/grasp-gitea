@@ -24,9 +24,11 @@ func NewService(st *store.SQLiteStore, nonceTTL time.Duration) *Service {
 // ChallengeResponse is the data returned to the browser to construct a NIP-98 event.
 type ChallengeResponse struct {
 	ChallengeID string `json:"challenge_id"`
-	URL         string `json:"url"`        // the verify URL to sign
-	Method      string `json:"method"`     // always "POST"
-	ExpiresAt   int64  `json:"expires_at"` // unix timestamp
+	URL         string `json:"url"`          // the verify URL to sign
+	Method      string `json:"method"`       // always "POST"
+	ExpiresAt   int64  `json:"expires_at"`   // unix timestamp
+	RedirectURI string `json:"redirect_uri"` // carried for NIP-46/55 flows
+	OAuth2State string `json:"oauth2_state"` // carried for NIP-46/55 flows
 }
 
 // IssueChallenge creates a nonce and returns the browser sign-in payload.
@@ -49,6 +51,8 @@ func (s *Service) IssueChallenge(ctx context.Context, oauth2State, redirectURI, 
 		URL:         verifyURL,
 		Method:      "POST",
 		ExpiresAt:   expiresAt.Unix(),
+		RedirectURI: redirectURI,
+		OAuth2State: oauth2State,
 	}, nil
 }
 

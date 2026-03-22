@@ -41,6 +41,12 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("/auth/nip07/verify", method(http.MethodPost, s.oauth2Provider.HandleVerify))
 		mux.HandleFunc("/auth/oauth2/token", method(http.MethodPost, s.oauth2Provider.HandleToken))
 		mux.HandleFunc("/auth/oauth2/userinfo", method(http.MethodGet, s.oauth2Provider.HandleUserInfo))
+		// NIP-46 remote signing (bunker)
+		mux.HandleFunc("/auth/nip46/init", method(http.MethodPost, s.oauth2Provider.HandleNIP46Init))
+		mux.HandleFunc("/auth/nip46/status", method(http.MethodGet, s.oauth2Provider.HandleNIP46Status))
+		// NIP-55 Android signer
+		mux.HandleFunc("/auth/nip55/challenge", method(http.MethodGet, s.oauth2Provider.HandleNIP55Challenge))
+		mux.HandleFunc("/auth/nip55/callback", s.oauth2Provider.HandleNIP55Callback) // GET+POST
 	}
 
 	return mux

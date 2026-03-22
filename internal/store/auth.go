@@ -86,6 +86,18 @@ func (s *SQLiteStore) initAuthSchema() error {
 			pubkey TEXT NOT NULL,
 			expires_at DATETIME NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS nip46_sessions (
+			session_token TEXT PRIMARY KEY,
+			bunker_pubkey TEXT NOT NULL DEFAULT '',
+			client_pubkey TEXT NOT NULL DEFAULT '',
+			oauth2_state  TEXT NOT NULL,
+			redirect_uri  TEXT NOT NULL,
+			status        TEXT NOT NULL DEFAULT 'pending',
+			auth_code     TEXT NOT NULL DEFAULT '',
+			error_msg     TEXT NOT NULL DEFAULT '',
+			created_at    DATETIME NOT NULL,
+			expires_at    DATETIME NOT NULL
+		);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -282,6 +294,77 @@ func (s *SQLiteStore) DeleteExpiredTokens(ctx context.Context) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := s.db.ExecContext(ctx,
 		`DELETE FROM oauth2_access_tokens WHERE expires_at < ?`, now,
+	)
+	return err
+}
+
+// --- NIP-46 sessions ---
+
+type NIP46Session struct {
+	SessionToken string
+	BunkerPubkey string
+	ClientPubkey string
+	OAuth2State  string
+	RedirectURI  string
+	Status       string // "pending" | "complete" | "error"
+	AuthCode     string
+	ErrorMsg     string
+	CreatedAt    time.Time
+	ExpiresAt    time.Time
+}
+
+func (s *SQLiteStore) CreateNIP46Session(ctx context.Context, sess NIP46Session) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO nip46_sessions
+		 (session_token, bunker_pubkey, client_pubkey, oauth2_state, redirect_uri, status, auth_code, error_msg, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, 'pending', '', '', ?, ?)`,
+		sess.SessionToken, sess.BunkerPubkey, sess.ClientPubkey,
+		sess.OAuth2State, sess.RedirectURI,
+		sess.CreatedAt.UTC().Format(time.RFC3339),
+		sess.ExpiresAt.UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+func (s *SQLiteStore) GetNIP46Session(ctx context.Context, sessionToken string) (NIP46Session, error) {
+	var sess NIP46Session
+	var createdStr, expiresStr string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT session_token, bunker_pubkey, client_pubkey, oauth2_state, redirect_uri,
+		        status, auth_code, error_msg, created_at, expires_at
+		 FROM nip46_sessions WHERE session_token = ?`, sessionToken,
+	).Scan(
+		&sess.SessionToken, &sess.BunkerPubkey, &sess.ClientPubkey,
+		&sess.OAuth2State, &sess.RedirectURI,
+		&sess.Status, &sess.AuthCode, &sess.ErrorMsg,
+		&createdStr, &expiresStr,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return NIP46Session{}, ErrNotFound
+	}
+	if err != nil {
+		return NIP46Session{}, err
+	}
+	sess.CreatedAt, _ = time.Parse(time.RFC3339, createdStr)
+	sess.ExpiresAt, _ = time.Parse(time.RFC3339, expiresStr)
+	if time.Now().After(sess.ExpiresAt) && sess.Status == "pending" {
+		return sess, ErrExpired
+	}
+	return sess, nil
+}
+
+func (s *SQLiteStore) CompleteNIP46Session(ctx context.Context, sessionToken, authCode string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE nip46_sessions SET status='complete', auth_code=? WHERE session_token=?`,
+		authCode, sessionToken,
+	)
+	return err
+}
+
+func (s *SQLiteStore) FailNIP46Session(ctx context.Context, sessionToken, errMsg string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE nip46_sessions SET status='error', error_msg=? WHERE session_token=?`,
+		errMsg, sessionToken,
 	)
 	return err
 }

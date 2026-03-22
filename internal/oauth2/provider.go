@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
+	"fiatjaf.com/nostr"
 	"github.com/sharegap/grasp-gitea/internal/auth"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
+	"github.com/sharegap/grasp-gitea/internal/nip46"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -256,6 +259,293 @@ func (p *Provider) HandleUserInfo(w http.ResponseWriter, r *http.Request) {
 		"name":               link.GiteaUsername,
 		"email":              link.GiteaUsername + "@nostr.local",
 	})
+}
+
+// --- NIP-46 (remote signing / bunker) ---
+
+// HandleNIP46Init starts a NIP-46 session. The browser posts the bunker URI
+// and OAuth2 params; this kicks off a background connection to the bunker and
+// returns a session token for polling.
+func (p *Provider) HandleNIP46Init(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		BunkerURI   string `json:"bunker_uri"`
+		OAuth2State string `json:"state"`
+		RedirectURI string `json:"redirect_uri"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body"})
+		return
+	}
+	if body.BunkerURI == "" || body.RedirectURI == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bunker_uri and redirect_uri required"})
+		return
+	}
+
+	sessionToken, err := store.GenerateToken()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	sess := store.NIP46Session{
+		SessionToken: sessionToken,
+		OAuth2State:  body.OAuth2State,
+		RedirectURI:  body.RedirectURI,
+		CreatedAt:    time.Now(),
+		ExpiresAt:    time.Now().Add(nip46.SessionTimeout),
+	}
+	if err := p.store.CreateNIP46Session(r.Context(), sess); err != nil {
+		p.logger.Error("create nip46 session", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	metrics.IncNIP46SessionsInitiated()
+
+	// Run the bunker handshake in the background.
+	challengeURL := strings.TrimRight(p.cfg.BridgePublicURL, "/") + "/auth/nip46/verify"
+	resultCh := nip46.RunSession(context.Background(), p.logger, body.BunkerURI, challengeURL, "POST")
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), nip46.SessionTimeout)
+		defer cancel()
+		_ = ctx
+
+		result := <-resultCh
+		if result.Err != nil {
+			p.logger.Warn("nip46 session failed", "session", sessionToken, "error", result.Err)
+			metrics.IncNIP46SessionsFailed()
+			_ = p.store.FailNIP46Session(context.Background(), sessionToken, result.Err.Error())
+			return
+		}
+
+		// Verify signed event.
+		evJSON, _ := json.Marshal(result.SignedEvent)
+		vr, err := auth.VerifyNIP98(auth.VerifyRequest{
+			SignedEventJSON: string(evJSON),
+			ExpectedURL:     challengeURL,
+			ExpectedMethod:  "POST",
+		})
+		if err != nil {
+			p.logger.Warn("nip46 nip98 verify failed", "session", sessionToken, "error", err)
+			metrics.IncNIP46SessionsFailed()
+			_ = p.store.FailNIP46Session(context.Background(), sessionToken, "signature verification failed: "+err.Error())
+			return
+		}
+
+		// Resolve/create Gitea user.
+		giteaUser, err := p.resolveGiteaUser(context.Background(), vr.Pubkey, vr.Npub)
+		if err != nil {
+			p.logger.Error("nip46 user resolve failed", "pubkey", vr.Pubkey, "error", err)
+			metrics.IncNIP46SessionsFailed()
+			_ = p.store.FailNIP46Session(context.Background(), sessionToken, "user provisioning failed")
+			return
+		}
+
+		// Issue auth code.
+		code, err := store.GenerateToken()
+		if err != nil {
+			_ = p.store.FailNIP46Session(context.Background(), sessionToken, "internal error")
+			return
+		}
+		if err := p.store.CreateAuthCode(context.Background(), code, vr.Pubkey, vr.Npub, sess.RedirectURI, time.Now().Add(authCodeTTL)); err != nil {
+			_ = p.store.FailNIP46Session(context.Background(), sessionToken, "internal error")
+			return
+		}
+
+		_ = p.store.CompleteNIP46Session(context.Background(), sessionToken, code)
+		metrics.IncNIP46SessionsCompleted()
+		p.logger.Info("nip46 login success", "pubkey", vr.Pubkey, "gitea_user", giteaUser.Username)
+	}()
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"session_token": sessionToken,
+		"poll_url":      strings.TrimRight(p.cfg.BridgePublicURL, "/") + "/auth/nip46/status",
+		"expires_at":    sess.ExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// HandleNIP46Status polls the status of a NIP-46 session.
+// Returns { status, redirect_url } where status is "pending" | "complete" | "error".
+func (p *Provider) HandleNIP46Status(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("session")
+	if token == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session required"})
+		return
+	}
+
+	sess, err := p.store.GetNIP46Session(r.Context(), token)
+	if err == store.ErrNotFound {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	if err == store.ErrExpired {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "error", "error": "session expired"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	resp := map[string]string{"status": sess.Status}
+	if sess.Status == "complete" {
+		sep := "?"
+		if strings.Contains(sess.RedirectURI, "?") {
+			sep = "&"
+		}
+		redirectURL := sess.RedirectURI + sep + "code=" + sess.AuthCode
+		if sess.OAuth2State != "" {
+			redirectURL += "&state=" + sess.OAuth2State
+		}
+		resp["redirect_url"] = redirectURL
+	}
+	if sess.Status == "error" {
+		resp["error"] = sess.ErrorMsg
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// --- NIP-55 (Android signer) ---
+
+const nip55SessionTimeout = 10 * time.Minute
+
+// HandleNIP55Challenge issues a NIP-55 challenge.
+// Returns a nostrsigner: URI the user can open with an Android signer app, plus a
+// session token for polling (reuses the NIP-46 poll endpoint).
+func (p *Provider) HandleNIP55Challenge(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	oauth2State := q.Get("state")
+	redirectURI := q.Get("redirect_uri")
+	if redirectURI == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "redirect_uri required"})
+		return
+	}
+
+	sessionToken, err := store.GenerateToken()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	callbackURL := strings.TrimRight(p.cfg.BridgePublicURL, "/") + "/auth/nip55/callback?session=" + sessionToken
+
+	// Build an unsigned NIP-98 challenge event. The signer app fills in pubkey + sig.
+	evt := nostr.Event{
+		Kind:      27235,
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Tags: nostr.Tags{
+			{"u", callbackURL},
+			{"method", "POST"},
+		},
+	}
+	evtJSON, _ := json.Marshal(evt)
+
+	nostrsignerURI := "nostrsigner:" + url.QueryEscape(string(evtJSON)) +
+		"?compressionType=none&returnType=event&callbackUrl=" + url.QueryEscape(callbackURL)
+
+	sess := store.NIP46Session{
+		SessionToken: sessionToken,
+		OAuth2State:  oauth2State,
+		RedirectURI:  redirectURI,
+		CreatedAt:    time.Now(),
+		ExpiresAt:    time.Now().Add(nip55SessionTimeout),
+	}
+	if err := p.store.CreateNIP46Session(r.Context(), sess); err != nil {
+		p.logger.Error("create nip55 session", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	metrics.IncNIP55ChallengesIssued()
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"session_token":   sessionToken,
+		"nostrsigner_uri": nostrsignerURI,
+		"callback_url":    callbackURL,
+		"poll_url":        strings.TrimRight(p.cfg.BridgePublicURL, "/") + "/auth/nip46/status",
+		"expires_at":      sess.ExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// HandleNIP55Callback receives the signed event from the Android signer app.
+func (p *Provider) HandleNIP55Callback(w http.ResponseWriter, r *http.Request) {
+	sessionToken := r.URL.Query().Get("session")
+	if sessionToken == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session required"})
+		return
+	}
+
+	sess, err := p.store.GetNIP46Session(r.Context(), sessionToken)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired session"})
+		return
+	}
+	if sess.Status != "pending" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "session already completed"})
+		return
+	}
+
+	// Accept signed event either as JSON body or form field "event".
+	var evtJSON string
+	ct := r.Header.Get("Content-Type")
+	if strings.Contains(ct, "application/json") {
+		var body struct {
+			Event string `json:"event"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			evtJSON = body.Event
+		}
+	}
+	if evtJSON == "" {
+		_ = r.ParseForm()
+		evtJSON = r.FormValue("event")
+	}
+	if evtJSON == "" {
+		metrics.IncNIP55VerifyFailure()
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "event required"})
+		return
+	}
+
+	callbackURL := strings.TrimRight(p.cfg.BridgePublicURL, "/") + "/auth/nip55/callback"
+	vr, err := auth.VerifyNIP98(auth.VerifyRequest{
+		SignedEventJSON: evtJSON,
+		ExpectedURL:     callbackURL,
+		ExpectedMethod:  "POST",
+	})
+	if err != nil {
+		metrics.IncNIP55VerifyFailure()
+		p.logger.Warn("nip55 verify failed", "session", sessionToken, "error", err)
+		_ = p.store.FailNIP46Session(r.Context(), sessionToken, "signature verification failed: "+err.Error())
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "verification failed"})
+		return
+	}
+
+	giteaUser, err := p.resolveGiteaUser(r.Context(), vr.Pubkey, vr.Npub)
+	if err != nil {
+		metrics.IncNIP55VerifyFailure()
+		_ = p.store.FailNIP46Session(r.Context(), sessionToken, "user provisioning failed")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "user provisioning failed"})
+		return
+	}
+
+	code, err := store.GenerateToken()
+	if err != nil {
+		_ = p.store.FailNIP46Session(r.Context(), sessionToken, "internal error")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if err := p.store.CreateAuthCode(r.Context(), code, vr.Pubkey, vr.Npub, sess.RedirectURI, time.Now().Add(authCodeTTL)); err != nil {
+		_ = p.store.FailNIP46Session(r.Context(), sessionToken, "internal error")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	_ = p.store.CompleteNIP46Session(r.Context(), sessionToken, code)
+	metrics.IncNIP55VerifySuccess()
+	p.logger.Info("nip55 login success", "pubkey", vr.Pubkey, "gitea_user", giteaUser.Username)
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "complete"})
 }
 
 // resolveGiteaUser looks up an existing identity link or provisions a new Gitea user.
