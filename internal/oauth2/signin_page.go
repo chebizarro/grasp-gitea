@@ -153,6 +153,7 @@ const signinPageTemplate = `<!DOCTYPE html>
     <button class="tab active" onclick="switchTab('nip07', this)">🔌 Browser Extension</button>
     <button class="tab" onclick="switchTab('nip46', this)">🔐 Remote Signer</button>
     <button class="tab" onclick="switchTab('nip55', this)">📱 Android Signer</button>
+    <button class="tab" onclick="switchTab('nip5f', this)" id="tab-nip5f">🖥 Local Signer</button>
   </div>
 
   <!-- NIP-07: Browser Extension -->
@@ -209,6 +210,33 @@ const signinPageTemplate = `<!DOCTYPE html>
       Compatible with
       <a href="https://github.com/greenart7c3/Amber" target="_blank" rel="noopener">Amber</a>
       and other NIP-55 Android signer apps.
+    </div>
+  </div>
+
+  <!-- NIP-5F / NIP-55L: Local Desktop Signer -->
+  <div id="panel-nip5f" class="tab-panel">
+    <p style="font-size:0.875rem;color:#8b949e;margin-bottom:1rem">
+      Sign using a local signer daemon on this machine via
+      <strong style="color:#c9d1d9">NIP-5F</strong> (Unix socket) or
+      <strong style="color:#c9d1d9">NIP-55L</strong> (D-Bus).<br><br>
+      Requires <code style="font-size:0.8rem;background:#0d1117;padding:2px 5px;border-radius:4px">grasp-local-signer</code> running locally.
+    </p>
+    <button class="btn-primary" id="btn-nip5f" onclick="signInLocal()">
+      🖥 Sign with Local Signer
+    </button>
+    <div class="status" id="status-nip5f"></div>
+    <div class="info-box" id="local-not-found" style="display:none">
+      <strong>grasp-local-signer not detected</strong> on <code>localhost:7070</code>.<br><br>
+      Start it on this machine:<br>
+      <code style="font-size:0.8rem;display:block;margin-top:0.5rem;background:#0d1117;padding:6px 8px;border-radius:4px">
+        grasp-local-signer
+      </code><br>
+      Supports <a href="https://github.com/chebizarro/grasp-gitea/blob/main/nips/nip5f/README.md" target="_blank">NIP-5F</a> (nostr-signer-sockd)
+      and <a href="https://github.com/chebizarro/grasp-gitea/blob/main/nips/nip55l/README.md" target="_blank">NIP-55L</a> (D-Bus org.nostr.Signer).
+    </div>
+    <div class="info-box" id="local-bridge-info" style="display:none;border-color:#2d6a4f">
+      <span style="color:#3fb950">✓</span> Local signer detected
+      (<span id="local-backend">—</span>)
     </div>
   </div>
 
@@ -410,6 +438,86 @@ async function initNIP55() {
   }
 }
 
+// ---- NIP-5F / NIP-55L: Local signer via grasp-local-signer bridge ----
+const LOCAL_BRIDGE = 'http://localhost:7070';
+
+async function probeLocalBridge() {
+  try {
+    const r = await fetch(LOCAL_BRIDGE + '/health', { signal: AbortSignal.timeout(1500) });
+    if (r.ok) {
+      const b = await r.json();
+      return b.backend || 'unknown';
+    }
+  } catch(_) {}
+  return null;
+}
+
+async function signInLocal() {
+  setLoading('nip5f', true, 'Connecting…');
+  setStatus('nip5f', 'Checking local signer bridge…');
+
+  const backend = await probeLocalBridge();
+  if (!backend) {
+    setLoading('nip5f', false, '🖥 Sign with Local Signer');
+    setStatus('nip5f', 'grasp-local-signer not reachable on localhost:7070', 'error');
+    document.getElementById('local-not-found').style.display = 'block';
+    return;
+  }
+
+  document.getElementById('local-not-found').style.display = 'none';
+  document.getElementById('local-backend').textContent = backend;
+  document.getElementById('local-bridge-info').style.display = 'block';
+
+  setStatus('nip5f', 'Fetching pubkey…');
+
+  try {
+    const pkResp = await fetch(LOCAL_BRIDGE + '/pubkey', { signal: AbortSignal.timeout(5000) });
+    const pkBody = await pkResp.json();
+    if (!pkResp.ok) throw new Error(pkBody.error || 'pubkey fetch failed');
+    const pubkey = pkBody.pubkey;
+
+    setStatus('nip5f', 'Requesting signature…');
+
+    const event = {
+      kind: 27235,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [['u', CHALLENGE.url], ['method', CHALLENGE.method]],
+      content: '',
+      pubkey,
+    };
+
+    const signResp = await fetch(LOCAL_BRIDGE + '/sign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(event),
+      signal: AbortSignal.timeout(15000),
+    });
+    const signBody = await signResp.json();
+    if (!signResp.ok) throw new Error(signBody.error || 'signing failed');
+
+    const signed = signBody.signed_event;
+    setStatus('nip5f', 'Verifying…');
+
+    const verifyResp = await fetch(CHALLENGE.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        challenge_id: CHALLENGE.challenge_id,
+        signed_event: JSON.stringify(signed),
+      }),
+    });
+    const verifyBody = await verifyResp.json();
+    if (!verifyResp.ok) throw new Error(verifyBody.error || 'verification failed');
+
+    setStatus('nip5f', 'Redirecting…', 'success');
+    window.location.href = verifyBody.redirect_url;
+
+  } catch(err) {
+    setLoading('nip5f', false, '🖥 Sign with Local Signer');
+    setStatus('nip5f', err.message || 'An error occurred.', 'error');
+  }
+}
+
 // ---- Init ----
 window.addEventListener('DOMContentLoaded', function() {
   if (!window.nostr) {
@@ -419,6 +527,18 @@ window.addEventListener('DOMContentLoaded', function() {
   document.getElementById('btn-nip07').dataset.label = '⚡ Sign in with Extension';
   document.getElementById('btn-nip46').dataset.label = '🔐 Connect Bunker';
   document.getElementById('btn-nip55').dataset.label = '📱 Generate QR Code';
+  document.getElementById('btn-nip5f').dataset.label = '🖥 Sign with Local Signer';
+
+  // Probe local bridge quietly on load and light up the tab if found
+  probeLocalBridge().then(function(backend) {
+    if (backend) {
+      const tab = document.getElementById('tab-nip5f');
+      tab.textContent = '🖥 Local Signer ✓';
+      tab.style.color = '#3fb950';
+      document.getElementById('local-backend').textContent = backend;
+      document.getElementById('local-bridge-info').style.display = 'block';
+    }
+  });
 });
 </script>
 </body>
