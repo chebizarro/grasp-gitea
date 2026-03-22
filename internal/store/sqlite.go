@@ -62,7 +62,12 @@ func Open(path string) (*SQLiteStore, error) {
 		}
 	}
 
-	return &SQLiteStore{db: db}, nil
+	st := &SQLiteStore{db: db}
+	if err := st.initAuthSchema(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return st, nil
 }
 
 func (s *SQLiteStore) Close() error {

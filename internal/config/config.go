@@ -22,6 +22,13 @@ type Config struct {
 	EmbeddedRelay        bool
 	EmbeddedRelayPort    int
 	EmbeddedRelayDB      string
+
+	// NIP-07 web auth
+	NIP07AuthEnabled   bool   // NIP07_AUTH_ENABLED
+	OAuth2ClientID     string // OAUTH2_CLIENT_ID
+	OAuth2ClientSecret string // OAUTH2_CLIENT_SECRET
+	BridgePublicURL    string // BRIDGE_PUBLIC_URL (public base URL of grasp-bridge)
+	NonceTTLSeconds    int    // NONCE_TTL_SECONDS, default 300
 }
 
 func Load() (Config, error) {
@@ -40,6 +47,12 @@ func Load() (Config, error) {
 		EmbeddedRelay:        boolEnv("EMBEDDED_RELAY", false),
 		EmbeddedRelayPort:    intEnv("EMBEDDED_RELAY_PORT", 3334),
 		EmbeddedRelayDB:      envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
+
+		NIP07AuthEnabled:   boolEnv("NIP07_AUTH_ENABLED", false),
+		OAuth2ClientID:     strings.TrimSpace(os.Getenv("OAUTH2_CLIENT_ID")),
+		OAuth2ClientSecret: strings.TrimSpace(os.Getenv("OAUTH2_CLIENT_SECRET")),
+		BridgePublicURL:    strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
+		NonceTTLSeconds:    intEnv("NONCE_TTL_SECONDS", 300),
 	}
 
 	if cfg.GiteaAdminToken == "" {
@@ -48,6 +61,18 @@ func Load() (Config, error) {
 
 	if len(cfg.RelayURLs) == 0 {
 		return Config{}, fmt.Errorf("RELAY_URLS is required for Phase 1")
+	}
+
+	if cfg.NIP07AuthEnabled {
+		if cfg.OAuth2ClientID == "" {
+			return Config{}, fmt.Errorf("OAUTH2_CLIENT_ID is required when NIP07_AUTH_ENABLED=true")
+		}
+		if cfg.OAuth2ClientSecret == "" {
+			return Config{}, fmt.Errorf("OAUTH2_CLIENT_SECRET is required when NIP07_AUTH_ENABLED=true")
+		}
+		if cfg.BridgePublicURL == "" {
+			return Config{}, fmt.Errorf("BRIDGE_PUBLIC_URL is required when NIP07_AUTH_ENABLED=true")
+		}
 	}
 
 	return cfg, nil

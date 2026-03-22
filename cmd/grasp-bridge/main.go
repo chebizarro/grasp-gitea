@@ -14,9 +14,11 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/api"
+	"github.com/sharegap/grasp-gitea/internal/auth"
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
+	"github.com/sharegap/grasp-gitea/internal/oauth2"
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/relay"
@@ -44,6 +46,20 @@ func main() {
 	provisionerSvc := provisioner.New(cfg, st, giteaClient, hookInstaller, logger)
 	proactiveSyncSvc := proactivesync.New(cfg.GiteaRepositoriesDir, logger)
 	apiServer := api.New(provisionerSvc, st, logger)
+
+	if cfg.NIP07AuthEnabled {
+		nonceTTL := time.Duration(cfg.NonceTTLSeconds) * time.Second
+		authSvc := auth.NewService(st, nonceTTL)
+		oauth2Cfg := oauth2.Config{
+			ClientID:        cfg.OAuth2ClientID,
+			ClientSecret:    cfg.OAuth2ClientSecret,
+			BridgePublicURL: cfg.BridgePublicURL,
+			RelayURL:        firstRelay(cfg.RelayURLs),
+		}
+		oauth2Provider := oauth2.New(oauth2Cfg, authSvc, st, giteaClient, logger)
+		apiServer.SetOAuth2Provider(oauth2Provider)
+		logger.Info("NIP-07 web auth enabled", "bridge_public_url", cfg.BridgePublicURL)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -103,4 +119,11 @@ func main() {
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
 	logger.Info("grasp-bridge stopped")
+}
+
+func firstRelay(relays []string) string {
+	if len(relays) > 0 {
+		return relays[0]
+	}
+	return ""
 }

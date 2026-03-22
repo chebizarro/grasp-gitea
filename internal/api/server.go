@@ -7,18 +7,25 @@ import (
 	"strings"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
+	"github.com/sharegap/grasp-gitea/internal/oauth2"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
 type Server struct {
-	provisioner *provisioner.Service
-	store       *store.SQLiteStore
-	logger      *slog.Logger
+	provisioner  *provisioner.Service
+	store        *store.SQLiteStore
+	logger       *slog.Logger
+	oauth2Provider *oauth2.Provider // nil when NIP-07 auth is disabled
 }
 
 func New(provisionerSvc *provisioner.Service, st *store.SQLiteStore, logger *slog.Logger) *Server {
 	return &Server{provisioner: provisionerSvc, store: st, logger: logger}
+}
+
+// SetOAuth2Provider enables NIP-07 web auth routes.
+func (s *Server) SetOAuth2Provider(p *oauth2.Provider) {
+	s.oauth2Provider = p
 }
 
 func (s *Server) Handler() http.Handler {
@@ -27,6 +34,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/metrics", method(http.MethodGet, s.metrics))
 	mux.HandleFunc("/mappings", method(http.MethodGet, s.mappings))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.manualProvision))
+
+	if s.oauth2Provider != nil {
+		mux.HandleFunc("/auth/oauth2/authorize", method(http.MethodGet, s.oauth2Provider.HandleAuthorize))
+		mux.HandleFunc("/auth/nip07/verify", method(http.MethodPost, s.oauth2Provider.HandleVerify))
+		mux.HandleFunc("/auth/oauth2/token", method(http.MethodPost, s.oauth2Provider.HandleToken))
+		mux.HandleFunc("/auth/oauth2/userinfo", method(http.MethodGet, s.oauth2Provider.HandleUserInfo))
+	}
+
 	return mux
 }
 
