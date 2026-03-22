@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
@@ -48,11 +48,11 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		metrics.IncAnnouncementRejected()
 		return errors.New("nil event")
 	}
-	if ev.Kind != KindRepositoryAnnouncement {
+	if ev.Kind != nostr.Kind(KindRepositoryAnnouncement) {
 		return nil
 	}
 
-	processed, err := s.store.EventProcessed(ctx, ev.ID)
+	processed, err := s.store.EventProcessed(ctx, ev.ID.Hex())
 	if err != nil {
 		metrics.IncAnnouncementRejected()
 		return err
@@ -61,7 +61,10 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		return nil
 	}
 
-	if strings.TrimSpace(ev.ID) == "" || strings.TrimSpace(ev.PubKey) == "" {
+	evID := ev.ID.Hex()
+	evPubkey := ev.PubKey.Hex()
+
+	if evID == "" || evPubkey == "" {
 		metrics.IncAnnouncementRejected()
 		return fmt.Errorf("invalid announcement: missing id/pubkey")
 	}
@@ -70,16 +73,12 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		return fmt.Errorf("announcement cryptographic validation failed: %w", err)
 	}
 
-	npub, err := nip19.EncodePublicKey(ev.PubKey)
-	if err != nil {
-		metrics.IncAnnouncementRejected()
-		return fmt.Errorf("encode npub from pubkey: %w", err)
-	}
+	npub := nip19.EncodeNpub(ev.PubKey)
 
 	repoID := getTagValue(ev.Tags, "d")
 	if repoID == "" {
 		metrics.IncAnnouncementRejected()
-		return fmt.Errorf("missing d tag for announcement %s", ev.ID)
+		return fmt.Errorf("missing d tag for announcement %s", evID)
 	}
 
 	cloneURL, ok := findCloneForPrefix(ev.Tags, s.cfg.ClonePrefix)
@@ -94,23 +93,23 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 				metrics.IncAnnouncementRejected()
 				return fmt.Errorf("archive repo %s/%s after clone tag removal: %w", npub, repoID, err)
 			}
-			_ = s.store.MarkEventProcessed(ctx, ev.ID, ev.PubKey, ev.Kind)
-			s.logger.Info("archived repository due to clone tag removal", "npub", npub, "repo_id", repoID, "event", ev.ID)
+			_ = s.store.MarkEventProcessed(ctx, evID, evPubkey, int(ev.Kind))
+			s.logger.Info("archived repository due to clone tag removal", "npub", npub, "repo_id", repoID, "event", evID)
 			return nil
 		}
 		return nil
 	}
 	if !cloneMatchesRepoID(cloneURL, repoID) {
 		metrics.IncAnnouncementRejected()
-		return fmt.Errorf("announcement %s clone URL does not match repo id %s", ev.ID, repoID)
+		return fmt.Errorf("announcement %s clone URL does not match repo id %s", evID, repoID)
 	}
 
-	if err := s.provisionFromAnnouncement(ctx, npub, ev.PubKey, repoID, cloneURL, ev.ID, relayURL); err != nil {
+	if err := s.provisionFromAnnouncement(ctx, npub, evPubkey, repoID, cloneURL, evID, relayURL); err != nil {
 		metrics.IncAnnouncementRejected()
 		return err
 	}
 
-	if err := s.store.MarkEventProcessed(ctx, ev.ID, ev.PubKey, ev.Kind); err != nil {
+	if err := s.store.MarkEventProcessed(ctx, evID, evPubkey, int(ev.Kind)); err != nil {
 		metrics.IncAnnouncementRejected()
 		return err
 	}
@@ -131,12 +130,12 @@ func (s *Service) ManualProvision(ctx context.Context, npub string, pubkey strin
 			metrics.IncManualProvisionFailures()
 			return Result{}, fmt.Errorf("expected npub, got %s", t)
 		}
-		decoded, ok := value.(string)
+		decoded, ok := value.(nostr.PubKey)
 		if !ok {
 			metrics.IncManualProvisionFailures()
 			return Result{}, fmt.Errorf("invalid decoded npub value")
 		}
-		pubkey = decoded
+		pubkey = decoded.Hex()
 	}
 
 	cloneURL := fmt.Sprintf("%s/%s/%s.git", s.cfg.ClonePrefix, npub, repoID)

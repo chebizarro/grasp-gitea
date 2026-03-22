@@ -4,20 +4,20 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip34"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip34"
 
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 )
 
 func FetchLatestRepositoryStateForRepo(ctx context.Context, relayURL string, ownerPubkey string, repoID string) (*nostr.Event, *nip34.RepositoryState, []string, error) {
-	relay, err := nostr.RelayConnect(ctx, relayURL)
+	relay, err := nostr.RelayConnect(ctx, relayURL, nostr.RelayOptions{})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("connect relay: %w", err)
 	}
 
 	filter := nostr.Filter{
-		Kinds: []int{nostr.KindRepositoryAnnouncement, nostr.KindRepositoryState},
+		Kinds: []nostr.Kind{nostr.KindRepositoryAnnouncement, nostr.KindRepositoryState},
 		Tags: nostr.TagMap{
 			"d": []string{repoID},
 		},
@@ -25,7 +25,7 @@ func FetchLatestRepositoryStateForRepo(ctx context.Context, relayURL string, own
 
 	subCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	sub, err := relay.Subscribe(subCtx, []nostr.Filter{filter})
+	sub, err := relay.Subscribe(subCtx, filter, nostr.SubscriptionOptions{Label: "grasp-state"})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("subscribe relay: %w", err)
 	}
@@ -36,17 +36,15 @@ func FetchLatestRepositoryStateForRepo(ctx context.Context, relayURL string, own
 
 	var events []nostr.Event
 	for ev := range sub.Events {
-		if ev == nil {
+		evCopy := ev
+		if err := nostrverify.ValidateEventIDAndSignature(&evCopy); err != nil {
 			continue
 		}
-		if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
-			continue
-		}
-		repo := nip34.ParseRepository(*ev)
+		repo := nip34.ParseRepository(ev)
 		if repo.ID != repoID {
 			continue
 		}
-		events = append(events, *ev)
+		events = append(events, ev)
 	}
 
 	maintainers, err := extractMaintainers(events, ownerPubkey, repoID)
@@ -65,7 +63,7 @@ func FetchLatestRepositoryStateForRepo(ctx context.Context, relayURL string, own
 		if ev.Kind != nostr.KindRepositoryState {
 			continue
 		}
-		if _, ok := maintainerSet[ev.PubKey]; !ok {
+		if _, ok := maintainerSet[ev.PubKey.Hex()]; !ok {
 			continue
 		}
 		if latest == nil || ev.CreatedAt > latest.CreatedAt {
@@ -92,7 +90,7 @@ func extractMaintainers(events []nostr.Event, ownerPubkey string, repoID string)
 		if repo.ID != repoID {
 			continue
 		}
-		announcementsByPubkey[ev.PubKey] = ev
+		announcementsByPubkey[ev.PubKey.Hex()] = ev
 	}
 
 	if _, ok := announcementsByPubkey[ownerPubkey]; !ok {
@@ -115,7 +113,7 @@ func extractMaintainers(events []nostr.Event, ownerPubkey string, repoID string)
 		}
 		repo := nip34.ParseRepository(ann)
 		for _, maintainer := range repo.Maintainers {
-			visit(maintainer)
+			visit(maintainer.Hex())
 		}
 	}
 

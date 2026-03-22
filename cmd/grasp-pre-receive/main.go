@@ -8,9 +8,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
-	"github.com/nbd-wtf/go-nostr/nip34"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
+	"fiatjaf.com/nostr/nip34"
 
 	"github.com/sharegap/grasp-gitea/internal/nostrstate"
 )
@@ -33,8 +33,12 @@ func main() {
 	if err != nil || decodedType != "npub" {
 		reject("invalid npub in GRASP_REPO_NPUB")
 	}
-	pubkey, ok := v.(string)
-	if !ok || strings.TrimSpace(pubkey) == "" {
+	pk, ok := v.(nostr.PubKey)
+	if !ok {
+		reject("invalid decoded pubkey")
+	}
+	pubkey := pk.Hex()
+	if pubkey == "" {
 		reject("invalid decoded pubkey")
 	}
 

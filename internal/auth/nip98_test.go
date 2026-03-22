@@ -5,14 +5,27 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 )
 
-func TestVerifyNIP98_ValidEvent(t *testing.T) {
-	sk := nostr.GeneratePrivateKey()
-	pk, _ := nostr.GetPublicKey(sk)
+func generateTestKeypair(t *testing.T) (nostr.SecretKey, nostr.PubKey) {
+	t.Helper()
+	sk := nostr.Generate()
+	return sk, sk.Public()
+}
 
-	event := nostr.Event{
+func signTestEvent(t *testing.T, sk nostr.SecretKey, event nostr.Event) nostr.Event {
+	t.Helper()
+	if err := event.Sign(sk); err != nil {
+		t.Fatalf("sign event: %v", err)
+	}
+	return event
+}
+
+func TestVerifyNIP98_ValidEvent(t *testing.T) {
+	sk, pk := generateTestKeypair(t)
+
+	event := signTestEvent(t, sk, nostr.Event{
 		Kind:      nip98Kind,
 		PubKey:    pk,
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
@@ -21,8 +34,7 @@ func TestVerifyNIP98_ValidEvent(t *testing.T) {
 			{"method", "POST"},
 		},
 		Content: "",
-	}
-	_ = event.Sign(sk)
+	})
 
 	eventJSON, _ := json.Marshal(event)
 
@@ -34,8 +46,8 @@ func TestVerifyNIP98_ValidEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
-	if result.Pubkey != pk {
-		t.Errorf("pubkey mismatch: got %s, want %s", result.Pubkey, pk)
+	if result.Pubkey != pk.Hex() {
+		t.Errorf("pubkey mismatch: got %s, want %s", result.Pubkey, pk.Hex())
 	}
 	if result.Npub == "" {
 		t.Error("npub should not be empty")
@@ -43,17 +55,15 @@ func TestVerifyNIP98_ValidEvent(t *testing.T) {
 }
 
 func TestVerifyNIP98_WrongKind(t *testing.T) {
-	sk := nostr.GeneratePrivateKey()
-	pk, _ := nostr.GetPublicKey(sk)
+	sk, pk := generateTestKeypair(t)
 
-	event := nostr.Event{
+	event := signTestEvent(t, sk, nostr.Event{
 		Kind:      1,
 		PubKey:    pk,
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Tags:      nostr.Tags{{"u", "https://example.com/auth"}, {"method", "POST"}},
 		Content:   "",
-	}
-	_ = event.Sign(sk)
+	})
 	eventJSON, _ := json.Marshal(event)
 
 	_, err := VerifyNIP98(VerifyRequest{SignedEventJSON: string(eventJSON), ExpectedURL: "https://example.com/auth", ExpectedMethod: "POST"})
@@ -63,17 +73,15 @@ func TestVerifyNIP98_WrongKind(t *testing.T) {
 }
 
 func TestVerifyNIP98_StaleTimestamp(t *testing.T) {
-	sk := nostr.GeneratePrivateKey()
-	pk, _ := nostr.GetPublicKey(sk)
+	sk, pk := generateTestKeypair(t)
 
-	event := nostr.Event{
+	event := signTestEvent(t, sk, nostr.Event{
 		Kind:      nip98Kind,
 		PubKey:    pk,
 		CreatedAt: nostr.Timestamp(time.Now().Add(-5 * time.Minute).Unix()),
 		Tags:      nostr.Tags{{"u", "https://example.com/auth"}, {"method", "POST"}},
 		Content:   "",
-	}
-	_ = event.Sign(sk)
+	})
 	eventJSON, _ := json.Marshal(event)
 
 	_, err := VerifyNIP98(VerifyRequest{SignedEventJSON: string(eventJSON), ExpectedURL: "https://example.com/auth", ExpectedMethod: "POST"})
@@ -83,17 +91,15 @@ func TestVerifyNIP98_StaleTimestamp(t *testing.T) {
 }
 
 func TestVerifyNIP98_URLMismatch(t *testing.T) {
-	sk := nostr.GeneratePrivateKey()
-	pk, _ := nostr.GetPublicKey(sk)
+	sk, pk := generateTestKeypair(t)
 
-	event := nostr.Event{
+	event := signTestEvent(t, sk, nostr.Event{
 		Kind:      nip98Kind,
 		PubKey:    pk,
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Tags:      nostr.Tags{{"u", "https://other.com/auth"}, {"method", "POST"}},
 		Content:   "",
-	}
-	_ = event.Sign(sk)
+	})
 	eventJSON, _ := json.Marshal(event)
 
 	_, err := VerifyNIP98(VerifyRequest{SignedEventJSON: string(eventJSON), ExpectedURL: "https://example.com/auth", ExpectedMethod: "POST"})
@@ -103,19 +109,17 @@ func TestVerifyNIP98_URLMismatch(t *testing.T) {
 }
 
 func TestVerifyNIP98_BadSignature(t *testing.T) {
-	sk := nostr.GeneratePrivateKey()
-	pk, _ := nostr.GetPublicKey(sk)
+	sk, pk := generateTestKeypair(t)
 
-	event := nostr.Event{
+	event := signTestEvent(t, sk, nostr.Event{
 		Kind:      nip98Kind,
 		PubKey:    pk,
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Tags:      nostr.Tags{{"u", "https://example.com/auth"}, {"method", "POST"}},
 		Content:   "",
-	}
-	_ = event.Sign(sk)
-	// Tamper with signature
-	event.Sig = "0000" + event.Sig[4:]
+	})
+	// Tamper with content after signing — ID becomes invalid
+	event.Content = "tampered"
 	eventJSON, _ := json.Marshal(event)
 
 	_, err := VerifyNIP98(VerifyRequest{SignedEventJSON: string(eventJSON), ExpectedURL: "https://example.com/auth", ExpectedMethod: "POST"})

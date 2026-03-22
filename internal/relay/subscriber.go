@@ -5,9 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 )
-
 
 type Handler func(ctx context.Context, ev *nostr.Event, relayURL string) error
 
@@ -35,14 +34,17 @@ func (s *Subscriber) watchRelay(ctx context.Context, relayURL string) {
 		default:
 		}
 
-		relay, err := nostr.RelayConnect(ctx, relayURL)
+		relay, err := nostr.RelayConnect(ctx, relayURL, nostr.RelayOptions{})
 		if err != nil {
 			s.logger.Error("failed to connect relay", "relay", relayURL, "error", err)
 			sleepOrDone(ctx, 3*time.Second)
 			continue
 		}
 
-		sub, err := relay.Subscribe(ctx, []nostr.Filter{{Kinds: []int{KindRepositoryAnnouncement, KindRepositoryState}}})
+		filter := nostr.Filter{
+			Kinds: []nostr.Kind{KindRepositoryAnnouncement, KindRepositoryState},
+		}
+		sub, err := relay.Subscribe(ctx, filter, nostr.SubscriptionOptions{Label: "grasp"})
 		if err != nil {
 			s.logger.Error("failed to subscribe relay", "relay", relayURL, "error", err)
 			sleepOrDone(ctx, 3*time.Second)
@@ -60,11 +62,9 @@ func (s *Subscriber) watchRelay(ctx context.Context, relayURL string) {
 					sleepOrDone(ctx, 2*time.Second)
 					goto reconnect
 				}
-				if ev == nil {
-					continue
-				}
-				if err := s.handler(ctx, ev, relayURL); err != nil {
-					s.logger.Warn("announcement handling failed", "relay", relayURL, "event", ev.ID, "error", err)
+				evCopy := ev
+				if err := s.handler(ctx, &evCopy, relayURL); err != nil {
+					s.logger.Warn("announcement handling failed", "relay", relayURL, "event", ev.ID.Hex(), "error", err)
 				}
 			}
 		}

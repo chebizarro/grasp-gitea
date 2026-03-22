@@ -8,29 +8,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip05"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip05"
 )
 
 var validOrgName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
-// OrgName resolves a short, Gitea-safe org name for a given pubkey.
-//
-// Strategy:
-//  1. Fetch the user's kind 0 (profile) event from the relay.
-//  2. Parse the "nip05" field from the profile content.
-//  3. Verify the NIP-05 identifier maps back to this pubkey.
-//  4. Return the sanitized local-part (e.g. "bizarro" from "bizarro@sharegap.net").
-//
-// Fallback: if no valid NIP-05 is found, returns the first 39 hex chars of the
-// pubkey — always unique, always within Gitea's 40-char limit.
+// OrgName resolves a short, Gitea-safe org name for a given pubkey (hex string).
 func OrgName(ctx context.Context, pubkey string, relayURL string) string {
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
 	name, err := resolve(ctx, pubkey, relayURL)
 	if err != nil || name == "" {
-		// Fallback: hex prefix (39 chars, unique per key, always valid)
 		if len(pubkey) >= 39 {
 			return pubkey[:39]
 		}
@@ -40,28 +30,33 @@ func OrgName(ctx context.Context, pubkey string, relayURL string) string {
 }
 
 func resolve(ctx context.Context, pubkey string, relayURL string) (string, error) {
-	relay, err := nostr.RelayConnect(ctx, relayURL)
+	pk, err := nostr.PubKeyFromHex(pubkey)
+	if err != nil {
+		return "", fmt.Errorf("parse pubkey: %w", err)
+	}
+
+	relay, err := nostr.RelayConnect(ctx, relayURL, nostr.RelayOptions{})
 	if err != nil {
 		return "", fmt.Errorf("connect to relay: %w", err)
 	}
 	defer relay.Close()
 
-	filters := nostr.Filters{{
-		Authors: []string{pubkey},
-		Kinds:   []int{0},
+	filter := nostr.Filter{
+		Authors: []nostr.PubKey{pk},
+		Kinds:   []nostr.Kind{0},
 		Limit:   1,
-	}}
+	}
 
-	sub, err := relay.Subscribe(ctx, filters)
+	sub, err := relay.Subscribe(ctx, filter, nostr.SubscriptionOptions{Label: "nip05"})
 	if err != nil {
 		return "", fmt.Errorf("subscribe for kind 0: %w", err)
 	}
-	defer sub.Unsub()
 
 	var ev *nostr.Event
 	select {
 	case e := <-sub.Events:
-		ev = e
+		copy := e
+		ev = &copy
 	case <-ctx.Done():
 		return "", fmt.Errorf("timeout waiting for kind 0")
 	}
@@ -85,23 +80,17 @@ func resolve(ctx context.Context, pubkey string, relayURL string) (string, error
 		return "", fmt.Errorf("parse nip05 identifier: %w", err)
 	}
 
-	// Verify the NIP-05 identifier resolves back to this pubkey.
 	pointer, err := nip05.QueryIdentifier(ctx, profile.NIP05)
 	if err != nil {
 		return "", fmt.Errorf("verify nip05: %w", err)
 	}
-	if pointer.PublicKey != pubkey {
+	if pointer.PublicKey.Hex() != pubkey {
 		return "", fmt.Errorf("nip05 pubkey mismatch")
 	}
 
 	return sanitize(localPart), nil
 }
 
-// sanitize converts a NIP-05 local-part to a Gitea-safe username:
-//   - lowercase
-//   - replace disallowed chars with '-'
-//   - strip leading/trailing hyphens
-//   - truncate to 39 chars (within Gitea's 40-char API limit)
 func sanitize(s string) string {
 	s = strings.ToLower(s)
 	var b strings.Builder
@@ -120,4 +109,10 @@ func sanitize(s string) string {
 		return ""
 	}
 	return result
+}
+
+// ResolveFromPubkey is kept for compatibility — same as OrgName but returns error.
+func ResolveFromPubkey(ctx context.Context, pubkey string) (string, error) {
+	_ = validOrgName // keep for future validation use
+	return resolve(ctx, pubkey, "")
 }

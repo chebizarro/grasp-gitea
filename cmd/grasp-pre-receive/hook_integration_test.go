@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nbd-wtf/go-nostr/nip34"
+	"fiatjaf.com/nostr/nip34"
 )
 
 func TestEvaluatePushUpdatesIntegration(t *testing.T) {

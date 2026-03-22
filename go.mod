@@ -1,16 +1,17 @@
 module github.com/sharegap/grasp-gitea
 
-go 1.24.1
+go 1.25
 
 require (
+	fiatjaf.com/nostr v0.0.0-20260301124453-4dab261bdf5d
 	github.com/fiatjaf/eventstore v0.16.7
 	github.com/fiatjaf/khatru v0.18.1
 	github.com/mattn/go-sqlite3 v1.14.24
-	github.com/nbd-wtf/go-nostr v0.52.0
+	github.com/nbd-wtf/go-nostr v0.51.8
 )
 
 require (
-	fiatjaf.com/lib v0.2.0 // indirect
+	fiatjaf.com/lib v0.3.6 // indirect
 	github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3 // indirect
 	github.com/PowerDNS/lmdb-go v1.9.3 // indirect
 	github.com/andybalholm/brotli v1.1.1 // indirect
@@ -36,6 +37,8 @@ require (
 	github.com/puzpuzpuz/xsync/v3 v3.5.1 // indirect
 	github.com/rs/cors v1.11.1 // indirect
 	github.com/savsgio/gotils v0.0.0-20240704082632-aef3928b8a38 // indirect
+	github.com/templexxx/cpu v0.0.1 // indirect
+	github.com/templexxx/xhex v0.0.0-20200614015412-aed53437177b // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
@@ -44,6 +47,6 @@ require (
 	github.com/valyala/fasthttp v1.59.0 // indirect
 	golang.org/x/arch v0.16.0 // indirect
 	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394 // indirect
-	golang.org/x/net v0.37.0 // indirect
-	golang.org/x/sys v0.32.0 // indirect
+	golang.org/x/net v0.41.0 // indirect
+	golang.org/x/sys v0.35.0 // indirect
 )

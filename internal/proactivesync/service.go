@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
-	"github.com/nbd-wtf/go-nostr/nip34"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
+	"fiatjaf.com/nostr/nip34"
 
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 )
@@ -38,10 +38,7 @@ func (s *Service) HandleStateEvent(ctx context.Context, ev *nostr.Event) error {
 		return fmt.Errorf("state event missing d tag")
 	}
 
-	npub, err := nip19.EncodePublicKey(ev.PubKey)
-	if err != nil {
-		return fmt.Errorf("encode pubkey to npub: %w", err)
-	}
+	npub := nip19.EncodeNpub(ev.PubKey)
 
 	repoPath := filepath.Join(s.repositoriesDir, npub, repoID+".git")
 	if st, err := os.Stat(repoPath); err != nil || !st.IsDir() {
@@ -63,7 +60,7 @@ func (s *Service) HandleStateEvent(ctx context.Context, ev *nostr.Event) error {
 		}
 	}
 
-	s.logger.Info("proactive sync applied state event", "repo", repoPath, "event", ev.ID)
+	s.logger.Info("proactive sync applied state event", "repo", repoPath, "event", ev.ID.Hex())
 	return nil
 }
 

@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/api"
 	"github.com/sharegap/grasp-gitea/internal/auth"
