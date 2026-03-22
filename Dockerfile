@@ -1,4 +1,4 @@
-FROM golang:1.24-alpine AS build
+FROM golang:1.25-alpine AS build
 ARG BUILD_TAGS=""
 RUN apk add --no-cache build-base
 WORKDIR /src
