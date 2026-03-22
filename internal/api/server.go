@@ -36,6 +36,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/provision", method(http.MethodPost, s.manualProvision))
 
 	if s.oauth2Provider != nil {
+		mux.HandleFunc("/.well-known/openid-configuration", method(http.MethodGet, s.oauth2Provider.HandleDiscovery))
 		mux.HandleFunc("/auth/oauth2/authorize", method(http.MethodGet, s.oauth2Provider.HandleAuthorize))
 		mux.HandleFunc("/auth/nip07/verify", method(http.MethodPost, s.oauth2Provider.HandleVerify))
 		mux.HandleFunc("/auth/oauth2/token", method(http.MethodPost, s.oauth2Provider.HandleToken))
