@@ -67,6 +67,11 @@ func (p *Publisher) PubKey() string {
 	return p.pubKey.Hex()
 }
 
+// RelayURLs returns the configured relay URLs.
+func (p *Publisher) RelayURLs() []string {
+	return p.relayURLs
+}
+
 // Publish signs the event with the server key and sends it to all configured relays.
 // The event's PubKey, CreatedAt, and ID are set automatically.
 func (p *Publisher) Publish(ctx context.Context, ev *nostr.Event) error {
