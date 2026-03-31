@@ -21,8 +21,10 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/oauth2"
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
+	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/webhook"
 )
 
 func main() {
@@ -46,6 +48,21 @@ func main() {
 	provisionerSvc := provisioner.New(cfg, st, giteaClient, hookInstaller, logger)
 	proactiveSyncSvc := proactivesync.New(cfg.GiteaRepositoriesDir, logger)
 	apiServer := api.New(provisionerSvc, st, logger)
+
+	// Outbound NIP-34 publishing — optional, activated by GRASP_SERVER_NSEC.
+	pub, err := publisher.New(cfg.ServerNsec, cfg.RelayURLs, logger)
+	if err != nil {
+		logger.Error("failed to initialise publisher", "error", err)
+		os.Exit(1)
+	}
+	if pub != nil {
+		webhookHandler := webhook.New(pub, st, cfg.GiteaWebhookSecret, logger)
+		apiServer.SetWebhookHandler(webhookHandler)
+		provisionerSvc.SetAnnouncer(webhookHandler)
+		logger.Info("NIP-34 outbound publishing enabled", "pubkey", pub.PubKey())
+	} else {
+		logger.Info("NIP-34 outbound publishing disabled (set GRASP_SERVER_NSEC to enable)")
+	}
 
 	if cfg.NIP07AuthEnabled {
 		nonceTTL := time.Duration(cfg.NonceTTLSeconds) * time.Second

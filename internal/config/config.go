@@ -29,6 +29,10 @@ type Config struct {
 	OAuth2ClientSecret string // OAUTH2_CLIENT_SECRET
 	BridgePublicURL    string // BRIDGE_PUBLIC_URL (public base URL of grasp-bridge)
 	NonceTTLSeconds    int    // NONCE_TTL_SECONDS, default 300
+
+	// Outbound NIP-34 publishing
+	ServerNsec          string // GRASP_SERVER_NSEC — server signing key (nsec or hex); optional
+	GiteaWebhookSecret  string // GITEA_WEBHOOK_SECRET — HMAC secret shared with Gitea system webhook
 }
 
 func Load() (Config, error) {
@@ -53,6 +57,9 @@ func Load() (Config, error) {
 		OAuth2ClientSecret: strings.TrimSpace(os.Getenv("OAUTH2_CLIENT_SECRET")),
 		BridgePublicURL:    strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
 		NonceTTLSeconds:    intEnv("NONCE_TTL_SECONDS", 300),
+
+		ServerNsec:         strings.TrimSpace(os.Getenv("GRASP_SERVER_NSEC")),
+		GiteaWebhookSecret: strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
 	}
 
 	if cfg.GiteaAdminToken == "" {

@@ -10,13 +10,15 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/oauth2"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/webhook"
 )
 
 type Server struct {
-	provisioner  *provisioner.Service
-	store        *store.SQLiteStore
-	logger       *slog.Logger
-	oauth2Provider *oauth2.Provider // nil when NIP-07 auth is disabled
+	provisioner    *provisioner.Service
+	store          *store.SQLiteStore
+	logger         *slog.Logger
+	oauth2Provider *oauth2.Provider  // nil when NIP-07 auth is disabled
+	webhookHandler *webhook.Handler  // nil when publishing is disabled
 }
 
 func New(provisionerSvc *provisioner.Service, st *store.SQLiteStore, logger *slog.Logger) *Server {
@@ -28,12 +30,21 @@ func (s *Server) SetOAuth2Provider(p *oauth2.Provider) {
 	s.oauth2Provider = p
 }
 
+// SetWebhookHandler enables the Gitea webhook receiver endpoint.
+func (s *Server) SetWebhookHandler(h *webhook.Handler) {
+	s.webhookHandler = h
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", method(http.MethodGet, s.health))
 	mux.HandleFunc("/metrics", method(http.MethodGet, s.metrics))
 	mux.HandleFunc("/mappings", method(http.MethodGet, s.mappings))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.manualProvision))
+
+	if s.webhookHandler != nil {
+		mux.Handle("/webhook/gitea", s.webhookHandler)
+	}
 
 	if s.oauth2Provider != nil {
 		mux.HandleFunc("/.well-known/openid-configuration", method(http.MethodGet, s.oauth2Provider.HandleDiscovery))

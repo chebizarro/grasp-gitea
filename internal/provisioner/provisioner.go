@@ -20,6 +20,13 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
+// Announcer is the interface used by the provisioner to publish NIP-34
+// repository announcement events after successful provisioning.
+// webhook.Handler implements this interface.
+type Announcer interface {
+	PublishAnnouncement(ctx context.Context, mapping store.Mapping, description string) error
+}
+
 const KindRepositoryAnnouncement = 30617
 
 type Service struct {
@@ -28,6 +35,12 @@ type Service struct {
 	gitea     *gitea.Client
 	logger    *slog.Logger
 	installer *hooks.Installer
+	announcer Announcer // optional — publishes kind:30617 after provisioning
+}
+
+// SetAnnouncer wires an outbound publisher for kind:30617 events.
+func (s *Service) SetAnnouncer(a Announcer) {
+	s.announcer = a
 }
 
 type Result struct {
@@ -220,6 +233,14 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 	}
 
 	s.logger.Info("provisioned repository", "npub", npub, "org_name", orgName, "repo_id", repoID, "relay", sourceRelay, "event", sourceEvent)
+
+	// Publish outbound kind:30617 announcement if an announcer is configured.
+	if s.announcer != nil {
+		if err := s.announcer.PublishAnnouncement(ctx, mapping, ""); err != nil {
+			s.logger.Warn("publish announcement event failed (non-fatal)", "npub", npub, "repo_id", repoID, "error", err)
+		}
+	}
+
 	return nil
 }
 

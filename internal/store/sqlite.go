@@ -166,3 +166,20 @@ func (s *SQLiteStore) GetMapping(ctx context.Context, npub string, repoID string
 	m.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	return m, nil
 }
+
+// GetMappingByOwnerRepo looks up a mapping by the Gitea owner+repo_name pair.
+// This is used by the webhook handler which receives Gitea repo full names.
+func (s *SQLiteStore) GetMappingByOwnerRepo(ctx context.Context, owner string, repoName string) (Mapping, error) {
+	var m Mapping
+	var createdAt, updatedAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, source_event, created_at, updated_at
+		FROM mappings WHERE owner = ? AND repo_name = ? LIMIT 1
+	`, owner, repoName).Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.SourceEvent, &createdAt, &updatedAt)
+	if err != nil {
+		return Mapping{}, err
+	}
+	m.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	m.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+	return m, nil
+}
