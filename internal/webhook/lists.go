@@ -18,7 +18,7 @@ func (h *Handler) PublishUserGraspList(ctx context.Context, userPubkey string, r
 	}
 	for _, m := range repos {
 		repoRef := fmt.Sprintf("%s/%s", m.Npub, m.RepoID)
-		tags = append(tags, nostr.Tag{"a", repoRef, "wss://relay.sharegap.net", listType})
+		tags = append(tags, nostr.Tag{"a", repoRef, h.relayHint, listType})
 	}
 
 	ev := &nostr.Event{
@@ -39,16 +39,22 @@ func (h *Handler) PublishNIP32Label(ctx context.Context, mapping store.Mapping, 
 		labelNS = "gitea"
 	}
 
+	tags := nostr.Tags{
+		{"L", labelNS},
+		{"l", labelName, labelNS},
+		{"a", repoTag},
+	}
+	// Only emit e/k tags when there is a valid target event ID.
+	// Standalone label-created events (no issue/PR subject) must not emit {"e", ""}.
+	if targetID != "" {
+		tags = append(tags, nostr.Tag{"e", targetID})
+		tags = append(tags, nostr.Tag{"k", fmt.Sprintf("%d", targetKind)})
+	}
+
 	ev := &nostr.Event{
 		Kind:    KindNIP32Label,
 		Content: labelName,
-		Tags: nostr.Tags{
-			{"L", labelNS},
-			{"l", labelName, labelNS},
-			{"a", repoTag},
-			{"e", targetID},
-			{"k", fmt.Sprintf("%d", targetKind)},
-		},
+		Tags:    tags,
 	}
 
 	return h.publish(ctx, ev)

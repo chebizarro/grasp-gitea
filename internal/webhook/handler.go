@@ -36,16 +36,19 @@ const (
 // Handler handles inbound Gitea webhook events, maps them to NIP-34 Nostr
 // events, and publishes via the publisher.
 type Handler struct {
-	pub    *publisher.Publisher
-	store  *store.SQLiteStore
-	secret string
-	logger *slog.Logger
+	pub       *publisher.Publisher
+	store     *store.SQLiteStore
+	secret    string
+	relayHint string // relay URL embedded in NIP-34 r/a tag hints
+	logger    *slog.Logger
 }
 
 // New creates a webhook Handler. If pub is nil, events are not published
-// (disabled mode — logs only).
-func New(pub *publisher.Publisher, st *store.SQLiteStore, secret string, logger *slog.Logger) *Handler {
-	return &Handler{pub: pub, store: st, secret: secret, logger: logger}
+// (disabled mode — logs only). relayHint is the relay URL embedded in NIP-34
+// event tags (r/a hints); pass the first RELAY_URLS entry or a dedicated
+// RELAY_HINT value.
+func New(pub *publisher.Publisher, st *store.SQLiteStore, secret string, relayHint string, logger *slog.Logger) *Handler {
+	return &Handler{pub: pub, store: st, secret: secret, relayHint: relayHint, logger: logger}
 }
 
 // ServeHTTP handles POST /webhook/gitea.
@@ -188,7 +191,6 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 	}
 
 	repoTag := fmt.Sprintf("%s/%s", mapping.Npub, mapping.RepoID)
-	prRef := fmt.Sprintf("%s/pr/%d", repoTag, p.Number)
 
 	var kind nostr.Kind
 	switch p.Action {
@@ -226,12 +228,13 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		return err
 	}
 
-	// Also publish a status event
+	// Publish a status event referencing the PR event by its Nostr event ID.
+	// Note: ev.ID is populated by publisher.Publish after signing.
 	statusEv := &nostr.Event{
 		Kind:    statusKind,
 		Content: "",
 		Tags: nostr.Tags{
-			{"e", prRef},
+			{"e", ev.ID.Hex()},
 			{"a", repoTag},
 		},
 	}
@@ -289,17 +292,17 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 		return err
 	}
 
-	// Publish status event
+	// Publish status event referencing the issue event by its Nostr event ID.
+	// Note: ev.ID is populated by publisher.Publish after signing.
 	statusKind := KindStatusOpen
 	if p.Issue.State == "closed" {
 		statusKind = KindStatusClosed
 	}
-	issueRef := fmt.Sprintf("%s/issue/%d", repoTag, p.Index)
 	statusEv := &nostr.Event{
 		Kind:    statusKind,
 		Content: "",
 		Tags: nostr.Tags{
-			{"e", issueRef},
+			{"e", ev.ID.Hex()},
 			{"a", repoTag},
 		},
 	}
@@ -368,7 +371,7 @@ func (h *Handler) PublishAnnouncement(ctx context.Context, mapping store.Mapping
 			{"d", mapping.RepoID},
 			{"name", mapping.RepoName},
 			{"clone", mapping.CloneURL},
-			{"r", "wss://relay.sharegap.net"},
+			{"r", h.relayHint},
 		},
 	}
 	return h.publish(ctx, ev)
@@ -446,18 +449,15 @@ func (h *Handler) fetchEventByID(ctx context.Context, relayURL string, eventID s
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func (h *Handler) publish(ctx context.Context, ev *nostr.Event) error {
 	if h.pub == nil {
 		h.logger.Debug("webhook: publisher disabled, skipping event", "kind", ev.Kind)
 		return nil
 	}
+	// Dedup policy: non-replaceable kinds (1617/1618/1619/1621/1985) are published
+	// with CreatedAt = time.Now() and will produce distinct event IDs on each call.
+	// Idempotency is the consumer's responsibility — Nostr clients deduplicate by event ID.
+	// Gitea webhook retries are suppressed by returning HTTP 200 unconditionally.
 	return h.pub.Publish(ctx, ev)
 }
 

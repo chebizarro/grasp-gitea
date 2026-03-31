@@ -33,6 +33,7 @@ type Config struct {
 	// Outbound NIP-34 publishing
 	ServerNsec          string // GRASP_SERVER_NSEC — server signing key (nsec or hex); optional
 	GiteaWebhookSecret  string // GITEA_WEBHOOK_SECRET — HMAC secret shared with Gitea system webhook
+	RelayHint           string // RELAY_HINT — relay URL embedded in NIP-34 event tags (r/a hints); defaults to first RELAY_URLS entry
 }
 
 func Load() (Config, error) {
@@ -60,6 +61,12 @@ func Load() (Config, error) {
 
 		ServerNsec:         strings.TrimSpace(os.Getenv("GRASP_SERVER_NSEC")),
 		GiteaWebhookSecret: strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
+		RelayHint:          strings.TrimSpace(os.Getenv("RELAY_HINT")),
+	}
+
+	// Default relay hint to first configured relay URL if not explicitly set.
+	if cfg.RelayHint == "" && len(cfg.RelayURLs) > 0 {
+		cfg.RelayHint = cfg.RelayURLs[0]
 	}
 
 	if cfg.GiteaAdminToken == "" {

@@ -56,7 +56,7 @@ func main() {
 		os.Exit(1)
 	}
 	if pub != nil {
-		webhookHandler := webhook.New(pub, st, cfg.GiteaWebhookSecret, logger)
+		webhookHandler := webhook.New(pub, st, cfg.GiteaWebhookSecret, cfg.RelayHint, logger)
 		apiServer.SetWebhookHandler(webhookHandler)
 		provisionerSvc.SetAnnouncer(webhookHandler)
 		logger.Info("NIP-34 outbound publishing enabled", "pubkey", pub.PubKey())
