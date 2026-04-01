@@ -16,6 +16,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/nip46"
+	"github.com/sharegap/grasp-gitea/internal/nostrprofile"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -587,6 +588,23 @@ func (p *Provider) resolveGiteaUser(ctx context.Context, pubkey, npub string) (g
 	user, err := p.gitea.EnsureUser(ctx, username, email)
 	if err != nil {
 		return gitea.User{}, fmt.Errorf("ensure gitea user: %w", err)
+	}
+
+	// Sync kind:0 profile into Gitea user account (non-fatal).
+	relayURLs := []string{}
+	if p.cfg.RelayURL != "" {
+		relayURLs = append(relayURLs, p.cfg.RelayURL)
+	}
+	if len(relayURLs) > 0 {
+		if profile, fetchErr := nostrprofile.Fetch(ctx, pubkey, relayURLs); fetchErr != nil {
+			p.logger.Debug("nostr profile fetch failed (non-fatal)", "pubkey", pubkey, "error", fetchErr)
+		} else if profile != nil && !profile.IsEmpty() {
+			if syncErr := p.gitea.SyncNostrProfile(ctx, user.Username, "", *profile); syncErr != nil {
+				p.logger.Warn("nostr profile sync partial failure (non-fatal)", "user", user.Username, "error", syncErr)
+			} else {
+				p.logger.Info("synced nostr profile to gitea user", "user", user.Username, "display_name", profile.DisplayName)
+			}
+		}
 	}
 
 	// Upsert identity link.
