@@ -17,6 +17,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
+	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/relay"
@@ -41,7 +42,8 @@ func main() {
 
 	giteaClient := gitea.NewClient(cfg.GiteaURL, cfg.GiteaAdminToken)
 	hookInstaller := hooks.NewInstaller(cfg.GiteaRepositoriesDir, cfg.HookBinaryPath, cfg.HookRelayURL)
-	provisionerSvc := provisioner.New(cfg, st, giteaClient, hookInstaller, logger)
+	nip05Resolver := nip05resolve.NewResolver(5 * time.Minute)
+	provisionerSvc := provisioner.New(cfg, st, giteaClient, hookInstaller, nip05Resolver, logger)
 	proactiveSyncSvc := proactivesync.New(cfg.GiteaRepositoriesDir, st, logger)
 	apiServer := api.New(cfg, provisionerSvc, st, logger)
 

@@ -12,10 +12,12 @@ import (
 	"testing"
 
 	"log/slog"
+	"time"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
+	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -114,7 +116,8 @@ func TestManualProvisionInstallsHookSelfContained(t *testing.T) {
 	giteaClient := gitea.NewClient(srv.URL, "test-token")
 	hookInstaller := hooks.NewInstaller(reposDir, "/usr/local/bin/grasp-pre-receive", "ws://localhost:3334")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	svc := New(cfg, st, giteaClient, hookInstaller, logger)
+	nip05Resolver := nip05resolve.NewResolver(5 * time.Minute)
+	svc := New(cfg, st, giteaClient, hookInstaller, nip05Resolver, logger)
 
 	result, err := svc.ManualProvision(ctx, "npub-test-owner", "owner-pubkey-hex", "repo1")
 	if err != nil {

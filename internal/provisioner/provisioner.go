@@ -27,6 +27,7 @@ type Service struct {
 	gitea     *gitea.Client
 	logger    *slog.Logger
 	installer *hooks.Installer
+	resolver  *nip05resolve.Resolver
 }
 
 type Result struct {
@@ -37,8 +38,8 @@ type Result struct {
 	Event  string `json:"event"`
 }
 
-func New(cfg config.Config, st *store.SQLiteStore, g *gitea.Client, installer *hooks.Installer, logger *slog.Logger) *Service {
-	return &Service{cfg: cfg, store: st, gitea: g, installer: installer, logger: logger}
+func New(cfg config.Config, st *store.SQLiteStore, g *gitea.Client, installer *hooks.Installer, resolver *nip05resolve.Resolver, logger *slog.Logger) *Service {
+	return &Service{cfg: cfg, store: st, gitea: g, installer: installer, resolver: resolver, logger: logger}
 }
 
 func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, relayURL string) error {
@@ -166,31 +167,14 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		return err
 	}
 
-	// Resolve a short, human-readable org name via NIP-05.
+	// Resolve a short, human-readable org name via NIP-05 (cached).
 	// Falls back to a hex prefix if no verified NIP-05 is found.
-	var orgName string
 	relayURLs := s.cfg.RelayURLs
 	if sourceRelay != "manual" && sourceRelay != "" {
 		// Try the source relay first (it just delivered this event, likely has kind 0 too).
 		relayURLs = append([]string{sourceRelay}, relayURLs...)
 	}
-	for _, relayURL := range relayURLs {
-		orgName = nip05resolve.OrgName(ctx, pubkey, relayURL)
-		hexFallback := pubkey
-		if len(pubkey) > 39 {
-			hexFallback = pubkey[:39]
-		}
-		if orgName != hexFallback {
-			break // resolved a NIP-05 name
-		}
-	}
-	if orgName == "" {
-		if len(pubkey) > 39 {
-			orgName = pubkey[:39]
-		} else {
-			orgName = pubkey
-		}
-	}
+	orgName := s.resolver.ResolveOrgName(ctx, pubkey, relayURLs)
 
 	s.logger.Info("resolved org name", "npub", npub, "org_name", orgName)
 
