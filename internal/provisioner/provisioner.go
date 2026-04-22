@@ -17,10 +17,9 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
+	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
-
-const KindRepositoryAnnouncement = 30617
 
 type Service struct {
 	cfg       config.Config
@@ -48,7 +47,7 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		metrics.IncAnnouncementRejected()
 		return errors.New("nil event")
 	}
-	if ev.Kind != KindRepositoryAnnouncement {
+	if ev.Kind != relay.KindRepositoryAnnouncement {
 		return nil
 	}
 
@@ -90,12 +89,19 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 			return fmt.Errorf("check existing mapping: %w", err)
 		}
 		if exists {
-			if err := s.gitea.ArchiveRepo(ctx, npub, repoID); err != nil {
+			// Look up actual org name from the store mapping, since the repo
+			// was created under the NIP-05-resolved orgName, not the npub.
+			mapping, lookupErr := s.store.GetMapping(ctx, npub, repoID)
+			orgName := npub
+			if lookupErr == nil && mapping.Owner != "" {
+				orgName = mapping.Owner
+			}
+			if err := s.gitea.ArchiveRepo(ctx, orgName, repoID); err != nil {
 				metrics.IncAnnouncementRejected()
-				return fmt.Errorf("archive repo %s/%s after clone tag removal: %w", npub, repoID, err)
+				return fmt.Errorf("archive repo %s/%s after clone tag removal: %w", orgName, repoID, err)
 			}
 			_ = s.store.MarkEventProcessed(ctx, ev.ID, ev.PubKey, ev.Kind)
-			s.logger.Info("archived repository due to clone tag removal", "npub", npub, "repo_id", repoID, "event", ev.ID)
+			s.logger.Info("archived repository due to clone tag removal", "npub", npub, "org", orgName, "repo_id", repoID, "event", ev.ID)
 			return nil
 		}
 		return nil
@@ -224,13 +230,6 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 	return nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func (s *Service) validatePolicy(ctx context.Context, npub string, pubkey string) error {
 	if s.cfg.AllowlistEnabled() {
 		if _, ok := s.cfg.PubkeyAllowlist[pubkey]; !ok {
@@ -254,12 +253,11 @@ func (s *Service) validatePolicy(ctx context.Context, npub string, pubkey string
 }
 
 func getTagValue(tags nostr.Tags, key string) string {
-	for _, tag := range tags {
-		if len(tag) >= 2 && tag[0] == key {
-			return tag[1]
-		}
+	v := tags.GetFirst([]string{key, ""})
+	if v == nil || len(*v) < 2 {
+		return ""
 	}
-	return ""
+	return (*v)[1]
 }
 
 func findCloneForPrefix(tags nostr.Tags, clonePrefix string) (string, bool) {

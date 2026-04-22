@@ -9,7 +9,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
+
+// maxResponseSize limits Gitea API response bodies to 10 MB.
+const maxResponseSize = 10 << 20
 
 type Client struct {
 	baseURL string
@@ -30,7 +34,7 @@ func NewClient(baseURL string, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		token:   token,
-		http:    &http.Client{},
+		http:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -135,7 +139,7 @@ func (c *Client) doJSON(ctx context.Context, method string, path string, body an
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +162,7 @@ func (e *HTTPError) Error() string {
 
 func parseRepo(resp []byte) (Repository, error) {
 	var raw struct {
-		ID       int64 `json:"id"`
+		ID       int64  `json:"id"`
 		Name     string `json:"name"`
 		CloneURL string `json:"clone_url"`
 		SSHURL   string `json:"ssh_url"`

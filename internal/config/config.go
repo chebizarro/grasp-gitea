@@ -8,12 +8,12 @@ import (
 )
 
 type Config struct {
-	GiteaURL           string
-	GiteaAdminToken    string
-	ClonePrefix        string
-	RelayURLs          []string
-	Listen             string
-	DBPath             string
+	GiteaURL             string
+	GiteaAdminToken      string
+	ClonePrefix          string
+	RelayURLs            []string
+	Listen               string
+	DBPath               string
 	PubkeyAllowlist      map[string]struct{}
 	ProvisionRateLimit   int
 	HookRelayURL         string
@@ -22,16 +22,17 @@ type Config struct {
 	EmbeddedRelay        bool
 	EmbeddedRelayPort    int
 	EmbeddedRelayDB      string
+	AdminAPIToken        string
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		GiteaURL:           envOrDefault("GITEA_URL", "http://gitea:3000"),
-		GiteaAdminToken:    strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
-		ClonePrefix:        strings.TrimRight(envOrDefault("CLONE_PREFIX", "https://git.sharegap.net"), "/"),
-		RelayURLs:          csvEnv("RELAY_URLS"),
-		Listen:             envOrDefault("LISTEN", ":8090"),
-		DBPath:             envOrDefault("DB_PATH", "./mappings.db"),
+		GiteaURL:             envOrDefault("GITEA_URL", "http://gitea:3000"),
+		GiteaAdminToken:      strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
+		ClonePrefix:          strings.TrimRight(envOrDefault("CLONE_PREFIX", "https://git.sharegap.net"), "/"),
+		RelayURLs:            csvEnv("RELAY_URLS"),
+		Listen:               envOrDefault("LISTEN", ":8090"),
+		DBPath:               envOrDefault("DB_PATH", "./mappings.db"),
 		PubkeyAllowlist:      parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
 		ProvisionRateLimit:   intEnv("PROVISION_RATE_LIMIT", 0),
 		HookRelayURL:         envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),
@@ -40,6 +41,7 @@ func Load() (Config, error) {
 		EmbeddedRelay:        boolEnv("EMBEDDED_RELAY", false),
 		EmbeddedRelayPort:    intEnv("EMBEDDED_RELAY_PORT", 3334),
 		EmbeddedRelayDB:      envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
+		AdminAPIToken:        strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
 	}
 
 	if cfg.GiteaAdminToken == "" {

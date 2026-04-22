@@ -27,12 +27,12 @@ func TestExtractMaintainersRecursive(t *testing.T) {
 		{
 			Kind:   nostr.KindRepositoryAnnouncement,
 			PubKey: "bob",
-			Tags: nostr.Tags{{"d", "repo1"}},
+			Tags:   nostr.Tags{{"d", "repo1"}},
 		},
 		{
 			Kind:   nostr.KindRepositoryAnnouncement,
 			PubKey: "other",
-			Tags: nostr.Tags{{"d", "repo2"}},
+			Tags:   nostr.Tags{{"d", "repo2"}},
 		},
 	}
 

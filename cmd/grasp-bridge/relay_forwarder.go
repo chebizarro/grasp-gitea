@@ -11,5 +11,6 @@ func forwardEventToRelay(ctx context.Context, relayURL string, ev *nostr.Event) 
 	if err != nil {
 		return err
 	}
+	defer relay.Close()
 	return relay.Publish(ctx, *ev)
 }

@@ -33,10 +33,10 @@ func TestManualProvisionInstallsHookSelfContained(t *testing.T) {
 		Org  string
 	}
 	var (
-		mu      sync.Mutex
-		orgs    = map[string]bool{}
-		repos   = map[string]repoRecord{}
-		nextID  int64 = 1
+		mu     sync.Mutex
+		orgs         = map[string]bool{}
+		repos        = map[string]repoRecord{}
+		nextID int64 = 1
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -132,11 +132,11 @@ func TestManualProvisionInstallsHookSelfContained(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected hook file at %s: %v", hookPath, err)
 	}
-	if !strings.Contains(string(content), "GRASP_REPO_ID=\"repo1\"") {
+	if !strings.Contains(string(content), "GRASP_REPO_ID='repo1'") {
 		t.Fatalf("hook content missing repo id env: %s", string(content))
 	}
 	// The hook script must still use the full npub for state lookups.
-	if !strings.Contains(string(content), "GRASP_REPO_NPUB=\"npub-test-owner\"") {
+	if !strings.Contains(string(content), "GRASP_REPO_NPUB='npub-test-owner'") {
 		t.Fatalf("hook content missing npub env: %s", string(content))
 	}
 }

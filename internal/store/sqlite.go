@@ -140,8 +140,15 @@ func (s *SQLiteStore) ListMappings(ctx context.Context) ([]Mapping, error) {
 		if err := rows.Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.SourceEvent, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
-		m.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-		m.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+		var parseErr error
+		m.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse created_at for %s/%s: %w", m.Npub, m.RepoID, parseErr)
+		}
+		m.UpdatedAt, parseErr = time.Parse(time.RFC3339, updatedAt)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse updated_at for %s/%s: %w", m.Npub, m.RepoID, parseErr)
+		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -157,7 +164,14 @@ func (s *SQLiteStore) GetMapping(ctx context.Context, npub string, repoID string
 	if err != nil {
 		return Mapping{}, err
 	}
-	m.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-	m.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+	var parseErr error
+	m.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
+	if parseErr != nil {
+		return Mapping{}, fmt.Errorf("parse created_at for %s/%s: %w", m.Npub, m.RepoID, parseErr)
+	}
+	m.UpdatedAt, parseErr = time.Parse(time.RFC3339, updatedAt)
+	if parseErr != nil {
+		return Mapping{}, fmt.Errorf("parse updated_at for %s/%s: %w", m.Npub, m.RepoID, parseErr)
+	}
 	return m, nil
 }

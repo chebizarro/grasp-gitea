@@ -42,8 +42,8 @@ func main() {
 	giteaClient := gitea.NewClient(cfg.GiteaURL, cfg.GiteaAdminToken)
 	hookInstaller := hooks.NewInstaller(cfg.GiteaRepositoriesDir, cfg.HookBinaryPath, cfg.HookRelayURL)
 	provisionerSvc := provisioner.New(cfg, st, giteaClient, hookInstaller, logger)
-	proactiveSyncSvc := proactivesync.New(cfg.GiteaRepositoriesDir, logger)
-	apiServer := api.New(provisionerSvc, st, logger)
+	proactiveSyncSvc := proactivesync.New(cfg.GiteaRepositoriesDir, st, logger)
+	apiServer := api.New(cfg, provisionerSvc, st, logger)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -102,5 +102,6 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+	subscriber.Wait()
 	logger.Info("grasp-bridge stopped")
 }
