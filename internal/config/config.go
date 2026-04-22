@@ -52,8 +52,8 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("CLONE_PREFIX is required (e.g. https://git.example.com)")
 	}
 
-	if len(cfg.RelayURLs) == 0 {
-		return Config{}, fmt.Errorf("RELAY_URLS is required for Phase 1")
+	if len(cfg.RelayURLs) == 0 && !cfg.EmbeddedRelay {
+		return Config{}, fmt.Errorf("RELAY_URLS is required (or set EMBEDDED_RELAY=true for embedded-only mode)")
 	}
 
 	return cfg, nil

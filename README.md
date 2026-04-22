@@ -64,7 +64,7 @@ make build
 GITEA_URL=http://gitea:3000
 GITEA_ADMIN_TOKEN=<token>              # required
 CLONE_PREFIX=https://git.example.com   # required — your public git domain
-RELAY_URLS=ws://gastown-relay:3334     # required (even for embedded mode, see caveat below)
+RELAY_URLS=ws://gastown-relay:3334     # required unless EMBEDDED_RELAY=true
 HOOK_RELAY_URL=ws://localhost:3334
 HOOK_BINARY_PATH=/usr/local/bin/grasp-pre-receive
 GITEA_REPOSITORIES_PATH=/gitea-data/git/repositories
@@ -78,9 +78,9 @@ PROVISION_RATE_LIMIT=10
 ADMIN_API_TOKEN=                       # optional — enables bearer auth on admin endpoints
 ```
 
-### Embedded relay caveat
+### Embedded-only mode
 
-`config.Load()` currently requires `RELAY_URLS` to be non-empty, even when `EMBEDDED_RELAY=true`. This means fully embedded-only operation requires providing at least one relay URL. Tracked as [phase3-006](.beads/issues.jsonl).
+When `EMBEDDED_RELAY=true`, the bridge can start without any external `RELAY_URLS`. It will subscribe only to its own embedded Khatru relay. External events must be forwarded to it via other means (e.g. another bridge instance or relay mirroring).
 
 ## Hook behavior
 

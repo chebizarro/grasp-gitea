@@ -76,6 +76,42 @@ func TestLoadMissingRelayURLs(t *testing.T) {
 	}
 }
 
+func TestLoadEmbeddedOnlyAllowsEmptyRelayURLs(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok123",
+		"CLONE_PREFIX":      "https://git.example.com",
+		"RELAY_URLS":        "",
+		"EMBEDDED_RELAY":    "true",
+	})
+	os.Unsetenv("RELAY_URLS")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() should succeed with EMBEDDED_RELAY=true and no RELAY_URLS, got: %v", err)
+	}
+	if !cfg.EmbeddedRelay {
+		t.Error("EmbeddedRelay should be true")
+	}
+	if len(cfg.RelayURLs) != 0 {
+		t.Errorf("RelayURLs should be empty, got %v", cfg.RelayURLs)
+	}
+}
+
+func TestLoadSidecarStillRequiresRelayURLs(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok123",
+		"CLONE_PREFIX":      "https://git.example.com",
+		"RELAY_URLS":        "",
+		"EMBEDDED_RELAY":    "false",
+	})
+	os.Unsetenv("RELAY_URLS")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error: sidecar mode with no RELAY_URLS should fail")
+	}
+}
+
 func TestLoadDefaults(t *testing.T) {
 	setEnvs(t, map[string]string{
 		"GITEA_ADMIN_TOKEN": "tok",
