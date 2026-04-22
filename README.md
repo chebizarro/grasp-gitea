@@ -39,14 +39,28 @@ This avoids Gitea's 40-character API username limit. The canonical identity rema
 
 When `ADMIN_API_TOKEN` is set, `/metrics`, `/mappings`, and `/provision` require a `Bearer` token. When unset, all endpoints are open (backwards-compatible).
 
+### Nostr authentication (behind `AUTH_ENABLED=true`)
+
+The bridge implements three Nostr login flows, all using NIP-98 signed proofs:
+
+| Flow | Endpoints | Use case |
+|------|-----------|----------|
+| **NIP-07** | `POST /auth/nip07/challenge`, `POST /auth/nip07/verify` | Browser extensions (nos2x, Alby) |
+| **NIP-46** | `POST /auth/nip46/init`, `GET /auth/nip46/status` | Remote signers (Signet bunker) |
+| **NIP-55** | `GET /auth/nip55/challenge`, `POST /auth/nip55/callback` | Android signer apps |
+
+All flows auto-create a Gitea user on first login using the same NIP-05 / hex-fallback naming policy as org provisioning. Identity links are persisted in SQLite.
+
+Metrics tracked: `auth_challenges_issued`, `auth_verify_success`, `auth_verify_failure`, `auth_replay_rejected`, `auth_user_provisioned`, `nip46_sessions_*`, `nip55_*`.
+
 ### Not implemented yet
 
 The bridge does **not** currently:
 
 - publish outbound NIP-34 events (announcements, state, patches, PRs, issues)
-- provide Nostr-based authentication (NIP-07/NIP-46/NIP-55)
 - handle webhook-driven event publishing
 - sync Nostr profiles to Gitea
+- provide a Gitea login page UI (the auth endpoints exist but no sign-in button yet)
 
 See the [backlog](.beads/issues.jsonl) for planned work.
 
@@ -76,6 +90,9 @@ DB_PATH=./mappings.db
 PUBKEY_ALLOWLIST=
 PROVISION_RATE_LIMIT=10
 ADMIN_API_TOKEN=                       # optional — enables bearer auth on admin endpoints
+AUTH_ENABLED=false                     # set true to enable Nostr auth endpoints
+BRIDGE_PUBLIC_URL=                     # required when AUTH_ENABLED=true — public URL of the bridge
+CHALLENGE_TTL=5m                       # NIP-98 challenge nonce lifetime
 ```
 
 ### Embedded-only mode
