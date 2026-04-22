@@ -15,6 +15,9 @@ var authUserProvisioned atomic.Int64
 var nip46SessionsInitiated atomic.Int64
 var nip46SessionsCompleted atomic.Int64
 var nip46SessionsFailed atomic.Int64
+var nip55ChallengesIssued atomic.Int64
+var nip55VerifySuccess atomic.Int64
+var nip55VerifyFailure atomic.Int64
 
 func IncAnnouncementReceived() {
 	announcementEventsReceived.Add(1)
@@ -68,6 +71,18 @@ func IncNIP46SessionsFailed() {
 	nip46SessionsFailed.Add(1)
 }
 
+func IncNIP55ChallengesIssued() {
+	nip55ChallengesIssued.Add(1)
+}
+
+func IncNIP55VerifySuccess() {
+	nip55VerifySuccess.Add(1)
+}
+
+func IncNIP55VerifyFailure() {
+	nip55VerifyFailure.Add(1)
+}
+
 func Snapshot() map[string]int64 {
 	return map[string]int64{
 		"announcement_events_received":    announcementEventsReceived.Load(),
@@ -83,5 +98,8 @@ func Snapshot() map[string]int64 {
 		"nip46_sessions_initiated":         nip46SessionsInitiated.Load(),
 		"nip46_sessions_completed":         nip46SessionsCompleted.Load(),
 		"nip46_sessions_failed":            nip46SessionsFailed.Load(),
+		"nip55_challenges_issued":          nip55ChallengesIssued.Load(),
+		"nip55_verify_success":             nip55VerifySuccess.Load(),
+		"nip55_verify_failure":             nip55VerifyFailure.Load(),
 	}
 }
