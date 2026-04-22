@@ -21,6 +21,13 @@ type Client struct {
 	http    *http.Client
 }
 
+type User struct {
+	ID       int64  `json:"id"`
+	Login    string `json:"login"`
+	FullName string `json:"full_name,omitempty"`
+	Email    string `json:"email"`
+}
+
 type Repository struct {
 	ID       int64  `json:"id"`
 	Owner    string `json:"owner"`
@@ -109,6 +116,33 @@ func (c *Client) GetRepo(ctx context.Context, org string, repo string) (Reposito
 	return parseRepo(resp)
 }
 
+// GetUser looks up a Gitea user by login name. Returns HTTPError with 404 if not found.
+func (c *Client) GetUser(ctx context.Context, login string) (User, error) {
+	resp, err := c.doJSON(ctx, http.MethodGet, "/api/v1/users/"+url.PathEscape(login), nil)
+	if err != nil {
+		return User{}, err
+	}
+	return parseUser(resp)
+}
+
+// CreateUser creates a new Gitea user with the given login, email, and password.
+// The user is created with login_name matching login for local auth.
+func (c *Client) CreateUser(ctx context.Context, login string, email string, password string) (User, error) {
+	body := map[string]any{
+		"login":                login,
+		"username":             login,
+		"email":                email,
+		"password":             password,
+		"must_change_password": false,
+		"visibility":           "public",
+	}
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/admin/users", body)
+	if err != nil {
+		return User{}, err
+	}
+	return parseUser(resp)
+}
+
 func (c *Client) getOrg(ctx context.Context, org string) ([]byte, error) {
 	return c.doJSON(ctx, http.MethodGet, "/api/v1/orgs/"+url.PathEscape(org), nil)
 }
@@ -192,4 +226,17 @@ func isNotFound(err error) bool {
 func isConflict(err error) bool {
 	e, ok := err.(*HTTPError)
 	return ok && e.StatusCode == http.StatusConflict
+}
+
+func parseUser(resp []byte) (User, error) {
+	var u User
+	if err := json.Unmarshal(resp, &u); err != nil {
+		return User{}, fmt.Errorf("decode gitea user: %w", err)
+	}
+	return u, nil
+}
+
+// IsNotFound reports whether the error is a 404 from the Gitea API.
+func IsNotFound(err error) bool {
+	return isNotFound(err)
 }

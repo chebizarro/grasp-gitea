@@ -13,16 +13,23 @@ import (
 	"testing"
 )
 
+type fakeUser struct {
+	ID    int64  `json:"id"`
+	Login string `json:"login"`
+	Email string `json:"email"`
+}
+
 // fakeGitea is a minimal Gitea API simulator for tests.
 type fakeGitea struct {
 	mu    sync.Mutex
 	orgs  map[string]bool
 	repos map[string]int64
+	users map[string]fakeUser
 	next  int64
 }
 
 func newFakeGitea() *fakeGitea {
-	return &fakeGitea{orgs: map[string]bool{}, repos: map[string]int64{}, next: 1}
+	return &fakeGitea{orgs: map[string]bool{}, repos: map[string]int64{}, users: map[string]fakeUser{}, next: 1}
 }
 
 func (f *fakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -94,6 +101,36 @@ func (f *fakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"id": id, "name": name,
 			"owner": map[string]any{"username": org},
 		})
+		return
+	}
+
+	// GET /api/v1/users/:login
+	if r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v1/users/") {
+		login := strings.TrimPrefix(path, "/api/v1/users/")
+		user, ok := f.users[login]
+		if !ok {
+			http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(user)
+		return
+	}
+
+	// POST /api/v1/admin/users
+	if r.Method == http.MethodPost && path == "/api/v1/admin/users" {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		login, _ := body["login"].(string)
+		if _, exists := f.users[login]; exists {
+			http.Error(w, `{"message":"user already exists"}`, http.StatusUnprocessableEntity)
+			return
+		}
+		email, _ := body["email"].(string)
+		id := f.next
+		f.next++
+		f.users[login] = fakeUser{ID: id, Login: login, Email: email}
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(f.users[login])
 		return
 	}
 
@@ -301,5 +338,82 @@ func TestClientTrimsBaseURL(t *testing.T) {
 	c := NewClient("http://example.com/", "tok")
 	if c.baseURL != "http://example.com" {
 		t.Errorf("expected trailing slash trimmed, got %q", c.baseURL)
+	}
+}
+
+func TestGetUserFound(t *testing.T) {
+	g := newFakeGitea()
+	g.users = map[string]fakeUser{"alice": {ID: 42, Login: "alice", Email: "alice@example.com"}}
+	ts := httptest.NewServer(g)
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "tok")
+	user, err := c.GetUser(context.Background(), "alice")
+	if err != nil {
+		t.Fatalf("GetUser: %v", err)
+	}
+	if user.ID != 42 {
+		t.Errorf("expected ID=42, got %d", user.ID)
+	}
+	if user.Login != "alice" {
+		t.Errorf("expected Login='alice', got %q", user.Login)
+	}
+}
+
+func TestGetUserNotFound(t *testing.T) {
+	g := newFakeGitea()
+	ts := httptest.NewServer(g)
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "tok")
+	_, err := c.GetUser(context.Background(), "nobody")
+	if err == nil {
+		t.Fatal("expected error for nonexistent user")
+	}
+	if !IsNotFound(err) {
+		t.Errorf("expected IsNotFound=true, got false for %v", err)
+	}
+}
+
+func TestCreateUser(t *testing.T) {
+	g := newFakeGitea()
+	ts := httptest.NewServer(g)
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "tok")
+	user, err := c.CreateUser(context.Background(), "bob", "bob@example.com", "secret123")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if user.Login != "bob" {
+		t.Errorf("expected Login='bob', got %q", user.Login)
+	}
+	if user.ID == 0 {
+		t.Error("expected non-zero user ID")
+	}
+}
+
+func TestCreateUserConflict(t *testing.T) {
+	g := newFakeGitea()
+	g.users = map[string]fakeUser{"bob": {ID: 10, Login: "bob", Email: "bob@example.com"}}
+	ts := httptest.NewServer(g)
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "tok")
+	_, err := c.CreateUser(context.Background(), "bob", "bob2@example.com", "secret123")
+	if err == nil {
+		t.Fatal("expected error for duplicate user")
+	}
+}
+
+func TestIsNotFoundExported(t *testing.T) {
+	if IsNotFound(nil) {
+		t.Error("nil should not be not-found")
+	}
+	if !IsNotFound(&HTTPError{StatusCode: 404}) {
+		t.Error("404 should be not-found")
+	}
+	if IsNotFound(&HTTPError{StatusCode: 500}) {
+		t.Error("500 should not be not-found")
 	}
 }
