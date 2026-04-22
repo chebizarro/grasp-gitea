@@ -112,6 +112,111 @@ func TestLoadSidecarStillRequiresRelayURLs(t *testing.T) {
 	}
 }
 
+func TestEmbeddedRelayConfigMatrix(t *testing.T) {
+	tests := []struct {
+		name        string
+		embedded    string
+		relayURLs   string
+		unsetRelays bool
+		wantErr     bool
+		wantRelays  int
+		wantEmbed   bool
+	}{
+		{
+			name:       "sidecar with relays",
+			embedded:   "false",
+			relayURLs:  "wss://relay1",
+			wantErr:    false,
+			wantRelays: 1,
+			wantEmbed:  false,
+		},
+		{
+			name:        "sidecar without relays fails",
+			embedded:    "false",
+			relayURLs:   "",
+			unsetRelays: true,
+			wantErr:     true,
+		},
+		{
+			name:       "embedded with external relays",
+			embedded:   "true",
+			relayURLs:  "wss://external-relay",
+			wantErr:    false,
+			wantRelays: 1,
+			wantEmbed:  true,
+		},
+		{
+			name:        "embedded without relays succeeds",
+			embedded:    "true",
+			relayURLs:   "",
+			unsetRelays: true,
+			wantErr:     false,
+			wantRelays:  0,
+			wantEmbed:   true,
+		},
+		{
+			name:       "embedded with multiple relays",
+			embedded:   "true",
+			relayURLs:  "wss://r1,wss://r2",
+			wantErr:    false,
+			wantRelays: 2,
+			wantEmbed:  true,
+		},
+		{
+			name:        "unset embedded defaults to sidecar",
+			relayURLs:   "",
+			unsetRelays: true,
+			wantErr:     true,
+		},
+		{
+			name:        "embedded with custom port and db",
+			embedded:    "true",
+			relayURLs:   "",
+			unsetRelays: true,
+			wantErr:     false,
+			wantRelays:  0,
+			wantEmbed:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			envs := map[string]string{
+				"GITEA_ADMIN_TOKEN": "tok",
+				"CLONE_PREFIX":      "https://git.example.com",
+				"RELAY_URLS":        tt.relayURLs,
+			}
+			if tt.embedded != "" {
+				envs["EMBEDDED_RELAY"] = tt.embedded
+			}
+			setEnvs(t, envs)
+			if tt.unsetRelays {
+				os.Unsetenv("RELAY_URLS")
+			}
+			if tt.embedded == "" {
+				os.Unsetenv("EMBEDDED_RELAY")
+			}
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(cfg.RelayURLs) != tt.wantRelays {
+				t.Errorf("expected %d relay URLs, got %d: %v", tt.wantRelays, len(cfg.RelayURLs), cfg.RelayURLs)
+			}
+			if cfg.EmbeddedRelay != tt.wantEmbed {
+				t.Errorf("expected EmbeddedRelay=%v, got %v", tt.wantEmbed, cfg.EmbeddedRelay)
+			}
+		})
+	}
+}
+
 func TestLoadDefaults(t *testing.T) {
 	setEnvs(t, map[string]string{
 		"GITEA_ADMIN_TOKEN": "tok",
