@@ -19,6 +19,7 @@ type Mapping struct {
 	CloneURL          string    `json:"clone_url"`
 	AnnouncedCloneURL string    `json:"announced_clone_url,omitempty"`
 	SourceEvent       string    `json:"source_event"`
+	HookInstalled     bool      `json:"hook_installed"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 }
@@ -68,6 +69,10 @@ func Open(path string) (*SQLiteStore, error) {
 	// "duplicate column" error.
 	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN announced_clone_url TEXT NOT NULL DEFAULT ''`)
 
+	// Migration: add hook_installed column to track provisioning completion.
+	// Existing rows default to 1 (true) since they were fully provisioned.
+	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN hook_installed INTEGER NOT NULL DEFAULT 1`)
+
 	return &SQLiteStore{db: db}, nil
 }
 
@@ -112,9 +117,13 @@ func (s *SQLiteStore) ProvisionCountSince(ctx context.Context, pubkey string, si
 
 func (s *SQLiteStore) UpsertMapping(ctx context.Context, m Mapping) error {
 	now := time.Now().UTC().Format(time.RFC3339)
+	hookVal := 0
+	if m.HookInstalled {
+		hookVal = 1
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO mappings(npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO mappings(npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(npub, repo_id) DO UPDATE SET
 			pubkey = excluded.pubkey,
 			owner = excluded.owner,
@@ -123,15 +132,38 @@ func (s *SQLiteStore) UpsertMapping(ctx context.Context, m Mapping) error {
 			clone_url = excluded.clone_url,
 			announced_clone_url = excluded.announced_clone_url,
 			source_event = excluded.source_event,
+			hook_installed = excluded.hook_installed,
 			updated_at = excluded.updated_at
-	`, m.Npub, m.RepoID, m.Pubkey, m.Owner, m.RepoName, m.GiteaRepoID, m.CloneURL, m.AnnouncedCloneURL, m.SourceEvent, now, now)
+	`, m.Npub, m.RepoID, m.Pubkey, m.Owner, m.RepoName, m.GiteaRepoID, m.CloneURL, m.AnnouncedCloneURL, m.SourceEvent, hookVal, now, now)
 	return err
 }
 
 func (s *SQLiteStore) ListMappings(ctx context.Context) ([]Mapping, error) {
+	return s.listMappingsWhere(ctx, "1=1")
+}
+
+// ListUnhookedMappings returns mappings where hook installation was not completed.
+// These represent interrupted provisioning that needs reconciliation on startup.
+func (s *SQLiteStore) ListUnhookedMappings(ctx context.Context) ([]Mapping, error) {
+	return s.listMappingsWhere(ctx, "hook_installed = 0")
+}
+
+// SetHookInstalled marks a mapping's hook as installed (or not).
+func (s *SQLiteStore) SetHookInstalled(ctx context.Context, npub string, repoID string, installed bool) error {
+	val := 0
+	if installed {
+		val = 1
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE mappings SET hook_installed = ?, updated_at = ? WHERE npub = ? AND repo_id = ?`,
+		val, time.Now().UTC().Format(time.RFC3339), npub, repoID)
+	return err
+}
+
+func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string) ([]Mapping, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, created_at, updated_at
+		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed, created_at, updated_at
 		FROM mappings
+		WHERE `+where+`
 		ORDER BY updated_at DESC
 	`)
 	if err != nil {
@@ -142,11 +174,13 @@ func (s *SQLiteStore) ListMappings(ctx context.Context) ([]Mapping, error) {
 	out := make([]Mapping, 0)
 	for rows.Next() {
 		var m Mapping
+		var hookVal int
 		var createdAt string
 		var updatedAt string
-		if err := rows.Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
+		m.HookInstalled = hookVal != 0
 		var parseErr error
 		m.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
 		if parseErr != nil {
@@ -163,14 +197,16 @@ func (s *SQLiteStore) ListMappings(ctx context.Context) ([]Mapping, error) {
 
 func (s *SQLiteStore) GetMapping(ctx context.Context, npub string, repoID string) (Mapping, error) {
 	var m Mapping
+	var hookVal int
 	var createdAt, updatedAt string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, created_at, updated_at
+		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed, created_at, updated_at
 		FROM mappings WHERE npub = ? AND repo_id = ? LIMIT 1
-	`, npub, repoID).Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &createdAt, &updatedAt)
+	`, npub, repoID).Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal, &createdAt, &updatedAt)
 	if err != nil {
 		return Mapping{}, err
 	}
+	m.HookInstalled = hookVal != 0
 	var parseErr error
 	m.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
 	if parseErr != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -28,6 +29,11 @@ type Service struct {
 	logger    *slog.Logger
 	installer *hooks.Installer
 	resolver  *nip05resolve.Resolver
+
+	// repoMu serializes provisioning per (npub, repoID) to prevent concurrent
+	// races when multiple events for the same repo arrive simultaneously.
+	repoMu    sync.Mutex
+	repoLocks map[string]*sync.Mutex
 }
 
 type Result struct {
@@ -39,7 +45,26 @@ type Result struct {
 }
 
 func New(cfg config.Config, st *store.SQLiteStore, g *gitea.Client, installer *hooks.Installer, resolver *nip05resolve.Resolver, logger *slog.Logger) *Service {
-	return &Service{cfg: cfg, store: st, gitea: g, installer: installer, resolver: resolver, logger: logger}
+	return &Service{
+		cfg: cfg, store: st, gitea: g,
+		installer: installer, resolver: resolver, logger: logger,
+		repoLocks: make(map[string]*sync.Mutex),
+	}
+}
+
+// lockRepo acquires a per-repo mutex, preventing concurrent provisioning
+// for the same (npub, repoID) pair.
+func (s *Service) lockRepo(npub, repoID string) *sync.Mutex {
+	key := npub + "\x00" + repoID
+	s.repoMu.Lock()
+	mu, ok := s.repoLocks[key]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.repoLocks[key] = mu
+	}
+	s.repoMu.Unlock()
+	mu.Lock()
+	return mu
 }
 
 func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, relayURL string) error {
@@ -167,6 +192,10 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		return err
 	}
 
+	// Serialize concurrent provisioning for the same (npub, repoID).
+	mu := s.lockRepo(npub, repoID)
+	defer mu.Unlock()
+
 	// Resolve a short, human-readable org name via NIP-05 (cached).
 	// Falls back to a hex prefix if no verified NIP-05 is found.
 	relayURLs := s.cfg.RelayURLs
@@ -192,6 +221,9 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		return fmt.Errorf("ensure repo %s/%s: %w", orgName, repoID, err)
 	}
 
+	// Phase 1: Record mapping with hook_installed=false.
+	// If the bridge crashes after this point, ReconcileHooks will
+	// find the incomplete mapping on startup and re-install the hook.
 	mapping := store.Mapping{
 		Npub:              npub,
 		RepoID:            repoID,
@@ -202,19 +234,65 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		CloneURL:          giteaCloneURL,
 		AnnouncedCloneURL: announcedCloneURL,
 		SourceEvent:       sourceEvent,
+		HookInstalled:     false,
 	}
 	if err := s.store.UpsertMapping(ctx, mapping); err != nil {
 		return fmt.Errorf("save mapping: %w", err)
 	}
 
+	// Phase 2: Install the pre-receive hook, then mark as complete.
 	if s.installer != nil {
 		if err := s.installer.Install(orgName, npub, repoID); err != nil {
 			return fmt.Errorf("install pre-receive hook: %w", err)
 		}
 	}
 
+	if err := s.store.SetHookInstalled(ctx, npub, repoID, true); err != nil {
+		return fmt.Errorf("mark hook installed: %w", err)
+	}
+
 	s.logger.Info("provisioned repository", "npub", npub, "org_name", orgName, "repo_id", repoID, "relay", sourceRelay, "event", sourceEvent)
 	return nil
+}
+
+// ReconcileHooks re-installs hooks for any mappings where provisioning
+// was interrupted before hook installation completed. Call on startup.
+func (s *Service) ReconcileHooks(ctx context.Context) error {
+	pending, err := s.store.ListUnhookedMappings(ctx)
+	if err != nil {
+		return fmt.Errorf("list unhooked mappings: %w", err)
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	s.logger.Info("reconciling incomplete provisioning", "count", len(pending))
+
+	var reconcileErrors []error
+	for _, m := range pending {
+		// Re-ensure org and repo exist (idempotent), then install hook.
+		if err := s.gitea.EnsureOrg(ctx, m.Owner); err != nil {
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: ensure org: %w", m.Owner, m.RepoID, err))
+			continue
+		}
+		if _, err := s.gitea.EnsureRepo(ctx, m.Owner, m.RepoID); err != nil {
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: ensure repo: %w", m.Owner, m.RepoID, err))
+			continue
+		}
+		if s.installer != nil {
+			if err := s.installer.Install(m.Owner, m.Npub, m.RepoID); err != nil {
+				reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: install hook: %w", m.Owner, m.RepoID, err))
+				continue
+			}
+		}
+		if err := s.store.SetHookInstalled(ctx, m.Npub, m.RepoID, true); err != nil {
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: mark installed: %w", m.Owner, m.RepoID, err))
+			continue
+		}
+		s.logger.Info("reconciled hook for repository", "owner", m.Owner, "repo_id", m.RepoID)
+	}
+
+	return errors.Join(reconcileErrors...)
 }
 
 func (s *Service) validatePolicy(ctx context.Context, npub string, pubkey string) error {

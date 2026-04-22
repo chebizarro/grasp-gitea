@@ -37,6 +37,7 @@ func TestUpsertAndGetMapping(t *testing.T) {
 		CloneURL:          "https://example.com/testorg/repo1.git",
 		AnnouncedCloneURL: "https://example.com/npub1test/repo1.git",
 		SourceEvent:       "event123",
+		HookInstalled:     true,
 	}
 
 	if err := st.UpsertMapping(ctx, m); err != nil {
@@ -58,6 +59,9 @@ func TestUpsertAndGetMapping(t *testing.T) {
 	}
 	if got.AnnouncedCloneURL != "https://example.com/npub1test/repo1.git" {
 		t.Errorf("expected announced clone URL, got %q", got.AnnouncedCloneURL)
+	}
+	if !got.HookInstalled {
+		t.Error("expected hook_installed to be true")
 	}
 	if got.CreatedAt.IsZero() {
 		t.Error("expected non-zero created_at")
@@ -181,14 +185,15 @@ func TestListMappings(t *testing.T) {
 
 	for i, id := range []string{"repo1", "repo2"} {
 		m := Mapping{
-			Npub:        "npub1test",
-			RepoID:      id,
-			Pubkey:      "pk1",
-			Owner:       "org1",
-			RepoName:    id,
-			GiteaRepoID: int64(i + 1),
-			CloneURL:    "url",
-			SourceEvent: "ev",
+			Npub:          "npub1test",
+			RepoID:        id,
+			Pubkey:        "pk1",
+			Owner:         "org1",
+			RepoName:      id,
+			GiteaRepoID:   int64(i + 1),
+			CloneURL:      "url",
+			SourceEvent:   "ev",
+			HookInstalled: true,
 		}
 		if err := st.UpsertMapping(ctx, m); err != nil {
 			t.Fatal(err)
@@ -201,5 +206,92 @@ func TestListMappings(t *testing.T) {
 	}
 	if len(mappings) != 2 {
 		t.Fatalf("expected 2 mappings, got %d", len(mappings))
+	}
+}
+
+func TestHookInstalledTracking(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Insert a mapping with hook_installed=false (simulates interrupted provisioning).
+	m := Mapping{
+		Npub:          "npub1test",
+		RepoID:        "repo1",
+		Pubkey:        "pk1",
+		Owner:         "org1",
+		RepoName:      "repo1",
+		GiteaRepoID:   1,
+		CloneURL:      "url",
+		SourceEvent:   "ev1",
+		HookInstalled: false,
+	}
+	if err := st.UpsertMapping(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+
+	// Also insert a fully provisioned mapping.
+	m2 := Mapping{
+		Npub:          "npub1test",
+		RepoID:        "repo2",
+		Pubkey:        "pk1",
+		Owner:         "org1",
+		RepoName:      "repo2",
+		GiteaRepoID:   2,
+		CloneURL:      "url2",
+		SourceEvent:   "ev2",
+		HookInstalled: true,
+	}
+	if err := st.UpsertMapping(ctx, m2); err != nil {
+		t.Fatal(err)
+	}
+
+	// ListUnhookedMappings should only return the incomplete one.
+	unhooked, err := st.ListUnhookedMappings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unhooked) != 1 {
+		t.Fatalf("expected 1 unhooked mapping, got %d", len(unhooked))
+	}
+	if unhooked[0].RepoID != "repo1" {
+		t.Errorf("expected repo1, got %s", unhooked[0].RepoID)
+	}
+	if unhooked[0].HookInstalled {
+		t.Error("expected hook_installed=false for unhooked mapping")
+	}
+
+	// GetMapping should reflect hook_installed=false.
+	got, err := st.GetMapping(ctx, "npub1test", "repo1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HookInstalled {
+		t.Error("expected hook_installed=false")
+	}
+
+	// SetHookInstalled should mark it as complete.
+	if err := st.SetHookInstalled(ctx, "npub1test", "repo1", true); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err = st.GetMapping(ctx, "npub1test", "repo1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HookInstalled {
+		t.Error("expected hook_installed=true after SetHookInstalled")
+	}
+
+	// No more unhooked mappings.
+	unhooked, err = st.ListUnhookedMappings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unhooked) != 0 {
+		t.Fatalf("expected 0 unhooked mappings after reconciliation, got %d", len(unhooked))
 	}
 }

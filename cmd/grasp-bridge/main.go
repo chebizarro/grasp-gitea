@@ -44,6 +44,13 @@ func main() {
 	hookInstaller := hooks.NewInstaller(cfg.GiteaRepositoriesDir, cfg.HookBinaryPath, cfg.HookRelayURL)
 	nip05Resolver := nip05resolve.NewResolver(5 * time.Minute)
 	provisionerSvc := provisioner.New(cfg, st, giteaClient, hookInstaller, nip05Resolver, logger)
+
+	// Reconcile any provisioning that was interrupted by a previous crash.
+	// This re-installs hooks for mappings saved with hook_installed=false.
+	if err := provisionerSvc.ReconcileHooks(context.Background()); err != nil {
+		logger.Warn("hook reconciliation had errors", "error", err)
+	}
+
 	proactiveSyncSvc := proactivesync.New(cfg.GiteaRepositoriesDir, st, logger)
 	apiServer := api.New(cfg, provisionerSvc, st, logger)
 
