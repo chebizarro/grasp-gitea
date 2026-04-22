@@ -13,7 +13,7 @@ Phase 1 + Phase 2 + Phase 3 implementation currently provides:
 - multi-maintainer state acceptance (maintainers from NIP-34 announcements)
 - Phase 3 integration assets:
   - gitea config snippet (`deploy/gitea/app.ini.phase3.snippet`)
-  - nginx vhost (`deploy/nginx/git.sharegap.net.conf`)
+  - nginx vhost template (`deploy/nginx/gitea-vhost.conf.example`)
   - e2e checklist (`docs/phase3-e2e-checklist.md`)
 - admin API:
   - `GET /health`
@@ -34,7 +34,7 @@ make build
 ```bash
 GITEA_URL=http://gitea:3000
 GITEA_ADMIN_TOKEN=<token>
-CLONE_PREFIX=https://git.sharegap.net
+CLONE_PREFIX=https://git.example.com  # required — your public git domain
 RELAY_URLS=ws://gastown-relay:3334
 HOOK_RELAY_URL=ws://localhost:3334
 HOOK_BINARY_PATH=/usr/local/bin/grasp-pre-receive
@@ -85,13 +85,13 @@ make build-full
 
 ## Phase 3 notes
 
-- Ensure gitea `ROOT_URL` is `https://git.sharegap.net`.
+- Ensure gitea `ROOT_URL` matches your `CLONE_PREFIX`.
 - Ensure proxy forwards `Host` and `X-Forwarded-Proto` headers.
 - Follow `docs/phase3-e2e-checklist.md` to validate ngit init + push accept/reject behavior.
 - Use the automation helper:
 
 ```bash
-GITEA_PUBLIC_URL=https://git.sharegap.net \
+GITEA_PUBLIC_URL=$CLONE_PREFIX \
 BRIDGE_ADMIN_URL=http://localhost:8090 \
 NPUB=npub1... \
 REPO_ID=myrepo \

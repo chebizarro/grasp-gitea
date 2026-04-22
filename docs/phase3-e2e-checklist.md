@@ -4,15 +4,15 @@
 
 - Confirm in `app.ini`:
   - `[service] MAX_USERNAME_LENGTH = 70`
-  - `[server] ROOT_URL = https://git.sharegap.net`
+  - `[server] ROOT_URL = <your CLONE_PREFIX value>`
 - Restart gitea and verify health.
 
 ## 2) Reverse proxy
 
-- Load nginx vhost from `deploy/nginx/git.sharegap.net.conf`.
+- Copy `deploy/nginx/gitea-vhost.conf.example`, replace `YOUR_DOMAIN` with your domain.
 - Reload nginx.
 - Verify:
-  - `curl -I https://git.sharegap.net` returns `200` or `302` from gitea.
+  - `curl -I https://<your-domain>` returns `200` or `302` from gitea.
 
 ## 3) Bridge + relay connectivity
 

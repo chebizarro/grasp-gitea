@@ -19,6 +19,7 @@ func setEnvs(t *testing.T, vars map[string]string) {
 func TestLoadMinimalValid(t *testing.T) {
 	setEnvs(t, map[string]string{
 		"GITEA_ADMIN_TOKEN": "tok123",
+		"CLONE_PREFIX":      "https://git.example.com",
 		"RELAY_URLS":        "wss://relay.example.com",
 	})
 
@@ -47,9 +48,24 @@ func TestLoadMissingToken(t *testing.T) {
 	}
 }
 
+func TestLoadMissingClonePrefix(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok123",
+		"CLONE_PREFIX":      "",
+		"RELAY_URLS":        "wss://relay.example.com",
+	})
+	os.Unsetenv("CLONE_PREFIX")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for missing CLONE_PREFIX")
+	}
+}
+
 func TestLoadMissingRelayURLs(t *testing.T) {
 	setEnvs(t, map[string]string{
 		"GITEA_ADMIN_TOKEN": "tok123",
+		"CLONE_PREFIX":      "https://git.example.com",
 		"RELAY_URLS":        "",
 	})
 	os.Unsetenv("RELAY_URLS")
@@ -63,6 +79,7 @@ func TestLoadMissingRelayURLs(t *testing.T) {
 func TestLoadDefaults(t *testing.T) {
 	setEnvs(t, map[string]string{
 		"GITEA_ADMIN_TOKEN": "tok",
+		"CLONE_PREFIX":      "https://git.example.com",
 		"RELAY_URLS":        "wss://r1",
 	})
 

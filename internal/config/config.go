@@ -29,7 +29,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		GiteaURL:             envOrDefault("GITEA_URL", "http://gitea:3000"),
 		GiteaAdminToken:      strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
-		ClonePrefix:          strings.TrimRight(envOrDefault("CLONE_PREFIX", "https://git.sharegap.net"), "/"),
+		ClonePrefix:          strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
 		RelayURLs:            csvEnv("RELAY_URLS"),
 		Listen:               envOrDefault("LISTEN", ":8090"),
 		DBPath:               envOrDefault("DB_PATH", "./mappings.db"),
@@ -46,6 +46,10 @@ func Load() (Config, error) {
 
 	if cfg.GiteaAdminToken == "" {
 		return Config{}, fmt.Errorf("GITEA_ADMIN_TOKEN is required")
+	}
+
+	if cfg.ClonePrefix == "" {
+		return Config{}, fmt.Errorf("CLONE_PREFIX is required (e.g. https://git.example.com)")
 	}
 
 	if len(cfg.RelayURLs) == 0 {

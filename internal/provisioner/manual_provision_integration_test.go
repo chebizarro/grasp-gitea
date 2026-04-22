@@ -111,7 +111,7 @@ func TestManualProvisionInstallsHookSelfContained(t *testing.T) {
 	defer st.Close()
 
 	cfg := config.Config{
-		ClonePrefix: "https://git.sharegap.net",
+		ClonePrefix: "https://git.example.com",
 	}
 	giteaClient := gitea.NewClient(srv.URL, "test-token")
 	hookInstaller := hooks.NewInstaller(reposDir, "/usr/local/bin/grasp-pre-receive", "ws://localhost:3334")

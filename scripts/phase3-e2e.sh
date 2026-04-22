@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Phase 3 deployed verification script
 # Required env:
-#   GITEA_PUBLIC_URL=https://git.sharegap.net
+#   GITEA_PUBLIC_URL=https://git.example.com  (your public git domain)
 #   BRIDGE_ADMIN_URL=http://localhost:8090
 #   NPUB=npub1...
 #   REPO_ID=myrepo

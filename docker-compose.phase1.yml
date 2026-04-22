@@ -7,7 +7,7 @@ services:
     environment:
       GITEA_URL: http://gitea:3000
       GITEA_ADMIN_TOKEN: ${GITEA_ADMIN_TOKEN}
-      CLONE_PREFIX: https://git.sharegap.net
+      CLONE_PREFIX: ${CLONE_PREFIX}
       RELAY_URLS: ws://gastown-relay:3334
       EMBEDDED_RELAY: "false"
       EMBEDDED_RELAY_PORT: "3334"
