@@ -7,8 +7,8 @@
 {"id":"phase2-003","title":"Add unit test coverage for ref/state validation","status":"closed","priority":2,"area":"hooks","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase3-001","title":"Add gitea ROOT_URL integration config for public clone domain","status":"closed","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase3-002","title":"Add nginx routing config for git.sharegap.net to gitea:3000","status":"closed","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
-{"id":"phase3-003","title":"Run live ngit end-to-end verification in deployed stack","status":"in_progress","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
-{"id":"phase3-005","title":"Resolve Gitea API username hard-limit (40) blocking npub org auto-provision","status":"open","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
+{"id":"phase3-003","title":"[epic-phase3-001] Run live ngit end-to-end verification in deployed stack","status":"in_progress","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
+{"id":"phase3-005","title":"[epic-phase3-001] Resolve Gitea API username hard-limit (40) blocking npub org auto-provision","status":"closed","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase3-004","title":"Provide single-container self-contained verification runner","status":"closed","priority":1,"area":"integration","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase4-001","title":"Enforce cryptographic validation for incoming kind:30617 announcements","status":"closed","priority":1,"area":"security","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase4-002","title":"Support multi-maintainer state acceptance in pre-receive validation","status":"closed","priority":1,"area":"hooks","created_at":"2026-03-08T00:00:00Z"}
@@ -20,3 +20,29 @@
 {"id":"phase4-008","title":"Implement proactive sync sub-service for external GRASP updates","status":"closed","priority":3,"area":"sync","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase4-009","title":"Finalize hook ref policy for PR/nostr refs with integration tests","status":"closed","priority":2,"area":"hooks","created_at":"2026-03-08T00:00:00Z"}
 {"id":"phase4-010","title":"Add unit tests for PR and refs/nostr hook policy behavior","status":"closed","priority":2,"area":"hooks","created_at":"2026-03-08T00:00:00Z"}
+{"id":"epic-docs-001","title":"Epic: documentation accuracy and source-of-truth cleanup","status":"closed","priority":1,"area":"docs","created_at":"2026-04-22T00:00:00Z"}
+{"id":"docs-001","title":"[epic-docs-001] Update grasp-gitea README to match code-verified behavior","status":"closed","priority":1,"area":"docs","created_at":"2026-04-22T00:00:00Z"}
+{"id":"docs-002","title":"[epic-docs-001] Correct fleet-planning grasp-gitea-spec to separate implemented from roadmap","status":"closed","priority":1,"area":"docs","created_at":"2026-04-22T00:00:00Z"}
+{"id":"docs-003","title":"[epic-docs-001] Correct fleet-planning git-services.md to reflect actual code state","status":"closed","priority":1,"area":"docs","created_at":"2026-04-22T00:00:00Z"}
+{"id":"docs-004","title":"[epic-docs-001] Update audit report with fixed-bug status and corrected scope","status":"closed","priority":1,"area":"docs","created_at":"2026-04-22T00:00:00Z"}
+{"id":"epic-phase3-001","title":"Epic: Phase 3 completion and post-mitigation verification","status":"in_progress","priority":1,"area":"integration","created_at":"2026-04-22T00:00:00Z"}
+{"id":"phase3-006","title":"[epic-phase3-001] Allow embedded-only mode without requiring RELAY_URLS","status":"open","priority":2,"area":"integration","created_at":"2026-04-22T00:00:00Z"}
+{"id":"epic-auth-001","title":"Epic: Nostr authentication implementation (NIP-07/46/55)","status":"open","priority":2,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
+{"id":"auth-001","title":"[epic-auth-001] Auth foundation: config, persistence, metrics, and session scaffold","status":"open","priority":1,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
+{"id":"auth-002","title":"[epic-auth-001] Gitea user lookup, auto-creation, and identity link from verified Nostr pubkey","status":"open","priority":1,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
+{"id":"auth-003","title":"[epic-auth-001] NIP-07 browser extension login flow end-to-end","status":"open","priority":1,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
+{"id":"auth-004","title":"[epic-auth-001] NIP-46 remote signer (bunker) login flow","status":"open","priority":2,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
+{"id":"auth-005","title":"[epic-auth-001] NIP-55 Android signer login flow","status":"open","priority":2,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
+{"id":"auth-006","title":"[epic-auth-001] Auth hardening, docs, metrics, and regression tests","status":"open","priority":2,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
+{"id":"epic-publish-001","title":"Epic: outbound NIP-34 event publishing","status":"open","priority":2,"area":"publish","created_at":"2026-04-22T00:00:00Z"}
+{"id":"publish-001","title":"[epic-publish-001] Webhook ingestion, signing config, and relay publication foundation","status":"open","priority":1,"area":"publish","created_at":"2026-04-22T00:00:00Z"}
+{"id":"publish-002","title":"[epic-publish-001] Outbound kind 30617/30618 repo announcement and state publishing","status":"open","priority":1,"area":"publish","created_at":"2026-04-22T00:00:00Z"}
+{"id":"publish-003","title":"[epic-publish-001] Patch event support (kind 1617) for refs/nostr push workflow","status":"open","priority":2,"area":"publish","created_at":"2026-04-22T00:00:00Z"}
+{"id":"publish-004","title":"[epic-publish-001] PR lifecycle publishing (kinds 1618/1619/1630-1633)","status":"open","priority":2,"area":"publish","created_at":"2026-04-22T00:00:00Z"}
+{"id":"publish-005","title":"[epic-publish-001] Issue and label publishing (kinds 1621/1985/1630/1632)","status":"open","priority":2,"area":"publish","created_at":"2026-04-22T00:00:00Z"}
+{"id":"publish-006","title":"[epic-publish-001] User grasp list publishing (kind 10317)","status":"open","priority":3,"area":"publish","created_at":"2026-04-22T00:00:00Z"}
+{"id":"epic-test-001","title":"Epic: coverage gap closure and regression hardening","status":"open","priority":2,"area":"test","created_at":"2026-04-22T00:00:00Z"}
+{"id":"test-001","title":"[epic-test-001] Bridge bootstrap, shutdown, and relay wiring test coverage","status":"open","priority":2,"area":"test","created_at":"2026-04-22T00:00:00Z"}
+{"id":"test-002","title":"[epic-test-001] Embedded-only config matrix regression tests","status":"open","priority":2,"area":"test","created_at":"2026-04-22T00:00:00Z"}
+{"id":"test-003","title":"[epic-test-001] Cross-package lifecycle integration tests (provision/archive/reconcile/sync)","status":"open","priority":2,"area":"test","created_at":"2026-04-22T00:00:00Z"}
+{"id":"test-004","title":"[epic-test-001] Auth and publisher regression suites (gate epic closure)","status":"open","priority":2,"area":"test","created_at":"2026-04-22T00:00:00Z"}
