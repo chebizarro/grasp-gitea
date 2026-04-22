@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 )
@@ -293,5 +294,326 @@ func TestHookInstalledTracking(t *testing.T) {
 	}
 	if len(unhooked) != 0 {
 		t.Fatalf("expected 0 unhooked mappings after reconciliation, got %d", len(unhooked))
+	}
+}
+
+// --- Auth challenge tests ---
+
+func TestCreateAndGetChallenge(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	c := AuthChallenge{
+		Nonce:       "test-nonce-001",
+		URL:         "https://bridge.example.com/auth/nip07/verify",
+		Method:      "POST",
+		RedirectURI: "/dashboard",
+		CreatedAt:   now,
+		ExpiresAt:   now.Add(5 * time.Minute),
+	}
+
+	if err := st.CreateChallenge(ctx, c); err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+
+	got, err := st.GetChallenge(ctx, "test-nonce-001")
+	if err != nil {
+		t.Fatalf("GetChallenge: %v", err)
+	}
+	if got.Nonce != c.Nonce {
+		t.Errorf("nonce: got %q, want %q", got.Nonce, c.Nonce)
+	}
+	if got.URL != c.URL {
+		t.Errorf("url: got %q, want %q", got.URL, c.URL)
+	}
+	if got.RedirectURI != c.RedirectURI {
+		t.Errorf("redirect_uri: got %q, want %q", got.RedirectURI, c.RedirectURI)
+	}
+	if got.Consumed {
+		t.Error("expected consumed=false")
+	}
+}
+
+func TestGetChallengeNotFound(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	_, err = st.GetChallenge(ctx, "nonexistent")
+	if err == nil {
+		t.Fatal("expected error for nonexistent challenge")
+	}
+}
+
+func TestConsumeChallenge(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC()
+	c := AuthChallenge{
+		Nonce:     "consume-test",
+		URL:       "https://example.com/verify",
+		Method:    "POST",
+		CreatedAt: now,
+		ExpiresAt: now.Add(5 * time.Minute),
+	}
+	if err := st.CreateChallenge(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+
+	// First consume should succeed.
+	if err := st.ConsumeChallenge(ctx, "consume-test"); err != nil {
+		t.Fatalf("first ConsumeChallenge: %v", err)
+	}
+
+	// Verify it's marked consumed.
+	got, err := st.GetChallenge(ctx, "consume-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Consumed {
+		t.Error("expected consumed=true after ConsumeChallenge")
+	}
+
+	// Second consume should fail.
+	if err := st.ConsumeChallenge(ctx, "consume-test"); err == nil {
+		t.Fatal("expected error on double consume")
+	}
+}
+
+func TestDeleteExpiredChallenges(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	past := time.Now().UTC().Add(-10 * time.Minute)
+	for i, nonce := range []string{"expired-1", "expired-2"} {
+		c := AuthChallenge{
+			Nonce:     nonce,
+			URL:       "https://example.com/verify",
+			Method:    "POST",
+			CreatedAt: past.Add(time.Duration(i) * time.Second),
+			ExpiresAt: past.Add(5 * time.Minute),
+		}
+		if err := st.CreateChallenge(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := st.DeleteExpiredChallenges(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("expected 2 deleted, got %d", n)
+	}
+}
+
+// --- Identity link tests ---
+
+func TestUpsertAndGetIdentityLink(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	link := NostrIdentityLink{
+		Pubkey:      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		Npub:        "npub1test",
+		GiteaUserID: 42,
+		GiteaUser:   "alice",
+		NIP05:       "alice@example.com",
+		LastLoginAt: time.Now().UTC().Truncate(time.Second),
+	}
+	if err := st.UpsertIdentityLink(ctx, link); err != nil {
+		t.Fatalf("UpsertIdentityLink: %v", err)
+	}
+
+	got, err := st.GetIdentityLinkByPubkey(ctx, link.Pubkey)
+	if err != nil {
+		t.Fatalf("GetIdentityLinkByPubkey: %v", err)
+	}
+	if got.GiteaUserID != 42 {
+		t.Errorf("gitea_user_id: got %d, want 42", got.GiteaUserID)
+	}
+	if got.GiteaUser != "alice" {
+		t.Errorf("gitea_user: got %q, want 'alice'", got.GiteaUser)
+	}
+	if got.NIP05 != "alice@example.com" {
+		t.Errorf("nip05: got %q, want 'alice@example.com'", got.NIP05)
+	}
+	if got.CreatedAt.IsZero() {
+		t.Error("expected non-zero created_at")
+	}
+}
+
+func TestGetIdentityLinkByGiteaUserID(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	link := NostrIdentityLink{
+		Pubkey:      "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd",
+		Npub:        "npub1user2",
+		GiteaUserID: 99,
+		GiteaUser:   "bob",
+		LastLoginAt: time.Now().UTC().Truncate(time.Second),
+	}
+	if err := st.UpsertIdentityLink(ctx, link); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetIdentityLinkByGiteaUserID(ctx, 99)
+	if err != nil {
+		t.Fatalf("GetIdentityLinkByGiteaUserID: %v", err)
+	}
+	if got.Pubkey != link.Pubkey {
+		t.Errorf("pubkey: got %q, want %q", got.Pubkey, link.Pubkey)
+	}
+}
+
+func TestGetIdentityLinkNotFound(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	_, err = st.GetIdentityLinkByPubkey(ctx, "nonexistent")
+	if err != sql.ErrNoRows {
+		t.Errorf("expected sql.ErrNoRows, got %v", err)
+	}
+
+	_, err = st.GetIdentityLinkByGiteaUserID(ctx, 999)
+	if err != sql.ErrNoRows {
+		t.Errorf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+func TestUpdateLastLogin(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	link := NostrIdentityLink{
+		Pubkey:      "1111111111111111111111111111111111111111111111111111111111111111",
+		Npub:        "npub1login",
+		GiteaUserID: 10,
+		GiteaUser:   "loginuser",
+	}
+	if err := st.UpsertIdentityLink(ctx, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.UpdateLastLogin(ctx, link.Pubkey); err != nil {
+		t.Fatalf("UpdateLastLogin: %v", err)
+	}
+
+	got, err := st.GetIdentityLinkByPubkey(ctx, link.Pubkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastLoginAt.IsZero() {
+		t.Error("expected non-zero last_login_at after UpdateLastLogin")
+	}
+}
+
+func TestListIdentityLinks(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	for i, pk := range []string{"aaaa", "bbbb"} {
+		link := NostrIdentityLink{
+			Pubkey:      pk,
+			Npub:        "npub1" + pk,
+			GiteaUserID: int64(i + 1),
+			GiteaUser:   "user" + pk,
+		}
+		if err := st.UpsertIdentityLink(ctx, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	links, err := st.ListIdentityLinks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 2 {
+		t.Errorf("expected 2 links, got %d", len(links))
+	}
+}
+
+func TestUpsertIdentityLinkUpdatesExisting(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	link := NostrIdentityLink{
+		Pubkey:      "2222222222222222222222222222222222222222222222222222222222222222",
+		Npub:        "npub1first",
+		GiteaUserID: 50,
+		GiteaUser:   "firstuser",
+		NIP05:       "old@example.com",
+	}
+	if err := st.UpsertIdentityLink(ctx, link); err != nil {
+		t.Fatal(err)
+	}
+
+	// Update with new NIP-05 and user.
+	link.NIP05 = "new@example.com"
+	link.GiteaUser = "updateduser"
+	if err := st.UpsertIdentityLink(ctx, link); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetIdentityLinkByPubkey(ctx, link.Pubkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NIP05 != "new@example.com" {
+		t.Errorf("nip05: got %q, want 'new@example.com'", got.NIP05)
+	}
+	if got.GiteaUser != "updateduser" {
+		t.Errorf("gitea_user: got %q, want 'updateduser'", got.GiteaUser)
+	}
+
+	// Should still be only one link.
+	links, err := st.ListIdentityLinks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 1 {
+		t.Errorf("expected 1 link after upsert, got %d", len(links))
 	}
 }

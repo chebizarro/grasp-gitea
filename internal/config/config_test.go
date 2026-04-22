@@ -6,6 +6,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 // setEnvs sets multiple environment variables and returns a cleanup function.
@@ -391,5 +392,114 @@ func TestParseAllowlist(t *testing.T) {
 	empty := parseAllowlist("")
 	if len(empty) != 0 {
 		t.Errorf("empty input should produce empty allowlist, got %d entries", len(empty))
+	}
+}
+
+func TestAuthEnabledRequiresBridgePublicURL(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN":  "tok",
+		"CLONE_PREFIX":       "https://git.example.com",
+		"RELAY_URLS":         "wss://relay",
+		"AUTH_ENABLED":       "true",
+		"BRIDGE_PUBLIC_URL":  "",
+	})
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error when AUTH_ENABLED=true without BRIDGE_PUBLIC_URL")
+	}
+}
+
+func TestAuthEnabledWithPublicURL(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN":  "tok",
+		"CLONE_PREFIX":       "https://git.example.com",
+		"RELAY_URLS":         "wss://relay",
+		"AUTH_ENABLED":       "true",
+		"BRIDGE_PUBLIC_URL":  "https://bridge.example.com/",
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.AuthEnabled {
+		t.Error("expected AuthEnabled=true")
+	}
+	if cfg.BridgePublicURL != "https://bridge.example.com" {
+		t.Errorf("expected trailing slash stripped, got %q", cfg.BridgePublicURL)
+	}
+}
+
+func TestAuthDisabledByDefault(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok",
+		"CLONE_PREFIX":      "https://git.example.com",
+		"RELAY_URLS":        "wss://relay",
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AuthEnabled {
+		t.Error("expected AuthEnabled=false by default")
+	}
+}
+
+func TestChallengeTTLDefault(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok",
+		"CLONE_PREFIX":      "https://git.example.com",
+		"RELAY_URLS":        "wss://relay",
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ChallengeTTL != 5*time.Minute {
+		t.Errorf("expected default ChallengeTTL=5m, got %v", cfg.ChallengeTTL)
+	}
+}
+
+func TestChallengeTTLCustom(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok",
+		"CLONE_PREFIX":      "https://git.example.com",
+		"RELAY_URLS":        "wss://relay",
+		"CHALLENGE_TTL":     "2m30s",
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ChallengeTTL != 2*time.Minute+30*time.Second {
+		t.Errorf("expected ChallengeTTL=2m30s, got %v", cfg.ChallengeTTL)
+	}
+}
+
+func TestDurationEnvParsing(t *testing.T) {
+	tests := []struct {
+		input    string
+		fallback time.Duration
+		expected time.Duration
+	}{
+		{"", 5 * time.Minute, 5 * time.Minute},
+		{"10s", 5 * time.Minute, 10 * time.Second},
+		{"1h", 0, 1 * time.Hour},
+		{"invalid", 3 * time.Minute, 3 * time.Minute},
+	}
+	for _, tt := range tests {
+		os.Setenv("__TEST_DUR", tt.input)
+		if tt.input == "" {
+			os.Unsetenv("__TEST_DUR")
+		}
+		result := durationEnv("__TEST_DUR", tt.fallback)
+		os.Unsetenv("__TEST_DUR")
+		if result != tt.expected {
+			t.Errorf("durationEnv(%q, %v): expected %v, got %v", tt.input, tt.fallback, tt.expected, result)
+		}
 	}
 }

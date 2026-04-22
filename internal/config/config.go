@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -23,6 +24,9 @@ type Config struct {
 	EmbeddedRelayPort    int
 	EmbeddedRelayDB      string
 	AdminAPIToken        string
+	AuthEnabled          bool
+	BridgePublicURL      string
+	ChallengeTTL         time.Duration
 }
 
 func Load() (Config, error) {
@@ -42,6 +46,9 @@ func Load() (Config, error) {
 		EmbeddedRelayPort:    intEnv("EMBEDDED_RELAY_PORT", 3334),
 		EmbeddedRelayDB:      envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
 		AdminAPIToken:        strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
+		AuthEnabled:          boolEnv("AUTH_ENABLED", false),
+		BridgePublicURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
+		ChallengeTTL:         durationEnv("CHALLENGE_TTL", 5*time.Minute),
 	}
 
 	if cfg.GiteaAdminToken == "" {
@@ -54,6 +61,10 @@ func Load() (Config, error) {
 
 	if len(cfg.RelayURLs) == 0 && !cfg.EmbeddedRelay {
 		return Config{}, fmt.Errorf("RELAY_URLS is required (or set EMBEDDED_RELAY=true for embedded-only mode)")
+	}
+
+	if cfg.AuthEnabled && cfg.BridgePublicURL == "" {
+		return Config{}, fmt.Errorf("BRIDGE_PUBLIC_URL is required when AUTH_ENABLED=true")
 	}
 
 	return cfg, nil
@@ -109,6 +120,18 @@ func csvEnv(key string) []string {
 		}
 	}
 	return res
+}
+
+func durationEnv(key string, fallback time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fallback
+	}
+	return d
 }
 
 func parseAllowlist(raw string) map[string]struct{} {

@@ -12,6 +12,11 @@ func TestSnapshotInitiallyZero(t *testing.T) {
 	announcementEventsProvisioned.Store(0)
 	manualProvisionRequests.Store(0)
 	manualProvisionFailures.Store(0)
+	authChallengesIssued.Store(0)
+	authVerifySuccess.Store(0)
+	authVerifyFailure.Store(0)
+	authReplayRejected.Store(0)
+	authUserProvisioned.Store(0)
 
 	snap := Snapshot()
 	for key, val := range snap {
@@ -28,6 +33,11 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 	announcementEventsProvisioned.Store(0)
 	manualProvisionRequests.Store(0)
 	manualProvisionFailures.Store(0)
+	authChallengesIssued.Store(0)
+	authVerifySuccess.Store(0)
+	authVerifyFailure.Store(0)
+	authReplayRejected.Store(0)
+	authUserProvisioned.Store(0)
 
 	IncAnnouncementReceived()
 	IncAnnouncementReceived()
@@ -38,6 +48,14 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 	IncManualProvisionRequests()
 	IncManualProvisionFailures()
 	IncManualProvisionFailures()
+	IncAuthChallengesIssued()
+	IncAuthChallengesIssued()
+	IncAuthVerifySuccess()
+	IncAuthVerifyFailure()
+	IncAuthVerifyFailure()
+	IncAuthVerifyFailure()
+	IncAuthReplayRejected()
+	IncAuthUserProvisioned()
 
 	snap := Snapshot()
 	expected := map[string]int64{
@@ -46,6 +64,11 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 		"announcement_events_provisioned": 3,
 		"manual_provision_requests":       1,
 		"manual_provision_failures":       2,
+		"auth_challenges_issued":          2,
+		"auth_verify_success":             1,
+		"auth_verify_failure":             3,
+		"auth_replay_rejected":            1,
+		"auth_user_provisioned":           1,
 	}
 	for key, want := range expected {
 		if got := snap[key]; got != want {
@@ -62,6 +85,11 @@ func TestSnapshotReturnsAllKeys(t *testing.T) {
 		"announcement_events_provisioned",
 		"manual_provision_requests",
 		"manual_provision_failures",
+		"auth_challenges_issued",
+		"auth_verify_success",
+		"auth_verify_failure",
+		"auth_replay_rejected",
+		"auth_user_provisioned",
 	}
 	for _, key := range requiredKeys {
 		if _, ok := snap[key]; !ok {
