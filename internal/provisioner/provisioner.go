@@ -178,8 +178,10 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 
 	s.logger.Info("resolved org name", "npub", npub, "org_name", orgName)
 
-	// Use orgName for the Gitea org/repo path; npub is preserved in the mapping.
-	cloneURL = fmt.Sprintf("%s/%s/%s.git", s.cfg.ClonePrefix, orgName, repoID)
+	// Preserve the original announced clone URL for traceability.
+	// The actual Gitea clone URL uses the resolved org name.
+	announcedCloneURL := cloneURL
+	giteaCloneURL := fmt.Sprintf("%s/%s/%s.git", s.cfg.ClonePrefix, orgName, repoID)
 
 	if err := s.gitea.EnsureOrg(ctx, orgName); err != nil {
 		return fmt.Errorf("ensure org %s: %w", orgName, err)
@@ -191,14 +193,15 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 	}
 
 	mapping := store.Mapping{
-		Npub:        npub,
-		RepoID:      repoID,
-		Pubkey:      pubkey,
-		Owner:       orgName,
-		RepoName:    repoID,
-		GiteaRepoID: repo.ID,
-		CloneURL:    cloneURL,
-		SourceEvent: sourceEvent,
+		Npub:              npub,
+		RepoID:            repoID,
+		Pubkey:            pubkey,
+		Owner:             orgName,
+		RepoName:          repoID,
+		GiteaRepoID:       repo.ID,
+		CloneURL:          giteaCloneURL,
+		AnnouncedCloneURL: announcedCloneURL,
+		SourceEvent:       sourceEvent,
 	}
 	if err := s.store.UpsertMapping(ctx, mapping); err != nil {
 		return fmt.Errorf("save mapping: %w", err)

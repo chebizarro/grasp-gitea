@@ -28,14 +28,15 @@ func TestUpsertAndGetMapping(t *testing.T) {
 	defer st.Close()
 
 	m := Mapping{
-		Npub:        "npub1test",
-		RepoID:      "repo1",
-		Pubkey:      "deadbeef",
-		Owner:       "testorg",
-		RepoName:    "repo1",
-		GiteaRepoID: 42,
-		CloneURL:    "https://example.com/testorg/repo1.git",
-		SourceEvent: "event123",
+		Npub:              "npub1test",
+		RepoID:            "repo1",
+		Pubkey:            "deadbeef",
+		Owner:             "testorg",
+		RepoName:          "repo1",
+		GiteaRepoID:       42,
+		CloneURL:          "https://example.com/testorg/repo1.git",
+		AnnouncedCloneURL: "https://example.com/npub1test/repo1.git",
+		SourceEvent:       "event123",
 	}
 
 	if err := st.UpsertMapping(ctx, m); err != nil {
@@ -51,6 +52,12 @@ func TestUpsertAndGetMapping(t *testing.T) {
 	}
 	if got.GiteaRepoID != 42 {
 		t.Errorf("expected gitea repo id 42, got %d", got.GiteaRepoID)
+	}
+	if got.CloneURL != "https://example.com/testorg/repo1.git" {
+		t.Errorf("expected gitea clone URL, got %q", got.CloneURL)
+	}
+	if got.AnnouncedCloneURL != "https://example.com/npub1test/repo1.git" {
+		t.Errorf("expected announced clone URL, got %q", got.AnnouncedCloneURL)
 	}
 	if got.CreatedAt.IsZero() {
 		t.Error("expected non-zero created_at")

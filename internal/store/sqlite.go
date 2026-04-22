@@ -10,16 +10,17 @@ import (
 )
 
 type Mapping struct {
-	Npub        string    `json:"npub"`
-	RepoID      string    `json:"repo_id"`
-	Pubkey      string    `json:"pubkey"`
-	Owner       string    `json:"owner"`
-	RepoName    string    `json:"repo_name"`
-	GiteaRepoID int64     `json:"gitea_repo_id"`
-	CloneURL    string    `json:"clone_url"`
-	SourceEvent string    `json:"source_event"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	Npub              string    `json:"npub"`
+	RepoID            string    `json:"repo_id"`
+	Pubkey            string    `json:"pubkey"`
+	Owner             string    `json:"owner"`
+	RepoName          string    `json:"repo_name"`
+	GiteaRepoID       int64     `json:"gitea_repo_id"`
+	CloneURL          string    `json:"clone_url"`
+	AnnouncedCloneURL string    `json:"announced_clone_url,omitempty"`
+	SourceEvent       string    `json:"source_event"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type SQLiteStore struct {
@@ -61,6 +62,11 @@ func Open(path string) (*SQLiteStore, error) {
 			return nil, fmt.Errorf("init sqlite schema: %w", err)
 		}
 	}
+
+	// Migration: add announced_clone_url column if it doesn't exist.
+	// SQLite has no IF NOT EXISTS for ALTER TABLE, so we ignore the
+	// "duplicate column" error.
+	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN announced_clone_url TEXT NOT NULL DEFAULT ''`)
 
 	return &SQLiteStore{db: db}, nil
 }
@@ -107,23 +113,24 @@ func (s *SQLiteStore) ProvisionCountSince(ctx context.Context, pubkey string, si
 func (s *SQLiteStore) UpsertMapping(ctx context.Context, m Mapping) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO mappings(npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, source_event, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO mappings(npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(npub, repo_id) DO UPDATE SET
 			pubkey = excluded.pubkey,
 			owner = excluded.owner,
 			repo_name = excluded.repo_name,
 			gitea_repo_id = excluded.gitea_repo_id,
 			clone_url = excluded.clone_url,
+			announced_clone_url = excluded.announced_clone_url,
 			source_event = excluded.source_event,
 			updated_at = excluded.updated_at
-	`, m.Npub, m.RepoID, m.Pubkey, m.Owner, m.RepoName, m.GiteaRepoID, m.CloneURL, m.SourceEvent, now, now)
+	`, m.Npub, m.RepoID, m.Pubkey, m.Owner, m.RepoName, m.GiteaRepoID, m.CloneURL, m.AnnouncedCloneURL, m.SourceEvent, now, now)
 	return err
 }
 
 func (s *SQLiteStore) ListMappings(ctx context.Context) ([]Mapping, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, source_event, created_at, updated_at
+		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, created_at, updated_at
 		FROM mappings
 		ORDER BY updated_at DESC
 	`)
@@ -137,7 +144,7 @@ func (s *SQLiteStore) ListMappings(ctx context.Context) ([]Mapping, error) {
 		var m Mapping
 		var createdAt string
 		var updatedAt string
-		if err := rows.Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.SourceEvent, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		var parseErr error
@@ -158,9 +165,9 @@ func (s *SQLiteStore) GetMapping(ctx context.Context, npub string, repoID string
 	var m Mapping
 	var createdAt, updatedAt string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, source_event, created_at, updated_at
+		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, created_at, updated_at
 		FROM mappings WHERE npub = ? AND repo_id = ? LIMIT 1
-	`, npub, repoID).Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.SourceEvent, &createdAt, &updatedAt)
+	`, npub, repoID).Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &createdAt, &updatedAt)
 	if err != nil {
 		return Mapping{}, err
 	}
