@@ -30,7 +30,7 @@
 {"id":"epic-auth-001","title":"Epic: Nostr authentication implementation (NIP-07/46/55)","status":"in_progress","priority":2,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
 {"id":"auth-001","title":"[epic-auth-001] Auth foundation: config, persistence, metrics, and session scaffold","status":"closed","priority":1,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
 {"id":"auth-002","title":"[epic-auth-001] Gitea user lookup, auto-creation, and identity link from verified Nostr pubkey","status":"closed","priority":1,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
-{"id":"auth-003","title":"[epic-auth-001] NIP-07 browser extension login flow end-to-end","status":"open","priority":1,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
+{"id":"auth-003","title":"[epic-auth-001] NIP-07 browser extension login flow end-to-end","status":"closed","priority":1,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
 {"id":"auth-004","title":"[epic-auth-001] NIP-46 remote signer (bunker) login flow","status":"open","priority":2,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
 {"id":"auth-005","title":"[epic-auth-001] NIP-55 Android signer login flow","status":"open","priority":2,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
 {"id":"auth-006","title":"[epic-auth-001] Auth hardening, docs, metrics, and regression tests","status":"open","priority":2,"area":"auth","created_at":"2026-04-22T00:00:00Z"}
