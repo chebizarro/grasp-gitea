@@ -24,6 +24,16 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
+// mergeRelayURLs combines configured relay URLs with the embedded relay URL,
+// deduplicating if the embedded URL is already in the list.
+func mergeRelayURLs(configured []string, embeddedURL string) []string {
+	result := append([]string{}, configured...)
+	if embeddedURL != "" && !slices.Contains(result, embeddedURL) {
+		result = append(result, embeddedURL)
+	}
+	return result
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -64,10 +74,7 @@ func main() {
 	}
 	defer shutdownEmbedded(context.Background())
 
-	relayURLs := append([]string{}, cfg.RelayURLs...)
-	if embeddedRelayURL != "" && !slices.Contains(relayURLs, embeddedRelayURL) {
-		relayURLs = append(relayURLs, embeddedRelayURL)
-	}
+	relayURLs := mergeRelayURLs(cfg.RelayURLs, embeddedRelayURL)
 
 	handler := func(ctx context.Context, ev *nostr.Event, sourceRelay string) error {
 		err := provisionerSvc.HandleAnnouncementEvent(ctx, ev, sourceRelay)

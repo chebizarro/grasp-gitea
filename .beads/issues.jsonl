@@ -42,7 +42,7 @@
 {"id":"publish-005","title":"[epic-publish-001] Issue and label publishing (kinds 1621/1985/1630/1632)","status":"open","priority":2,"area":"publish","created_at":"2026-04-22T00:00:00Z"}
 {"id":"publish-006","title":"[epic-publish-001] User grasp list publishing (kind 10317)","status":"open","priority":3,"area":"publish","created_at":"2026-04-22T00:00:00Z"}
 {"id":"epic-test-001","title":"Epic: coverage gap closure and regression hardening","status":"open","priority":2,"area":"test","created_at":"2026-04-22T00:00:00Z"}
-{"id":"test-001","title":"[epic-test-001] Bridge bootstrap, shutdown, and relay wiring test coverage","status":"open","priority":2,"area":"test","created_at":"2026-04-22T00:00:00Z"}
+{"id":"test-001","title":"[epic-test-001] Bridge bootstrap, shutdown, and relay wiring test coverage","status":"closed","priority":2,"area":"test","created_at":"2026-04-22T00:00:00Z"}
 {"id":"test-002","title":"[epic-test-001] Embedded-only config matrix regression tests","status":"closed","priority":2,"area":"test","created_at":"2026-04-22T00:00:00Z"}
 {"id":"test-003","title":"[epic-test-001] Cross-package lifecycle integration tests (provision/archive/reconcile/sync)","status":"closed","priority":2,"area":"test","created_at":"2026-04-22T00:00:00Z"}
 {"id":"test-004","title":"[epic-test-001] Auth and publisher regression suites (gate epic closure)","status":"open","priority":2,"area":"test","created_at":"2026-04-22T00:00:00Z"}
