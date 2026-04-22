@@ -571,6 +571,128 @@ func TestListIdentityLinks(t *testing.T) {
 	}
 }
 
+// --- NIP-46 session tests ---
+
+func TestCreateAndGetNIP46Session(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	sess := NIP46Session{
+		SessionToken: "test-token-001",
+		BunkerPubkey: "deadbeef",
+		ClientPubkey: "clientpk",
+		State:        "pending",
+		RedirectURI:  "/dashboard",
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(2 * time.Minute),
+	}
+
+	if err := st.CreateNIP46Session(ctx, sess); err != nil {
+		t.Fatalf("CreateNIP46Session: %v", err)
+	}
+
+	got, err := st.GetNIP46Session(ctx, "test-token-001")
+	if err != nil {
+		t.Fatalf("GetNIP46Session: %v", err)
+	}
+	if got.State != "pending" {
+		t.Errorf("state: got %q, want 'pending'", got.State)
+	}
+	if got.BunkerPubkey != "deadbeef" {
+		t.Errorf("bunker_pubkey: got %q", got.BunkerPubkey)
+	}
+	if got.RedirectURI != "/dashboard" {
+		t.Errorf("redirect_uri: got %q", got.RedirectURI)
+	}
+}
+
+func TestGetNIP46SessionNotFound(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	_, err = st.GetNIP46Session(ctx, "nonexistent")
+	if err != sql.ErrNoRows {
+		t.Errorf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+func TestUpdateNIP46SessionState(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC()
+	sess := NIP46Session{
+		SessionToken: "update-test",
+		BunkerPubkey: "bpk",
+		ClientPubkey: "cpk",
+		State:        "pending",
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(2 * time.Minute),
+	}
+	if err := st.CreateNIP46Session(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+
+	// Update to complete.
+	if err := st.UpdateNIP46SessionState(ctx, "update-test", "complete", "signer-pk", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetNIP46Session(ctx, "update-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "complete" {
+		t.Errorf("state: got %q, want 'complete'", got.State)
+	}
+	if got.ResultPubkey != "signer-pk" {
+		t.Errorf("result_pubkey: got %q", got.ResultPubkey)
+	}
+}
+
+func TestDeleteExpiredNIP46Sessions(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	past := time.Now().UTC().Add(-10 * time.Minute)
+	sess := NIP46Session{
+		SessionToken: "expired-sess",
+		BunkerPubkey: "bpk",
+		ClientPubkey: "cpk",
+		State:        "pending",
+		CreatedAt:    past,
+		ExpiresAt:    past.Add(2 * time.Minute),
+	}
+	if err := st.CreateNIP46Session(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := st.DeleteExpiredNIP46Sessions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 deleted, got %d", n)
+	}
+}
+
 func TestUpsertIdentityLinkUpdatesExisting(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(t.TempDir() + "/test.db")

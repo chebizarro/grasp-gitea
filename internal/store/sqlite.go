@@ -20,6 +20,19 @@ type AuthChallenge struct {
 	Consumed    bool      `json:"consumed"`
 }
 
+// NIP46Session tracks an in-flight or completed NIP-46 bunker login session.
+type NIP46Session struct {
+	SessionToken string    `json:"session_token"`
+	BunkerPubkey string    `json:"bunker_pubkey"`
+	ClientPubkey string    `json:"client_pubkey"`
+	State        string    `json:"state"` // pending, complete, error
+	RedirectURI  string    `json:"redirect_uri,omitempty"`
+	ResultPubkey string    `json:"result_pubkey,omitempty"` // verified signer pubkey on success
+	Error        string    `json:"error,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
 // NostrIdentityLink binds a Nostr pubkey to a Gitea user.
 type NostrIdentityLink struct {
 	Pubkey      string    `json:"pubkey"`
@@ -96,6 +109,17 @@ func Open(path string) (*SQLiteStore, error) {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			last_login_at TEXT NOT NULL DEFAULT ''
+		);`,
+		`CREATE TABLE IF NOT EXISTS nip46_sessions (
+			session_token TEXT PRIMARY KEY,
+			bunker_pubkey TEXT NOT NULL,
+			client_pubkey TEXT NOT NULL,
+			state TEXT NOT NULL DEFAULT 'pending',
+			redirect_uri TEXT NOT NULL DEFAULT '',
+			result_pubkey TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL
 		);`,
 	}
 
@@ -456,4 +480,61 @@ func (s *SQLiteStore) ListIdentityLinks(ctx context.Context) ([]NostrIdentityLin
 		links = append(links, link)
 	}
 	return links, rows.Err()
+}
+
+// --- NIP-46 session methods ---
+
+// CreateNIP46Session persists a new NIP-46 login session.
+func (s *SQLiteStore) CreateNIP46Session(ctx context.Context, sess NIP46Session) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO nip46_sessions(session_token, bunker_pubkey, client_pubkey, state, redirect_uri, result_pubkey, error, created_at, expires_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, sess.SessionToken, sess.BunkerPubkey, sess.ClientPubkey, sess.State,
+		sess.RedirectURI, sess.ResultPubkey, sess.Error,
+		sess.CreatedAt.UTC().Format(time.RFC3339),
+		sess.ExpiresAt.UTC().Format(time.RFC3339))
+	return err
+}
+
+// GetNIP46Session retrieves a session by token. Returns sql.ErrNoRows if not found.
+func (s *SQLiteStore) GetNIP46Session(ctx context.Context, token string) (NIP46Session, error) {
+	var sess NIP46Session
+	var createdAt, expiresAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT session_token, bunker_pubkey, client_pubkey, state, redirect_uri, result_pubkey, error, created_at, expires_at
+		FROM nip46_sessions WHERE session_token = ?
+	`, token).Scan(&sess.SessionToken, &sess.BunkerPubkey, &sess.ClientPubkey,
+		&sess.State, &sess.RedirectURI, &sess.ResultPubkey, &sess.Error,
+		&createdAt, &expiresAt)
+	if err != nil {
+		return NIP46Session{}, err
+	}
+	var parseErr error
+	sess.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
+	if parseErr != nil {
+		return NIP46Session{}, fmt.Errorf("parse created_at for session %s: %w", token, parseErr)
+	}
+	sess.ExpiresAt, parseErr = time.Parse(time.RFC3339, expiresAt)
+	if parseErr != nil {
+		return NIP46Session{}, fmt.Errorf("parse expires_at for session %s: %w", token, parseErr)
+	}
+	return sess, nil
+}
+
+// UpdateNIP46SessionState updates a session's state and result fields.
+func (s *SQLiteStore) UpdateNIP46SessionState(ctx context.Context, token string, state string, resultPubkey string, errMsg string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE nip46_sessions SET state = ?, result_pubkey = ?, error = ? WHERE session_token = ?
+	`, state, resultPubkey, errMsg, token)
+	return err
+}
+
+// DeleteExpiredNIP46Sessions removes sessions past their expiration time.
+func (s *SQLiteStore) DeleteExpiredNIP46Sessions(ctx context.Context) (int64, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM nip46_sessions WHERE expires_at < ?`, now)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

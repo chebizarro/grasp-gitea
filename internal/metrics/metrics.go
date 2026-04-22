@@ -12,6 +12,9 @@ var authVerifySuccess atomic.Int64
 var authVerifyFailure atomic.Int64
 var authReplayRejected atomic.Int64
 var authUserProvisioned atomic.Int64
+var nip46SessionsInitiated atomic.Int64
+var nip46SessionsCompleted atomic.Int64
+var nip46SessionsFailed atomic.Int64
 
 func IncAnnouncementReceived() {
 	announcementEventsReceived.Add(1)
@@ -53,6 +56,18 @@ func IncAuthUserProvisioned() {
 	authUserProvisioned.Add(1)
 }
 
+func IncNIP46SessionsInitiated() {
+	nip46SessionsInitiated.Add(1)
+}
+
+func IncNIP46SessionsCompleted() {
+	nip46SessionsCompleted.Add(1)
+}
+
+func IncNIP46SessionsFailed() {
+	nip46SessionsFailed.Add(1)
+}
+
 func Snapshot() map[string]int64 {
 	return map[string]int64{
 		"announcement_events_received":    announcementEventsReceived.Load(),
@@ -65,5 +80,8 @@ func Snapshot() map[string]int64 {
 		"auth_verify_failure":             authVerifyFailure.Load(),
 		"auth_replay_rejected":            authReplayRejected.Load(),
 		"auth_user_provisioned":           authUserProvisioned.Load(),
+		"nip46_sessions_initiated":         nip46SessionsInitiated.Load(),
+		"nip46_sessions_completed":         nip46SessionsCompleted.Load(),
+		"nip46_sessions_failed":            nip46SessionsFailed.Load(),
 	}
 }
