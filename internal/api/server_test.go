@@ -21,7 +21,7 @@ func TestHealthEndpointNoAuth(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(cfg, nil, st, nil)
+	srv := New(cfg, nil, nil, st, nil)
 	handler := srv.Handler()
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -41,7 +41,7 @@ func TestAuthRequiredWhenTokenConfigured(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(cfg, nil, st, nil)
+	srv := New(cfg, nil, nil, st, nil)
 	handler := srv.Handler()
 
 	// Request without auth header should be rejected.
@@ -82,7 +82,7 @@ func TestNoAuthRequiredWhenTokenEmpty(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(cfg, nil, st, nil)
+	srv := New(cfg, nil, nil, st, nil)
 	handler := srv.Handler()
 
 	req := httptest.NewRequest(http.MethodGet, "/mappings", nil)
@@ -102,7 +102,7 @@ func TestProvisionBodySizeLimit(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(cfg, nil, st, nil)
+	srv := New(cfg, nil, nil, st, nil)
 	handler := srv.Handler()
 
 	// Send a body larger than maxRequestBodySize (1MB).

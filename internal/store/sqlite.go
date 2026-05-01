@@ -58,6 +58,15 @@ type Mapping struct {
 	HookInstalled     bool      `json:"hook_installed"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
+
+	// Mirror republish fields: cached owner-signed announcement and publish tracking.
+	AnnouncementEventJSON         string    `json:"announcement_event_json,omitempty"`
+	AnnouncementEventID           string    `json:"announcement_event_id,omitempty"`
+	LastRepublishedAnnouncementID string    `json:"last_republished_announcement_id,omitempty"`
+	LastRepublishedAnnouncementAt time.Time `json:"last_republished_announcement_at,omitempty"`
+	LastStateDigest               string    `json:"last_state_digest,omitempty"`
+	LastStateEventID              string    `json:"last_state_event_id,omitempty"`
+	LastStatePublishedAt          time.Time `json:"last_state_published_at,omitempty"`
 }
 
 type SQLiteStore struct {
@@ -138,6 +147,18 @@ func Open(path string) (*SQLiteStore, error) {
 	// Migration: add hook_installed column to track provisioning completion.
 	// Existing rows default to 1 (true) since they were fully provisioned.
 	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN hook_installed INTEGER NOT NULL DEFAULT 1`)
+
+	// Migration: add mirror republish tracking columns.
+	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN announcement_event_json TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN announcement_event_id TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_republished_announcement_id TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_republished_announcement_at TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_state_digest TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_state_event_id TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_state_published_at TEXT NOT NULL DEFAULT ''`)
+
+	// Index for looking up mappings by Gitea repo ID (used by mirror sync callback).
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_mappings_gitea_repo_id ON mappings(gitea_repo_id)`)
 
 	return &SQLiteStore{db: db}, nil
 }
@@ -227,7 +248,11 @@ func (s *SQLiteStore) SetHookInstalled(ctx context.Context, npub string, repoID 
 
 func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string) ([]Mapping, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed, created_at, updated_at
+		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed,
+			announcement_event_json, announcement_event_id,
+			last_republished_announcement_id, last_republished_announcement_at,
+			last_state_digest, last_state_event_id, last_state_published_at,
+			created_at, updated_at
 		FROM mappings
 		WHERE `+where+`
 		ORDER BY updated_at DESC
@@ -241,9 +266,16 @@ func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string) ([]Ma
 	for rows.Next() {
 		var m Mapping
 		var hookVal int
-		var createdAt string
-		var updatedAt string
-		if err := rows.Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal, &createdAt, &updatedAt); err != nil {
+		var createdAt, updatedAt string
+		var lastRepubAnnAt, lastStatePubAt string
+		if err := rows.Scan(
+			&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID,
+			&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal,
+			&m.AnnouncementEventJSON, &m.AnnouncementEventID,
+			&m.LastRepublishedAnnouncementID, &lastRepubAnnAt,
+			&m.LastStateDigest, &m.LastStateEventID, &lastStatePubAt,
+			&createdAt, &updatedAt,
+		); err != nil {
 			return nil, err
 		}
 		m.HookInstalled = hookVal != 0
@@ -256,6 +288,12 @@ func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string) ([]Ma
 		if parseErr != nil {
 			return nil, fmt.Errorf("parse updated_at for %s/%s: %w", m.Npub, m.RepoID, parseErr)
 		}
+		if lastRepubAnnAt != "" {
+			m.LastRepublishedAnnouncementAt, _ = time.Parse(time.RFC3339, lastRepubAnnAt)
+		}
+		if lastStatePubAt != "" {
+			m.LastStatePublishedAt, _ = time.Parse(time.RFC3339, lastStatePubAt)
+		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -265,10 +303,22 @@ func (s *SQLiteStore) GetMapping(ctx context.Context, npub string, repoID string
 	var m Mapping
 	var hookVal int
 	var createdAt, updatedAt string
+	var lastRepubAnnAt, lastStatePubAt string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed, created_at, updated_at
+		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed,
+			announcement_event_json, announcement_event_id,
+			last_republished_announcement_id, last_republished_announcement_at,
+			last_state_digest, last_state_event_id, last_state_published_at,
+			created_at, updated_at
 		FROM mappings WHERE npub = ? AND repo_id = ? LIMIT 1
-	`, npub, repoID).Scan(&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID, &m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal, &createdAt, &updatedAt)
+	`, npub, repoID).Scan(
+		&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID,
+		&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal,
+		&m.AnnouncementEventJSON, &m.AnnouncementEventID,
+		&m.LastRepublishedAnnouncementID, &lastRepubAnnAt,
+		&m.LastStateDigest, &m.LastStateEventID, &lastStatePubAt,
+		&createdAt, &updatedAt,
+	)
 	if err != nil {
 		return Mapping{}, err
 	}
@@ -281,6 +331,12 @@ func (s *SQLiteStore) GetMapping(ctx context.Context, npub string, repoID string
 	m.UpdatedAt, parseErr = time.Parse(time.RFC3339, updatedAt)
 	if parseErr != nil {
 		return Mapping{}, fmt.Errorf("parse updated_at for %s/%s: %w", m.Npub, m.RepoID, parseErr)
+	}
+	if lastRepubAnnAt != "" {
+		m.LastRepublishedAnnouncementAt, _ = time.Parse(time.RFC3339, lastRepubAnnAt)
+	}
+	if lastStatePubAt != "" {
+		m.LastStatePublishedAt, _ = time.Parse(time.RFC3339, lastStatePubAt)
 	}
 	return m, nil
 }
@@ -480,6 +536,80 @@ func (s *SQLiteStore) ListIdentityLinks(ctx context.Context) ([]NostrIdentityLin
 		links = append(links, link)
 	}
 	return links, rows.Err()
+}
+
+// --- Mirror republish methods ---
+
+// GetMappingByGiteaRepoID looks up a mapping by its Gitea repository ID.
+// Returns sql.ErrNoRows if not found.
+func (s *SQLiteStore) GetMappingByGiteaRepoID(ctx context.Context, giteaRepoID int64) (Mapping, error) {
+	var m Mapping
+	var hookVal int
+	var createdAt, updatedAt string
+	var lastRepubAnnAt, lastStatePubAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed,
+			announcement_event_json, announcement_event_id,
+			last_republished_announcement_id, last_republished_announcement_at,
+			last_state_digest, last_state_event_id, last_state_published_at,
+			created_at, updated_at
+		FROM mappings WHERE gitea_repo_id = ? LIMIT 1
+	`, giteaRepoID).Scan(
+		&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID,
+		&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal,
+		&m.AnnouncementEventJSON, &m.AnnouncementEventID,
+		&m.LastRepublishedAnnouncementID, &lastRepubAnnAt,
+		&m.LastStateDigest, &m.LastStateEventID, &lastStatePubAt,
+		&createdAt, &updatedAt,
+	)
+	if err != nil {
+		return Mapping{}, err
+	}
+	m.HookInstalled = hookVal != 0
+	var parseErr error
+	m.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
+	if parseErr != nil {
+		return Mapping{}, fmt.Errorf("parse created_at: %w", parseErr)
+	}
+	m.UpdatedAt, parseErr = time.Parse(time.RFC3339, updatedAt)
+	if parseErr != nil {
+		return Mapping{}, fmt.Errorf("parse updated_at: %w", parseErr)
+	}
+	if lastRepubAnnAt != "" {
+		m.LastRepublishedAnnouncementAt, _ = time.Parse(time.RFC3339, lastRepubAnnAt)
+	}
+	if lastStatePubAt != "" {
+		m.LastStatePublishedAt, _ = time.Parse(time.RFC3339, lastStatePubAt)
+	}
+	return m, nil
+}
+
+// SetAnnouncementEvent caches the raw owner-signed announcement event JSON and ID.
+func (s *SQLiteStore) SetAnnouncementEvent(ctx context.Context, npub, repoID, eventJSON, eventID string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE mappings SET announcement_event_json = ?, announcement_event_id = ?, updated_at = ?
+		WHERE npub = ? AND repo_id = ?
+	`, eventJSON, eventID, now, npub, repoID)
+	return err
+}
+
+// RecordAnnouncementRepublished records that the cached announcement was republished.
+func (s *SQLiteStore) RecordAnnouncementRepublished(ctx context.Context, npub, repoID, announcementEventID string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE mappings SET last_republished_announcement_id = ?, last_republished_announcement_at = ?
+		WHERE npub = ? AND repo_id = ?
+	`, announcementEventID, at.UTC().Format(time.RFC3339), npub, repoID)
+	return err
+}
+
+// RecordStatePublished records the digest and event ID of the last published state event.
+func (s *SQLiteStore) RecordStatePublished(ctx context.Context, npub, repoID, digest, stateEventID string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE mappings SET last_state_digest = ?, last_state_event_id = ?, last_state_published_at = ?
+		WHERE npub = ? AND repo_id = ?
+	`, digest, stateEventID, at.UTC().Format(time.RFC3339), npub, repoID)
+	return err
 }
 
 // --- NIP-46 session methods ---

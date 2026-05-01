@@ -9,6 +9,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
+	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -16,14 +17,23 @@ import (
 const maxRequestBodySize = 1 << 20
 
 type Server struct {
-	provisioner *provisioner.Service
-	store       *store.SQLiteStore
-	logger      *slog.Logger
-	apiToken    string
+	provisioner          *provisioner.Service
+	publisher            *publisher.Service
+	store                *store.SQLiteStore
+	logger               *slog.Logger
+	apiToken             string
+	mirrorCallbackToken  string
 }
 
-func New(cfg config.Config, provisionerSvc *provisioner.Service, st *store.SQLiteStore, logger *slog.Logger) *Server {
-	return &Server{provisioner: provisionerSvc, store: st, logger: logger, apiToken: cfg.AdminAPIToken}
+func New(cfg config.Config, provisionerSvc *provisioner.Service, publisherSvc *publisher.Service, st *store.SQLiteStore, logger *slog.Logger) *Server {
+	return &Server{
+		provisioner:         provisionerSvc,
+		publisher:           publisherSvc,
+		store:               st,
+		logger:              logger,
+		apiToken:            cfg.AdminAPIToken,
+		mirrorCallbackToken: cfg.MirrorCallbackToken,
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -32,6 +42,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/metrics", method(http.MethodGet, s.requireAuth(s.metrics)))
 	mux.HandleFunc("/mappings", method(http.MethodGet, s.requireAuth(s.mappings)))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.requireAuth(s.manualProvision)))
+	mux.HandleFunc("/internal/mirror-sync", method(http.MethodPost, s.requireMirrorAuth(s.mirrorSync)))
 	return mux
 }
 

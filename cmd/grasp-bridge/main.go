@@ -20,6 +20,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
+	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -62,7 +63,6 @@ func main() {
 	}
 
 	proactiveSyncSvc := proactivesync.New(cfg.GiteaRepositoriesDir, st, logger)
-	apiServer := api.New(cfg, provisionerSvc, st, logger)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -75,6 +75,18 @@ func main() {
 	defer shutdownEmbedded(context.Background())
 
 	relayURLs := mergeRelayURLs(cfg.RelayURLs, embeddedRelayURL)
+
+	// Create the publisher (signs & publishes NIP-34 events on mirror sync).
+	var publisherSvc *publisher.Service
+	if cfg.MirrorPublishEnabled() {
+		publisherSvc, err = publisher.New(cfg.BridgeNsec, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
+		if err != nil {
+			logger.Error("failed to create publisher", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
 
 	handler := func(ctx context.Context, ev *nostr.Event, sourceRelay string) error {
 		err := provisionerSvc.HandleAnnouncementEvent(ctx, ev, sourceRelay)

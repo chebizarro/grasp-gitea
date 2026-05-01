@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -142,6 +143,11 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		return err
 	}
 
+	// Cache the raw owner-signed announcement for later republishing (e.g. mirror sync).
+	if cacheErr := s.CacheAnnouncementEvent(ctx, ev); cacheErr != nil {
+		s.logger.Warn("failed to cache announcement event", "event", ev.ID, "error", cacheErr)
+	}
+
 	if err := s.store.MarkEventProcessed(ctx, ev.ID, ev.PubKey, ev.Kind); err != nil {
 		metrics.IncAnnouncementRejected()
 		return err
@@ -253,6 +259,27 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 
 	s.logger.Info("provisioned repository", "npub", npub, "org_name", orgName, "repo_id", repoID, "relay", sourceRelay, "event", sourceEvent)
 	return nil
+}
+
+// CacheAnnouncementEvent persists the raw owner-signed announcement event
+// so the publisher can republish it later (e.g. after mirror syncs).
+func (s *Service) CacheAnnouncementEvent(ctx context.Context, ev *nostr.Event) error {
+	if ev == nil || ev.Kind != relay.KindRepositoryAnnouncement {
+		return nil
+	}
+	npub, err := nip19.EncodePublicKey(ev.PubKey)
+	if err != nil {
+		return fmt.Errorf("encode npub: %w", err)
+	}
+	repoID := getTagValue(ev.Tags, "d")
+	if repoID == "" {
+		return nil
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		return fmt.Errorf("marshal announcement event: %w", err)
+	}
+	return s.store.SetAnnouncementEvent(ctx, npub, repoID, string(raw), ev.ID)
 }
 
 // ReconcileHooks re-installs hooks for any mappings where provisioning

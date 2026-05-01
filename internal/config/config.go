@@ -27,6 +27,10 @@ type Config struct {
 	AuthEnabled          bool
 	BridgePublicURL      string
 	ChallengeTTL         time.Duration
+
+	// Mirror republish: bridge signs NIP-34 state events with this key.
+	BridgeNsec          string
+	MirrorCallbackToken string
 }
 
 func Load() (Config, error) {
@@ -49,6 +53,8 @@ func Load() (Config, error) {
 		AuthEnabled:          boolEnv("AUTH_ENABLED", false),
 		BridgePublicURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
 		ChallengeTTL:         durationEnv("CHALLENGE_TTL", 5*time.Minute),
+		BridgeNsec:           strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
+		MirrorCallbackToken:  strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
 	}
 
 	if cfg.GiteaAdminToken == "" {
@@ -72,6 +78,12 @@ func Load() (Config, error) {
 
 func (c Config) AllowlistEnabled() bool {
 	return len(c.PubkeyAllowlist) > 0
+}
+
+// MirrorPublishEnabled reports whether the bridge is configured to republish
+// NIP-34 events on mirror sync callbacks.
+func (c Config) MirrorPublishEnabled() bool {
+	return c.BridgeNsec != ""
 }
 
 func envOrDefault(key string, fallback string) string {
