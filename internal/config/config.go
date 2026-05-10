@@ -31,6 +31,11 @@ type Config struct {
 	// Mirror republish: bridge signs NIP-34 state events with this key.
 	BridgeNsec          string
 	MirrorCallbackToken string
+
+	// CI workflow run publishing: emit kind:5401 when state events arrive
+	// for repos that have CI workflows configured.
+	CIEnabled      bool
+	CITriggerRepos []string // ["*"] or ["owner/repo-id", ...]
 }
 
 func Load() (Config, error) {
@@ -55,6 +60,8 @@ func Load() (Config, error) {
 		ChallengeTTL:         durationEnv("CHALLENGE_TTL", 5*time.Minute),
 		BridgeNsec:           strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
 		MirrorCallbackToken:  strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
+		CIEnabled:            boolEnv("CI_ENABLED", false),
+		CITriggerRepos:       csvEnv("CI_TRIGGER_REPOS"),
 	}
 
 	if cfg.GiteaAdminToken == "" {

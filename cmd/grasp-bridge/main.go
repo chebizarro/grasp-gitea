@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"sync"
 	"syscall"
 	"time"
 
@@ -84,9 +85,30 @@ func main() {
 			logger.Error("failed to create publisher", "error", err)
 			os.Exit(1)
 		}
+		if cfg.CIEnabled {
+			publisherSvc.SetCIConfig(true, cfg.CITriggerRepos)
+			logger.Info("CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
+		}
 	}
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
+
+	// Per-repo lock serialises state-event processing (CI + proactive
+	// sync) across relay goroutines so ref reads in the CI handler
+	// cannot race with ref writes from proactive sync.
+	var repoStateMu sync.Mutex
+	repoStateLocks := make(map[string]*sync.Mutex)
+	lockRepoState := func(key string) func() {
+		repoStateMu.Lock()
+		mu, ok := repoStateLocks[key]
+		if !ok {
+			mu = &sync.Mutex{}
+			repoStateLocks[key] = mu
+		}
+		repoStateMu.Unlock()
+		mu.Lock()
+		return mu.Unlock
+	}
 
 	handler := func(ctx context.Context, ev *nostr.Event, sourceRelay string) error {
 		err := provisionerSvc.HandleAnnouncementEvent(ctx, ev, sourceRelay)
@@ -101,9 +123,26 @@ func main() {
 			}
 		}
 		if ev.Kind == relay.KindRepositoryState {
+			// Derive a stable repo key from the event to serialise
+			// CI + proactive-sync per repo.
+			dTag := ""
+			if t := ev.Tags.GetFirst([]string{"d", ""}); t != nil && len(*t) >= 2 {
+				dTag = (*t)[1]
+			}
+			unlock := lockRepoState(ev.PubKey + "/" + dTag)
+
+			// CI trigger runs before proactive sync so local refs
+			// still reflect the previous state for change detection.
+			if publisherSvc != nil {
+				if ciErr := publisherSvc.HandleStateEventCI(ctx, ev, sourceRelay); ciErr != nil {
+					logger.Warn("CI workflow-run trigger failed", "event", ev.ID, "error", ciErr)
+				}
+			}
 			if syncErr := proactiveSyncSvc.HandleStateEvent(ctx, ev); syncErr != nil {
 				logger.Warn("proactive sync failed", "event", ev.ID, "error", syncErr)
 			}
+
+			unlock()
 		}
 		return nil
 	}

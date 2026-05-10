@@ -38,6 +38,10 @@ type Service struct {
 
 	repoMu    sync.Mutex
 	repoLocks map[int64]*sync.Mutex
+
+	ciEnabled      bool
+	ciTriggerRepos []string
+	ciDedup        *ciDedup
 }
 
 // New creates a publisher service. If bridgeNsec is empty, the service
