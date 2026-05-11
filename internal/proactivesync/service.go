@@ -52,7 +52,11 @@ func (s *Service) HandleStateEvent(ctx context.Context, ev *nostr.Event) error {
 		return fmt.Errorf("state event missing d tag")
 	}
 
-	npub, err := nip19.EncodePublicKey(ev.PubKey)
+	lookupPubkey := ev.PubKey
+	if ownerPubkey := tagValue(ev.Tags, "p"); ownerPubkey != "" {
+		lookupPubkey = ownerPubkey
+	}
+	npub, err := nip19.EncodePublicKey(lookupPubkey)
 	if err != nil {
 		return fmt.Errorf("encode pubkey to npub: %w", err)
 	}

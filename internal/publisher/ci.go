@@ -20,6 +20,7 @@ import (
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/relay"
+	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -121,12 +122,7 @@ func (s *Service) HandleStateEventCI(ctx context.Context, ev *nostr.Event, sourc
 		return nil
 	}
 
-	npub, err := nip19.EncodePublicKey(ev.PubKey)
-	if err != nil {
-		return fmt.Errorf("encode pubkey to npub: %w", err)
-	}
-
-	mapping, err := s.store.GetMapping(ctx, npub, repoID)
+	mapping, err := s.resolveStateEventMapping(ctx, ev, repoID)
 	if err == sql.ErrNoRows {
 		return nil // not provisioned — skip silently
 	}
@@ -223,6 +219,69 @@ func (s *Service) isRepoCIAllowed(owner, repoID string) bool {
 		}
 	}
 	return false
+}
+
+// HandleWebhookPushCI emits workflow-run events directly from a Gitea push
+// webhook using the before/after SHA pair, which is necessary for local push
+// flows where the repository refs have already advanced before a relay state
+// event is observed again.
+func (s *Service) HandleWebhookPushCI(ctx context.Context, giteaRepoID int64, ref, before, after, sourceRelay string) error {
+	if !s.CIEnabled() {
+		return nil
+	}
+	if !strings.HasPrefix(ref, "refs/heads/") {
+		return nil
+	}
+	if after == "" || after == before || strings.Trim(after, "0") == "" {
+		return nil
+	}
+
+	mapping, err := s.store.GetMappingByGiteaRepoID(ctx, giteaRepoID)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lookup mapping by gitea repo id %d: %w", giteaRepoID, err)
+	}
+	if !s.isRepoCIAllowed(mapping.Owner, mapping.RepoID) {
+		return nil
+	}
+
+	branch := strings.TrimPrefix(ref, "refs/heads/")
+	repoPath := filepath.Join(s.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
+	workflows, wfErr := detectWorkflows(ctx, repoPath, after)
+	if wfErr != nil {
+		s.logger.Debug("CI: workflow detection error on webhook push",
+			"repo", mapping.RepoID, "branch", branch, "error", wfErr)
+		return nil
+	}
+	if len(workflows) == 0 {
+		s.logger.Debug("no CI workflow runs triggered on webhook push", "repo", mapping.RepoID, "branch", branch)
+		return nil
+	}
+
+	for _, wf := range workflows {
+		wfEv, buildErr := s.buildWorkflowRunEvent(mapping.Pubkey, mapping.RepoID, after, branch, wf, sourceRelay)
+		if buildErr != nil {
+			s.logger.Warn("failed to build workflow run event from webhook push",
+				"repo", mapping.RepoID, "branch", branch,
+				"workflow", wf, "error", buildErr)
+			continue
+		}
+		if pubErr := s.publishToRelays(ctx, wfEv); pubErr != nil {
+			metrics.IncCIWorkflowRunsFailed()
+			s.logger.Warn("failed to publish workflow run event from webhook push",
+				"repo", mapping.RepoID, "branch", branch,
+				"workflow", wf, "error", pubErr)
+			continue
+		}
+		metrics.IncCIWorkflowRunsPublished()
+		s.logger.Info("published CI workflow run event",
+			"repo", mapping.RepoID, "branch", branch,
+			"workflow", wf, "commit", after,
+			"event_id", wfEv.ID)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -330,4 +389,34 @@ func evTagValue(tags nostr.Tags, key string) string {
 		return ""
 	}
 	return (*v)[1]
+}
+
+func (s *Service) resolveStateEventMapping(ctx context.Context, ev *nostr.Event, repoID string) (store.Mapping, error) {
+	candidatePubkeys := []string{}
+	if ownerPubkey := evTagValue(ev.Tags, "p"); ownerPubkey != "" {
+		candidatePubkeys = append(candidatePubkeys, ownerPubkey)
+	}
+	if ev != nil && ev.PubKey != "" {
+		candidatePubkeys = append(candidatePubkeys, ev.PubKey)
+	}
+
+	seen := map[string]bool{}
+	for _, pubkey := range candidatePubkeys {
+		if pubkey == "" || seen[pubkey] {
+			continue
+		}
+		seen[pubkey] = true
+		npub, err := nip19.EncodePublicKey(pubkey)
+		if err != nil {
+			continue
+		}
+		mapping, err := s.store.GetMapping(ctx, npub, repoID)
+		if err == nil {
+			return mapping, nil
+		}
+		if err != sql.ErrNoRows {
+			return store.Mapping{}, err
+		}
+	}
+	return store.Mapping{}, sql.ErrNoRows
 }

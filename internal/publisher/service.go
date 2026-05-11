@@ -148,7 +148,7 @@ func (s *Service) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) 
 	}
 
 	// Build and sign a new state event.
-	stateEvent, err := s.buildStateEvent(mapping.RepoID, head, branches, tags)
+	stateEvent, err := s.buildStateEvent(mapping.Pubkey, mapping.RepoID, head, branches, tags)
 	if err != nil {
 		return fmt.Errorf("build state event: %w", err)
 	}
@@ -190,10 +190,13 @@ func (s *Service) republishAnnouncement(ctx context.Context, mapping *store.Mapp
 
 // buildStateEvent creates a new NIP-34 repository state event and signs it
 // with the bridge key.
-func (s *Service) buildStateEvent(repoID string, head string, branches map[string]string, tags map[string]string) (*nostr.Event, error) {
+func (s *Service) buildStateEvent(ownerPubkey string, repoID string, head string, branches map[string]string, tags map[string]string) (*nostr.Event, error) {
 	// Build tags in deterministic order.
-	eventTags := make(nostr.Tags, 0, 2+len(branches)+len(tags))
+	eventTags := make(nostr.Tags, 0, 3+len(branches)+len(tags))
 	eventTags = append(eventTags, nostr.Tag{"d", repoID})
+	if ownerPubkey != "" {
+		eventTags = append(eventTags, nostr.Tag{"p", ownerPubkey})
+	}
 
 	branchNames := sortedKeys(branches)
 	for _, name := range branchNames {
