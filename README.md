@@ -1,68 +1,28 @@
 # grasp-bridge
 
-A Go bridge that makes Gitea usable as a GRASP/NIP-34-backed git server.
+Phase 1 + Phase 2 + Phase 3 implementation currently provides:
 
-## Current scope
+> **Protocol note:** this bridge speaks NIP-34 for repo state and emits Hive CI `kind:5401` workflow-run events. It does **not** use legacy NIP-90 `kind:5900` as part of its CI trigger path. Actual compute dispatch belongs downstream in Loom `kind:5100` jobs.
 
-The bridge handles **inbound** NIP-34 relay events and enforces push validation:
-
-- relay subscriber for NIP-34 repository announcements (kind `30617`) and state (kind `30618`)
-- automatic Gitea org/repo provisioning when an announcement includes a clone URL under `CLONE_PREFIX`
+- relay subscriber for NIP-34 repository announcements (kind `30617`)
+- automatic Gitea org/repo provisioning for clone URLs matching `CLONE_PREFIX`
 - automatic repo archival when a later announcement removes this server from `clone` tags
 - proactive sync listener for repository state events (best-effort local ref update)
-- SQLite mapping store for `{npub, repo-id}` → Gitea repo metadata
-- pre-receive hook installation into provisioned repositories
+- SQLite mapping store for `{npub}/{repo-id} -> gitea repo`
+- pre-receive companion hook installation into provisioned repositories via Gitea's `hooks/pre-receive.d/` chain
 - `grasp-pre-receive` hook binary that validates pushed refs against latest kind `30618`
-- cryptographic ID/signature validation for all consumed relay events
-- multi-maintainer state acceptance (maintainers from NIP-34 announcement graph)
-- optional embedded Khatru relay behind the `full` build tag
-
-### Owner-path resolution
-
-Provisioned repos are **not** created under raw `npub` org names. The bridge resolves a short, Gitea-safe org name:
-
-1. Fetch the user's kind `0` profile from a relay
-2. Extract and verify the `nip05` field resolves back to the same pubkey
-3. Sanitize the NIP-05 local-part for Gitea username rules, truncate to 39 chars
-4. If NIP-05 resolution fails, fall back to the first 39 hex chars of the pubkey
-
-This avoids Gitea's 40-character API username limit. The canonical identity remains the `npub` in the SQLite mapping.
-
-### Admin API
-
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/health` | GET | No | Health check |
-| `/metrics` | GET | Bearer | In-memory metric counters (JSON) |
-| `/mappings` | GET | Bearer | List all stored mappings |
-| `/provision` | POST | Bearer | Trigger manual provisioning |
-
-When `ADMIN_API_TOKEN` is set, `/metrics`, `/mappings`, and `/provision` require a `Bearer` token. When unset, all endpoints are open (backwards-compatible).
-
-### Nostr authentication (behind `AUTH_ENABLED=true`)
-
-The bridge implements three Nostr login flows, all using NIP-98 signed proofs:
-
-| Flow | Endpoints | Use case |
-|------|-----------|----------|
-| **NIP-07** | `POST /auth/nip07/challenge`, `POST /auth/nip07/verify` | Browser extensions (nos2x, Alby) |
-| **NIP-46** | `POST /auth/nip46/init`, `GET /auth/nip46/status` | Remote signers (Signet bunker) |
-| **NIP-55** | `GET /auth/nip55/challenge`, `POST /auth/nip55/callback` | Android signer apps |
-
-All flows auto-create a Gitea user on first login using the same NIP-05 / hex-fallback naming policy as org provisioning. Identity links are persisted in SQLite.
-
-Metrics tracked: `auth_challenges_issued`, `auth_verify_success`, `auth_verify_failure`, `auth_replay_rejected`, `auth_user_provisioned`, `nip46_sessions_*`, `nip55_*`.
-
-### Not implemented yet
-
-The bridge does **not** currently:
-
-- publish outbound NIP-34 events (announcements, state, patches, PRs, issues)
-- handle webhook-driven event publishing
-- sync Nostr profiles to Gitea
-- provide a Gitea login page UI (the auth endpoints exist but no sign-in button yet)
-
-See the [backlog](.beads/issues.jsonl) for planned work.
+- cryptographic ID/signature validation for relay events used in provisioning and hook checks
+- multi-maintainer state acceptance (maintainers from NIP-34 announcements)
+- Phase 3 integration assets:
+  - gitea config snippet (`deploy/gitea/app.ini.phase3.snippet`)
+  - nginx vhost (`deploy/nginx/git.sharegap.net.conf`)
+  - e2e checklist (`docs/phase3-e2e-checklist.md`)
+- Hive CI trigger publishing (`kind:5401`) when repo changes reveal CI workflows
+- admin API:
+  - `GET /health`
+  - `GET /metrics`
+  - `GET /mappings`
+  - `POST /provision`
 
 ## Quick start
 
@@ -76,9 +36,9 @@ make build
 
 ```bash
 GITEA_URL=http://gitea:3000
-GITEA_ADMIN_TOKEN=<token>              # required
-CLONE_PREFIX=https://git.example.com   # required — your public git domain
-RELAY_URLS=ws://gastown-relay:3334     # required unless EMBEDDED_RELAY=true
+GITEA_ADMIN_TOKEN=<token>
+CLONE_PREFIX=https://git.sharegap.net
+RELAY_URLS=ws://gastown-relay:3334
 HOOK_RELAY_URL=ws://localhost:3334
 HOOK_BINARY_PATH=/usr/local/bin/grasp-pre-receive
 GITEA_REPOSITORIES_PATH=/gitea-data/git/repositories
@@ -89,26 +49,20 @@ LISTEN=:8090
 DB_PATH=./mappings.db
 PUBKEY_ALLOWLIST=
 PROVISION_RATE_LIMIT=10
-ADMIN_API_TOKEN=                       # optional — enables bearer auth on admin endpoints
-AUTH_ENABLED=false                     # set true to enable Nostr auth endpoints
-BRIDGE_PUBLIC_URL=                     # required when AUTH_ENABLED=true — public URL of the bridge
-CHALLENGE_TTL=5m                       # NIP-98 challenge nonce lifetime
 ```
-
-### Embedded-only mode
-
-When `EMBEDDED_RELAY=true`, the bridge can start without any external `RELAY_URLS`. It will subscribe only to its own embedded Khatru relay. External events must be forwarded to it via other means (e.g. another bridge instance or relay mirroring).
 
 ## Hook behavior
 
 `grasp-pre-receive`:
 
-- accepts `refs/nostr/<event-id>` when event id is valid hex (no state check required)
+- accepts `refs/nostr/<event-id>` when event id is valid hex
 - rejects `refs/heads/pr/*` (must be sent over nostr refs)
 - for `refs/heads/*` and `refs/tags/*`, requires exact SHA match with latest NIP-34 state event
-- rejects push when no state event exists (for state-checked refs only)
+- rejects push when no state event exists
 
 ## Self-contained test container
+
+Run this to execute the bridge test suite in a single container (no live services required):
 
 ```bash
 make selftest
@@ -134,15 +88,17 @@ make build-full
 
 ## Phase 3 notes
 
-- Ensure Gitea `ROOT_URL` matches your `CLONE_PREFIX`.
+- Ensure gitea `ROOT_URL` is `https://git.sharegap.net`.
 - Ensure proxy forwards `Host` and `X-Forwarded-Proto` headers.
 - Follow `docs/phase3-e2e-checklist.md` to validate ngit init + push accept/reject behavior.
 - Use the automation helper:
 
 ```bash
-GITEA_PUBLIC_URL=$CLONE_PREFIX \
+GITEA_PUBLIC_URL=https://git.sharegap.net \
 BRIDGE_ADMIN_URL=http://localhost:8090 \
 NPUB=npub1... \
 REPO_ID=myrepo \
 make phase3-e2e
 ```
+
+- Save results to `docs/phase3-e2e-report.md`.
