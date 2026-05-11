@@ -9,7 +9,7 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -tags "${BUILD_TAGS}" -o /out
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/grasp-pre-receive ./cmd/grasp-pre-receive
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates sqlite-libs
+RUN apk add --no-cache ca-certificates git sqlite-libs
 WORKDIR /app
 COPY --from=build /out/grasp-bridge /usr/local/bin/grasp-bridge
 COPY --from=build /out/grasp-pre-receive /usr/local/bin/grasp-pre-receive

@@ -120,12 +120,11 @@ func (s *Service) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) 
 		return fmt.Errorf("lookup mapping by gitea repo id %d: %w", giteaRepoID, err)
 	}
 
-	if mapping.AnnouncementEventJSON == "" {
-		s.logger.Debug("repo not eligible for republishing (no cached announcement)", "owner", mapping.Owner, "repo", mapping.RepoID)
-		return nil
-	}
-
 	now := time.Now().UTC()
+
+	if mapping.AnnouncementEventJSON == "" {
+		s.logger.Debug("continuing state publish without cached announcement", "owner", mapping.Owner, "repo", mapping.RepoID)
+	}
 
 	// Republish the cached owner-signed announcement if not already done.
 	if mapping.AnnouncementEventID != "" && mapping.AnnouncementEventID != mapping.LastRepublishedAnnouncementID {
