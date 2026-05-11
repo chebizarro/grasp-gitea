@@ -15,6 +15,7 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/api"
+	"github.com/sharegap/grasp-gitea/internal/auth"
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
@@ -93,6 +94,20 @@ func main() {
 	}
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
+
+	if cfg.AuthEnabled {
+		authSvc := auth.NewService(cfg, st, logger)
+		identitySvc := auth.NewIdentityService(st, giteaClient, nip05Resolver, logger)
+		nip07Handler := auth.NewNIP07Handler(authSvc, identitySvc, relayURLs, logger)
+		nip46Handler := auth.NewNIP46Handler(st, identitySvc, relayURLs, cfg.BridgePublicURL, nil, logger)
+		nip55Handler := auth.NewNIP55Handler(authSvc, identitySvc, relayURLs, logger)
+		apiServer.AddRouteRegistrar(func(mux *http.ServeMux) {
+			nip07Handler.RegisterRoutes(mux)
+			nip46Handler.RegisterRoutes(mux)
+			nip55Handler.RegisterRoutes(mux)
+		})
+		logger.Info("Nostr auth routes enabled", "bridge_public_url", cfg.BridgePublicURL)
+	}
 
 	// Wire webhook handler for NIP-34 events (PRs, issues, patches, labels)
 	if publisherSvc != nil && cfg.GiteaWebhookSecret != "" {
