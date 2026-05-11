@@ -87,6 +87,8 @@ func TestBuildWorkflowRunEvent(t *testing.T) {
 	assertTag(t, ev, "commit", commitSHA)
 	assertTag(t, ev, "branch", branch)
 	assertTag(t, ev, "workflow", workflow)
+	assertTag(t, ev, "triggered-by", "push")
+	assertTag(t, ev, "publisher", pubKey)
 	assertTag(t, ev, "relay", relayHint)
 
 	// Verify signature.
@@ -108,6 +110,8 @@ func TestBuildWorkflowRunEventDifferentBranch(t *testing.T) {
 
 	assertTag(t, ev, "branch", "develop")
 	assertTag(t, ev, "workflow", ".github/workflows/test.yml")
+	assertTag(t, ev, "triggered-by", "push")
+	assertTag(t, ev, "publisher", pubKey)
 }
 
 func TestBuildWorkflowRunEventHiveWorkflow(t *testing.T) {
@@ -124,6 +128,8 @@ func TestBuildWorkflowRunEventHiveWorkflow(t *testing.T) {
 
 	assertTag(t, ev, "workflow", ".hive/workflows/build.yaml")
 	assertTag(t, ev, "branch", "main")
+	assertTag(t, ev, "triggered-by", "push")
+	assertTag(t, ev, "publisher", pubKey)
 }
 
 func TestCIEnabledRequiresBothFlags(t *testing.T) {
