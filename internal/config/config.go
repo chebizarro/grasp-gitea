@@ -32,6 +32,9 @@ type Config struct {
 	BridgeNsec          string
 	MirrorCallbackToken string
 
+	// Gitea webhook handler for NIP-34 events (PRs, issues, patches, labels)
+	GiteaWebhookSecret string
+
 	// CI workflow run publishing: emit kind:5401 when state events arrive
 	// for repos that have CI workflows configured.
 	CIEnabled      bool
@@ -60,6 +63,7 @@ func Load() (Config, error) {
 		ChallengeTTL:         durationEnv("CHALLENGE_TTL", 5*time.Minute),
 		BridgeNsec:           strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
 		MirrorCallbackToken:  strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
+		GiteaWebhookSecret:   strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
 		CIEnabled:            boolEnv("CI_ENABLED", false),
 		CITriggerRepos:       csvEnv("CI_TRIGGER_REPOS"),
 	}

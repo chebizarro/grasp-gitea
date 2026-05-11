@@ -23,6 +23,7 @@ type Server struct {
 	logger               *slog.Logger
 	apiToken             string
 	mirrorCallbackToken  string
+	webhookHandler       http.Handler // Gitea webhook handler for NIP-34 events
 }
 
 func New(cfg config.Config, provisionerSvc *provisioner.Service, publisherSvc *publisher.Service, st *store.SQLiteStore, logger *slog.Logger) *Server {
@@ -36,6 +37,11 @@ func New(cfg config.Config, provisionerSvc *provisioner.Service, publisherSvc *p
 	}
 }
 
+// SetWebhookHandler wires the Gitea webhook handler for NIP-34 event publishing.
+func (s *Server) SetWebhookHandler(h http.Handler) {
+	s.webhookHandler = h
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", method(http.MethodGet, s.health))
@@ -43,6 +49,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/mappings", method(http.MethodGet, s.requireAuth(s.mappings)))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.requireAuth(s.manualProvision)))
 	mux.HandleFunc("/internal/mirror-sync", method(http.MethodPost, s.requireMirrorAuth(s.mirrorSync)))
+	
+	// Gitea webhook endpoint for NIP-34 events (PRs, issues, patches, labels)
+	if s.webhookHandler != nil {
+		mux.Handle("/webhook/gitea", s.webhookHandler)
+	}
+	
 	return mux
 }
 

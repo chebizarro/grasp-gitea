@@ -24,6 +24,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/webhook"
 )
 
 // mergeRelayURLs combines configured relay URLs with the embedded relay URL,
@@ -92,6 +93,13 @@ func main() {
 	}
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
+
+	// Wire webhook handler for NIP-34 events (PRs, issues, patches, labels)
+	if publisherSvc != nil && cfg.GiteaWebhookSecret != "" {
+		webhookHandler := webhook.New(publisherSvc, st, cfg.GiteaWebhookSecret, logger)
+		apiServer.SetWebhookHandler(webhookHandler)
+		logger.Info("Gitea webhook handler enabled for NIP-34 events")
+	}
 
 	// Per-repo lock serialises state-event processing (CI + proactive
 	// sync) across relay goroutines so ref reads in the CI handler

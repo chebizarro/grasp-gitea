@@ -222,6 +222,22 @@ func (s *Service) buildStateEvent(repoID string, head string, branches map[strin
 	return ev, nil
 }
 
+// PublishEvent signs and publishes an arbitrary event to all configured relays.
+// Used by the webhook handler to publish NIP-34 events (PRs, issues, patches, labels).
+func (s *Service) PublishEvent(ctx context.Context, ev *nostr.Event) error {
+	if !s.Enabled() {
+		return fmt.Errorf("publisher not enabled")
+	}
+
+	// Set pubkey and sign with bridge key
+	ev.PubKey = s.bridgePubKey
+	if err := ev.Sign(s.bridgePrivKey); err != nil {
+		return fmt.Errorf("sign event: %w", err)
+	}
+
+	return s.publishToRelays(ctx, ev)
+}
+
 // publishToRelays publishes an event to all configured relays.
 // Returns an error only if no relay accepted the event.
 func (s *Service) publishToRelays(ctx context.Context, ev *nostr.Event) error {
