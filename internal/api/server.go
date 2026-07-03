@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
+	"github.com/sharegap/grasp-gitea/internal/signer"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -26,6 +28,12 @@ type Server struct {
 	webhookHandler      http.Handler // Gitea webhook handler for NIP-34 events
 	routeRegistrars     []func(*http.ServeMux)
 	giteaURL            string
+	signerAuthorizer    SignerAuthorizer
+}
+
+type SignerAuthorizer interface {
+	Enabled() bool
+	CreateGrant(ctx context.Context, bunkerURI string) (signer.GrantInfo, error)
 }
 
 func New(cfg config.Config, provisionerSvc *provisioner.Service, publisherSvc *publisher.Service, st *store.SQLiteStore, logger *slog.Logger) *Server {
@@ -45,6 +53,11 @@ func (s *Server) SetWebhookHandler(h http.Handler) {
 	s.webhookHandler = h
 }
 
+// SetSignerAuthorizer wires persistent NIP-46 grant authorization endpoints.
+func (s *Server) SetSignerAuthorizer(authorizer SignerAuthorizer) {
+	s.signerAuthorizer = authorizer
+}
+
 // AddRouteRegistrar lets optional subsystems register extra routes on the main mux.
 func (s *Server) AddRouteRegistrar(register func(*http.ServeMux)) {
 	if register != nil {
@@ -58,6 +71,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/metrics", method(http.MethodGet, s.requireAuth(s.metrics)))
 	mux.HandleFunc("/mappings", method(http.MethodGet, s.requireAuth(s.mappings)))
 	mux.HandleFunc("/outbound-events", method(http.MethodGet, s.requireAuth(s.outboundEvents)))
+	mux.HandleFunc("/signer/authorize", method(http.MethodPost, s.requireAuth(s.signerAuthorize)))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.requireAuth(s.manualProvision)))
 	mux.HandleFunc("/internal/mirror-sync", method(http.MethodPost, s.requireMirrorAuth(s.mirrorSync)))
 

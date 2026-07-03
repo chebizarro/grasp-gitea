@@ -21,6 +21,7 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
 
+	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -36,6 +37,9 @@ type Service struct {
 	bridgePrivKey string
 	bridgePubKey  string
 
+	ownerStateSigner StateSigner
+	ownerStateOutbox StateOutbox
+
 	repoMu    sync.Mutex
 	repoLocks map[int64]*sync.Mutex
 
@@ -44,8 +48,19 @@ type Service struct {
 	ciDedup        *ciDedup
 }
 
-// New creates a publisher service. If bridgeNsec is empty, the service
-// will be a no-op (MirrorPublishEnabled should be checked first).
+// StateSigner reports whether user grant signing is available.
+type StateSigner interface {
+	Enabled() bool
+}
+
+// StateOutbox persists unsigned state events for asynchronous owner signing.
+type StateOutbox interface {
+	Enqueue(ctx context.Context, kind int, authorPubkey string, scope string, unsignedEvent *nostr.Event, dedupeKey string) error
+}
+
+// New creates a publisher service. If bridgeNsec is empty, bridge-signed
+// publishing is disabled, but owner-signed outbox publishing can still be wired
+// with SetOwnerStateSigning.
 func New(bridgeNsec string, st *store.SQLiteStore, relayURLs []string, repositoriesDir string, logger *slog.Logger) (*Service, error) {
 	s := &Service{
 		store:           st,
@@ -82,9 +97,20 @@ func New(bridgeNsec string, st *store.SQLiteStore, relayURLs []string, repositor
 	return s, nil
 }
 
-// Enabled reports whether the publisher has a signing key configured.
+// Enabled reports whether the publisher has a bridge signing key configured.
 func (s *Service) Enabled() bool {
 	return s.bridgePrivKey != ""
+}
+
+// SetOwnerStateSigning wires the Phase-B outbox and signer availability check
+// used to enqueue owner-authored kind:30618 state events for user signing.
+func (s *Service) SetOwnerStateSigning(signer StateSigner, outbox StateOutbox) {
+	s.ownerStateSigner = signer
+	s.ownerStateOutbox = outbox
+}
+
+func (s *Service) ownerStateSigningConfigured() bool {
+	return s.ownerStateSigner != nil && s.ownerStateSigner.Enabled() && s.ownerStateOutbox != nil && s.store != nil
 }
 
 // lockRepo acquires a per-repo mutex for serializing concurrent callbacks.
@@ -102,9 +128,11 @@ func (s *Service) lockRepo(giteaRepoID int64) *sync.Mutex {
 
 // RepublishForGiteaRepo looks up the mapping for a Gitea repo, republishes
 // the cached owner-signed announcement if new, snapshots current refs, and
-// publishes a bridge-signed NIP-34 state event if the digest changed.
+// publishes a NIP-34 state event if the digest changed. State events prefer the
+// owner's signer grant via the outbox and fall back to bridge signing when the
+// signer path is unavailable or no owner grant exists yet.
 func (s *Service) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) error {
-	if !s.Enabled() {
+	if !s.Enabled() && !s.ownerStateSigningConfigured() {
 		return nil
 	}
 
@@ -147,11 +175,69 @@ func (s *Service) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) 
 		return nil
 	}
 
-	// Build and sign a new state event.
+	// Build a new unsigned owner-authored state event.
 	stateEvent, err := s.buildStateEvent(mapping.Pubkey, mapping.RepoID, head, branches, tags)
 	if err != nil {
 		return fmt.Errorf("build state event: %w", err)
 	}
+
+	enqueued, err := s.enqueueOwnerSignedState(ctx, &mapping, stateEvent, digest)
+	if err != nil {
+		return fmt.Errorf("enqueue owner-signed state event: %w", err)
+	}
+	if enqueued {
+		s.logger.Info("enqueued owner-signed NIP-34 state event",
+			"owner", mapping.Owner, "repo", mapping.RepoID,
+			"author_pubkey", mapping.Pubkey, "digest", digest,
+			"branches", len(branches), "tags", len(tags))
+		return nil
+	}
+
+	return s.publishBridgeSignedState(ctx, &mapping, stateEvent, digest, now, branches, tags)
+}
+
+func (s *Service) enqueueOwnerSignedState(ctx context.Context, mapping *store.Mapping, ev *nostr.Event, digest string) (bool, error) {
+	if mapping == nil || ev == nil {
+		return false, fmt.Errorf("state event and mapping are required")
+	}
+	if !s.ownerStateSigningConfigured() {
+		return false, nil
+	}
+	grant, err := s.store.GetSignerGrant(ctx, mapping.Pubkey)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lookup owner signer grant: %w", err)
+	}
+	if grant.Status != "active" || grant.RevokedAt != nil {
+		return false, nil
+	}
+
+	dedupeKey := fmt.Sprintf("repo-state:%d:%s:%s", mapping.GiteaRepoID, mapping.RepoID, digest)
+	scope := fmt.Sprintf("repo:%s/%s", mapping.Owner, mapping.RepoName)
+	if err := s.ownerStateOutbox.Enqueue(ctx, relay.KindRepositoryState, mapping.Pubkey, scope, ev, dedupeKey); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Service) publishBridgeSignedState(ctx context.Context, mapping *store.Mapping, unsigned *nostr.Event, digest string, now time.Time, branches map[string]string, tags map[string]string) error {
+	if !s.Enabled() {
+		s.logger.Warn("skipping NIP-34 state fallback because bridge signing is disabled", "owner", mapping.Owner, "repo", mapping.RepoID, "digest", digest)
+		return nil
+	}
+
+	stateEvent := cloneStateEvent(unsigned)
+	stateEvent.PubKey = s.bridgePubKey
+	stateEvent.ID = ""
+	stateEvent.Sig = ""
+	if err := stateEvent.Sign(s.bridgePrivKey); err != nil {
+		return fmt.Errorf("sign state event with bridge key: %w", err)
+	}
+
+	metrics.IncBridgeSignedFallback()
+	s.logger.Warn("bridge-signed fallback for NIP-34 state event", "owner", mapping.Owner, "repo", mapping.RepoID, "digest", digest)
 
 	if err := s.publishToRelays(ctx, stateEvent); err != nil {
 		return fmt.Errorf("publish state event: %w", err)
@@ -161,11 +247,23 @@ func (s *Service) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) 
 		s.logger.Warn("failed to record state publish", "error", err)
 	}
 
-	s.logger.Info("published NIP-34 state event",
+	s.logger.Info("published bridge-signed NIP-34 state event",
 		"owner", mapping.Owner, "repo", mapping.RepoID,
 		"event_id", stateEvent.ID, "digest", digest,
 		"branches", len(branches), "tags", len(tags))
 	return nil
+}
+
+func cloneStateEvent(ev *nostr.Event) *nostr.Event {
+	if ev == nil {
+		return nil
+	}
+	clone := *ev
+	clone.Tags = make(nostr.Tags, len(ev.Tags))
+	for i, tag := range ev.Tags {
+		clone.Tags[i] = append(nostr.Tag(nil), tag...)
+	}
+	return &clone
 }
 
 // republishAnnouncement publishes the cached owner-signed announcement event.
@@ -188,8 +286,7 @@ func (s *Service) republishAnnouncement(ctx context.Context, mapping *store.Mapp
 	return nil
 }
 
-// buildStateEvent creates a new NIP-34 repository state event and signs it
-// with the bridge key.
+// buildStateEvent creates a new unsigned owner-authored NIP-34 repository state event.
 func (s *Service) buildStateEvent(ownerPubkey string, repoID string, head string, branches map[string]string, tags map[string]string) (*nostr.Event, error) {
 	// Build tags in deterministic order.
 	eventTags := make(nostr.Tags, 0, 3+len(branches)+len(tags))
@@ -212,16 +309,12 @@ func (s *Service) buildStateEvent(ownerPubkey string, repoID string, head string
 		eventTags = append(eventTags, nostr.Tag{"HEAD", "ref: refs/heads/" + head})
 	}
 
-	ev := &nostr.Event{
-		PubKey:    s.bridgePubKey,
+	return &nostr.Event{
+		PubKey:    ownerPubkey,
 		CreatedAt: nostr.Now(),
 		Kind:      relay.KindRepositoryState,
 		Tags:      eventTags,
-	}
-	if err := ev.Sign(s.bridgePrivKey); err != nil {
-		return nil, fmt.Errorf("sign state event: %w", err)
-	}
-	return ev, nil
+	}, nil
 }
 
 // PublishEvent signs and publishes an arbitrary event to all configured relays.

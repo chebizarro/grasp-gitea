@@ -153,16 +153,14 @@ func TestBuildStateEventSignedAndStructured(t *testing.T) {
 	if ev.Kind != relay.KindRepositoryState {
 		t.Errorf("kind = %d, want %d", ev.Kind, relay.KindRepositoryState)
 	}
-	// State events are a mirror fact asserted by the bridge, so they are signed
-	// by the bridge key (not the owner). The owner is referenced via a 'p' tag.
-	if ev.PubKey != svc.bridgePubKey {
-		t.Errorf("state event pubkey = %q, want bridge key %q", ev.PubKey, svc.bridgePubKey)
+	// State events are owner-authored templates. They stay unsigned here so the
+	// outbox can sign them with the owner's grant; bridge signing is only a
+	// transition fallback in RepublishForGiteaRepo.
+	if ev.PubKey != owner {
+		t.Errorf("state event pubkey = %q, want owner pubkey %q", ev.PubKey, owner)
 	}
-	if ok, err := ev.CheckSignature(); !ok || err != nil {
-		t.Errorf("state event signature invalid: ok=%v err=%v", ok, err)
-	}
-	if ev.ID == "" {
-		t.Error("signed event must have an ID")
+	if ev.ID != "" || ev.Sig != "" {
+		t.Errorf("state event should be unsigned, got id=%q sig=%q", ev.ID, ev.Sig)
 	}
 
 	want := map[string]string{
@@ -211,8 +209,11 @@ func TestBuildStateEventOmitsEmptyOwnerAndHead(t *testing.T) {
 	if v, _ := firstVal(ev, "d"); v != "repo" {
 		t.Errorf("d tag = %q, want repo", v)
 	}
-	if ok, err := ev.CheckSignature(); !ok || err != nil {
-		t.Errorf("signature invalid: ok=%v err=%v", ok, err)
+	if ev.PubKey != "" {
+		t.Errorf("empty owner pubkey should leave event pubkey empty, got %q", ev.PubKey)
+	}
+	if ev.ID != "" || ev.Sig != "" {
+		t.Errorf("state event should be unsigned, got id=%q sig=%q", ev.ID, ev.Sig)
 	}
 }
 

@@ -23,6 +23,16 @@ func TestSnapshotInitiallyZero(t *testing.T) {
 	nip55ChallengesIssued.Store(0)
 	nip55VerifySuccess.Store(0)
 	nip55VerifyFailure.Store(0)
+	ciWorkflowRunsPublished.Store(0)
+	ciWorkflowRunsFailed.Store(0)
+	webhookEventsReceived.Store(0)
+	webhookEventsPublished.Store(0)
+	webhookEventsFailed.Store(0)
+	outboxQueueDepth.Store(0)
+	outboxPublished.Store(0)
+	outboxRetried.Store(0)
+	outboxDeadLettered.Store(0)
+	bridgeSignedFallback.Store(0)
 
 	snap := Snapshot()
 	for key, val := range snap {
@@ -50,6 +60,16 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 	nip55ChallengesIssued.Store(0)
 	nip55VerifySuccess.Store(0)
 	nip55VerifyFailure.Store(0)
+	ciWorkflowRunsPublished.Store(0)
+	ciWorkflowRunsFailed.Store(0)
+	webhookEventsReceived.Store(0)
+	webhookEventsPublished.Store(0)
+	webhookEventsFailed.Store(0)
+	outboxQueueDepth.Store(0)
+	outboxPublished.Store(0)
+	outboxRetried.Store(0)
+	outboxDeadLettered.Store(0)
+	bridgeSignedFallback.Store(0)
 
 	IncAnnouncementReceived()
 	IncAnnouncementReceived()
@@ -76,6 +96,16 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 	IncNIP55VerifySuccess()
 	IncNIP55VerifyFailure()
 	IncNIP55VerifyFailure()
+	IncCIWorkflowRunsPublished()
+	IncCIWorkflowRunsFailed()
+	IncWebhookEventsReceived()
+	IncWebhookEventsPublished()
+	IncWebhookEventsFailed()
+	SetOutboxQueueDepth(7)
+	IncOutboxPublished()
+	IncOutboxRetried()
+	IncOutboxDeadLettered()
+	IncBridgeSignedFallback()
 
 	snap := Snapshot()
 	expected := map[string]int64{
@@ -89,12 +119,22 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 		"auth_verify_failure":             3,
 		"auth_replay_rejected":            1,
 		"auth_user_provisioned":           1,
-		"nip46_sessions_initiated":         2,
-		"nip46_sessions_completed":         1,
-		"nip46_sessions_failed":            1,
-		"nip55_challenges_issued":          1,
-		"nip55_verify_success":             1,
-		"nip55_verify_failure":             2,
+		"nip46_sessions_initiated":        2,
+		"nip46_sessions_completed":        1,
+		"nip46_sessions_failed":           1,
+		"nip55_challenges_issued":         1,
+		"nip55_verify_success":            1,
+		"nip55_verify_failure":            2,
+		"ci_workflow_runs_published":      1,
+		"ci_workflow_runs_failed":         1,
+		"webhook_events_received":         1,
+		"webhook_events_published":        1,
+		"webhook_events_failed":           1,
+		"outbox_queue_depth":              7,
+		"outbox_published":                1,
+		"outbox_retried":                  1,
+		"outbox_dead_lettered":            1,
+		"bridge_signed_fallback":          1,
 	}
 	for key, want := range expected {
 		if got := snap[key]; got != want {
@@ -122,6 +162,16 @@ func TestSnapshotReturnsAllKeys(t *testing.T) {
 		"nip55_challenges_issued",
 		"nip55_verify_success",
 		"nip55_verify_failure",
+		"ci_workflow_runs_published",
+		"ci_workflow_runs_failed",
+		"webhook_events_received",
+		"webhook_events_published",
+		"webhook_events_failed",
+		"outbox_queue_depth",
+		"outbox_published",
+		"outbox_retried",
+		"outbox_dead_lettered",
+		"bridge_signed_fallback",
 	}
 	for _, key := range requiredKeys {
 		if _, ok := snap[key]; !ok {

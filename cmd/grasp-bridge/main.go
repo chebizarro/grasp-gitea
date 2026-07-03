@@ -132,6 +132,7 @@ func main() {
 	var outboxDone chan struct{}
 	if signerSvc != nil && signerSvc.Enabled() && publisherSvc != nil {
 		outboxWorker := outbox.New(st, signerSvc, publisherSvc, logger)
+		publisherSvc.SetOwnerStateSigning(signerSvc, outboxWorker)
 		outboxDone = make(chan struct{})
 		go func() {
 			defer close(outboxDone)
@@ -141,6 +142,9 @@ func main() {
 	}
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
+	if signerSvc != nil {
+		apiServer.SetSignerAuthorizer(signerSvc)
+	}
 
 	if cfg.AuthEnabled {
 		authSvc := auth.NewService(cfg, st, logger)

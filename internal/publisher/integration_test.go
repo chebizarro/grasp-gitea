@@ -124,6 +124,143 @@ func TestRepublishForGiteaRepoPublishesStateAndSkipsUnchanged(t *testing.T) {
 	}
 }
 
+func TestRepublishForGiteaRepoEnqueuesOwnerSignedStateWhenGrantPresent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	st := newTestStore(t)
+	repositoriesDir := t.TempDir()
+	createBareRepoFixture(t, repositoriesDir, "alice", "signed")
+
+	ownerPriv := nostr.GeneratePrivateKey()
+	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	if err != nil {
+		t.Fatalf("owner public key: %v", err)
+	}
+	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	if err != nil {
+		t.Fatalf("owner npub: %v", err)
+	}
+	seedMapping(t, ctx, st, appstore.Mapping{
+		Npub:          ownerNpub,
+		RepoID:        "signed-repo-id",
+		Pubkey:        ownerPub,
+		Owner:         "alice",
+		RepoName:      "signed",
+		GiteaRepoID:   4242,
+		CloneURL:      "https://git.example/alice/signed.git",
+		SourceEvent:   "seed-event",
+		HookInstalled: true,
+	})
+	if err := st.UpsertSignerGrant(ctx, appstore.SignerGrant{
+		Pubkey:          ownerPub,
+		ClientSeckeyEnc: []byte("ciphertext-client"),
+		BunkerURIEnc:    []byte("ciphertext-bunker"),
+		Relays:          `[]`,
+		Permissions:     `["sign_event"]`,
+		GrantedAt:       time.Now().UTC(),
+		Status:          "active",
+	}); err != nil {
+		t.Fatalf("seed signer grant: %v", err)
+	}
+
+	svc, err := New(genNsec(t), st, nil, repositoriesDir, discardLogger())
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	outbox := &fakeStateOutbox{}
+	svc.SetOwnerStateSigning(fakeStateSigner{enabled: true}, outbox)
+
+	if err := svc.RepublishForGiteaRepo(ctx, 4242); err != nil {
+		t.Fatalf("RepublishForGiteaRepo: %v", err)
+	}
+
+	if len(outbox.calls) != 1 {
+		t.Fatalf("outbox enqueue calls = %d, want 1", len(outbox.calls))
+	}
+	call := outbox.calls[0]
+	if call.kind != relaypkg.KindRepositoryState {
+		t.Fatalf("enqueued kind = %d, want %d", call.kind, relaypkg.KindRepositoryState)
+	}
+	if call.authorPubkey != ownerPub {
+		t.Fatalf("enqueued author = %q, want owner pubkey %q", call.authorPubkey, ownerPub)
+	}
+	if call.event.PubKey != ownerPub {
+		t.Fatalf("unsigned event pubkey = %q, want owner pubkey %q", call.event.PubKey, ownerPub)
+	}
+	if call.event.ID != "" || call.event.Sig != "" {
+		t.Fatalf("enqueued event should be unsigned, got id=%q sig=%q", call.event.ID, call.event.Sig)
+	}
+	if got, ok := firstVal(&call.event, "d"); !ok || got != "signed-repo-id" {
+		t.Fatalf("enqueued event d tag = %q (present %v), want signed-repo-id", got, ok)
+	}
+	if call.scope != "repo:alice/signed" {
+		t.Fatalf("scope = %q, want repo:alice/signed", call.scope)
+	}
+	if !strings.HasPrefix(call.dedupeKey, "repo-state:4242:signed-repo-id:") {
+		t.Fatalf("dedupe key = %q, want stable repo-state prefix", call.dedupeKey)
+	}
+}
+
+func TestRepublishForGiteaRepoFallsBackToBridgeWhenOwnerGrantMissing(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	relay := newTestRelay(t)
+	st := newTestStore(t)
+	repositoriesDir := t.TempDir()
+	createBareRepoFixture(t, repositoriesDir, "carol", "fallback")
+
+	ownerPriv := nostr.GeneratePrivateKey()
+	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	if err != nil {
+		t.Fatalf("owner public key: %v", err)
+	}
+	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	if err != nil {
+		t.Fatalf("owner npub: %v", err)
+	}
+	seedMapping(t, ctx, st, appstore.Mapping{
+		Npub:          ownerNpub,
+		RepoID:        "fallback-repo-id",
+		Pubkey:        ownerPub,
+		Owner:         "carol",
+		RepoName:      "fallback",
+		GiteaRepoID:   5150,
+		CloneURL:      "https://git.example/carol/fallback.git",
+		SourceEvent:   "seed-event",
+		HookInstalled: true,
+	})
+
+	svc, err := New(genNsec(t), st, []string{relay.url}, repositoriesDir, discardLogger())
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	outbox := &fakeStateOutbox{}
+	svc.SetOwnerStateSigning(fakeStateSigner{enabled: true}, outbox)
+
+	if err := svc.RepublishForGiteaRepo(ctx, 5150); err != nil {
+		t.Fatalf("RepublishForGiteaRepo: %v", err)
+	}
+	if len(outbox.calls) != 0 {
+		t.Fatalf("outbox enqueue calls = %d, want 0 without owner grant", len(outbox.calls))
+	}
+	savedStateEvents := relay.savedEventsByKind(relaypkg.KindRepositoryState)
+	if len(savedStateEvents) != 1 {
+		t.Fatalf("relay saved %d kind:%d events, want 1", len(savedStateEvents), relaypkg.KindRepositoryState)
+	}
+	stateEvent := savedStateEvents[0]
+	if stateEvent.PubKey != svc.bridgePubKey {
+		t.Fatalf("fallback pubkey = %q, want bridge pubkey %q", stateEvent.PubKey, svc.bridgePubKey)
+	}
+	if ok, err := stateEvent.CheckSignature(); !ok || err != nil {
+		t.Fatalf("fallback signature invalid: ok=%v err=%v", ok, err)
+	}
+	if got, ok := firstVal(stateEvent, "p"); !ok || got != ownerPub {
+		t.Fatalf("fallback p tag = %q (present %v), want owner pubkey", got, ok)
+	}
+}
+
 func TestRepublishForGiteaRepoRebroadcastsCachedAnnouncement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -243,6 +380,38 @@ func TestFetchEventRoundTripsThroughRelay(t *testing.T) {
 		t.Fatal("FetchEvent returned nil event")
 	}
 	assertSameEvent(t, &ev, got)
+}
+
+type fakeStateSigner struct {
+	enabled bool
+}
+
+func (s fakeStateSigner) Enabled() bool { return s.enabled }
+
+type fakeStateOutbox struct {
+	calls []fakeStateOutboxCall
+}
+
+type fakeStateOutboxCall struct {
+	kind         int
+	authorPubkey string
+	scope        string
+	dedupeKey    string
+	event        nostr.Event
+}
+
+func (o *fakeStateOutbox) Enqueue(_ context.Context, kind int, authorPubkey string, scope string, unsignedEvent *nostr.Event, dedupeKey string) error {
+	call := fakeStateOutboxCall{
+		kind:         kind,
+		authorPubkey: authorPubkey,
+		scope:        scope,
+		dedupeKey:    dedupeKey,
+	}
+	if unsignedEvent != nil {
+		call.event = *cloneEvent(unsignedEvent)
+	}
+	o.calls = append(o.calls, call)
+	return nil
 }
 
 type testRelay struct {
