@@ -9,25 +9,26 @@ import (
 )
 
 type Config struct {
-	GiteaURL             string
-	GiteaAdminToken      string
-	ClonePrefix          string
-	RelayURLs            []string
-	Listen               string
-	DBPath               string
-	PubkeyAllowlist      map[string]struct{}
-	ProvisionRateLimit   int
-	HookRelayURL         string
-	HookBinaryPath       string
-	GiteaRepositoriesDir string
-	EmbeddedRelay        bool
-	EmbeddedRelayPort    int
-	EmbeddedRelayDB      string
-	ArchiveMode          bool
-	AdminAPIToken        string
-	AuthEnabled          bool
-	BridgePublicURL      string
-	ChallengeTTL         time.Duration
+	GiteaURL              string
+	GiteaAdminToken       string
+	ClonePrefix           string
+	RelayURLs             []string
+	Listen                string
+	DBPath                string
+	PubkeyAllowlist       map[string]struct{}
+	ProvisionRateLimit    int
+	HookRelayURL          string
+	HookBinaryPath        string
+	GiteaRepositoriesDir  string
+	EmbeddedRelay         bool
+	EmbeddedRelayPort     int
+	EmbeddedRelayDB       string
+	ArchiveMode           bool
+	AdminAPIToken         string
+	AuthEnabled           bool
+	BridgePublicURL       string
+	ChallengeTTL          time.Duration
+	ProactiveSyncInterval time.Duration
 
 	// Mirror republish: bridge signs NIP-34 state events with this key.
 	BridgeNsec          string
@@ -44,30 +45,31 @@ type Config struct {
 
 func Load() (Config, error) {
 	cfg := Config{
-		GiteaURL:             envOrDefault("GITEA_URL", "http://gitea:3000"),
-		GiteaAdminToken:      strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
-		ClonePrefix:          strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
-		RelayURLs:            csvEnv("RELAY_URLS"),
-		Listen:               envOrDefault("LISTEN", ":8090"),
-		DBPath:               envOrDefault("DB_PATH", "./mappings.db"),
-		PubkeyAllowlist:      parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
-		ProvisionRateLimit:   intEnv("PROVISION_RATE_LIMIT", 0),
-		HookRelayURL:         envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),
-		HookBinaryPath:       envOrDefault("HOOK_BINARY_PATH", "/usr/local/bin/grasp-pre-receive"),
-		GiteaRepositoriesDir: envOrDefault("GITEA_REPOSITORIES_PATH", "/gitea-data/git/repositories"),
-		EmbeddedRelay:        boolEnv("EMBEDDED_RELAY", false),
-		EmbeddedRelayPort:    intEnv("EMBEDDED_RELAY_PORT", 3334),
-		EmbeddedRelayDB:      envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
-		ArchiveMode:          boolEnv("GRASP05_ARCHIVE_MODE", false),
-		AdminAPIToken:        strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
-		AuthEnabled:          boolEnv("AUTH_ENABLED", false),
-		BridgePublicURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
-		ChallengeTTL:         durationEnv("CHALLENGE_TTL", 5*time.Minute),
-		BridgeNsec:           strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
-		MirrorCallbackToken:  strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
-		GiteaWebhookSecret:   strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
-		CIEnabled:            boolEnv("CI_ENABLED", false),
-		CITriggerRepos:       csvEnv("CI_TRIGGER_REPOS"),
+		GiteaURL:              envOrDefault("GITEA_URL", "http://gitea:3000"),
+		GiteaAdminToken:       strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
+		ClonePrefix:           strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
+		RelayURLs:             csvEnv("RELAY_URLS"),
+		Listen:                envOrDefault("LISTEN", ":8090"),
+		DBPath:                envOrDefault("DB_PATH", "./mappings.db"),
+		PubkeyAllowlist:       parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
+		ProvisionRateLimit:    intEnv("PROVISION_RATE_LIMIT", 0),
+		HookRelayURL:          envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),
+		HookBinaryPath:        envOrDefault("HOOK_BINARY_PATH", "/usr/local/bin/grasp-pre-receive"),
+		GiteaRepositoriesDir:  envOrDefault("GITEA_REPOSITORIES_PATH", "/gitea-data/git/repositories"),
+		EmbeddedRelay:         boolEnv("EMBEDDED_RELAY", false),
+		EmbeddedRelayPort:     intEnv("EMBEDDED_RELAY_PORT", 3334),
+		EmbeddedRelayDB:       envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
+		ArchiveMode:           boolEnv("GRASP05_ARCHIVE_MODE", false),
+		AdminAPIToken:         strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
+		AuthEnabled:           boolEnv("AUTH_ENABLED", false),
+		BridgePublicURL:       strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
+		ChallengeTTL:          durationEnv("CHALLENGE_TTL", 5*time.Minute),
+		ProactiveSyncInterval: normalizeProactiveSyncInterval(durationEnv("PROACTIVE_SYNC_INTERVAL", time.Hour)),
+		BridgeNsec:            strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
+		MirrorCallbackToken:   strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
+		GiteaWebhookSecret:    strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
+		CIEnabled:             boolEnv("CI_ENABLED", false),
+		CITriggerRepos:        csvEnv("CI_TRIGGER_REPOS"),
 	}
 
 	if cfg.GiteaAdminToken == "" {
@@ -157,6 +159,13 @@ func durationEnv(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+func normalizeProactiveSyncInterval(interval time.Duration) time.Duration {
+	if interval <= 0 || interval > time.Hour {
+		return time.Hour
+	}
+	return interval
 }
 
 func parseAllowlist(raw string) map[string]struct{} {

@@ -6,13 +6,19 @@ package proactivesync
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip19"
 
+	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -172,4 +178,342 @@ func TestRepoPathSkippedWhenNotFound(t *testing.T) {
 	// The event will fail signature validation before reaching the path check,
 	// but we can at least confirm the service is correctly wired.
 	_ = fmt.Sprintf("svc=%v", svc)
+}
+
+type stubStore struct {
+	stubResolver
+	mappingsList []store.Mapping
+}
+
+func (s *stubStore) ListMappings(_ context.Context) ([]store.Mapping, error) {
+	return append([]store.Mapping{}, s.mappingsList...), nil
+}
+
+type fetchCall struct {
+	repoPath string
+	remote   string
+	refspecs []string
+}
+
+type fakeGitRunner struct {
+	mu      sync.Mutex
+	objects map[string]bool
+	fetches []fetchCall
+	updates map[string]string
+}
+
+func newFakeGitRunner() *fakeGitRunner {
+	return &fakeGitRunner{objects: map[string]bool{}, updates: map[string]string{}}
+}
+
+func (g *fakeGitRunner) ObjectExists(_ context.Context, _ string, sha string) (bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.objects[sha], nil
+}
+
+func (g *fakeGitRunner) UpdateRef(_ context.Context, repoPath string, ref string, sha string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.objects[sha] {
+		return fmt.Errorf("missing object %s", sha)
+	}
+	g.updates[repoPath+"|"+ref] = sha
+	return nil
+}
+
+func (g *fakeGitRunner) Fetch(_ context.Context, repoPath string, remoteURL string, refspecs []string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fetches = append(g.fetches, fetchCall{repoPath: repoPath, remote: remoteURL, refspecs: append([]string{}, refspecs...)})
+	for _, refspec := range refspecs {
+		src := refspec
+		if strings.HasPrefix(src, "+") {
+			src = strings.TrimPrefix(src, "+")
+		}
+		if idx := strings.Index(src, ":"); idx >= 0 {
+			src = src[:idx]
+		}
+		if validHex.MatchString(src) {
+			g.objects[src] = true
+		}
+	}
+	return nil
+}
+
+type fakeRelayQueries struct {
+	mu      sync.Mutex
+	queries []nostr.Filter
+	state   []*nostr.Event
+	prs     []*nostr.Event
+}
+
+func (q *fakeRelayQueries) query(_ context.Context, _ string, filter nostr.Filter) ([]*nostr.Event, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.queries = append(q.queries, filter)
+	if filterHasKind(filter, relay.KindRepositoryState) {
+		return append([]*nostr.Event{}, q.state...), nil
+	}
+	if filterHasKind(filter, relay.KindPROpen) || filterHasKind(filter, relay.KindPRUpdate) {
+		return append([]*nostr.Event{}, q.prs...), nil
+	}
+	return nil, nil
+}
+
+func filterHasKind(filter nostr.Filter, kind int) bool {
+	for _, k := range filter.Kinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
+type fakeTicker struct {
+	ch      chan time.Time
+	stopped bool
+}
+
+func (t *fakeTicker) C() <-chan time.Time { return t.ch }
+func (t *fakeTicker) Stop()               { t.stopped = true }
+
+func TestSyncOnceFetchesMissingStateObjectsAndPRTips(t *testing.T) {
+	ctx := context.Background()
+	reposDir := t.TempDir()
+	owner := "alice"
+	repoID := "project"
+	repoPath := reposDir + "/" + owner + "/" + repoID + ".git"
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("create bare repo dir: %v", err)
+	}
+
+	ownerPriv := nostr.GeneratePrivateKey()
+	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	if err != nil {
+		t.Fatalf("owner public key: %v", err)
+	}
+	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	if err != nil {
+		t.Fatalf("owner npub: %v", err)
+	}
+
+	cloneURL := "https://git.example.com/alice/project.git"
+	relayURL := "wss://relay.example.com"
+	announcement := signedTestEvent(t, ownerPriv, relay.KindRepositoryAnnouncement, nostr.Tags{
+		{"d", repoID},
+		{"clone", cloneURL},
+		{"relays", relayURL},
+	})
+	announcementJSON, err := json.Marshal(announcement)
+	if err != nil {
+		t.Fatalf("marshal announcement: %v", err)
+	}
+
+	stateSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	stateEvent := signedTestEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", repoID},
+		{"refs/heads/main", stateSHA},
+	})
+	prSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	prEvent := signedTestEvent(t, ownerPriv, relay.KindPROpen, nostr.Tags{
+		{"a", fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement, ownerPub, repoID)},
+		{"clone", cloneURL},
+		{"c", prSHA},
+	})
+
+	mapping := store.Mapping{
+		Npub:                  ownerNpub,
+		RepoID:                repoID,
+		Pubkey:                ownerPub,
+		Owner:                 owner,
+		RepoName:              repoID,
+		GiteaRepoID:           7,
+		CloneURL:              cloneURL,
+		AnnouncedCloneURL:     cloneURL,
+		AnnouncementEventJSON: string(announcementJSON),
+	}
+	st := &stubStore{
+		stubResolver: stubResolver{mappings: map[string]store.Mapping{ownerNpub + "/" + repoID: mapping}},
+		mappingsList: []store.Mapping{mapping},
+	}
+	git := newFakeGitRunner()
+	relays := &fakeRelayQueries{state: []*nostr.Event{stateEvent}, prs: []*nostr.Event{prEvent}}
+
+	svc := New(reposDir, st, testLogger())
+	svc.git = git
+	svc.queryRelay = relays.query
+
+	if err := svc.SyncOnce(ctx); err != nil {
+		t.Fatalf("SyncOnce() error: %v", err)
+	}
+
+	git.mu.Lock()
+	defer git.mu.Unlock()
+	if len(git.fetches) != 2 {
+		t.Fatalf("fetches = %d, want 2: %#v", len(git.fetches), git.fetches)
+	}
+	if got := git.fetches[0].remote; got != cloneURL {
+		t.Errorf("state fetch remote = %q, want %q", got, cloneURL)
+	}
+	if got := git.fetches[0].refspecs; len(got) != 1 || got[0] != stateSHA {
+		t.Errorf("state fetch refspecs = %v, want [%s]", got, stateSHA)
+	}
+	wantPRRefspec := "+" + prSHA + ":refs/nostr/" + prEvent.ID
+	if got := git.fetches[1].refspecs; len(got) != 1 || got[0] != wantPRRefspec {
+		t.Errorf("PR fetch refspecs = %v, want [%s]", got, wantPRRefspec)
+	}
+	if got := git.updates[repoPath+"|refs/heads/main"]; got != stateSHA {
+		t.Errorf("updated main ref = %q, want %q", got, stateSHA)
+	}
+}
+
+func TestSyncOnceIgnoresStateEventThatOnlyTagsOwner(t *testing.T) {
+	ctx := context.Background()
+	reposDir := t.TempDir()
+	owner := "alice"
+	repoID := "project"
+	if err := os.MkdirAll(reposDir+"/"+owner+"/"+repoID+".git", 0o755); err != nil {
+		t.Fatalf("create bare repo dir: %v", err)
+	}
+
+	ownerPriv := nostr.GeneratePrivateKey()
+	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	if err != nil {
+		t.Fatalf("owner public key: %v", err)
+	}
+	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	if err != nil {
+		t.Fatalf("owner npub: %v", err)
+	}
+	announcement := signedTestEvent(t, ownerPriv, relay.KindRepositoryAnnouncement, nostr.Tags{
+		{"d", repoID},
+		{"clone", "https://git.example.com/alice/project.git"},
+		{"relays", "wss://relay.example.com"},
+	})
+	announcementJSON, err := json.Marshal(announcement)
+	if err != nil {
+		t.Fatalf("marshal announcement: %v", err)
+	}
+
+	attackerPriv := nostr.GeneratePrivateKey()
+	spoofedState := signedTestEvent(t, attackerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", repoID},
+		{"p", ownerPub},
+		{"refs/heads/main", "cccccccccccccccccccccccccccccccccccccccc"},
+	})
+	mapping := store.Mapping{
+		Npub:                  ownerNpub,
+		RepoID:                repoID,
+		Pubkey:                ownerPub,
+		Owner:                 owner,
+		RepoName:              repoID,
+		AnnouncedCloneURL:     "https://git.example.com/alice/project.git",
+		AnnouncementEventJSON: string(announcementJSON),
+	}
+	st := &stubStore{mappingsList: []store.Mapping{mapping}}
+	git := newFakeGitRunner()
+	relays := &fakeRelayQueries{state: []*nostr.Event{spoofedState}}
+
+	svc := New(reposDir, st, testLogger())
+	svc.git = git
+	svc.queryRelay = relays.query
+
+	if err := svc.SyncOnce(ctx); err != nil {
+		t.Fatalf("SyncOnce() error: %v", err)
+	}
+	git.mu.Lock()
+	defer git.mu.Unlock()
+	if len(git.fetches) != 0 {
+		t.Fatalf("spoofed state triggered fetches: %#v", git.fetches)
+	}
+	if len(git.updates) != 0 {
+		t.Fatalf("spoofed state triggered updates: %#v", git.updates)
+	}
+}
+
+func TestQueryRelayHistoryPaginatesWithUntil(t *testing.T) {
+	svc := New(t.TempDir(), nil, testLogger())
+	var calls int
+	svc.queryRelay = func(_ context.Context, _ string, filter nostr.Filter) ([]*nostr.Event, error) {
+		calls++
+		if filter.Until == nil {
+			return []*nostr.Event{{CreatedAt: 30}, {CreatedAt: 20}}, nil
+		}
+		if *filter.Until == 19 {
+			return []*nostr.Event{{CreatedAt: 10}}, nil
+		}
+		return nil, nil
+	}
+
+	events, err := svc.queryRelayHistory(context.Background(), "wss://relay.example.com", nostr.Filter{}, 2)
+	if err != nil {
+		t.Fatalf("queryRelayHistory() error: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events = %d, want 3", len(events))
+	}
+	if calls != 2 {
+		t.Fatalf("query calls = %d, want 2", calls)
+	}
+}
+
+func TestRunHonorsConfiguredIntervalAndTicks(t *testing.T) {
+	svc := New(t.TempDir(), &stubStore{}, testLogger())
+	ticker := &fakeTicker{ch: make(chan time.Time, 1)}
+	intervalCh := make(chan time.Duration, 1)
+	svc.newTicker = func(interval time.Duration) syncTicker {
+		intervalCh <- interval
+		return ticker
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.Run(ctx, 37*time.Millisecond)
+	}()
+
+	gotInterval := <-intervalCh
+	if gotInterval != 37*time.Millisecond {
+		t.Fatalf("ticker interval = %v, want 37ms", gotInterval)
+	}
+	ticker.ch <- time.Now()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop after context cancellation")
+	}
+	if !ticker.stopped {
+		t.Error("ticker was not stopped")
+	}
+}
+
+func TestNormalizeSyncIntervalClampsAboveOneHour(t *testing.T) {
+	if got := NormalizeSyncInterval(2 * time.Hour); got != time.Hour {
+		t.Errorf("NormalizeSyncInterval(2h) = %v, want 1h", got)
+	}
+	if got := NormalizeSyncInterval(15 * time.Minute); got != 15*time.Minute {
+		t.Errorf("NormalizeSyncInterval(15m) = %v, want 15m", got)
+	}
+}
+
+func signedTestEvent(t *testing.T, priv string, kind int, tags nostr.Tags) *nostr.Event {
+	t.Helper()
+	pub, err := nostr.GetPublicKey(priv)
+	if err != nil {
+		t.Fatalf("public key: %v", err)
+	}
+	ev := &nostr.Event{
+		PubKey:    pub,
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Kind:      kind,
+		Tags:      tags,
+		Content:   "",
+	}
+	if err := ev.Sign(priv); err != nil {
+		t.Fatalf("sign event: %v", err)
+	}
+	return ev
 }

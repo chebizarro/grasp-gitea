@@ -247,6 +247,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ArchiveMode {
 		t.Error("default ArchiveMode should be false")
 	}
+	if cfg.ProactiveSyncInterval != time.Hour {
+		t.Errorf("default ProactiveSyncInterval: got %v", cfg.ProactiveSyncInterval)
+	}
 }
 
 func TestLoadOverridesAllFields(t *testing.T) {
@@ -267,6 +270,7 @@ func TestLoadOverridesAllFields(t *testing.T) {
 		"EMBEDDED_RELAY_DB":       "/tmp/relay-db",
 		"GRASP05_ARCHIVE_MODE":    "true",
 		"ADMIN_API_TOKEN":         "admin-secret",
+		"PROACTIVE_SYNC_INTERVAL": "30m",
 	})
 
 	cfg, err := Load()
@@ -300,6 +304,26 @@ func TestLoadOverridesAllFields(t *testing.T) {
 	}
 	if !cfg.ArchiveMode {
 		t.Error("ArchiveMode should be true")
+	}
+	if cfg.ProactiveSyncInterval != 30*time.Minute {
+		t.Errorf("ProactiveSyncInterval: got %v", cfg.ProactiveSyncInterval)
+	}
+}
+
+func TestProactiveSyncIntervalClampsAboveOneHour(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN":       "tok",
+		"CLONE_PREFIX":            "https://git.example.com",
+		"RELAY_URLS":              "wss://relay",
+		"PROACTIVE_SYNC_INTERVAL": "2h",
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ProactiveSyncInterval != time.Hour {
+		t.Errorf("expected ProactiveSyncInterval clamped to 1h, got %v", cfg.ProactiveSyncInterval)
 	}
 }
 

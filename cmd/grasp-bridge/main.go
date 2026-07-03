@@ -80,6 +80,13 @@ func main() {
 
 	relayURLs := mergeRelayURLs(cfg.RelayURLs, embeddedRelayURL)
 
+	proactiveSyncDone := make(chan struct{})
+	go func() {
+		defer close(proactiveSyncDone)
+		proactiveSyncSvc.Run(ctx, cfg.ProactiveSyncInterval)
+	}()
+	logger.Info("GRASP-02 proactive sync scheduler started", "interval", cfg.ProactiveSyncInterval.String())
+
 	refsNostrReaper := refsnostr.NewReaper(
 		st,
 		refsnostr.NewRelayChecker(relayURLs, logger),
@@ -207,6 +214,11 @@ func main() {
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
 	subscriber.Wait()
+	select {
+	case <-proactiveSyncDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("proactive sync scheduler did not stop before shutdown timeout")
+	}
 	select {
 	case <-refsNostrReaperDone:
 	case <-shutdownCtx.Done():
