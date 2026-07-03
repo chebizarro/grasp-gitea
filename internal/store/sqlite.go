@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -58,6 +59,35 @@ type SignerGrant struct {
 	RevokedAt       *time.Time
 	LastOKAt        *time.Time
 	Status          string
+}
+
+const (
+	OutboundStatePending   = "pending"
+	OutboundStatePublished = "published"
+	OutboundStateDead      = "dead"
+)
+
+// OutboundEvent is a persisted unsigned event awaiting user-grant signing and relay publication.
+type OutboundEvent struct {
+	ID               int64     `json:"id"`
+	DedupeKey        string    `json:"dedupe_key"`
+	Kind             int       `json:"kind"`
+	AuthorPubkey     string    `json:"author_pubkey"`
+	Scope            string    `json:"scope"`
+	UnsignedJSON     string    `json:"unsigned_json"`
+	State            string    `json:"state"`
+	Attempts         int       `json:"attempts"`
+	NextAttemptAt    time.Time `json:"next_attempt_at"`
+	LastError        string    `json:"last_error,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	PublishedEventID string    `json:"published_event_id,omitempty"`
+}
+
+// OutboundQueueCounts summarizes outbound_events by state.
+type OutboundQueueCounts struct {
+	Pending   int64 `json:"pending"`
+	Published int64 `json:"published"`
+	Dead      int64 `json:"dead"`
 }
 
 type Mapping struct {
@@ -177,6 +207,20 @@ func Open(path string) (*SQLiteStore, error) {
 			last_ok_at TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'active'
 		);`,
+		`CREATE TABLE IF NOT EXISTS outbound_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			dedupe_key TEXT NOT NULL UNIQUE,
+			kind INTEGER NOT NULL,
+			author_pubkey TEXT NOT NULL,
+			scope TEXT NOT NULL DEFAULT '',
+			unsigned_json TEXT NOT NULL,
+			state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'published', 'dead')),
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_attempt_at TEXT NOT NULL,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			published_event_id TEXT NOT NULL DEFAULT ''
+		);`,
 	}
 
 	for _, stmt := range stmts {
@@ -207,12 +251,268 @@ func Open(path string) (*SQLiteStore, error) {
 	// Index for looking up mappings by Gitea repo ID (used by mirror sync callback).
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_mappings_gitea_repo_id ON mappings(gitea_repo_id)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_nostr_refs_first_seen_at ON pending_nostr_refs(first_seen_at)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbound_events_due ON outbound_events(state, next_attempt_at, id)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbound_events_created_at ON outbound_events(created_at)`)
 
 	return &SQLiteStore{db: db}, nil
 }
 
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()
+}
+
+// EnqueueOutboundEvent inserts an unsigned outbound event unless its dedupe key already exists.
+// It returns true when a new row was inserted; duplicate dedupe keys are a no-op.
+func (s *SQLiteStore) EnqueueOutboundEvent(ctx context.Context, ev OutboundEvent, now time.Time) (bool, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if ev.NextAttemptAt.IsZero() {
+		ev.NextAttemptAt = now
+	}
+	if ev.State == "" {
+		ev.State = OutboundStatePending
+	}
+	res, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO outbound_events(dedupe_key, kind, author_pubkey, scope, unsigned_json, state, attempts, next_attempt_at, last_error, created_at, published_event_id)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, ev.DedupeKey, ev.Kind, ev.AuthorPubkey, ev.Scope, ev.UnsignedJSON, ev.State, ev.Attempts,
+		ev.NextAttemptAt.UTC().Format(time.RFC3339), ev.LastError, now.UTC().Format(time.RFC3339), ev.PublishedEventID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// ClaimDueOutboundEvents leases due pending events by moving next_attempt_at forward.
+// If the worker crashes after claim, rows become due again after the lease expires.
+func (s *SQLiteStore) ClaimDueOutboundEvents(ctx context.Context, now time.Time, limit int, lease time.Duration) ([]OutboundEvent, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	if lease <= 0 {
+		lease = time.Minute
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	claimUntil := now.Add(lease).UTC().Format(time.RFC3339)
+	dueAt := now.UTC().Format(time.RFC3339)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM outbound_events
+		WHERE state = ? AND next_attempt_at <= ?
+		ORDER BY next_attempt_at ASC, id ASC
+		LIMIT ?
+	`, OutboundStatePending, dueAt, limit)
+	if err != nil {
+		return nil, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	claimed := make([]OutboundEvent, 0, len(ids))
+	for _, id := range ids {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE outbound_events SET next_attempt_at = ?
+			WHERE id = ? AND state = ? AND next_attempt_at <= ?
+		`, claimUntil, id, OutboundStatePending, dueAt)
+		if err != nil {
+			return nil, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			continue
+		}
+		row := tx.QueryRowContext(ctx, outboundEventSelectSQL()+` WHERE id = ?`, id)
+		ev, err := scanOutboundEvent(row)
+		if err != nil {
+			return nil, err
+		}
+		claimed = append(claimed, ev)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return claimed, nil
+}
+
+// MarkOutboundPublished marks a pending outbound row as published and records the Nostr event id.
+func (s *SQLiteStore) MarkOutboundPublished(ctx context.Context, id int64, publishedEventID string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE outbound_events SET state = ?, published_event_id = ?, last_error = ''
+		WHERE id = ? AND state = ?
+	`, OutboundStatePublished, publishedEventID, id, OutboundStatePending)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// MarkOutboundRetry bumps attempts and schedules the next retry for a pending outbound row.
+func (s *SQLiteStore) MarkOutboundRetry(ctx context.Context, id int64, nextAttemptAt time.Time, lastErr string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE outbound_events
+		SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?
+		WHERE id = ? AND state = ?
+	`, nextAttemptAt.UTC().Format(time.RFC3339), lastErr, id, OutboundStatePending)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// MarkOutboundDead moves a pending outbound row to the dead-letter state.
+func (s *SQLiteStore) MarkOutboundDead(ctx context.Context, id int64, lastErr string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE outbound_events
+		SET state = ?, attempts = attempts + 1, last_error = ?
+		WHERE id = ? AND state = ?
+	`, OutboundStateDead, lastErr, id, OutboundStatePending)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// OutboundQueueCounts returns counts for each queue state.
+func (s *SQLiteStore) OutboundQueueCounts(ctx context.Context) (OutboundQueueCounts, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT state, COUNT(1) FROM outbound_events GROUP BY state`)
+	if err != nil {
+		return OutboundQueueCounts{}, err
+	}
+	defer rows.Close()
+
+	var counts OutboundQueueCounts
+	for rows.Next() {
+		var state string
+		var count int64
+		if err := rows.Scan(&state, &count); err != nil {
+			return OutboundQueueCounts{}, err
+		}
+		switch state {
+		case OutboundStatePending:
+			counts.Pending = count
+		case OutboundStatePublished:
+			counts.Published = count
+		case OutboundStateDead:
+			counts.Dead = count
+		}
+	}
+	return counts, rows.Err()
+}
+
+// RecentOutboundEvents returns recent outbound rows for admin inspection.
+func (s *SQLiteStore) RecentOutboundEvents(ctx context.Context, limit int) ([]OutboundEvent, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, outboundEventSelectSQL()+`
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []OutboundEvent
+	for rows.Next() {
+		ev, err := scanOutboundEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+type outboundEventScanner interface {
+	Scan(dest ...any) error
+}
+
+func outboundEventSelectSQL() string {
+	return `SELECT id, dedupe_key, kind, author_pubkey, scope, unsigned_json, state, attempts, next_attempt_at, last_error, created_at, published_event_id FROM outbound_events`
+}
+
+func scanOutboundEvent(scanner outboundEventScanner) (OutboundEvent, error) {
+	var ev OutboundEvent
+	var nextAttemptAt, createdAt string
+	if err := scanner.Scan(&ev.ID, &ev.DedupeKey, &ev.Kind, &ev.AuthorPubkey, &ev.Scope, &ev.UnsignedJSON,
+		&ev.State, &ev.Attempts, &nextAttemptAt, &ev.LastError, &createdAt, &ev.PublishedEventID); err != nil {
+		return OutboundEvent{}, err
+	}
+	var err error
+	ev.NextAttemptAt, err = time.Parse(time.RFC3339, nextAttemptAt)
+	if err != nil {
+		return OutboundEvent{}, fmt.Errorf("parse outbound next_attempt_at for %d: %w", ev.ID, err)
+	}
+	ev.CreatedAt, err = time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return OutboundEvent{}, fmt.Errorf("parse outbound created_at for %d: %w", ev.ID, err)
+	}
+	return ev, nil
+}
+
+func truncateError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	if len(msg) > 1000 {
+		return msg[:1000]
+	}
+	return msg
 }
 
 // UpsertSignerGrant creates or replaces a durable NIP-46 signer grant.

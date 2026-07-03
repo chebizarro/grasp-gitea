@@ -240,6 +240,16 @@ func (s *Service) PublishEvent(ctx context.Context, ev *nostr.Event) error {
 	return s.publishToRelays(ctx, ev)
 }
 
+// PublishSigned publishes an already-signed event to all configured relays.
+// It intentionally does not sign or mutate the event; Phase-B outbox rows are
+// signed by the user's NIP-46 grant before reaching this method.
+func (s *Service) PublishSigned(ctx context.Context, ev *nostr.Event) error {
+	if ev == nil {
+		return fmt.Errorf("event is required")
+	}
+	return s.publishToRelays(ctx, ev)
+}
+
 // FetchEvent retrieves a single event by ID from the configured relays.
 // It queries relays in order and returns the first match. It returns
 // (nil, nil) when the event is not found on any relay (a normal condition,

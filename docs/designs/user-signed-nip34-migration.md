@@ -7,7 +7,7 @@ Status: **Proposed** (rev. 2 — corrected: NIP-34 *does* define kinds 1618/1619
 Phases (see §9). Each is implemented by a dedicated agent, verified, and committed before the next.
 
 - [x] **Phase A** (phase1-w24) — Persistent NIP-46 signer foundation ✅ `internal/signer` (encrypted grants + BunkerClient pool + SignWithGrant)
-- [ ] **Phase B** (phase1-s0f) — Outbound signing queue
+- [x] **Phase B** (phase1-s0f) — Outbound signing queue ✅ `internal/outbox` (persistent, dedup, retry/backoff/dead-letter, admin endpoint)
 - [ ] **Phase C** (phase1-tu6) — Owner-authored events (30618) user-signed
 - [ ] **Phase D** (phase1-5ud) — Contributor signer grants
 - [ ] **Phase E** (phase1-xwx) — Full NIP-34 tag-schema compliance

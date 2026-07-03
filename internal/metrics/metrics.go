@@ -23,6 +23,10 @@ var ciWorkflowRunsFailed atomic.Int64
 var webhookEventsReceived atomic.Int64
 var webhookEventsPublished atomic.Int64
 var webhookEventsFailed atomic.Int64
+var outboxQueueDepth atomic.Int64
+var outboxPublished atomic.Int64
+var outboxRetried atomic.Int64
+var outboxDeadLettered atomic.Int64
 
 func IncAnnouncementReceived() {
 	announcementEventsReceived.Add(1)
@@ -108,6 +112,25 @@ func IncWebhookEventsFailed() {
 	webhookEventsFailed.Add(1)
 }
 
+func SetOutboxQueueDepth(depth int64) {
+	if depth < 0 {
+		depth = 0
+	}
+	outboxQueueDepth.Store(depth)
+}
+
+func IncOutboxPublished() {
+	outboxPublished.Add(1)
+}
+
+func IncOutboxRetried() {
+	outboxRetried.Add(1)
+}
+
+func IncOutboxDeadLettered() {
+	outboxDeadLettered.Add(1)
+}
+
 func Snapshot() map[string]int64 {
 	return map[string]int64{
 		"announcement_events_received":    announcementEventsReceived.Load(),
@@ -120,16 +143,20 @@ func Snapshot() map[string]int64 {
 		"auth_verify_failure":             authVerifyFailure.Load(),
 		"auth_replay_rejected":            authReplayRejected.Load(),
 		"auth_user_provisioned":           authUserProvisioned.Load(),
-		"nip46_sessions_initiated":         nip46SessionsInitiated.Load(),
-		"nip46_sessions_completed":         nip46SessionsCompleted.Load(),
-		"nip46_sessions_failed":            nip46SessionsFailed.Load(),
-		"nip55_challenges_issued":          nip55ChallengesIssued.Load(),
-		"nip55_verify_success":             nip55VerifySuccess.Load(),
-		"nip55_verify_failure":             nip55VerifyFailure.Load(),
-		"ci_workflow_runs_published":       ciWorkflowRunsPublished.Load(),
-		"ci_workflow_runs_failed":          ciWorkflowRunsFailed.Load(),
-		"webhook_events_received":          webhookEventsReceived.Load(),
-		"webhook_events_published":         webhookEventsPublished.Load(),
-		"webhook_events_failed":            webhookEventsFailed.Load(),
+		"nip46_sessions_initiated":        nip46SessionsInitiated.Load(),
+		"nip46_sessions_completed":        nip46SessionsCompleted.Load(),
+		"nip46_sessions_failed":           nip46SessionsFailed.Load(),
+		"nip55_challenges_issued":         nip55ChallengesIssued.Load(),
+		"nip55_verify_success":            nip55VerifySuccess.Load(),
+		"nip55_verify_failure":            nip55VerifyFailure.Load(),
+		"ci_workflow_runs_published":      ciWorkflowRunsPublished.Load(),
+		"ci_workflow_runs_failed":         ciWorkflowRunsFailed.Load(),
+		"webhook_events_received":         webhookEventsReceived.Load(),
+		"webhook_events_published":        webhookEventsPublished.Load(),
+		"webhook_events_failed":           webhookEventsFailed.Load(),
+		"outbox_queue_depth":              outboxQueueDepth.Load(),
+		"outbox_published":                outboxPublished.Load(),
+		"outbox_retried":                  outboxRetried.Load(),
+		"outbox_dead_lettered":            outboxDeadLettered.Load(),
 	}
 }

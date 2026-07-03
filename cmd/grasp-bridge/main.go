@@ -20,6 +20,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
+	"github.com/sharegap/grasp-gitea/internal/outbox"
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
@@ -92,7 +93,6 @@ func main() {
 	} else {
 		logger.Info("persistent NIP-46 signer service disabled", "reason", "SIGNER_MASTER_KEY not configured")
 	}
-	_ = signerSvc // constructed for later signing phases; no event paths are routed through it in Phase A.
 
 	proactiveSyncDone := make(chan struct{})
 	go func() {
@@ -114,18 +114,30 @@ func main() {
 	}()
 	logger.Info("refs/nostr lifecycle reaper started", "ttl", refsnostr.DefaultAcceptanceTTL.String(), "interval", refsnostr.DefaultSweepInterval.String())
 
-	// Create the publisher (signs & publishes NIP-34 events on mirror sync).
+	// Create the publisher. Bridge signing requires BRIDGE_NSEC, but Phase-B
+	// outbox publishing only needs relay URLs because events are already signed.
 	var publisherSvc *publisher.Service
-	if cfg.MirrorPublishEnabled() {
+	if cfg.MirrorPublishEnabled() || (signerSvc != nil && signerSvc.Enabled()) {
 		publisherSvc, err = publisher.New(cfg.BridgeNsec, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
 		if err != nil {
 			logger.Error("failed to create publisher", "error", err)
 			os.Exit(1)
 		}
-		if cfg.CIEnabled {
+		if cfg.CIEnabled && publisherSvc.Enabled() {
 			publisherSvc.SetCIConfig(true, cfg.CITriggerRepos)
 			logger.Info("CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
 		}
+	}
+
+	var outboxDone chan struct{}
+	if signerSvc != nil && signerSvc.Enabled() && publisherSvc != nil {
+		outboxWorker := outbox.New(st, signerSvc, publisherSvc, logger)
+		outboxDone = make(chan struct{})
+		go func() {
+			defer close(outboxDone)
+			outboxWorker.Run(ctx)
+		}()
+		logger.Info("outbound signing queue worker started")
 	}
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
@@ -145,7 +157,7 @@ func main() {
 	}
 
 	// Wire webhook handler for NIP-34 events (PRs, issues, patches, labels)
-	if publisherSvc != nil && cfg.GiteaWebhookSecret != "" {
+	if publisherSvc != nil && publisherSvc.Enabled() && cfg.GiteaWebhookSecret != "" {
 		webhookHandler := webhook.New(publisherSvc, st, cfg.GiteaWebhookSecret, logger)
 		apiServer.SetWebhookHandler(webhookHandler)
 		logger.Info("Gitea webhook handler enabled for NIP-34 events")
@@ -237,6 +249,13 @@ func main() {
 	case <-refsNostrReaperDone:
 	case <-shutdownCtx.Done():
 		logger.Warn("refs/nostr lifecycle reaper did not stop before shutdown timeout")
+	}
+	if outboxDone != nil {
+		select {
+		case <-outboxDone:
+		case <-shutdownCtx.Done():
+			logger.Warn("outbound signing queue worker did not stop before shutdown timeout")
+		}
 	}
 	logger.Info("grasp-bridge stopped")
 }

@@ -57,6 +57,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", method(http.MethodGet, s.health))
 	mux.HandleFunc("/metrics", method(http.MethodGet, s.requireAuth(s.metrics)))
 	mux.HandleFunc("/mappings", method(http.MethodGet, s.requireAuth(s.mappings)))
+	mux.HandleFunc("/outbound-events", method(http.MethodGet, s.requireAuth(s.outboundEvents)))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.requireAuth(s.manualProvision)))
 	mux.HandleFunc("/internal/mirror-sync", method(http.MethodPost, s.requireMirrorAuth(s.mirrorSync)))
 
