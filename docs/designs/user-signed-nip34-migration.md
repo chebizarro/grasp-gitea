@@ -1,6 +1,6 @@
 # Design: Migrate to Fully User-Signed, NIP-34-Compliant Repositories
 
-Status: **Proposed** · Owner: bridge team · Supersedes the current gateway-signing model
+Status: **Proposed** (rev. 2 — corrected: NIP-34 *does* define kinds 1618/1619 PR/PR-update; they are kept, and the real gap is their tag schema) · Owner: bridge team · Supersedes the current gateway-signing model
 
 ## 1. Objective
 
@@ -22,7 +22,7 @@ Signing model today (`internal/publisher`, `internal/webhook`):
 | 30617 | repo announcement | **owner** (cached + rebroadcast verbatim) | owner ✅ |
 | 30618 | repo state | **bridge** (`BRIDGE_NSEC`) | owner ✗ |
 | 1617 | patch | contributor (reacted to, not signed) | contributor ✅ |
-| 1618/1619 | PR open/update *(non-standard)* | **bridge** | contributor ✗ + not NIP-34 |
+| 1618/1619 | PR open / PR update | **bridge** | contributor ✗ (NIP-34 kinds, but tag schema non-compliant) |
 | 1621 | issue | **bridge** | contributor ✗ |
 | 1630–1633 | status | **bridge** | actor ✗ |
 | 1985 | NIP-32 label | **bridge** | labeler ✗ |
@@ -110,7 +110,7 @@ material security improvement (§8).
 | 30617 announcement | owner | unchanged (cache + rebroadcast owner-signed) | already correct |
 | 30618 state | owner | queue → owner grant → sign → publish | if owner offline, state publish is deferred+retried |
 | 1617 patch | contributor | ingest contributor-signed; for Gitea-web patches, sign with actor grant | never bridge-signed |
-| 1618/1619 PR | — | **deprecate**; model PRs as 1617 patch-sets + status | see §6 |
+| 1618/1619 PR | actor | queue → actor grant; **keep** (NIP-34 kinds); fix tag schema | see §6 |
 | 1621 issue | actor | queue → actor grant | fallback policy for unlinked actors (§9-D) |
 | 1630–1633 status | actor/maintainer | queue → actor grant; proper e/a/p/r markers | |
 | 1985 label | labeler/maintainer | queue → labeler grant | |
@@ -119,10 +119,16 @@ material security improvement (§8).
 
 ## 6. Full NIP-34 compliance expansion
 
-1. **Patch-based pull requests.** Replace the non-standard 1618/1619 kinds with NIP-34 patch
-   sets: 1617 with `a` (repo addr), `r` (euc), `p` (recipients/maintainers), `t`
-   (`root`/`root-revision`), `commit`, `parent-commit`, `commit-pgp-sig`, `committer`, and
-   revision threading. Use `go-nostr/nip34.Patch`.
+1. **Bring PRs, patches, issues, and status to the NIP-34 tag schema.** NIP-34 defines BOTH
+   patches (1617) and pull requests (1618 open / 1619 update) as first-class kinds — keep
+   both. Gaps in what we currently emit: PR/issue use `title` where the spec wants `subject`;
+   PR `r` carries a human path instead of the earliest-unique-commit (`euc`); PRs omit `c`
+   (tip commit-id), `clone`, and `branch-name`, and emit non-spec `head`/`base` tags; 1619
+   updates omit the required `E`/`P` reference to the PR being updated (and close/reopen should
+   be **status** events, not 1619); patches (1617) need `t root`/`root-revision`, `commit`,
+   `parent-commit`, `commit-pgp-sig`, `committer`; status (1630-1633) needs `e` root/reply
+   markers plus `q`/`merge-commit`/`applied-as-commits`; replies use NIP-22 (kind 1111). Use
+   the `go-nostr/nip34` helpers (`Repository`/`Patch`/`RepositoryState`).
 2. **Earliest-unique-commit (euc)** `r` tag as the stable cross-fork repo identity; compute at
    provisioning and thread through announcements/patches.
 3. **Maintainers** — populate the `maintainers` tag on announcements and honor multi-maintainer
@@ -174,8 +180,10 @@ key (env-provided; e.g. NaCl secretbox / age). Plaintext keys are never persiste
 - **Phase D — Contributor grants.** Reusable NIP-46 login → persistent grant; Gitea user →
   pubkey → grant; sign 1617/1621/status/label with the acting user's grant; explicit fallback
   policy for unlinked actors (queue-until-linked vs reject vs operator-attributed).
-- **Phase E — NIP-34 compliance.** Patch-based PR model (retire 1618/1619); euc; maintainers;
-  NIP-22 comments; status threading.
+- **Phase E — NIP-34 compliance.** Fix tag schemas for PRs (1618/1619 — **kept**, they are
+  NIP-34 kinds), patches (1617), issues (1621), and status (1630-1633) to match the spec
+  (`subject`, euc `r`, `c`/`clone`/`branch-name`, `E`/`P` on PR updates, patch commit tags,
+  status `e` markers); add euc, maintainers, and NIP-22 (1111) comments.
 - **Phase F — Bidirectional sync (Nostr → Gitea).** Ingest collaboration kinds scoped by repo
   `a`; reflect into Gitea; echo-loop prevention.
 - **Phase G — Migration, compat & docs.** Deprecation window for 1618/1619; backfill/migration
@@ -187,8 +195,10 @@ key (env-provided; e.g. NaCl secretbox / age). Plaintext keys are never persiste
   queue depth/age. Consider optional NIP-46 "always-online" signer guidance.
 - **Contributor onboarding friction.** Every acting contributor needs a signer; the fallback
   policy (Phase D) is a product decision, not just engineering.
-- **Non-standard 1618/1619 already emitted.** Needs a compat/deprecation window and a migration
-  note for existing consumers.
+- **Tag-schema change for already-emitted 1618/1619/1621.** Existing events used
+  `title`/`head`/`base`/`action`; moving to spec tags (`subject`/`c`/`clone`/`branch-name`/
+  `E`/`P`) is a consumer-visible change that needs a compat note (the kinds themselves are
+  unchanged and remain valid NIP-34).
 - **Echo loops.** Gitea webhook → Nostr and Nostr → Gitea can loop; require idempotency and
   source-tagging (extend `processed_events`, tag bridge-origin writes) so reflected events are
   not re-ingested.
