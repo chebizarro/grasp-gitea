@@ -25,6 +25,7 @@ type Server struct {
 	mirrorCallbackToken string
 	webhookHandler      http.Handler // Gitea webhook handler for NIP-34 events
 	routeRegistrars     []func(*http.ServeMux)
+	giteaURL            string
 }
 
 func New(cfg config.Config, provisionerSvc *provisioner.Service, publisherSvc *publisher.Service, st *store.SQLiteStore, logger *slog.Logger) *Server {
@@ -35,6 +36,7 @@ func New(cfg config.Config, provisionerSvc *provisioner.Service, publisherSvc *p
 		logger:              logger,
 		apiToken:            cfg.AdminAPIToken,
 		mirrorCallbackToken: cfg.MirrorCallbackToken,
+		giteaURL:            cfg.GiteaURL,
 	}
 }
 
@@ -57,7 +59,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/mappings", method(http.MethodGet, s.requireAuth(s.mappings)))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.requireAuth(s.manualProvision)))
 	mux.HandleFunc("/internal/mirror-sync", method(http.MethodPost, s.requireMirrorAuth(s.mirrorSync)))
-	
+
 	// Gitea webhook endpoint for NIP-34 events (PRs, issues, patches, labels)
 	if s.webhookHandler != nil {
 		mux.Handle("/webhook/gitea", s.webhookHandler)
@@ -66,6 +68,8 @@ func (s *Server) Handler() http.Handler {
 	for _, register := range s.routeRegistrars {
 		register(mux)
 	}
+
+	mux.HandleFunc("/", s.gitHTTPNpubProxy)
 
 	return mux
 }
