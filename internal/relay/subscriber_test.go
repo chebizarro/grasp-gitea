@@ -85,4 +85,7 @@ func TestKindConstants(t *testing.T) {
 	if KindRepositoryState != 30618 {
 		t.Errorf("KindRepositoryState: expected 30618, got %d", KindRepositoryState)
 	}
+	if KindNIP22Comment != 1111 {
+		t.Errorf("KindNIP22Comment: expected 1111, got %d", KindNIP22Comment)
+	}
 }

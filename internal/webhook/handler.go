@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
+	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -150,6 +152,9 @@ func (h *Handler) handlePush(ctx context.Context, body []byte) error {
 	if strings.HasPrefix(p.Ref, "refs/nostr/") {
 		eventID := strings.TrimPrefix(p.Ref, "refs/nostr/")
 		if err := h.handlePatchPush(ctx, eventID, p, mapping); err != nil {
+			if errors.Is(err, refsnostr.ErrDifferingTip) {
+				return err
+			}
 			h.logger.Warn("webhook: patch event handling failed (non-fatal)", "event_id", eventID, "error", err)
 		}
 	}
@@ -361,10 +366,6 @@ func (h *Handler) handleLabel(ctx context.Context, body []byte) error {
 func (h *Handler) handlePatchPush(ctx context.Context, eventID string, p PushPayload, mapping store.Mapping) error {
 	h.logger.Info("webhook: patch push detected", "event_id", eventID, "repo", mapping.RepoID)
 
-	if h.pub == nil {
-		return fmt.Errorf("publisher not configured")
-	}
-
 	// A refs/nostr/<id> ref must carry a 32-byte hex event id; anything else
 	// would produce a malformed "e" tag, so skip status emission.
 	if len(eventID) != 64 {
@@ -376,17 +377,54 @@ func (h *Handler) handlePatchPush(ctx context.Context, eventID string, p PushPay
 		return nil
 	}
 
-	// Best-effort: fetch the referenced patch event so we can attribute the
-	// applied status to its author and validate its kind. Failure is non-fatal.
+	if p.After == "" || strings.Trim(p.After, "0") == "" {
+		if h.store != nil {
+			if err := h.store.DeletePendingNostrRef(ctx, mapping.GiteaRepoID, eventID); err != nil {
+				h.logger.Warn("webhook: failed to clear pending refs/nostr deletion", "event_id", eventID, "error", err)
+			}
+		}
+		return nil
+	}
+
+	// Best-effort: fetch the referenced event so we can reject known differing
+	// tips and attribute the applied status to a kind:1617 patch author. Fetch
+	// failures are non-fatal, but a relay event that lists only other c-tag tips
+	// is treated as a rejected refs/nostr push for lifecycle purposes.
 	var patch *nostr.Event
-	if fetched, err := h.pub.FetchEvent(ctx, eventID); err != nil {
-		h.logger.Warn("webhook: fetch patch event failed (continuing)", "event_id", eventID, "error", err)
-	} else if fetched == nil {
+	var fetched *nostr.Event
+	if h.pub != nil {
+		var err error
+		fetched, err = refsnostr.FetchEventForTip(ctx, h.pub, eventID, p.After)
+		if err != nil {
+			if errors.Is(err, refsnostr.ErrDifferingTip) {
+				return fmt.Errorf("reject refs/nostr push %s at %s: %w", eventID, p.After, err)
+			}
+			h.logger.Warn("webhook: fetch patch event failed (continuing)", "event_id", eventID, "error", err)
+		}
+	}
+	if fetched == nil {
 		h.logger.Info("webhook: patch event not found on relays; emitting applied status from push metadata", "event_id", eventID)
 	} else if fetched.Kind != KindPatch {
 		h.logger.Warn("webhook: refs/nostr referenced event is not a kind:1617 patch", "event_id", eventID, "kind", fetched.Kind)
 	} else {
 		patch = fetched
+	}
+
+	if h.store != nil {
+		if err := h.store.RecordPendingNostrRef(ctx, store.PendingNostrRef{
+			EventID:     eventID,
+			TipSHA:      p.After,
+			GiteaRepoID: mapping.GiteaRepoID,
+			Owner:       mapping.Owner,
+			RepoName:    mapping.RepoName,
+			FirstSeenAt: time.Now().UTC(),
+		}); err != nil {
+			return fmt.Errorf("record pending refs/nostr ref: %w", err)
+		}
+	}
+
+	if h.pub == nil {
+		return fmt.Errorf("publisher not configured")
 	}
 
 	tags := nostr.Tags{

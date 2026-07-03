@@ -17,6 +17,26 @@ server {
 
     client_max_body_size 1g;
 
+    # GRASP-01 CORS Support: fixed CORS headers on all git smart-HTTP
+    # responses and 204 No Content preflight handling for info/refs,
+    # upload-pack, and receive-pack.
+    location ~ ^/.+\.git/(info/refs|git-upload-pack|git-receive-pack)$ {
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Methods "GET, POST" always;
+        add_header Access-Control-Allow-Headers "Content-Type" always;
+
+        if ($request_method = OPTIONS) {
+            return 204;
+        }
+
+        proxy_pass http://gitea:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     location / {
         proxy_pass http://gitea:3000;
         proxy_http_version 1.1;

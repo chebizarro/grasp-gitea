@@ -12,5 +12,6 @@ const (
 	KindStatusApplied          = 1631
 	KindStatusClosed           = 1632
 	KindStatusDraft            = 1633
+	KindNIP22Comment           = 1111
 	KindNIP32Label             = 1985
 )

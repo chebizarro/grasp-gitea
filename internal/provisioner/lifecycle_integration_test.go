@@ -163,7 +163,8 @@ func newTestService(t *testing.T) (*Service, *store.SQLiteStore, *testGiteaServe
 	t.Cleanup(func() { st.Close() })
 
 	cfg := config.Config{
-		ClonePrefix: "https://git.example.com",
+		ClonePrefix:  "https://git.example.com",
+		HookRelayURL: "ws://localhost:3334",
 	}
 	giteaClient := gitea.NewClient(srv.URL, "test-token")
 	hookInstaller := hooks.NewInstaller(reposDir, "/usr/local/bin/grasp-pre-receive", "ws://localhost:3334")
@@ -181,11 +182,21 @@ const testSecretKey = "0123456789abcdef0123456789abcdef0123456789abcdef012345678
 // makeSignedAnnouncementEvent creates a properly signed kind:30617 event.
 func makeSignedAnnouncementEvent(t *testing.T, repoID, cloneURL string) *nostr.Event {
 	t.Helper()
+	return makeSignedAnnouncementEventWithRelays(t, repoID, cloneURL, []string{"ws://localhost:3334"})
+}
+
+func makeSignedAnnouncementEventWithRelays(t *testing.T, repoID, cloneURL string, relayURLs []string) *nostr.Event {
+	t.Helper()
 	tags := nostr.Tags{
 		{"d", repoID},
 	}
 	if cloneURL != "" {
 		tags = append(tags, nostr.Tag{"clone", cloneURL})
+	}
+	if len(relayURLs) > 0 {
+		relaysTag := nostr.Tag{"relays"}
+		relaysTag = append(relaysTag, relayURLs...)
+		tags = append(tags, relaysTag)
 	}
 	ev := &nostr.Event{
 		Kind:      relay.KindRepositoryAnnouncement,
@@ -249,6 +260,54 @@ func TestAnnouncementProvisionsNewRepo(t *testing.T) {
 	}
 }
 
+func TestAnnouncementRejectsMissingServiceRelay(t *testing.T) {
+	svc, st, state, _ := newTestService(t)
+	ctx := context.Background()
+
+	ev := makeSignedAnnouncementEventWithRelays(t, "missing-relay", "https://git.example.com/whatever/missing-relay.git", []string{"ws://other-relay:3334"})
+	err := svc.HandleAnnouncementEvent(ctx, ev, "ws://relay")
+	if err == nil {
+		t.Fatal("expected rejection when announcement relays tag omits this service")
+	}
+	if !strings.Contains(err.Error(), "relays tags") {
+		t.Errorf("expected relays tag error, got: %v", err)
+	}
+
+	mappings, mapErr := st.ListMappings(ctx)
+	if mapErr != nil {
+		t.Fatal(mapErr)
+	}
+	if len(mappings) != 0 {
+		t.Fatalf("expected no mapping for rejected announcement, got %d", len(mappings))
+	}
+
+	state.mu.Lock()
+	repoCount := len(state.repos)
+	state.mu.Unlock()
+	if repoCount != 0 {
+		t.Errorf("expected no repo to be provisioned, got %d", repoCount)
+	}
+}
+
+func TestAnnouncementArchiveModeSkipsServiceRelayRequirement(t *testing.T) {
+	svc, st, _, _ := newTestService(t)
+	svc.cfg.ArchiveMode = true
+	ctx := context.Background()
+
+	ev := makeSignedAnnouncementEventWithRelays(t, "archive-relay-skip", "https://git.example.com/whatever/archive-relay-skip.git", nil)
+	if err := svc.HandleAnnouncementEvent(ctx, ev, "ws://relay"); err != nil {
+		t.Fatalf("archive mode should skip relays-tag rejection: %v", err)
+	}
+
+	mappings, err := st.ListMappings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mappings) != 1 {
+		t.Fatalf("expected mapping to be provisioned in archive mode, got %d", len(mappings))
+	}
+}
+
 func TestDuplicateEventIsIgnored(t *testing.T) {
 	svc, st, state, _ := newTestService(t)
 	ctx := context.Background()
@@ -286,6 +345,7 @@ func TestDuplicateEventIsIgnored(t *testing.T) {
 
 func TestAnnouncementArchivesRemovedClone(t *testing.T) {
 	svc, st, state, _ := newTestService(t)
+	svc.cfg.ArchiveMode = true
 	ctx := context.Background()
 
 	// First: provision with matching clone URL.
@@ -426,6 +486,7 @@ func TestAllowlistBlocksUnauthorized(t *testing.T) {
 
 	cfg := config.Config{
 		ClonePrefix:     "https://git.example.com",
+		HookRelayURL:    "ws://localhost:3334",
 		PubkeyAllowlist: map[string]struct{}{"allowed-pubkey": {}},
 	}
 	giteaClient := gitea.NewClient(srv.URL, "test-token")
@@ -462,6 +523,7 @@ func TestRateLimitBlocksExcessive(t *testing.T) {
 
 	cfg := config.Config{
 		ClonePrefix:        "https://git.example.com",
+		HookRelayURL:       "ws://localhost:3334",
 		ProvisionRateLimit: 1, // allow only 1 provision per hour
 	}
 	giteaClient := gitea.NewClient(srv.URL, "test-token")

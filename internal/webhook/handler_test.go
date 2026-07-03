@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,9 +19,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -447,6 +450,52 @@ func TestPatchPush_EmitsAppliedStatus(t *testing.T) {
 	// Repo state is still published for the push.
 	if len(fake.republished) != 1 {
 		t.Errorf("expected repo-state republish, got %v", fake.republished)
+	}
+}
+
+func TestPatchPush_RecordsPendingRef(t *testing.T) {
+	h, _, st := newTestHandler(t, "")
+	seedMapping(t, st)
+
+	post(t, h, "push", patchPush(testPatchEventID), "")
+
+	pending, err := st.ListPendingNostrRefsOlderThan(context.Background(), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ListPendingNostrRefsOlderThan: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending rows = %d, want 1", len(pending))
+	}
+	if pending[0].EventID != testPatchEventID || pending[0].TipSHA != testCommitSHA || pending[0].GiteaRepoID != testGiteaID {
+		t.Fatalf("unexpected pending row: %#v", pending[0])
+	}
+}
+
+func TestPatchPush_DifferingRelayTipRejected(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	fake.fetchResult = &nostr.Event{
+		Kind: KindPatch,
+		Tags: nostr.Tags{{"c", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+	}
+	mapping, err := st.GetMappingByGiteaRepoID(context.Background(), testGiteaID)
+	if err != nil {
+		t.Fatalf("mapping: %v", err)
+	}
+
+	err = h.handlePatchPush(context.Background(), testPatchEventID, patchPush(testPatchEventID), mapping)
+	if !errors.Is(err, refsnostr.ErrDifferingTip) {
+		t.Fatalf("expected ErrDifferingTip, got %v", err)
+	}
+	if fake.firstOfKind(KindStatusApplied) != nil {
+		t.Fatalf("differing tip should not emit applied status")
+	}
+	pending, err := st.ListPendingNostrRefsOlderThan(context.Background(), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ListPendingNostrRefsOlderThan: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("differing tip should not be recorded pending, got %#v", pending)
 	}
 }
 

@@ -5,5 +5,5 @@ bin/
 .env
 
 # Compiled binaries
-grasp-bridge
-grasp-pre-receive
+/grasp-bridge
+/grasp-pre-receive

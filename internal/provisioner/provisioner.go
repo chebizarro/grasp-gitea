@@ -110,6 +110,10 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 
 	cloneURL, ok := findCloneForPrefix(ev.Tags, s.cfg.ClonePrefix)
 	if !ok {
+		if !s.cfg.ArchiveMode {
+			metrics.IncAnnouncementRejected()
+			return fmt.Errorf("announcement %s does not list this service in clone tags", ev.ID)
+		}
 		exists, err := s.store.MappingExists(ctx, npub, repoID)
 		if err != nil {
 			metrics.IncAnnouncementRejected()
@@ -136,6 +140,10 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 	if !cloneMatchesRepoID(cloneURL, repoID) {
 		metrics.IncAnnouncementRejected()
 		return fmt.Errorf("announcement %s clone URL does not match repo id %s", ev.ID, repoID)
+	}
+	if !s.cfg.ArchiveMode && !hasRelayForService(ev.Tags, s.cfg.HookRelayURL) {
+		metrics.IncAnnouncementRejected()
+		return fmt.Errorf("announcement %s does not list this service in relays tags", ev.ID)
 	}
 
 	if err := s.provisionFromAnnouncement(ctx, npub, ev.PubKey, repoID, cloneURL, ev.ID, relayURL); err != nil {
@@ -363,6 +371,28 @@ func findCloneForPrefix(tags nostr.Tags, clonePrefix string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func hasRelayForService(tags nostr.Tags, serviceRelayURL string) bool {
+	serviceRelayURL = normalizeRelayURL(serviceRelayURL)
+	if serviceRelayURL == "" {
+		return false
+	}
+	for _, tag := range tags {
+		if len(tag) < 2 || tag[0] != "relays" {
+			continue
+		}
+		for _, relayURL := range tag[1:] {
+			if normalizeRelayURL(relayURL) == serviceRelayURL {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizeRelayURL(relayURL string) string {
+	return strings.TrimRight(strings.TrimSpace(relayURL), "/")
 }
 
 func cloneMatchesRepoID(cloneURL string, repoID string) bool {

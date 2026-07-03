@@ -244,6 +244,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.EmbeddedRelayPort != 3334 {
 		t.Errorf("default EmbeddedRelayPort: got %d", cfg.EmbeddedRelayPort)
 	}
+	if cfg.ArchiveMode {
+		t.Error("default ArchiveMode should be false")
+	}
 }
 
 func TestLoadOverridesAllFields(t *testing.T) {
@@ -262,6 +265,7 @@ func TestLoadOverridesAllFields(t *testing.T) {
 		"EMBEDDED_RELAY":          "true",
 		"EMBEDDED_RELAY_PORT":     "4000",
 		"EMBEDDED_RELAY_DB":       "/tmp/relay-db",
+		"GRASP05_ARCHIVE_MODE":    "true",
 		"ADMIN_API_TOKEN":         "admin-secret",
 	})
 
@@ -293,6 +297,9 @@ func TestLoadOverridesAllFields(t *testing.T) {
 	}
 	if cfg.AdminAPIToken != "admin-secret" {
 		t.Errorf("AdminAPIToken: got %q", cfg.AdminAPIToken)
+	}
+	if !cfg.ArchiveMode {
+		t.Error("ArchiveMode should be true")
 	}
 }
 
@@ -397,11 +404,11 @@ func TestParseAllowlist(t *testing.T) {
 
 func TestAuthEnabledRequiresBridgePublicURL(t *testing.T) {
 	setEnvs(t, map[string]string{
-		"GITEA_ADMIN_TOKEN":  "tok",
-		"CLONE_PREFIX":       "https://git.example.com",
-		"RELAY_URLS":         "wss://relay",
-		"AUTH_ENABLED":       "true",
-		"BRIDGE_PUBLIC_URL":  "",
+		"GITEA_ADMIN_TOKEN": "tok",
+		"CLONE_PREFIX":      "https://git.example.com",
+		"RELAY_URLS":        "wss://relay",
+		"AUTH_ENABLED":      "true",
+		"BRIDGE_PUBLIC_URL": "",
 	})
 
 	_, err := Load()
@@ -412,11 +419,11 @@ func TestAuthEnabledRequiresBridgePublicURL(t *testing.T) {
 
 func TestAuthEnabledWithPublicURL(t *testing.T) {
 	setEnvs(t, map[string]string{
-		"GITEA_ADMIN_TOKEN":  "tok",
-		"CLONE_PREFIX":       "https://git.example.com",
-		"RELAY_URLS":         "wss://relay",
-		"AUTH_ENABLED":       "true",
-		"BRIDGE_PUBLIC_URL":  "https://bridge.example.com/",
+		"GITEA_ADMIN_TOKEN": "tok",
+		"CLONE_PREFIX":      "https://git.example.com",
+		"RELAY_URLS":        "wss://relay",
+		"AUTH_ENABLED":      "true",
+		"BRIDGE_PUBLIC_URL": "https://bridge.example.com/",
 	})
 
 	cfg, err := Load()

@@ -4,3 +4,12 @@ MAX_USERNAME_LENGTH = 70
 [server]
 ; Set ROOT_URL to match your CLONE_PREFIX value.
 ROOT_URL = https://git.example.com
+
+[git.config]
+; GRASP-01 git advertisement: advertise partial clone filtering and SHA-1-in-want support.
+; Gitea maps this to uploadpack.allowfilter and uploadpack.allowAnySHA1InWant.
+uploadpack.allowFilter = true
+uploadpack.allowAnySHA1InWant = true
+; For strict literal GRASP-01 compliance, operators may also set these per served repo:
+;   git -C /path/to/repo.git config uploadpack.allowTipSHA1InWant true
+;   git -C /path/to/repo.git config uploadpack.allowReachableSHA1InWant true

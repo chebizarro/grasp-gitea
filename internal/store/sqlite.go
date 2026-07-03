@@ -69,6 +69,18 @@ type Mapping struct {
 	LastStatePublishedAt          time.Time `json:"last_state_published_at,omitempty"`
 }
 
+// PendingNostrRef tracks an observed refs/nostr/<event-id> push until the
+// relay accepts a matching PR/PR-update event or the lifecycle reaper deletes
+// the temporary ref.
+type PendingNostrRef struct {
+	EventID     string    `json:"event_id"`
+	TipSHA      string    `json:"tip_sha"`
+	GiteaRepoID int64     `json:"gitea_repo_id"`
+	Owner       string    `json:"owner"`
+	RepoName    string    `json:"repo_name"`
+	FirstSeenAt time.Time `json:"first_seen_at"`
+}
+
 type SQLiteStore struct {
 	db *sql.DB
 }
@@ -99,6 +111,15 @@ func Open(path string) (*SQLiteStore, error) {
 			pubkey TEXT NOT NULL,
 			kind INTEGER NOT NULL,
 			seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS pending_nostr_refs (
+			event_id TEXT NOT NULL,
+			tip_sha TEXT NOT NULL,
+			gitea_repo_id INTEGER NOT NULL,
+			owner TEXT NOT NULL,
+			repo_name TEXT NOT NULL,
+			first_seen_at TEXT NOT NULL,
+			PRIMARY KEY (gitea_repo_id, event_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS auth_challenges (
 			nonce TEXT PRIMARY KEY,
@@ -159,6 +180,7 @@ func Open(path string) (*SQLiteStore, error) {
 
 	// Index for looking up mappings by Gitea repo ID (used by mirror sync callback).
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_mappings_gitea_repo_id ON mappings(gitea_repo_id)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_nostr_refs_first_seen_at ON pending_nostr_refs(first_seen_at)`)
 
 	return &SQLiteStore{db: db}, nil
 }
@@ -297,6 +319,63 @@ func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string) ([]Ma
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// RecordPendingNostrRef records or refreshes an observed refs/nostr/<event-id>
+// push. Updating first_seen_at on conflict treats a changed/refreshed tip as a
+// new 20-minute acceptance window.
+func (s *SQLiteStore) RecordPendingNostrRef(ctx context.Context, ref PendingNostrRef) error {
+	firstSeen := ref.FirstSeenAt
+	if firstSeen.IsZero() {
+		firstSeen = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO pending_nostr_refs(event_id, tip_sha, gitea_repo_id, owner, repo_name, first_seen_at)
+		VALUES(?, ?, ?, ?, ?, ?)
+		ON CONFLICT(gitea_repo_id, event_id) DO UPDATE SET
+			tip_sha = excluded.tip_sha,
+			owner = excluded.owner,
+			repo_name = excluded.repo_name,
+			first_seen_at = excluded.first_seen_at
+	`, ref.EventID, ref.TipSHA, ref.GiteaRepoID, ref.Owner, ref.RepoName, firstSeen.UTC().Format(time.RFC3339))
+	return err
+}
+
+// ListPendingNostrRefsOlderThan returns pending refs whose acceptance window
+// has expired.
+func (s *SQLiteStore) ListPendingNostrRefsOlderThan(ctx context.Context, cutoff time.Time) ([]PendingNostrRef, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT event_id, tip_sha, gitea_repo_id, owner, repo_name, first_seen_at
+		FROM pending_nostr_refs
+		WHERE first_seen_at <= ?
+		ORDER BY first_seen_at ASC
+	`, cutoff.UTC().Format(time.RFC3339))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PendingNostrRef
+	for rows.Next() {
+		var ref PendingNostrRef
+		var firstSeen string
+		if err := rows.Scan(&ref.EventID, &ref.TipSHA, &ref.GiteaRepoID, &ref.Owner, &ref.RepoName, &firstSeen); err != nil {
+			return nil, err
+		}
+		parsed, parseErr := time.Parse(time.RFC3339, firstSeen)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse first_seen_at for refs/nostr/%s: %w", ref.EventID, parseErr)
+		}
+		ref.FirstSeenAt = parsed
+		out = append(out, ref)
+	}
+	return out, rows.Err()
+}
+
+// DeletePendingNostrRef removes a pending refs/nostr lifecycle row.
+func (s *SQLiteStore) DeletePendingNostrRef(ctx context.Context, giteaRepoID int64, eventID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM pending_nostr_refs WHERE gitea_repo_id = ? AND event_id = ?`, giteaRepoID, eventID)
+	return err
 }
 
 func (s *SQLiteStore) GetMapping(ctx context.Context, npub string, repoID string) (Mapping, error) {

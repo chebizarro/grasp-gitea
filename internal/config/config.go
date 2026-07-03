@@ -23,6 +23,7 @@ type Config struct {
 	EmbeddedRelay        bool
 	EmbeddedRelayPort    int
 	EmbeddedRelayDB      string
+	ArchiveMode          bool
 	AdminAPIToken        string
 	AuthEnabled          bool
 	BridgePublicURL      string
@@ -57,6 +58,7 @@ func Load() (Config, error) {
 		EmbeddedRelay:        boolEnv("EMBEDDED_RELAY", false),
 		EmbeddedRelayPort:    intEnv("EMBEDDED_RELAY_PORT", 3334),
 		EmbeddedRelayDB:      envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
+		ArchiveMode:          boolEnv("GRASP05_ARCHIVE_MODE", false),
 		AdminAPIToken:        strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
 		AuthEnabled:          boolEnv("AUTH_ENABLED", false),
 		BridgePublicURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),

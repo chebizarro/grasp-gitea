@@ -8,12 +8,16 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
 
 // maxResponseSize limits Gitea API response bodies to 10 MB.
 const maxResponseSize = 10 << 20
+
+var safeBareRefName = regexp.MustCompile(`^refs/[A-Za-z0-9._/\-]+$`)
 
 type Client struct {
 	baseURL string
@@ -123,6 +127,25 @@ func (c *Client) GetUser(ctx context.Context, login string) (User, error) {
 		return User{}, err
 	}
 	return parseUser(resp)
+}
+
+// DeleteBareRef deletes ref from a bare repository using git update-ref -d.
+func DeleteBareRef(ctx context.Context, repoPath string, ref string) error {
+	if repoPath == "" {
+		return fmt.Errorf("repo path is required")
+	}
+	if !safeBareRefName.MatchString(ref) || strings.Contains(ref, "..") {
+		return fmt.Errorf("unsafe ref name %q", ref)
+	}
+	out, err := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "update-ref", "-d", ref).CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("delete bare ref %s: %w: %s", ref, err, msg)
+		}
+		return fmt.Errorf("delete bare ref %s: %w", ref, err)
+	}
+	return nil
 }
 
 // CreateUser creates a new Gitea user with the given login, email, and password.

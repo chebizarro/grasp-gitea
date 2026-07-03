@@ -23,6 +23,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
+	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 	"github.com/sharegap/grasp-gitea/internal/webhook"
@@ -78,6 +79,19 @@ func main() {
 	defer shutdownEmbedded(context.Background())
 
 	relayURLs := mergeRelayURLs(cfg.RelayURLs, embeddedRelayURL)
+
+	refsNostrReaper := refsnostr.NewReaper(
+		st,
+		refsnostr.NewRelayChecker(relayURLs, logger),
+		refsnostr.NewGitRefDeleter(cfg.GiteaRepositoriesDir),
+		logger,
+	)
+	refsNostrReaperDone := make(chan struct{})
+	go func() {
+		defer close(refsNostrReaperDone)
+		refsNostrReaper.Run(ctx)
+	}()
+	logger.Info("refs/nostr lifecycle reaper started", "ttl", refsnostr.DefaultAcceptanceTTL.String(), "interval", refsnostr.DefaultSweepInterval.String())
 
 	// Create the publisher (signs & publishes NIP-34 events on mirror sync).
 	var publisherSvc *publisher.Service
@@ -193,5 +207,10 @@ func main() {
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
 	subscriber.Wait()
+	select {
+	case <-refsNostrReaperDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("refs/nostr lifecycle reaper did not stop before shutdown timeout")
+	}
 	logger.Info("grasp-bridge stopped")
 }
