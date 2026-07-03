@@ -4,6 +4,7 @@
 package publisher
 
 import (
+	"context"
 	"testing"
 )
 
@@ -91,5 +92,21 @@ func TestNewServiceInvalidNsec(t *testing.T) {
 	_, err := New("not-an-nsec", nil, nil, "/tmp", nil)
 	if err == nil {
 		t.Fatal("expected error for invalid nsec")
+	}
+}
+
+func TestFetchEventNoRelays(t *testing.T) {
+	svc, err := New("", nil, nil, "/tmp", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// With no relay URLs configured, FetchEvent cannot query anything and
+	// must surface an error rather than silently returning a nil event.
+	ev, err := svc.FetchEvent(context.Background(), "deadbeef")
+	if err == nil {
+		t.Fatal("expected error when no relay URLs are configured")
+	}
+	if ev != nil {
+		t.Fatalf("expected nil event on error, got %v", ev)
 	}
 }

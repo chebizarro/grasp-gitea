@@ -42,6 +42,10 @@ type fakePublisher struct {
 	republished []int64
 	ciPushes    []ciPush
 	failPublish bool
+
+	fetched     []string
+	fetchResult *nostr.Event
+	fetchErr    error
 }
 
 type ciPush struct {
@@ -77,6 +81,13 @@ func (f *fakePublisher) HandleWebhookPushCI(_ context.Context, giteaRepoID int64
 	defer f.mu.Unlock()
 	f.ciPushes = append(f.ciPushes, ciPush{giteaRepoID, ref, before, after})
 	return nil
+}
+
+func (f *fakePublisher) FetchEvent(_ context.Context, id string) (*nostr.Event, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetched = append(f.fetched, id)
+	return f.fetchResult, f.fetchErr
 }
 
 func (f *fakePublisher) kinds() []int {
@@ -366,5 +377,134 @@ func TestNoNpubInSemanticTags(t *testing.T) {
 				t.Errorf("kind %d: semantic tag %q contains bech32 npub: %q", ev.Kind, tag[0], tag[1])
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// refs/nostr/<event-id> patch-push handling (phase1-cwt)
+// ---------------------------------------------------------------------------
+
+const (
+	testPatchEventID   = "1111111111111111111111111111111111111111111111111111111111111111"
+	testPatchAuthorHex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testCommitSHA      = "cafebabecafebabecafebabecafebabecafebabe"
+)
+
+func tagValues(ev *nostr.Event, key string) []string {
+	var out []string
+	for _, tag := range ev.Tags {
+		if len(tag) >= 2 && tag[0] == key {
+			out = append(out, tag[1])
+		}
+	}
+	return out
+}
+
+func firstTagValue(ev *nostr.Event, key string) string {
+	vs := tagValues(ev, key)
+	if len(vs) == 0 {
+		return ""
+	}
+	return vs[0]
+}
+
+func patchPush(eventID string) PushPayload {
+	return PushPayload{
+		Ref:        "refs/nostr/" + eventID,
+		After:      testCommitSHA,
+		Repository: Repository{ID: testGiteaID},
+	}
+}
+
+func TestPatchPush_EmitsAppliedStatus(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	fake.fetchResult = nil // patch not found on relays
+
+	rr := post(t, h, "push", patchPush(testPatchEventID), "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+
+	if len(fake.fetched) != 1 || fake.fetched[0] != testPatchEventID {
+		t.Fatalf("expected FetchEvent(%q), got %v", testPatchEventID, fake.fetched)
+	}
+
+	ev := fake.firstOfKind(KindStatusApplied)
+	if ev == nil {
+		t.Fatalf("expected kind %d (applied) status; got %v", KindStatusApplied, fake.kinds())
+	}
+	assertTagsWellFormed(t, ev)
+	if got := firstTagValue(ev, "e"); got != testPatchEventID {
+		t.Errorf("'e' tag = %q, want patch id %q", got, testPatchEventID)
+	}
+	if got := firstTagValue(ev, "applied-as-commits"); got != testCommitSHA {
+		t.Errorf("'applied-as-commits' = %q, want %q", got, testCommitSHA)
+	}
+	if got := firstTagValue(ev, "p"); got != testPubkeyHex {
+		t.Errorf("'p' tag = %q, want maintainer hex %q", got, testPubkeyHex)
+	}
+	// Repo state is still published for the push.
+	if len(fake.republished) != 1 {
+		t.Errorf("expected repo-state republish, got %v", fake.republished)
+	}
+}
+
+func TestPatchPush_AttributesPatchAuthor(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	fake.fetchResult = &nostr.Event{Kind: KindPatch, PubKey: testPatchAuthorHex}
+
+	post(t, h, "push", patchPush(testPatchEventID), "")
+
+	ev := fake.firstOfKind(KindStatusApplied)
+	if ev == nil {
+		t.Fatalf("expected applied status; got %v", fake.kinds())
+	}
+	ps := tagValues(ev, "p")
+	if len(ps) != 2 {
+		t.Fatalf("expected 2 'p' tags (maintainer + author), got %v", ps)
+	}
+	if ps[0] != testPubkeyHex || ps[1] != testPatchAuthorHex {
+		t.Errorf("'p' tags = %v, want [%s %s]", ps, testPubkeyHex, testPatchAuthorHex)
+	}
+	for _, p := range ps {
+		if !isHex64(p) {
+			t.Errorf("'p' tag not hex64: %q", p)
+		}
+	}
+}
+
+func TestPatchPush_InvalidEventIDSkipsStatus(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+
+	post(t, h, "push", patchPush("not-a-hex-id"), "")
+
+	if fake.firstOfKind(KindStatusApplied) != nil {
+		t.Errorf("malformed refs/nostr id must not emit an applied status")
+	}
+	if len(fake.fetched) != 0 {
+		t.Errorf("should not fetch for malformed id, got %v", fake.fetched)
+	}
+	// The push itself is still processed for repo state.
+	if len(fake.republished) != 1 {
+		t.Errorf("expected repo-state republish, got %v", fake.republished)
+	}
+}
+
+func TestPatchPush_FetchErrorStillEmits(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	fake.fetchErr = fmt.Errorf("relays unreachable")
+
+	post(t, h, "push", patchPush(testPatchEventID), "")
+
+	ev := fake.firstOfKind(KindStatusApplied)
+	if ev == nil {
+		t.Fatalf("applied status should still be emitted on fetch error; got %v", fake.kinds())
+	}
+	if ps := tagValues(ev, "p"); len(ps) != 1 {
+		t.Errorf("fetch error => no author attribution; want 1 'p' tag, got %v", ps)
 	}
 }

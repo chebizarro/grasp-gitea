@@ -44,6 +44,7 @@ type Publisher interface {
 	PublishEvent(ctx context.Context, ev *nostr.Event) error
 	RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) error
 	HandleWebhookPushCI(ctx context.Context, giteaRepoID int64, ref, before, after, sourceRelay string) error
+	FetchEvent(ctx context.Context, id string) (*nostr.Event, error)
 }
 
 // Handler handles inbound Gitea webhook events, maps them to NIP-34 Nostr
@@ -351,16 +352,63 @@ func (h *Handler) handleLabel(ctx context.Context, body []byte) error {
 	return nil
 }
 
-// handlePatchPush handles refs/nostr/<event-id> pushes by fetching or synthesizing
-// a kind:1617 patch event.
+// handlePatchPush handles refs/nostr/<event-id> pushes (the ngit patch
+// workflow). It confirms the referenced kind:1617 patch event on the relays
+// when possible and publishes a kind:1631 (applied) status event that ties the
+// patch to the repository and the commits it landed as. The git ref push is
+// authoritative evidence that the patch was applied, so the applied status is
+// emitted even when the patch event cannot be fetched (e.g. propagation lag).
 func (h *Handler) handlePatchPush(ctx context.Context, eventID string, p PushPayload, mapping store.Mapping) error {
-	// Try to fetch the pre-published patch event from relay
-	// If not found, synthesize a minimal event from push metadata
 	h.logger.Info("webhook: patch push detected", "event_id", eventID, "repo", mapping.RepoID)
 
-	// For now, just log — full implementation would fetch from relay
-	// and emit a kind:1631 (applied) status event
-	return nil
+	if h.pub == nil {
+		return fmt.Errorf("publisher not configured")
+	}
+
+	// A refs/nostr/<id> ref must carry a 32-byte hex event id; anything else
+	// would produce a malformed "e" tag, so skip status emission.
+	if len(eventID) != 64 {
+		h.logger.Warn("webhook: refs/nostr event id is not 64 hex chars, skipping", "event_id", eventID)
+		return nil
+	}
+	if _, err := hex.DecodeString(eventID); err != nil {
+		h.logger.Warn("webhook: refs/nostr event id is not hex, skipping", "event_id", eventID)
+		return nil
+	}
+
+	// Best-effort: fetch the referenced patch event so we can attribute the
+	// applied status to its author and validate its kind. Failure is non-fatal.
+	var patch *nostr.Event
+	if fetched, err := h.pub.FetchEvent(ctx, eventID); err != nil {
+		h.logger.Warn("webhook: fetch patch event failed (continuing)", "event_id", eventID, "error", err)
+	} else if fetched == nil {
+		h.logger.Info("webhook: patch event not found on relays; emitting applied status from push metadata", "event_id", eventID)
+	} else if fetched.Kind != KindPatch {
+		h.logger.Warn("webhook: refs/nostr referenced event is not a kind:1617 patch", "event_id", eventID, "kind", fetched.Kind)
+	} else {
+		patch = fetched
+	}
+
+	tags := nostr.Tags{
+		{"e", eventID},
+		{"a", repoAddr(mapping)},
+		{"p", mapping.Pubkey},
+	}
+	// Record the commit the patch landed as (NIP-34 applied-as-commits).
+	if p.After != "" && strings.Trim(p.After, "0") != "" {
+		tags = append(tags, nostr.Tag{"applied-as-commits", p.After})
+	}
+	// Attribute to the patch author when known and distinct from the maintainer.
+	if patch != nil && patch.PubKey != "" && patch.PubKey != mapping.Pubkey {
+		tags = append(tags, nostr.Tag{"p", patch.PubKey})
+	}
+
+	statusEv := &nostr.Event{
+		Kind:      KindStatusApplied,
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Tags:      tags,
+	}
+	return h.publish(ctx, statusEv)
 }
 
 // PublishNIP32Label publishes a kind:1985 NIP-32 label event that labels the

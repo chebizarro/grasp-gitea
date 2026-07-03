@@ -240,6 +240,43 @@ func (s *Service) PublishEvent(ctx context.Context, ev *nostr.Event) error {
 	return s.publishToRelays(ctx, ev)
 }
 
+// FetchEvent retrieves a single event by ID from the configured relays.
+// It queries relays in order and returns the first match. It returns
+// (nil, nil) when the event is not found on any relay (a normal condition,
+// not an error), and a non-nil error only when no relay could be queried.
+func (s *Service) FetchEvent(ctx context.Context, id string) (*nostr.Event, error) {
+	if len(s.relayURLs) == 0 {
+		return nil, fmt.Errorf("no relay URLs configured")
+	}
+
+	var queried int
+	for _, url := range s.relayURLs {
+		qCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		r, err := nostr.RelayConnect(qCtx, url)
+		if err != nil {
+			cancel()
+			s.logger.Warn("relay connect failed for fetch", "relay", url, "error", err)
+			continue
+		}
+		events, err := r.QuerySync(qCtx, nostr.Filter{IDs: []string{id}, Limit: 1})
+		r.Close()
+		cancel()
+		if err != nil {
+			s.logger.Warn("relay query failed", "relay", url, "event", id, "error", err)
+			continue
+		}
+		queried++
+		if len(events) > 0 {
+			return events[0], nil
+		}
+	}
+
+	if queried == 0 {
+		return nil, fmt.Errorf("event %s: all %d relays unreachable", id, len(s.relayURLs))
+	}
+	return nil, nil // queried successfully but not found
+}
+
 // publishToRelays publishes an event to all configured relays.
 // Returns an error only if no relay accepted the event.
 func (s *Service) publishToRelays(ctx context.Context, ev *nostr.Event) error {
