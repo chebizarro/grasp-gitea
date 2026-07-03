@@ -203,9 +203,9 @@ To test the webhook handler:
 
 ## Future Enhancements
 
-- [ ] Fetch pre-published `kind:1617` patch events from relays
-- [ ] Emit `kind:1631` (applied) status for merged patches
-- [ ] Support for `kind:10317` user repository tracking lists
+- [x] Fetch pre-published `kind:1617` patch events from relays
+- [x] Emit `kind:1631` (applied) status for merged patches
+- [x] Resolve `kind:10317` user GRASP lists as owner-signed only; bridge-originated publishing is intentionally unsupported. See [kind:10317 User GRASP List Design Finding](kind10317-user-grasp-list-design.md).
 - [ ] Webhook event replay/recovery mechanism
 - [ ] Rate limiting for webhook endpoints
 - [ ] Webhook event queue for reliability
