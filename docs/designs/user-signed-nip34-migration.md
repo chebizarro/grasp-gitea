@@ -2,6 +2,34 @@
 
 Status: **Proposed** (rev. 2 — corrected: NIP-34 *does* define kinds 1618/1619 PR/PR-update; they are kept, and the real gap is their tag schema) · Owner: bridge team · Supersedes the current gateway-signing model
 
+## 0. Execution progress & decisions (living checklist — orchestrator-owned)
+
+Phases (see §9). Each is implemented by a dedicated agent, verified, and committed before the next.
+
+- [x] **Phase A** (phase1-w24) — Persistent NIP-46 signer foundation ✅ `internal/signer` (encrypted grants + BunkerClient pool + SignWithGrant)
+- [ ] **Phase B** (phase1-s0f) — Outbound signing queue
+- [ ] **Phase C** (phase1-tu6) — Owner-authored events (30618) user-signed
+- [ ] **Phase D** (phase1-5ud) — Contributor signer grants
+- [ ] **Phase E** (phase1-xwx) — Full NIP-34 tag-schema compliance
+- [ ] **Phase F** (phase1-ki5) — Bidirectional sync (Nostr→Gitea)
+- [ ] **Phase G** (phase1-cmj) — Migration, compat & docs
+- [ ] **10317** (phase1-kyg) — owner-signed grasp-list cache + rebroadcast
+
+**Decisions baked for execution (defaults; flag for later review):**
+
+1. **Contributor fallback (Phase D).** If an acting Gitea user has no linked NIP-46 signer
+   grant, their collaboration event is **queued as pending and NOT published** until they link
+   a signer (`queue-until-linked`). The bridge does **not** fall back to signing user content
+   with `BRIDGE_NSEC` (that would reintroduce the impersonation problem). Behavior is
+   configurable, but the safe default is queue-until-linked; operator-attributed signing stays
+   OFF.
+2. **Offline signer.** Publishing is **eventually-consistent** via the Phase-B queue
+   (retry/backoff, TTL/dead-letter). When an owner/contributor signer is offline, the event is
+   deferred and retried; it is never dropped silently (dead-letter is surfaced via metrics).
+3. **CI (5401)** stays operator-signed (executor attestation), not user-signed.
+4. **Crypto.** Grants encrypted at rest with `golang.org/x/crypto/nacl/secretbox` using a
+   32-byte master key from env (`SIGNER_MASTER_KEY`, base64/hex); plaintext keys never persisted.
+
 ## 1. Objective
 
 Every Nostr event that represents **user-owned or contributor-authored content** must be

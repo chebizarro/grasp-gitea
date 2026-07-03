@@ -7,6 +7,7 @@ require (
 	github.com/fiatjaf/khatru v0.18.1
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/nbd-wtf/go-nostr v0.52.0
+	golang.org/x/crypto v0.36.0
 )
 
 require (

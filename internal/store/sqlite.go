@@ -45,6 +45,21 @@ type NostrIdentityLink struct {
 	LastLoginAt time.Time `json:"last_login_at,omitempty"`
 }
 
+// SignerGrant stores a reusable NIP-46 signing authorization.
+// ClientSeckeyEnc and BunkerURIEnc are ciphertext blobs; plaintext signer
+// secrets and bunker URIs must never be persisted.
+type SignerGrant struct {
+	Pubkey          string
+	ClientSeckeyEnc []byte
+	BunkerURIEnc    []byte
+	Relays          string
+	Permissions     string
+	GrantedAt       time.Time
+	RevokedAt       *time.Time
+	LastOKAt        *time.Time
+	Status          string
+}
+
 type Mapping struct {
 	Npub              string    `json:"npub"`
 	RepoID            string    `json:"repo_id"`
@@ -151,6 +166,17 @@ func Open(path string) (*SQLiteStore, error) {
 			created_at TEXT NOT NULL,
 			expires_at TEXT NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS signer_grants (
+			pubkey TEXT PRIMARY KEY,
+			client_seckey_enc BLOB NOT NULL,
+			bunker_uri_enc BLOB NOT NULL,
+			relays TEXT NOT NULL DEFAULT '',
+			permissions TEXT NOT NULL DEFAULT '',
+			granted_at TEXT NOT NULL,
+			revoked_at TEXT NOT NULL DEFAULT '',
+			last_ok_at TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'active'
+		);`,
 	}
 
 	for _, stmt := range stmts {
@@ -187,6 +213,106 @@ func Open(path string) (*SQLiteStore, error) {
 
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()
+}
+
+// UpsertSignerGrant creates or replaces a durable NIP-46 signer grant.
+func (s *SQLiteStore) UpsertSignerGrant(ctx context.Context, grant SignerGrant) error {
+	if grant.GrantedAt.IsZero() {
+		grant.GrantedAt = time.Now().UTC()
+	}
+	if grant.Status == "" {
+		grant.Status = "active"
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO signer_grants(pubkey, client_seckey_enc, bunker_uri_enc, relays, permissions, granted_at, revoked_at, last_ok_at, status)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(pubkey) DO UPDATE SET
+			client_seckey_enc = excluded.client_seckey_enc,
+			bunker_uri_enc = excluded.bunker_uri_enc,
+			relays = excluded.relays,
+			permissions = excluded.permissions,
+			granted_at = excluded.granted_at,
+			revoked_at = excluded.revoked_at,
+			last_ok_at = excluded.last_ok_at,
+			status = excluded.status
+	`, grant.Pubkey, grant.ClientSeckeyEnc, grant.BunkerURIEnc, grant.Relays, grant.Permissions,
+		grant.GrantedAt.UTC().Format(time.RFC3339), formatOptionalTime(grant.RevokedAt),
+		formatOptionalTime(grant.LastOKAt), grant.Status)
+	return err
+}
+
+// GetSignerGrant returns a stored signer grant by pubkey.
+func (s *SQLiteStore) GetSignerGrant(ctx context.Context, pubkey string) (SignerGrant, error) {
+	var grant SignerGrant
+	var grantedAt, revokedAt, lastOKAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT pubkey, client_seckey_enc, bunker_uri_enc, relays, permissions, granted_at, revoked_at, last_ok_at, status
+		FROM signer_grants WHERE pubkey = ?
+	`, pubkey).Scan(&grant.Pubkey, &grant.ClientSeckeyEnc, &grant.BunkerURIEnc, &grant.Relays,
+		&grant.Permissions, &grantedAt, &revokedAt, &lastOKAt, &grant.Status)
+	if err != nil {
+		return SignerGrant{}, err
+	}
+	var parseErr error
+	grant.GrantedAt, parseErr = time.Parse(time.RFC3339, grantedAt)
+	if parseErr != nil {
+		return SignerGrant{}, fmt.Errorf("parse granted_at for signer grant %s: %w", pubkey, parseErr)
+	}
+	grant.RevokedAt, parseErr = parseOptionalTime(revokedAt)
+	if parseErr != nil {
+		return SignerGrant{}, fmt.Errorf("parse revoked_at for signer grant %s: %w", pubkey, parseErr)
+	}
+	grant.LastOKAt, parseErr = parseOptionalTime(lastOKAt)
+	if parseErr != nil {
+		return SignerGrant{}, fmt.Errorf("parse last_ok_at for signer grant %s: %w", pubkey, parseErr)
+	}
+	return grant, nil
+}
+
+// RevokeSignerGrant marks a signer grant as revoked without deleting its audit row.
+func (s *SQLiteStore) RevokeSignerGrant(ctx context.Context, pubkey string, at time.Time) error {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE signer_grants SET revoked_at = ?, status = 'revoked' WHERE pubkey = ?`, at.UTC().Format(time.RFC3339), pubkey)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// RecordSignerGrantOK updates the last successful signer health/sign timestamp.
+func (s *SQLiteStore) RecordSignerGrantOK(ctx context.Context, pubkey string, at time.Time) error {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE signer_grants SET last_ok_at = ? WHERE pubkey = ?`, at.UTC().Format(time.RFC3339), pubkey)
+	return err
+}
+
+func formatOptionalTime(t *time.Time) string {
+	if t == nil || t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+func parseOptionalTime(raw string) (*time.Time, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
 }
 
 func (s *SQLiteStore) EventProcessed(ctx context.Context, eventID string) (bool, error) {

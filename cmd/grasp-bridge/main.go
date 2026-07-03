@@ -25,6 +25,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/relay"
+	"github.com/sharegap/grasp-gitea/internal/signer"
 	"github.com/sharegap/grasp-gitea/internal/store"
 	"github.com/sharegap/grasp-gitea/internal/webhook"
 )
@@ -79,6 +80,19 @@ func main() {
 	defer shutdownEmbedded(context.Background())
 
 	relayURLs := mergeRelayURLs(cfg.RelayURLs, embeddedRelayURL)
+
+	var signerSvc *signer.Service
+	if cfg.SignerEnabled() {
+		signerSvc, err = signer.NewService(st, cfg.SignerMasterKey)
+		if err != nil {
+			logger.Error("failed to create signer service", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("persistent NIP-46 signer service enabled")
+	} else {
+		logger.Info("persistent NIP-46 signer service disabled", "reason", "SIGNER_MASTER_KEY not configured")
+	}
+	_ = signerSvc // constructed for later signing phases; no event paths are routed through it in Phase A.
 
 	proactiveSyncDone := make(chan struct{})
 	go func() {

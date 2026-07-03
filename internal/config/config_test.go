@@ -4,6 +4,8 @@
 package config
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"os"
 	"testing"
 	"time"
@@ -12,6 +14,9 @@ import (
 // setEnvs sets multiple environment variables and returns a cleanup function.
 func setEnvs(t *testing.T, vars map[string]string) {
 	t.Helper()
+	if _, ok := vars["SIGNER_MASTER_KEY"]; !ok {
+		t.Setenv("SIGNER_MASTER_KEY", "")
+	}
 	for k, v := range vars {
 		t.Setenv(k, v)
 	}
@@ -249,6 +254,54 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.ProactiveSyncInterval != time.Hour {
 		t.Errorf("default ProactiveSyncInterval: got %v", cfg.ProactiveSyncInterval)
+	}
+	if cfg.SignerEnabled() {
+		t.Error("signer should be disabled by default")
+	}
+}
+
+func TestLoadSignerMasterKey(t *testing.T) {
+	key := []byte("12345678901234567890123456789012")
+	for _, tt := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "base64", raw: base64.StdEncoding.EncodeToString(key)},
+		{name: "hex", raw: hex.EncodeToString(key)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setEnvs(t, map[string]string{
+				"GITEA_ADMIN_TOKEN": "tok",
+				"CLONE_PREFIX":      "https://git.example.com",
+				"RELAY_URLS":        "wss://relay",
+				"SIGNER_MASTER_KEY": tt.raw,
+			})
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if !cfg.SignerEnabled() {
+				t.Fatal("signer should be enabled")
+			}
+			if string(cfg.SignerMasterKey) != string(key) {
+				t.Fatalf("decoded signer key mismatch")
+			}
+		})
+	}
+}
+
+func TestLoadSignerMasterKeyInvalid(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok",
+		"CLONE_PREFIX":      "https://git.example.com",
+		"RELAY_URLS":        "wss://relay",
+		"SIGNER_MASTER_KEY": "too-short",
+	})
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected invalid SIGNER_MASTER_KEY error")
 	}
 }
 

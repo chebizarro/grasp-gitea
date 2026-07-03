@@ -1,6 +1,8 @@
 package config
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -29,6 +31,10 @@ type Config struct {
 	BridgePublicURL       string
 	ChallengeTTL          time.Duration
 	ProactiveSyncInterval time.Duration
+
+	// SignerMasterKey enables the persistent NIP-46 signer subsystem when set.
+	// It is decoded from SIGNER_MASTER_KEY (base64 or hex) and must be 32 bytes.
+	SignerMasterKey []byte
 
 	// Mirror republish: bridge signs NIP-34 state events with this key.
 	BridgeNsec          string
@@ -65,12 +71,19 @@ func Load() (Config, error) {
 		BridgePublicURL:       strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
 		ChallengeTTL:          durationEnv("CHALLENGE_TTL", 5*time.Minute),
 		ProactiveSyncInterval: normalizeProactiveSyncInterval(durationEnv("PROACTIVE_SYNC_INTERVAL", time.Hour)),
+		SignerMasterKey:       nil,
 		BridgeNsec:            strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
 		MirrorCallbackToken:   strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
 		GiteaWebhookSecret:    strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
 		CIEnabled:             boolEnv("CI_ENABLED", false),
 		CITriggerRepos:        csvEnv("CI_TRIGGER_REPOS"),
 	}
+
+	signerMasterKey, err := parseSignerMasterKey(os.Getenv("SIGNER_MASTER_KEY"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.SignerMasterKey = signerMasterKey
 
 	if cfg.GiteaAdminToken == "" {
 		return Config{}, fmt.Errorf("GITEA_ADMIN_TOKEN is required")
@@ -99,6 +112,11 @@ func (c Config) AllowlistEnabled() bool {
 // NIP-34 events on mirror sync callbacks.
 func (c Config) MirrorPublishEnabled() bool {
 	return c.BridgeNsec != ""
+}
+
+// SignerEnabled reports whether persistent NIP-46 signer grants can be used.
+func (c Config) SignerEnabled() bool {
+	return len(c.SignerMasterKey) == 32
 }
 
 func envOrDefault(key string, fallback string) string {
@@ -147,6 +165,31 @@ func csvEnv(key string) []string {
 		}
 	}
 	return res
+}
+
+func parseSignerMasterKey(raw string) ([]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	decodeAttempts := []func(string) ([]byte, error){
+		hex.DecodeString,
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+	}
+	var decoded []byte
+	for _, decode := range decodeAttempts {
+		b, err := decode(raw)
+		if err == nil {
+			decoded = b
+			break
+		}
+	}
+	if len(decoded) != 32 {
+		return nil, fmt.Errorf("SIGNER_MASTER_KEY must decode to 32 bytes (base64 or hex)")
+	}
+	return decoded, nil
 }
 
 func durationEnv(key string, fallback time.Duration) time.Duration {
