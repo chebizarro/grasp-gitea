@@ -5,8 +5,45 @@ package publisher
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"testing"
+
+	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip19"
+
+	"github.com/sharegap/grasp-gitea/internal/relay"
 )
+
+func genNsec(t *testing.T) string {
+	t.Helper()
+	sk := nostr.GeneratePrivateKey()
+	nsec, err := nip19.EncodePrivateKey(sk)
+	if err != nil {
+		t.Fatalf("encode nsec: %v", err)
+	}
+	return nsec
+}
+
+func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func firstVal(ev *nostr.Event, key string) (string, bool) {
+	for _, tag := range ev.Tags {
+		if len(tag) >= 2 && tag[0] == key {
+			return tag[1], true
+		}
+	}
+	return "", false
+}
+
+func tagIndex(ev *nostr.Event, key string) int {
+	for i, tag := range ev.Tags {
+		if len(tag) >= 2 && tag[0] == key {
+			return i
+		}
+	}
+	return -1
+}
 
 func TestComputeDigestDeterministic(t *testing.T) {
 	branches := map[string]string{
@@ -92,6 +129,90 @@ func TestNewServiceInvalidNsec(t *testing.T) {
 	_, err := New("not-an-nsec", nil, nil, "/tmp", nil)
 	if err == nil {
 		t.Fatal("expected error for invalid nsec")
+	}
+}
+
+func TestBuildStateEventSignedAndStructured(t *testing.T) {
+	svc, err := New(genNsec(t), nil, nil, "/tmp", discardLogger())
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	owner := "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2"
+	branches := map[string]string{
+		"main": "1111111111111111111111111111111111111111",
+		"dev":  "2222222222222222222222222222222222222222",
+	}
+	tags := map[string]string{"v1.0": "3333333333333333333333333333333333333333"}
+
+	ev, err := svc.buildStateEvent(owner, "myrepo", "main", branches, tags)
+	if err != nil {
+		t.Fatalf("buildStateEvent: %v", err)
+	}
+
+	if ev.Kind != relay.KindRepositoryState {
+		t.Errorf("kind = %d, want %d", ev.Kind, relay.KindRepositoryState)
+	}
+	// State events are a mirror fact asserted by the bridge, so they are signed
+	// by the bridge key (not the owner). The owner is referenced via a 'p' tag.
+	if ev.PubKey != svc.bridgePubKey {
+		t.Errorf("state event pubkey = %q, want bridge key %q", ev.PubKey, svc.bridgePubKey)
+	}
+	if ok, err := ev.CheckSignature(); !ok || err != nil {
+		t.Errorf("state event signature invalid: ok=%v err=%v", ok, err)
+	}
+	if ev.ID == "" {
+		t.Error("signed event must have an ID")
+	}
+
+	want := map[string]string{
+		"d":               "myrepo",
+		"p":               owner,
+		"refs/heads/main": branches["main"],
+		"refs/heads/dev":  branches["dev"],
+		"refs/tags/v1.0":  tags["v1.0"],
+		"HEAD":            "ref: refs/heads/main",
+	}
+	for k, v := range want {
+		got, ok := firstVal(ev, k)
+		if !ok {
+			t.Errorf("missing tag %q", k)
+			continue
+		}
+		if got != v {
+			t.Errorf("tag %q = %q, want %q", k, got, v)
+		}
+	}
+
+	// Branch tags must be emitted in deterministic (sorted) order so the digest
+	// and event content are stable across runs: dev before main.
+	if di, mi := tagIndex(ev, "refs/heads/dev"), tagIndex(ev, "refs/heads/main"); di == -1 || mi == -1 || di > mi {
+		t.Errorf("branch tags not in sorted order: dev@%d main@%d", di, mi)
+	}
+}
+
+func TestBuildStateEventOmitsEmptyOwnerAndHead(t *testing.T) {
+	svc, err := New(genNsec(t), nil, nil, "/tmp", discardLogger())
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	ev, err := svc.buildStateEvent("", "repo", "", map[string]string{}, map[string]string{})
+	if err != nil {
+		t.Fatalf("buildStateEvent: %v", err)
+	}
+
+	if _, ok := firstVal(ev, "p"); ok {
+		t.Error("empty owner pubkey should omit the 'p' tag")
+	}
+	if _, ok := firstVal(ev, "HEAD"); ok {
+		t.Error("empty head should omit the 'HEAD' tag")
+	}
+	if v, _ := firstVal(ev, "d"); v != "repo" {
+		t.Errorf("d tag = %q, want repo", v)
+	}
+	if ok, err := ev.CheckSignature(); !ok || err != nil {
+		t.Errorf("signature invalid: ok=%v err=%v", ok, err)
 	}
 }
 

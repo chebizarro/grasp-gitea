@@ -431,23 +431,11 @@ func (h *Handler) PublishNIP32Label(ctx context.Context, mapping store.Mapping, 
 	return h.publish(ctx, ev)
 }
 
-// PublishAnnouncement publishes a kind:30617 repository announcement event
-// after successful provisioning.
-func (h *Handler) PublishAnnouncement(ctx context.Context, mapping store.Mapping, description string) error {
-	ev := &nostr.Event{
-		Kind:      relay.KindRepositoryAnnouncement,
-		CreatedAt: nostr.Timestamp(time.Now().Unix()),
-		Tags: nostr.Tags{
-			{"d", mapping.RepoID},
-			{"name", mapping.RepoID},
-			{"description", description},
-			{"clone", mapping.CloneURL},
-		},
-		Content: description,
-	}
-
-	return h.publish(ctx, ev)
-}
+// NOTE: kind:30617 repository announcements are NOT minted by the bridge.
+// The owner signs their own announcement; the bridge caches it at provisioning
+// time (provisioner.CacheAnnouncementEvent) and rebroadcasts that owner-signed
+// event verbatim (publisher.republishAnnouncement). A bridge-signed 30617 would
+// misattribute the announcement to the bridge key, so no such method exists here.
 
 func (h *Handler) publishRepoState(ctx context.Context, mapping store.Mapping, repo Repository) error {
 	// Delegate to publisher service for kind:30618
