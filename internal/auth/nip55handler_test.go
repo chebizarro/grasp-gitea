@@ -187,7 +187,10 @@ func TestNIP55CallbackReplayRejected(t *testing.T) {
 func TestNIP55CallbackMissingEvent(t *testing.T) {
 	env := newTestNIP55Env(t)
 
-	resp, _ := http.Post(env.server.URL+"/auth/nip55/callback", "application/json", bytes.NewBufferString(`{}`))
+	resp, err := http.Post(env.server.URL+"/auth/nip55/callback", "application/json", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -213,7 +216,10 @@ func TestNIP55CallbackWrongKind(t *testing.T) {
 	ev.Sign(testSecretKey)
 
 	reqBody, _ := json.Marshal(nip55CallbackRequest{SignedEvent: ev})
-	resp, _ := http.Post(env.server.URL+"/auth/nip55/callback", "application/json", bytes.NewReader(reqBody))
+	resp, err := http.Post(env.server.URL+"/auth/nip55/callback", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
@@ -239,7 +245,10 @@ func TestNIP55CallbackExpiredTimestamp(t *testing.T) {
 	ev.Sign(testSecretKey)
 
 	reqBody, _ := json.Marshal(nip55CallbackRequest{SignedEvent: ev})
-	resp, _ := http.Post(env.server.URL+"/auth/nip55/callback", "application/json", bytes.NewReader(reqBody))
+	resp, err := http.Post(env.server.URL+"/auth/nip55/callback", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
@@ -250,7 +259,10 @@ func TestNIP55CallbackExpiredTimestamp(t *testing.T) {
 func TestNIP55CallbackInvalidJSON(t *testing.T) {
 	env := newTestNIP55Env(t)
 
-	resp, _ := http.Post(env.server.URL+"/auth/nip55/callback", "application/json", bytes.NewBufferString("broken"))
+	resp, err := http.Post(env.server.URL+"/auth/nip55/callback", "application/json", bytes.NewBufferString("broken"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {

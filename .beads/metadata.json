@@ -1,6 +1,5 @@
 {
   "database": "dolt",
-  "jsonl_export": "issues.jsonl",
   "backend": "dolt",
-  "dolt_database": "beads_grasp-gitea"
+  "dolt_database": "beads_grasp_gitea"
 }

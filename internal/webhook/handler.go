@@ -36,10 +36,20 @@ const (
 	KindNIP32Label    = 1985
 )
 
+// Publisher is the subset of *publisher.Service that the webhook handler needs
+// to sign and publish NIP-34 events. It is defined as an interface so the
+// handler can be exercised in tests with a capturing fake instead of a live
+// relay connection.
+type Publisher interface {
+	PublishEvent(ctx context.Context, ev *nostr.Event) error
+	RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) error
+	HandleWebhookPushCI(ctx context.Context, giteaRepoID int64, ref, before, after, sourceRelay string) error
+}
+
 // Handler handles inbound Gitea webhook events, maps them to NIP-34 Nostr
 // events, and publishes via the publisher.
 type Handler struct {
-	pub    *publisher.Service
+	pub    Publisher
 	store  *store.SQLiteStore
 	secret string
 	logger *slog.Logger
@@ -47,7 +57,13 @@ type Handler struct {
 
 // New creates a webhook Handler.
 func New(pub *publisher.Service, st *store.SQLiteStore, secret string, logger *slog.Logger) *Handler {
-	return &Handler{pub: pub, store: st, secret: secret, logger: logger}
+	h := &Handler{store: st, secret: secret, logger: logger}
+	// Guard against a typed-nil *publisher.Service being stored as a non-nil
+	// interface, which would defeat the h.pub == nil checks below.
+	if pub != nil {
+		h.pub = pub
+	}
+	return h
 }
 
 // ServeHTTP handles POST /webhook/gitea.
@@ -192,8 +208,8 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		return nil
 	}
 
-	repoTag := fmt.Sprintf("%s/%s", mapping.Npub, mapping.RepoID)
-	prRef := fmt.Sprintf("%s/pull/%d", repoTag, p.Number)
+	repoAddr := repoAddr(mapping)
+	prRef := fmt.Sprintf("%s/%s/pull/%d", mapping.Npub, mapping.RepoID, p.Number)
 
 	var ev *nostr.Event
 	switch p.Action {
@@ -202,8 +218,8 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 			Kind:      KindPROpen,
 			CreatedAt: nostr.Timestamp(time.Now().Unix()),
 			Tags: nostr.Tags{
-				{"a", repoTag},
-				{"p", mapping.Npub},
+				{"a", repoAddr},
+				{"p", mapping.Pubkey},
 				{"r", prRef},
 				{"title", p.PullRequest.Title},
 				{"head", p.PullRequest.Head.Ref},
@@ -216,8 +232,8 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 			Kind:      KindPRUpdate,
 			CreatedAt: nostr.Timestamp(time.Now().Unix()),
 			Tags: nostr.Tags{
-				{"a", repoTag},
-				{"p", mapping.Npub},
+				{"a", repoAddr},
+				{"p", mapping.Pubkey},
 				{"r", prRef},
 				{"action", p.Action},
 			},
@@ -248,7 +264,8 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Tags: nostr.Tags{
 			{"e", ev.ID},
-			{"p", mapping.Npub},
+			{"a", repoAddr},
+			{"p", mapping.Pubkey},
 		},
 	}
 
@@ -280,15 +297,15 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 		return nil
 	}
 
-	repoTag := fmt.Sprintf("%s/%s", mapping.Npub, mapping.RepoID)
+	repoAddr := repoAddr(mapping)
 
 	ev := &nostr.Event{
 		Kind:      KindIssue,
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Tags: nostr.Tags{
-			{"a", repoTag},
-			{"p", mapping.Npub},
-			{"r", fmt.Sprintf("%s/issue/%d", repoTag, p.Number)},
+			{"a", repoAddr},
+			{"p", mapping.Pubkey},
+			{"r", fmt.Sprintf("%s/%s/issue/%d", mapping.Npub, mapping.RepoID, p.Number)},
 			{"title", p.Issue.Title},
 			{"action", p.Action},
 		},
@@ -312,7 +329,8 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Tags: nostr.Tags{
 			{"e", ev.ID},
-			{"p", mapping.Npub},
+			{"a", repoAddr},
+			{"p", mapping.Pubkey},
 		},
 	}
 
@@ -345,7 +363,10 @@ func (h *Handler) handlePatchPush(ctx context.Context, eventID string, p PushPay
 	return nil
 }
 
-// PublishNIP32Label publishes a kind:1985 NIP-32 label event.
+// PublishNIP32Label publishes a kind:1985 NIP-32 label event that labels the
+// repository the target belongs to. The label references the repo announcement
+// coordinate (30617:<hex-pubkey>:<repo-id>) and records the human-readable
+// target (e.g. "npub/repo/issue/N") in an "r" tag for context.
 func (h *Handler) PublishNIP32Label(ctx context.Context, mapping store.Mapping, targetKind int, targetRef string, label string, namespace string) error {
 	ev := &nostr.Event{
 		Kind:      KindNIP32Label,
@@ -353,8 +374,9 @@ func (h *Handler) PublishNIP32Label(ctx context.Context, mapping store.Mapping, 
 		Tags: nostr.Tags{
 			{"L", namespace},
 			{"l", label, namespace},
-			{"a", fmt.Sprintf("%d:%s:%s", targetKind, mapping.Npub, targetRef)},
-			{"p", mapping.Npub},
+			{"a", repoAddr(mapping)},
+			{"r", targetRef},
+			{"p", mapping.Pubkey},
 		},
 	}
 
@@ -394,10 +416,10 @@ func (h *Handler) publish(ctx context.Context, ev *nostr.Event) error {
 	return h.pub.PublishEvent(ctx, ev)
 }
 
-func splitFullName(fullName string) (owner, repo string) {
-	parts := strings.SplitN(fullName, "/", 2)
-	if len(parts) == 2 {
-		return parts[0], parts[1]
-	}
-	return "", fullName
+// repoAddr returns the NIP-34 addressable coordinate for a repository
+// announcement: "30617:<hex-pubkey>:<repo-id>". This is the canonical
+// reference used in "a" tags of PR, issue, status, and label events so that
+// Nostr clients can resolve them back to the repo announcement.
+func repoAddr(m store.Mapping) string {
+	return fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement, m.Pubkey, m.RepoID)
 }
