@@ -10,6 +10,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,11 +30,19 @@ type reflectorFakeGitea struct {
 	mu       sync.Mutex
 	next     int64
 	issues   map[int64]gitea.Issue
+	pulls    map[int64]reflectorPR
 	comments map[int64][]string
 }
 
+type reflectorPR struct {
+	gitea.PullRequest
+	Head string
+	Base string
+	Body string
+}
+
 func newReflectorFakeGitea() *reflectorFakeGitea {
-	return &reflectorFakeGitea{next: 1, issues: map[int64]gitea.Issue{}, comments: map[int64][]string{}}
+	return &reflectorFakeGitea{next: 1, issues: map[int64]gitea.Issue{}, pulls: map[int64]reflectorPR{}, comments: map[int64][]string{}}
 }
 
 func (f *reflectorFakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -39,7 +50,34 @@ func (f *reflectorFakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/repos/"), "/")
-	if len(parts) < 3 || parts[0] != "org1" || parts[1] != "repo1" || parts[2] != "issues" {
+	if len(parts) < 3 || parts[0] != "org1" || parts[1] != "repo1" {
+		http.NotFound(w, r)
+		return
+	}
+
+	if parts[2] == "pulls" && r.Method == http.MethodPost && len(parts) == 3 {
+		var body struct {
+			Head  string `json:"head"`
+			Base  string `json:"base"`
+			Title string `json:"title"`
+			Body  string `json:"body"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		idx := f.next
+		f.next++
+		pr := reflectorPR{
+			PullRequest: gitea.PullRequest{ID: idx, Index: idx, Number: idx, Title: body.Title, State: "open", HTMLURL: "https://git.example/org1/repo1/pulls/" + strconv.FormatInt(idx, 10)},
+			Head:        body.Head,
+			Base:        body.Base,
+			Body:        body.Body,
+		}
+		f.pulls[idx] = pr
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(pr.PullRequest)
+		return
+	}
+
+	if parts[2] != "issues" {
 		http.NotFound(w, r)
 		return
 	}
@@ -201,6 +239,178 @@ func TestReflectorReflectsIssueCommentStatusAndDedupes(t *testing.T) {
 	fake.mu.Unlock()
 }
 
+func TestReflectorTipPatchCreatesPullRequest(t *testing.T) {
+	for _, kind := range []int{relay.KindPatch, relay.KindPROpen} {
+		t.Run(strconv.Itoa(kind), func(t *testing.T) {
+			ctx := context.Background()
+			st, mapping, coord := newReflectorTestStore(t)
+			repo := setupReflectorGitRepo(t)
+			fake := newReflectorFakeGitea()
+			ts := httptest.NewServer(fake)
+			defer ts.Close()
+
+			r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			actorPriv := nostr.GeneratePrivateKey()
+			ev := signedEvent(t, actorPriv, kind, nostr.Tags{
+				{"a", coord},
+				{"subject", "Tip PR"},
+				{"c", repo.tip},
+				{"clone", repo.workDir},
+				{"branch-name", "feature/tip"},
+			}, "tip body")
+
+			if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err != nil {
+				t.Fatalf("reflect tip patch: %v", err)
+			}
+			fake.mu.Lock()
+			if len(fake.pulls) != 1 {
+				fake.mu.Unlock()
+				t.Fatalf("expected 1 PR, got %d", len(fake.pulls))
+			}
+			pr := fake.pulls[1]
+			fake.mu.Unlock()
+			if pr.Head != "feature/tip" || pr.Base != "main" || pr.Title != "Tip PR" {
+				t.Fatalf("unexpected PR request: %+v", pr)
+			}
+			if !strings.Contains(pr.Body, ev.ID) {
+				t.Fatalf("PR body missing source event id: %q", pr.Body)
+			}
+
+			gotTip := strings.TrimSpace(reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "rev-parse", "refs/heads/feature/tip"))
+			if gotTip != repo.tip {
+				t.Fatalf("head branch tip = %s, want %s", gotTip, repo.tip)
+			}
+			ref, err := st.GetReflectedEvent(ctx, ev.ID)
+			if err != nil {
+				t.Fatalf("get reflected PR row: %v", err)
+			}
+			if ref.GiteaRepoID != mapping.GiteaRepoID || ref.GiteaIndex != 1 || ref.Kind != relay.KindPROpen {
+				t.Fatalf("unexpected reflected row: %+v", ref)
+			}
+		})
+	}
+}
+
+func TestReflectorExistingBranchNameFallsBackToEventBranch(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	actorPriv := nostr.GeneratePrivateKey()
+	ev := signedEvent(t, actorPriv, relay.KindPROpen, nostr.Tags{
+		{"a", coord},
+		{"subject", "Do not overwrite main"},
+		{"c", repo.tip},
+		{"clone", repo.workDir},
+		{"branch-name", "main"},
+	}, "tip body")
+
+	if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err != nil {
+		t.Fatalf("reflect protected branch patch: %v", err)
+	}
+	wantHead := "nostr-pr-" + ev.ID[:12]
+	fake.mu.Lock()
+	pr := fake.pulls[1]
+	fake.mu.Unlock()
+	if pr.Head != wantHead || pr.Base != "main" {
+		t.Fatalf("PR head/base = %q/%q, want %q/main", pr.Head, pr.Base, wantHead)
+	}
+	mainTip := strings.TrimSpace(reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "rev-parse", "refs/heads/main"))
+	if mainTip != repo.base {
+		t.Fatalf("main was moved to %s, want base %s", mainTip, repo.base)
+	}
+	fallbackTip := strings.TrimSpace(reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "rev-parse", "refs/heads/"+wantHead))
+	if fallbackTip != repo.tip {
+		t.Fatalf("fallback branch tip = %s, want %s", fallbackTip, repo.tip)
+	}
+}
+
+func TestReflectorContentPatchAppliesAndCreatesPullRequest(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+
+	patch := reflectorGitOutput(t, repo.workDir, "format-patch", "-1", "--stdout", "HEAD")
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	actorPriv := nostr.GeneratePrivateKey()
+	ev := signedEvent(t, actorPriv, relay.KindPatch, nostr.Tags{
+		{"a", coord},
+		{"subject", "Content patch"},
+		{"branch-name", "content patch"},
+	}, patch)
+
+	if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err != nil {
+		t.Fatalf("reflect content patch: %v", err)
+	}
+	fake.mu.Lock()
+	if len(fake.pulls) != 1 {
+		fake.mu.Unlock()
+		t.Fatalf("expected 1 PR, got %d", len(fake.pulls))
+	}
+	pr := fake.pulls[1]
+	fake.mu.Unlock()
+	if pr.Head != "content-patch" || pr.Base != "main" || pr.Title != "Content patch" {
+		t.Fatalf("unexpected PR request: %+v", pr)
+	}
+	readme := reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "show", "refs/heads/content-patch:README.md")
+	if !strings.Contains(readme, "feature") {
+		t.Fatalf("applied branch README = %q, want feature change", readme)
+	}
+	ref, err := st.GetReflectedEvent(ctx, ev.ID)
+	if err != nil {
+		t.Fatalf("get reflected content PR row: %v", err)
+	}
+	if ref.GiteaIndex != 1 || ref.Kind != relay.KindPROpen {
+		t.Fatalf("unexpected reflected content row: %+v", ref)
+	}
+}
+
+func TestReflectorGarbagePatchFallsBackAndCleansWorktree(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	actorPriv := nostr.GeneratePrivateKey()
+	garbage := "From bad patch\n\ndiff --git a/README.md b/README.md\nthis is not a valid patch\n"
+	ev := signedEvent(t, actorPriv, relay.KindPatch, nostr.Tags{
+		{"a", coord},
+		{"subject", "Bad patch"},
+		{"branch-name", "bad-patch"},
+	}, garbage)
+
+	if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err != nil {
+		t.Fatalf("garbage patch should fall back without crashing: %v", err)
+	}
+	fake.mu.Lock()
+	if len(fake.pulls) != 0 {
+		fake.mu.Unlock()
+		t.Fatalf("garbage patch created PRs: %#v", fake.pulls)
+	}
+	fake.mu.Unlock()
+	ref, err := st.GetReflectedEvent(ctx, ev.ID)
+	if err != nil {
+		t.Fatalf("get reflected fallback row: %v", err)
+	}
+	if ref.GiteaIndex != 0 || ref.Kind != relay.KindPatch {
+		t.Fatalf("unexpected fallback reflected row: %+v", ref)
+	}
+	worktrees := reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "worktree", "list", "--porcelain")
+	if got := strings.Count(worktrees, "worktree "); got != 1 {
+		t.Fatalf("dangling worktrees after failed patch: count=%d output=%s", got, worktrees)
+	}
+}
+
 func TestReflectorRejectsUnverifiedEvent(t *testing.T) {
 	ctx := context.Background()
 	st, _, coord := newReflectorTestStore(t)
@@ -252,6 +462,65 @@ func newReflectorTestStore(t *testing.T) (*store.SQLiteStore, store.Mapping, str
 	}
 	coord := "30617:" + ownerPub + ":" + mapping.RepoID
 	return st, mapping, coord
+}
+
+type reflectorGitRepo struct {
+	repositoriesDir string
+	repoPath        string
+	workDir         string
+	base            string
+	tip             string
+}
+
+func setupReflectorGitRepo(t *testing.T) reflectorGitRepo {
+	t.Helper()
+	tmp := t.TempDir()
+	work := filepath.Join(tmp, "work")
+	repositoriesDir := filepath.Join(tmp, "git", "repositories")
+	repoPath := filepath.Join(repositoriesDir, "org1", "repo1.git")
+	reflectorGit(t, tmp, "init", "-b", "main", work)
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("root\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	reflectorGit(t, work, "add", "README.md")
+	reflectorGit(t, work, "commit", "-m", "root")
+	base := strings.TrimSpace(reflectorGitOutput(t, work, "rev-parse", "HEAD"))
+	if err := os.MkdirAll(filepath.Dir(repoPath), 0o755); err != nil {
+		t.Fatalf("mkdir repo parent: %v", err)
+	}
+	reflectorGit(t, tmp, "clone", "--bare", work, repoPath)
+
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("root\nfeature\n"), 0o644); err != nil {
+		t.Fatalf("write feature README: %v", err)
+	}
+	reflectorGit(t, work, "add", "README.md")
+	reflectorGit(t, work, "commit", "-m", "feature")
+	tip := strings.TrimSpace(reflectorGitOutput(t, work, "rev-parse", "HEAD"))
+	return reflectorGitRepo{repositoriesDir: repositoriesDir, repoPath: repoPath, workDir: work, base: base, tip: tip}
+}
+
+func reflectorGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	_ = reflectorGitOutput(t, dir, args...)
+}
+
+func reflectorGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Tester",
+		"GIT_AUTHOR_EMAIL=tester@example.com",
+		"GIT_COMMITTER_NAME=Tester",
+		"GIT_COMMITTER_EMAIL=tester@example.com",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed in %s: %v\n%s", strings.Join(args, " "), dir, err, string(out))
+	}
+	return string(out)
 }
 
 func signedEvent(t *testing.T, priv string, kind int, tags nostr.Tags, content string) *nostr.Event {

@@ -47,6 +47,6 @@ Watch these metrics:
 - CI `5401` events remain operator-signed by `BRIDGE_NSEC`.
 - Contributor events from unlinked actors are skipped and counted as `unlinked_actor_skipped`; they are not bridge-signed and are not backfilled after the actor links a signer.
 - Historical `BRIDGE_NSEC`-signed events are not re-signed.
-- Full patch-apply to a branch remains deferred; Phase F records refs/nostr tips and reflects supported issue/comment/status state only (`phase1-ki5`).
+- Nostr patches/PRs (1617/1618) are reflected as Gitea pull requests (tip fetch or `git am` apply → head branch → Gitea PR) (`phase1-2gq`); issue/comment/status reflection is also supported (`phase1-ki5`). PR-update (1619) tip updates remain a follow-up.
 - `maintainers` on `30617` is owner-driven; the bridge will not add it.
 - Kind `10317` owner-list cache/rebroadcast is tracked separately (`phase1-kyg`).

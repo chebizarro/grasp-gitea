@@ -28,6 +28,7 @@ func subscriptionFilters() []nostr.Filter {
 		KindUserGraspList,
 		KindNIP22Comment,
 		KindPatch,
+		KindPROpen,
 		KindIssue,
 		KindStatusOpen,
 		KindStatusApplied,

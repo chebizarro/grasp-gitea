@@ -268,6 +268,16 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		return nil
 	}
 
+	if p.Action == "opened" {
+		index := p.Number
+		if index == 0 {
+			index = p.PullRequest.Number
+		}
+		if h.wasReflected(ctx, mapping.GiteaRepoID, index, KindPROpen, "pr") {
+			return nil
+		}
+	}
+
 	euc := h.eucForRepo(ctx, mapping, p.Repository, p.PullRequest.Base.Ref)
 
 	switch p.Action {

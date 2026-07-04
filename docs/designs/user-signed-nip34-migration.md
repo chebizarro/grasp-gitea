@@ -11,7 +11,7 @@ Phases (see §9). Each is implemented by a dedicated agent, verified, and commit
 - [x] **Phase C** (phase1-tu6) — Owner-authored events (30618) user-signed ✅ enqueued owner-signed via outbox; `/signer/authorize`; bridge-signed fallback
 - [x] **Phase D** (phase1-5ud) — Contributor signer grants ✅ NIP-46 login persists reusable grant; webhook events enqueued under acting user; unlinked → skip (no bridge-sign)
 - [x] **Phase E** (phase1-xwx) — Full NIP-34 tag-schema compliance ✅ subject/c/clone/branch-name/euc-r; 1619 tip-only + E/P; status e-markers; NIP-22 1111 comments
-- [x] **Phase F** (phase1-ki5) — Bidirectional sync (Nostr→Gitea) ✅ reflector: 1621→issue, 1111→comment, 1630/1632→state; echo-loop guard; patch-apply deferred
+- [x] **Phase F** (phase1-ki5) — Bidirectional sync (Nostr→Gitea) ✅ reflector: 1621→issue, 1111→comment, 1630/1632→state; echo-loop guard; **patch/PR apply → Gitea PR done (phase1-2gq)**
 - [x] **Phase G** (phase1-cmj) — Migration, compat & docs ✅ README/webhook-impl/ops runbook/.env updated to the user-signed model
 - [x] **10317** (phase1-kyg) — owner-signed grasp-list cache + rebroadcast ✅ ingest→cache(replaceable)→verbatim rebroadcast; mint guardrail kept
 

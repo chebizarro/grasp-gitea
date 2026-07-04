@@ -88,7 +88,7 @@ The response includes the authorized user pubkey, bridge client pubkey, relays, 
 
 - Events emitted before this migration and signed by historical `BRIDGE_NSEC` are not re-signed.
 - Events created before a contributor links a signer are not backfilled; unlinked webhook actors are skipped (`phase1-5ud`).
-- Full patch-apply from Nostr to a branch is deferred; Phase F records refs/nostr tips and reflects supported issue/comment/status state only (`phase1-ki5`).
+- Nostr patches/PRs (kind 1617/1618) are reflected as Gitea pull requests: the referenced tip is fetched (or a format-patch is applied via a temporary worktree + `git am`) onto a head branch and a Gitea PR is opened against the base branch (`phase1-2gq`). PR-update (kind 1619) branch-tip updates remain a follow-up.
 - `maintainers` on `30617` is owner-driven; the bridge honors owner announcements and will not add maintainers itself.
 - Kind `10317` owner-list cache/rebroadcast is tracked separately (`phase1-kyg`).
 

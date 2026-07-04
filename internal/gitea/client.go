@@ -50,6 +50,15 @@ type Issue struct {
 	State  string `json:"state"`
 }
 
+type PullRequest struct {
+	ID      int64  `json:"id"`
+	Index   int64  `json:"index"`
+	Number  int64  `json:"number,omitempty"`
+	Title   string `json:"title"`
+	State   string `json:"state"`
+	HTMLURL string `json:"html_url"`
+}
+
 type IssueComment struct {
 	ID   int64  `json:"id"`
 	Body string `json:"body"`
@@ -154,6 +163,21 @@ func (c *Client) CreateIssue(ctx context.Context, owner string, repo string, tit
 		return Issue{}, err
 	}
 	return parseIssue(resp)
+}
+
+// CreatePullRequest creates a Gitea pull request in owner/repo.
+func (c *Client) CreatePullRequest(ctx context.Context, owner string, repo string, head string, base string, title string, body string) (PullRequest, error) {
+	payload := map[string]any{
+		"head":  head,
+		"base":  base,
+		"title": title,
+		"body":  body,
+	}
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/pulls", payload)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	return parsePullRequest(resp)
 }
 
 // CreateIssueComment creates a comment on a Gitea issue or pull request index.
@@ -276,6 +300,20 @@ func parseIssue(resp []byte) (Issue, error) {
 		issue.Number = issue.Index
 	}
 	return issue, nil
+}
+
+func parsePullRequest(resp []byte) (PullRequest, error) {
+	var pr PullRequest
+	if err := json.Unmarshal(resp, &pr); err != nil {
+		return PullRequest{}, fmt.Errorf("decode gitea pull request: %w", err)
+	}
+	if pr.Index == 0 && pr.Number != 0 {
+		pr.Index = pr.Number
+	}
+	if pr.Number == 0 && pr.Index != 0 {
+		pr.Number = pr.Index
+	}
+	return pr, nil
 }
 
 func parseIssueComment(resp []byte) (IssueComment, error) {

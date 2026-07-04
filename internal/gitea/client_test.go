@@ -27,6 +27,7 @@ type fakeGitea struct {
 	repos    map[string]int64
 	users    map[string]fakeUser
 	issues   map[string]map[int64]Issue
+	pulls    map[string]map[int64]PullRequest
 	comments map[string]map[int64][]IssueComment
 	next     int64
 }
@@ -37,6 +38,7 @@ func newFakeGitea() *fakeGitea {
 		repos:    map[string]int64{},
 		users:    map[string]fakeUser{},
 		issues:   map[string]map[int64]Issue{},
+		pulls:    map[string]map[int64]PullRequest{},
 		comments: map[string]map[int64][]IssueComment{},
 		next:     1,
 	}
@@ -112,6 +114,30 @@ func (f *fakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.issues[key][idx] = issue
 			w.WriteHeader(http.StatusCreated)
 			json.NewEncoder(w).Encode(issue)
+			return
+		}
+	}
+
+	// POST /api/v1/repos/:owner/:repo/pulls
+	if r.Method == http.MethodPost && strings.HasPrefix(path, "/api/v1/repos/") && strings.HasSuffix(path, "/pulls") {
+		parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(path, "/api/v1/repos/"), "/pulls"), "/")
+		if len(parts) == 2 {
+			key := parts[0] + "/" + parts[1]
+			if _, ok := f.repos[key]; !ok {
+				http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+				return
+			}
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			idx := f.next
+			f.next++
+			if f.pulls[key] == nil {
+				f.pulls[key] = map[int64]PullRequest{}
+			}
+			pr := PullRequest{ID: idx, Index: idx, Number: idx, Title: body["title"].(string), State: "open", HTMLURL: "https://git.example/" + key + "/pulls/" + fmt.Sprint(idx)}
+			f.pulls[key][idx] = pr
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(pr)
 			return
 		}
 	}
@@ -494,6 +520,22 @@ func TestIsNotFoundExported(t *testing.T) {
 	}
 	if IsNotFound(&HTTPError{StatusCode: 500}) {
 		t.Error("500 should not be not-found")
+	}
+}
+
+func TestCreatePullRequest(t *testing.T) {
+	g := newFakeGitea()
+	g.repos["org1/repo1"] = 10
+	ts := httptest.NewServer(g)
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "tok")
+	pr, err := c.CreatePullRequest(context.Background(), "org1", "repo1", "nostr-pr", "main", "from nostr", "body")
+	if err != nil {
+		t.Fatalf("CreatePullRequest: %v", err)
+	}
+	if pr.Index == 0 || pr.Number != pr.Index || pr.Title != "from nostr" || pr.State != "open" || pr.HTMLURL == "" {
+		t.Fatalf("unexpected pull request: %+v", pr)
 	}
 }
 

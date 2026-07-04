@@ -766,6 +766,37 @@ func TestIssueOpenedSkipsBridgeReflectedObject(t *testing.T) {
 	}
 }
 
+func TestPROpenedSkipsBridgeReflectedObject(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
+		NostrEventID: "nostr-pr-event",
+		GiteaRepoID:  testGiteaID,
+		GiteaIndex:   7,
+		Kind:         KindPROpen,
+	}); err != nil {
+		t.Fatalf("record reflected PR event: %v", err)
+	}
+
+	payload := PullRequestPayload{Action: "opened", Number: 7, Repository: Repository{ID: testGiteaID}}
+	payload.PullRequest.Number = 7
+	payload.PullRequest.Title = "Reflected PR"
+	payload.PullRequest.Body = "already came from Nostr"
+	payload.PullRequest.State = "open"
+	payload.PullRequest.Head.Ref = "nostr-pr"
+	payload.PullRequest.Base.Ref = "main"
+	post(t, h, "pull_request", payload, "")
+
+	if got := fake.kinds(); len(got) != 0 {
+		t.Fatalf("bridge-reflected PR webhook echoed to Nostr: %v", got)
+	}
+
+	post(t, h, "pull_request", payload, "")
+	if got := fake.kinds(); len(got) != 1 || got[0] != KindPROpen {
+		t.Fatalf("expected second PR webhook to publish after guard consumption, got %v", got)
+	}
+}
+
 func TestIssue_LabeledEmitsNIP32Label(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)

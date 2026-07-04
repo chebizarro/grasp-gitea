@@ -108,6 +108,7 @@ func TestSubscriptionFiltersIncludeCollaborationKinds(t *testing.T) {
 		KindUserGraspList,
 		KindNIP22Comment,
 		KindPatch,
+		KindPROpen,
 		KindIssue,
 		KindStatusOpen,
 		KindStatusApplied,
