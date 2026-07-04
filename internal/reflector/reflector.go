@@ -20,6 +20,7 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
@@ -161,10 +162,11 @@ func (r *Reflector) reflectIssue(ctx context.Context, mapping store.Mapping, ev 
 		return false, fmt.Errorf("create Gitea issue returned no index")
 	}
 	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
-		NostrEventID: ev.ID,
-		GiteaRepoID:  mapping.GiteaRepoID,
-		GiteaIndex:   index,
-		Kind:         ev.Kind,
+		NostrEventID:    ev.ID,
+		GiteaRepoID:     mapping.GiteaRepoID,
+		GiteaIndex:      index,
+		Kind:            ev.Kind,
+		EchoFingerprint: echofp.Issue(title, ev.Content),
 	}); err != nil {
 		return false, fmt.Errorf("record reflected issue: %w", err)
 	}
@@ -191,10 +193,11 @@ func (r *Reflector) reflectComment(ctx context.Context, mapping store.Mapping, e
 		return false, fmt.Errorf("create Gitea issue comment: %w", err)
 	}
 	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
-		NostrEventID: ev.ID,
-		GiteaRepoID:  mapping.GiteaRepoID,
-		GiteaIndex:   root.GiteaIndex,
-		Kind:         ev.Kind,
+		NostrEventID:    ev.ID,
+		GiteaRepoID:     mapping.GiteaRepoID,
+		GiteaIndex:      root.GiteaIndex,
+		Kind:            ev.Kind,
+		EchoFingerprint: echofp.Comment(ev.Content),
 	}); err != nil {
 		return false, fmt.Errorf("record reflected comment: %w", err)
 	}
@@ -225,10 +228,11 @@ func (r *Reflector) reflectIssueStatus(ctx context.Context, mapping store.Mappin
 		return false, fmt.Errorf("set Gitea issue state: %w", err)
 	}
 	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
-		NostrEventID: ev.ID,
-		GiteaRepoID:  mapping.GiteaRepoID,
-		GiteaIndex:   root.GiteaIndex,
-		Kind:         ev.Kind,
+		NostrEventID:    ev.ID,
+		GiteaRepoID:     mapping.GiteaRepoID,
+		GiteaIndex:      root.GiteaIndex,
+		Kind:            ev.Kind,
+		EchoFingerprint: echofp.IssueStatus(state),
 	}); err != nil {
 		return false, fmt.Errorf("record reflected status: %w", err)
 	}
@@ -271,7 +275,9 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 		}
 	}
 
-	pr, err := r.gitea.CreatePullRequest(ctx, mapping.Owner, mapping.RepoName, branch, base, patchTitle(ev), patchBody(ev))
+	title := patchTitle(ev)
+	body := patchBody(ev)
+	pr, err := r.gitea.CreatePullRequest(ctx, mapping.Owner, mapping.RepoName, branch, base, title, body)
 	if err != nil {
 		r.logger.Warn("reflector: failed to create Gitea PR for patch; recording only", "event", ev.ID, "branch", branch, "base", base, "error", err)
 		return r.recordPatchOnly(ctx, mapping, ev, tip)
@@ -285,11 +291,12 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 		return r.recordPatchOnly(ctx, mapping, ev, tip)
 	}
 	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
-		NostrEventID: ev.ID,
-		GiteaRepoID:  mapping.GiteaRepoID,
-		GiteaIndex:   index,
-		HeadBranch:   branch,
-		Kind:         relay.KindPROpen,
+		NostrEventID:    ev.ID,
+		GiteaRepoID:     mapping.GiteaRepoID,
+		GiteaIndex:      index,
+		HeadBranch:      branch,
+		Kind:            relay.KindPROpen,
+		EchoFingerprint: echofp.PROpen(title, body),
 	}); err != nil {
 		return false, fmt.Errorf("record reflected patch PR: %w", err)
 	}
@@ -347,11 +354,12 @@ func (r *Reflector) reflectPRUpdate(ctx context.Context, mapping store.Mapping, 
 			return false, nil
 		}
 		if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
-			NostrEventID: ev.ID,
-			GiteaRepoID:  mapping.GiteaRepoID,
-			GiteaIndex:   root.GiteaIndex,
-			HeadBranch:   root.HeadBranch,
-			Kind:         relay.KindPRUpdate,
+			NostrEventID:    ev.ID,
+			GiteaRepoID:     mapping.GiteaRepoID,
+			GiteaIndex:      root.GiteaIndex,
+			HeadBranch:      root.HeadBranch,
+			Kind:            relay.KindPRUpdate,
+			EchoFingerprint: echofp.PRUpdate(tip),
 		}); err != nil {
 			return false, fmt.Errorf("record reflected PR update: %w", err)
 		}

@@ -22,6 +22,7 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
@@ -77,6 +78,8 @@ type Handler struct {
 	actorOutbox     ActorOutbox
 	actorLookup     ActorIdentityLookup
 	repositoriesDir string
+	now             func() time.Time
+	echoGuardWindow time.Duration
 
 	eucMu    sync.Mutex
 	eucCache map[int64]string
@@ -97,7 +100,7 @@ type threadRef struct {
 
 // New creates a webhook Handler.
 func New(pub *publisher.Service, st *store.SQLiteStore, secret string, logger *slog.Logger) *Handler {
-	h := &Handler{store: st, secret: secret, logger: logger, actorLookup: st}
+	h := &Handler{store: st, secret: secret, logger: logger, actorLookup: st, now: time.Now, echoGuardWindow: store.DefaultEchoGuardWindow}
 	// Guard against a typed-nil *publisher.Service being stored as a non-nil
 	// interface, which would defeat the h.pub == nil checks below.
 	if pub != nil {
@@ -275,11 +278,13 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		}
 		kind := KindPROpen
 		scope := "pr"
+		fingerprint := echofp.PROpen(p.PullRequest.Title, p.PullRequest.Body)
 		if p.Action == "synchronized" {
 			kind = KindPRUpdate
 			scope = "pr-update"
+			fingerprint = echofp.PRUpdate(p.PullRequest.Head.SHA)
 		}
-		if h.wasReflected(ctx, mapping.GiteaRepoID, index, kind, scope) {
+		if h.wasReflected(ctx, mapping.GiteaRepoID, index, kind, fingerprint, scope) {
 			return nil
 		}
 	}
@@ -398,7 +403,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, body []byte) error {
 	if commentIndex == 0 {
 		commentIndex = p.PullRequest.Number
 	}
-	if h.wasReflected(ctx, mapping.GiteaRepoID, commentIndex, KindComment, "comment") {
+	if h.wasReflected(ctx, mapping.GiteaRepoID, commentIndex, KindComment, echofp.Comment(p.Comment.Body), "comment") {
 		return nil
 	}
 
@@ -618,26 +623,38 @@ func (h *Handler) shouldSkipReflectedIssueWebhook(ctx context.Context, mapping s
 
 	kind := 0
 	scope := "issue"
+	fingerprint := ""
 	switch p.Action {
 	case "opened", "edited":
 		kind = KindIssue
+		fingerprint = echofp.Issue(p.Issue.Title, p.Issue.Body)
 	case "closed":
 		kind = KindStatusClosed
 		scope = "issue status"
+		fingerprint = echofp.IssueStatus("closed")
 	case "reopened":
 		kind = KindStatusOpen
 		scope = "issue status"
+		fingerprint = echofp.IssueStatus("open")
 	default:
 		return false
 	}
-	return h.wasReflected(ctx, mapping.GiteaRepoID, index, kind, scope)
+	return h.wasReflected(ctx, mapping.GiteaRepoID, index, kind, fingerprint, scope)
 }
 
-func (h *Handler) wasReflected(ctx context.Context, repoID int64, index int64, kind int, scope string) bool {
+func (h *Handler) wasReflected(ctx context.Context, repoID int64, index int64, kind int, fingerprint string, scope string) bool {
 	if h.store == nil || repoID == 0 || index == 0 || kind == 0 {
 		return false
 	}
-	reflected, err := h.store.ConsumeReflectedGiteaEcho(ctx, repoID, index, kind)
+	now := time.Now().UTC()
+	if h.now != nil {
+		now = h.now().UTC()
+	}
+	window := h.echoGuardWindow
+	if window <= 0 {
+		window = store.DefaultEchoGuardWindow
+	}
+	reflected, err := h.store.CheckReflectedGiteaEcho(ctx, repoID, index, kind, fingerprint, now, window)
 	if err != nil {
 		if h.logger != nil {
 			h.logger.Warn("webhook: reflected-event guard lookup failed", "repo_id", repoID, "index", index, "kind", kind, "error", err)

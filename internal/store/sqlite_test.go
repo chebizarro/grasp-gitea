@@ -182,12 +182,15 @@ func TestReflectedEvents(t *testing.T) {
 	}
 	defer st.Close()
 
+	armedAt := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	inserted, err := st.RecordReflectedEvent(ctx, ReflectedEvent{
-		NostrEventID: "ev1",
-		GiteaRepoID:  42,
-		GiteaIndex:   7,
-		HeadBranch:   "feature/tip",
-		Kind:         1621,
+		NostrEventID:    "ev1",
+		GiteaRepoID:     42,
+		GiteaIndex:      7,
+		HeadBranch:      "feature/tip",
+		Kind:            1621,
+		EchoArmedAt:     armedAt,
+		EchoFingerprint: "fp1",
 	})
 	if err != nil {
 		t.Fatalf("record reflected event: %v", err)
@@ -212,7 +215,7 @@ func TestReflectedEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get reflected event: %v", err)
 	}
-	if ref.GiteaRepoID != 42 || ref.GiteaIndex != 7 || ref.HeadBranch != "feature/tip" || ref.Kind != 1621 {
+	if ref.GiteaRepoID != 42 || ref.GiteaIndex != 7 || ref.HeadBranch != "feature/tip" || ref.Kind != 1621 || ref.EchoFingerprint != "fp1" || !ref.EchoArmedAt.Equal(armedAt) {
 		t.Fatalf("unexpected reflected event: %+v", ref)
 	}
 	ok, err := st.WasReflectedGiteaObject(ctx, 42, 7, 1621)
@@ -230,19 +233,33 @@ func TestReflectedEvents(t *testing.T) {
 		t.Fatal("did not expect other kind to match")
 	}
 
-	consumed, err := st.ConsumeReflectedGiteaEcho(ctx, 42, 7, 1621)
+	matched, err := st.CheckReflectedGiteaEcho(ctx, 42, 7, 1621, "fp1", armedAt.Add(time.Minute), 5*time.Minute)
 	if err != nil {
-		t.Fatalf("consume echo: %v", err)
+		t.Fatalf("check echo: %v", err)
 	}
-	if !consumed {
-		t.Fatal("expected first echo consume to match")
+	if !matched {
+		t.Fatal("expected first echo check to match")
 	}
-	consumed, err = st.ConsumeReflectedGiteaEcho(ctx, 42, 7, 1621)
+	matched, err = st.CheckReflectedGiteaEcho(ctx, 42, 7, 1621, "fp1", armedAt.Add(2*time.Minute), 5*time.Minute)
 	if err != nil {
-		t.Fatalf("consume echo again: %v", err)
+		t.Fatalf("check echo again: %v", err)
 	}
-	if consumed {
-		t.Fatal("expected echo guard to be one-shot")
+	if !matched {
+		t.Fatal("duplicate echo should still match inside the window")
+	}
+	matched, err = st.CheckReflectedGiteaEcho(ctx, 42, 7, 1621, "different", armedAt.Add(3*time.Minute), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("check echo mismatch: %v", err)
+	}
+	if matched {
+		t.Fatal("different fingerprint must not match inside the window")
+	}
+	matched, err = st.CheckReflectedGiteaEcho(ctx, 42, 7, 1621, "fp1", armedAt.Add(6*time.Minute), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("check expired echo: %v", err)
+	}
+	if matched {
+		t.Fatal("expired guard must not match")
 	}
 }
 
@@ -273,12 +290,65 @@ func TestNostrObjectMappingDoesNotArmEchoGuard(t *testing.T) {
 	if ref.GiteaIndex != 9 {
 		t.Fatalf("unexpected mapping: %+v", ref)
 	}
-	consumed, err := st.ConsumeReflectedGiteaEcho(ctx, 42, 9, 1621)
+	matched, err := st.CheckReflectedGiteaEcho(ctx, 42, 9, 1621, "", time.Now().UTC(), 5*time.Minute)
 	if err != nil {
-		t.Fatalf("consume echo: %v", err)
+		t.Fatalf("check echo: %v", err)
 	}
-	if consumed {
+	if matched {
 		t.Fatal("Gitea-origin mapping must not arm echo guard")
+	}
+}
+
+func TestDisarmExpiredEchoGuards(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	armedAt := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	if _, err := st.RecordReflectedEvent(ctx, ReflectedEvent{
+		NostrEventID:    "old",
+		GiteaRepoID:     42,
+		GiteaIndex:      7,
+		Kind:            1621,
+		EchoArmedAt:     armedAt,
+		EchoFingerprint: "fp",
+	}); err != nil {
+		t.Fatalf("record old guard: %v", err)
+	}
+	if _, err := st.RecordReflectedEvent(ctx, ReflectedEvent{
+		NostrEventID:    "fresh",
+		GiteaRepoID:     42,
+		GiteaIndex:      8,
+		Kind:            1621,
+		EchoArmedAt:     armedAt.Add(4 * time.Minute),
+		EchoFingerprint: "fp2",
+	}); err != nil {
+		t.Fatalf("record fresh guard: %v", err)
+	}
+
+	disarmed, err := st.DisarmExpiredEchoGuards(ctx, armedAt.Add(6*time.Minute), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("disarm expired guards: %v", err)
+	}
+	if disarmed != 1 {
+		t.Fatalf("disarmed = %d, want 1", disarmed)
+	}
+	matched, err := st.CheckReflectedGiteaEcho(ctx, 42, 7, 1621, "fp", armedAt.Add(6*time.Minute), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("check old guard: %v", err)
+	}
+	if matched {
+		t.Fatal("old guard should be disarmed")
+	}
+	matched, err = st.CheckReflectedGiteaEcho(ctx, 42, 8, 1621, "fp2", armedAt.Add(6*time.Minute), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("check fresh guard: %v", err)
+	}
+	if !matched {
+		t.Fatal("fresh guard should remain armed")
 	}
 }
 

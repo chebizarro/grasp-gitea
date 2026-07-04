@@ -26,6 +26,7 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -740,11 +741,16 @@ func TestIssue_OpenedEmitsNIP34Schema(t *testing.T) {
 func TestIssueOpenedSkipsBridgeReflectedObject(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	h.now = func() time.Time { return now }
+	h.echoGuardWindow = 5 * time.Minute
 	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
-		NostrEventID: "nostr-issue-event",
-		GiteaRepoID:  testGiteaID,
-		GiteaIndex:   3,
-		Kind:         KindIssue,
+		NostrEventID:    "nostr-issue-event",
+		GiteaRepoID:     testGiteaID,
+		GiteaIndex:      3,
+		Kind:            KindIssue,
+		EchoArmedAt:     now,
+		EchoFingerprint: echofp.Issue("Reflected issue", "already came from Nostr"),
 	}); err != nil {
 		t.Fatalf("record reflected event: %v", err)
 	}
@@ -753,27 +759,59 @@ func TestIssueOpenedSkipsBridgeReflectedObject(t *testing.T) {
 	payload.Issue.Title = "Reflected issue"
 	payload.Issue.Body = "already came from Nostr"
 	post(t, h, "issues", payload, "")
+	post(t, h, "issues", payload, "")
 
 	if got := fake.kinds(); len(got) != 0 {
-		t.Fatalf("bridge-reflected issue webhook echoed to Nostr: %v", got)
+		t.Fatalf("duplicate bridge-reflected issue webhooks echoed to Nostr: %v", got)
 	}
 
-	// The guard is one-shot: later genuine Gitea activity on the same issue/kind
-	// is not suppressed forever by the reflected_events mapping row.
+	now = now.Add(6 * time.Minute)
 	post(t, h, "issues", payload, "")
 	if got := fake.kinds(); len(got) != 1 || got[0] != KindIssue {
-		t.Fatalf("expected second webhook to publish after guard consumption, got %v", got)
+		t.Fatalf("expected webhook to publish after guard expiry, got %v", got)
+	}
+}
+
+func TestIssueOpenedDifferentContentWithinWindowPublishes(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	h.now = func() time.Time { return now }
+	h.echoGuardWindow = 5 * time.Minute
+	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
+		NostrEventID:    "nostr-issue-event",
+		GiteaRepoID:     testGiteaID,
+		GiteaIndex:      3,
+		Kind:            KindIssue,
+		EchoArmedAt:     now,
+		EchoFingerprint: echofp.Issue("Reflected issue", "already came from Nostr"),
+	}); err != nil {
+		t.Fatalf("record reflected event: %v", err)
+	}
+
+	payload := IssuePayload{Action: "opened", Number: 3, Repository: Repository{ID: testGiteaID}}
+	payload.Issue.Title = "Reflected issue"
+	payload.Issue.Body = "genuine user edit"
+	post(t, h, "issues", payload, "")
+
+	if got := fake.kinds(); len(got) != 1 || got[0] != KindIssue {
+		t.Fatalf("fingerprint mismatch should publish, got %v", got)
 	}
 }
 
 func TestPROpenedSkipsBridgeReflectedObject(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	h.now = func() time.Time { return now }
+	h.echoGuardWindow = 5 * time.Minute
 	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
-		NostrEventID: "nostr-pr-event",
-		GiteaRepoID:  testGiteaID,
-		GiteaIndex:   7,
-		Kind:         KindPROpen,
+		NostrEventID:    "nostr-pr-event",
+		GiteaRepoID:     testGiteaID,
+		GiteaIndex:      7,
+		Kind:            KindPROpen,
+		EchoArmedAt:     now,
+		EchoFingerprint: echofp.PROpen("Reflected PR", "already came from Nostr"),
 	}); err != nil {
 		t.Fatalf("record reflected PR event: %v", err)
 	}
@@ -786,27 +824,28 @@ func TestPROpenedSkipsBridgeReflectedObject(t *testing.T) {
 	payload.PullRequest.Head.Ref = "nostr-pr"
 	payload.PullRequest.Base.Ref = "main"
 	post(t, h, "pull_request", payload, "")
+	post(t, h, "pull_request", payload, "")
 
 	if got := fake.kinds(); len(got) != 0 {
-		t.Fatalf("bridge-reflected PR webhook echoed to Nostr: %v", got)
-	}
-
-	post(t, h, "pull_request", payload, "")
-	if got := fake.kinds(); len(got) != 1 || got[0] != KindPROpen {
-		t.Fatalf("expected second PR webhook to publish after guard consumption, got %v", got)
+		t.Fatalf("duplicate bridge-reflected PR webhooks echoed to Nostr: %v", got)
 	}
 }
 
 func TestPRSynchronizedSkipsBridgeReflectedUpdateOnce(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	h.now = func() time.Time { return now }
+	h.echoGuardWindow = 5 * time.Minute
 	h.rememberThread("pr", testGiteaID, 7, threadRef{EventID: "root-pr-event", Pubkey: testActorPubkeyHex, Kind: KindPROpen})
 	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
-		NostrEventID: "nostr-pr-update-event",
-		GiteaRepoID:  testGiteaID,
-		GiteaIndex:   7,
-		HeadBranch:   "nostr-pr",
-		Kind:         KindPRUpdate,
+		NostrEventID:    "nostr-pr-update-event",
+		GiteaRepoID:     testGiteaID,
+		GiteaIndex:      7,
+		HeadBranch:      "nostr-pr",
+		Kind:            KindPRUpdate,
+		EchoArmedAt:     now,
+		EchoFingerprint: echofp.PRUpdate("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
 	}); err != nil {
 		t.Fatalf("record reflected PR update event: %v", err)
 	}
@@ -817,14 +856,69 @@ func TestPRSynchronizedSkipsBridgeReflectedUpdateOnce(t *testing.T) {
 	payload.PullRequest.Head.Ref = "nostr-pr"
 	payload.PullRequest.Base.Ref = "main"
 	post(t, h, "pull_request", payload, "")
+	post(t, h, "pull_request", payload, "")
 
 	if got := fake.kinds(); len(got) != 0 {
-		t.Fatalf("bridge-reflected PR-update webhook echoed to Nostr: %v", got)
+		t.Fatalf("duplicate bridge-reflected PR-update webhooks echoed to Nostr: %v", got)
+	}
+}
+
+func TestIssueClosedSkipsBridgeReflectedStatusDuplicates(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	h.now = func() time.Time { return now }
+	h.echoGuardWindow = 5 * time.Minute
+	h.rememberThread("issue", testGiteaID, 3, threadRef{EventID: "root-issue-event", Pubkey: testActorPubkeyHex, Kind: KindIssue})
+	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
+		NostrEventID:    "nostr-status-event",
+		GiteaRepoID:     testGiteaID,
+		GiteaIndex:      3,
+		Kind:            KindStatusClosed,
+		EchoArmedAt:     now,
+		EchoFingerprint: echofp.IssueStatus("closed"),
+	}); err != nil {
+		t.Fatalf("record reflected status event: %v", err)
 	}
 
-	post(t, h, "pull_request", payload, "")
-	if got := fake.kinds(); len(got) != 1 || got[0] != KindPRUpdate {
-		t.Fatalf("expected second synchronized webhook to publish after guard consumption, got %v", got)
+	payload := IssuePayload{Action: "closed", Number: 3, Repository: Repository{ID: testGiteaID}}
+	payload.Issue.Number = 3
+	payload.Issue.State = "closed"
+	post(t, h, "issues", payload, "")
+	post(t, h, "issues", payload, "")
+
+	if got := fake.kinds(); len(got) != 0 {
+		t.Fatalf("duplicate bridge-reflected status webhooks echoed to Nostr: %v", got)
+	}
+}
+
+func TestIssueCommentSkipsBridgeReflectedDuplicates(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	h.now = func() time.Time { return now }
+	h.echoGuardWindow = 5 * time.Minute
+	h.rememberThread("issue", testGiteaID, 3, threadRef{EventID: "root-issue-event", Pubkey: testActorPubkeyHex, Kind: KindIssue})
+	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
+		NostrEventID:    "nostr-comment-event",
+		GiteaRepoID:     testGiteaID,
+		GiteaIndex:      3,
+		Kind:            KindComment,
+		EchoArmedAt:     now,
+		EchoFingerprint: echofp.Comment("comment from Nostr"),
+	}); err != nil {
+		t.Fatalf("record reflected comment event: %v", err)
+	}
+
+	payload := IssueCommentPayload{Action: "created", Repository: Repository{ID: testGiteaID}}
+	payload.Issue.Number = 3
+	payload.Comment.ID = 101
+	payload.Comment.Body = "comment from Nostr"
+	post(t, h, "issue_comment", payload, "")
+	post(t, h, "issue_comment", payload, "")
+
+	if got := fake.kinds(); len(got) != 0 {
+		t.Fatalf("duplicate bridge-reflected comment webhooks echoed to Nostr: %v", got)
 	}
 }
 

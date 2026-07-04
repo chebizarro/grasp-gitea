@@ -141,13 +141,17 @@ type PendingNostrRef struct {
 // materialised into a Gitea object. Webhook handling consults these rows to
 // avoid echoing bridge-created objects back to Nostr.
 type ReflectedEvent struct {
-	NostrEventID string    `json:"nostr_event_id"`
-	GiteaRepoID  int64     `json:"gitea_repo_id"`
-	GiteaIndex   int64     `json:"gitea_index"`
-	HeadBranch   string    `json:"gitea_head_branch,omitempty"`
-	Kind         int       `json:"kind"`
-	CreatedAt    time.Time `json:"created_at"`
+	NostrEventID    string    `json:"nostr_event_id"`
+	GiteaRepoID     int64     `json:"gitea_repo_id"`
+	GiteaIndex      int64     `json:"gitea_index"`
+	HeadBranch      string    `json:"gitea_head_branch,omitempty"`
+	Kind            int       `json:"kind"`
+	CreatedAt       time.Time `json:"created_at"`
+	EchoArmedAt     time.Time `json:"echo_armed_at,omitempty"`
+	EchoFingerprint string    `json:"echo_fingerprint,omitempty"`
 }
+
+const DefaultEchoGuardWindow = 5 * time.Minute
 
 type SQLiteStore struct {
 	db *sql.DB
@@ -188,7 +192,9 @@ func Open(path string) (*SQLiteStore, error) {
 			kind INTEGER NOT NULL,
 			created_at TEXT NOT NULL,
 			echo_pending INTEGER NOT NULL DEFAULT 1,
-			echo_consumed_at TEXT NOT NULL DEFAULT ''
+			echo_consumed_at TEXT NOT NULL DEFAULT '',
+			echo_armed_at TEXT NOT NULL DEFAULT '',
+			echo_fingerprint TEXT NOT NULL DEFAULT ''
 		);`,
 		`CREATE TABLE IF NOT EXISTS pending_nostr_refs (
 			event_id TEXT NOT NULL,
@@ -294,11 +300,14 @@ func Open(path string) (*SQLiteStore, error) {
 	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN gitea_head_branch TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_pending INTEGER NOT NULL DEFAULT 1`)
 	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_consumed_at TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_armed_at TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_fingerprint TEXT NOT NULL DEFAULT ''`)
 
 	// Index for looking up mappings by Gitea repo ID (used by mirror sync callback).
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_mappings_gitea_repo_id ON mappings(gitea_repo_id)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_nostr_refs_first_seen_at ON pending_nostr_refs(first_seen_at)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_reflected_events_gitea_object ON reflected_events(gitea_repo_id, gitea_index, kind)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_reflected_events_echo_guard ON reflected_events(echo_pending, echo_armed_at)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbound_events_due ON outbound_events(state, next_attempt_at, id)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbound_events_created_at ON outbound_events(created_at)`)
 
@@ -686,10 +695,13 @@ func (s *SQLiteStore) RecordReflectedEvent(ctx context.Context, ref ReflectedEve
 	if ref.CreatedAt.IsZero() {
 		ref.CreatedAt = time.Now().UTC()
 	}
+	if ref.EchoArmedAt.IsZero() {
+		ref.EchoArmedAt = time.Now().UTC()
+	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO reflected_events(nostr_event_id, gitea_repo_id, gitea_index, gitea_head_branch, kind, created_at, echo_pending, echo_consumed_at)
-		VALUES(?, ?, ?, ?, ?, ?, 1, '')
-	`, ref.NostrEventID, ref.GiteaRepoID, ref.GiteaIndex, ref.HeadBranch, ref.Kind, ref.CreatedAt.UTC().Format(time.RFC3339))
+		INSERT OR IGNORE INTO reflected_events(nostr_event_id, gitea_repo_id, gitea_index, gitea_head_branch, kind, created_at, echo_pending, echo_consumed_at, echo_armed_at, echo_fingerprint)
+		VALUES(?, ?, ?, ?, ?, ?, 1, '', ?, ?)
+	`, ref.NostrEventID, ref.GiteaRepoID, ref.GiteaIndex, ref.HeadBranch, ref.Kind, ref.CreatedAt.UTC().Format(time.RFC3339), ref.EchoArmedAt.UTC().Format(time.RFC3339), ref.EchoFingerprint)
 	if err != nil {
 		return false, err
 	}
@@ -709,8 +721,8 @@ func (s *SQLiteStore) RecordNostrObjectMapping(ctx context.Context, ref Reflecte
 		ref.CreatedAt = time.Now().UTC()
 	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO reflected_events(nostr_event_id, gitea_repo_id, gitea_index, gitea_head_branch, kind, created_at, echo_pending, echo_consumed_at)
-		VALUES(?, ?, ?, ?, ?, ?, 0, '')
+		INSERT OR IGNORE INTO reflected_events(nostr_event_id, gitea_repo_id, gitea_index, gitea_head_branch, kind, created_at, echo_pending, echo_consumed_at, echo_armed_at, echo_fingerprint)
+		VALUES(?, ?, ?, ?, ?, ?, 0, '', '', '')
 	`, ref.NostrEventID, ref.GiteaRepoID, ref.GiteaIndex, ref.HeadBranch, ref.Kind, ref.CreatedAt.UTC().Format(time.RFC3339))
 	if err != nil {
 		return false, err
@@ -725,11 +737,11 @@ func (s *SQLiteStore) RecordNostrObjectMapping(ctx context.Context, ref Reflecte
 // GetReflectedEvent returns the reflected Gitea object for a Nostr event ID.
 func (s *SQLiteStore) GetReflectedEvent(ctx context.Context, nostrEventID string) (ReflectedEvent, error) {
 	var ref ReflectedEvent
-	var createdAt string
+	var createdAt, echoArmedAt string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT nostr_event_id, gitea_repo_id, gitea_index, gitea_head_branch, kind, created_at
+		SELECT nostr_event_id, gitea_repo_id, gitea_index, gitea_head_branch, kind, created_at, echo_armed_at, echo_fingerprint
 		FROM reflected_events WHERE nostr_event_id = ?
-	`, nostrEventID).Scan(&ref.NostrEventID, &ref.GiteaRepoID, &ref.GiteaIndex, &ref.HeadBranch, &ref.Kind, &createdAt)
+	`, nostrEventID).Scan(&ref.NostrEventID, &ref.GiteaRepoID, &ref.GiteaIndex, &ref.HeadBranch, &ref.Kind, &createdAt, &echoArmedAt, &ref.EchoFingerprint)
 	if err != nil {
 		return ReflectedEvent{}, err
 	}
@@ -738,25 +750,39 @@ func (s *SQLiteStore) GetReflectedEvent(ctx context.Context, nostrEventID string
 		return ReflectedEvent{}, fmt.Errorf("parse reflected event created_at for %s: %w", nostrEventID, parseErr)
 	}
 	ref.CreatedAt = parsed
+	if echoArmedAt != "" {
+		armedAt, parseErr := time.Parse(time.RFC3339, echoArmedAt)
+		if parseErr != nil {
+			return ReflectedEvent{}, fmt.Errorf("parse reflected event echo_armed_at for %s: %w", nostrEventID, parseErr)
+		}
+		ref.EchoArmedAt = armedAt
+	}
 	return ref, nil
 }
 
-// ConsumeReflectedGiteaEcho consumes one pending echo guard for a Gitea
-// repo/index/kind. It returns true only once for each Nostr-origin reflected
-// write, preventing the immediate Gitea webhook echo without suppressing future
-// Gitea-origin activity on the same object.
-func (s *SQLiteStore) ConsumeReflectedGiteaEcho(ctx context.Context, giteaRepoID int64, giteaIndex int64, kind int) (bool, error) {
+// CheckReflectedGiteaEcho reports whether a Gitea webhook matches an armed
+// Nostr-origin echo guard. Matching is non-consuming: duplicate deliveries with
+// the same fingerprint are suppressed throughout the guard window. Expired
+// guards are lazily disarmed before checking.
+func (s *SQLiteStore) CheckReflectedGiteaEcho(ctx context.Context, giteaRepoID int64, giteaIndex int64, kind int, fingerprint string, now time.Time, window time.Duration) (bool, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if window <= 0 {
+		window = DefaultEchoGuardWindow
+	}
+	if _, err := s.DisarmExpiredEchoGuards(ctx, now, window); err != nil {
+		return false, err
+	}
+	cutoff := now.UTC().Add(-window).Format(time.RFC3339)
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE reflected_events
 		SET echo_consumed_at = ?
-		WHERE nostr_event_id = (
-			SELECT nostr_event_id FROM reflected_events
-			WHERE gitea_repo_id = ? AND gitea_index = ? AND kind = ?
-				AND echo_pending = 1 AND echo_consumed_at = ''
-			ORDER BY created_at ASC
-			LIMIT 1
-		)
-	`, time.Now().UTC().Format(time.RFC3339), giteaRepoID, giteaIndex, kind)
+		WHERE gitea_repo_id = ? AND gitea_index = ? AND kind = ?
+			AND echo_pending = 1
+			AND COALESCE(NULLIF(echo_armed_at, ''), created_at) >= ?
+			AND (echo_fingerprint = ? OR echo_fingerprint = '')
+	`, now.UTC().Format(time.RFC3339), giteaRepoID, giteaIndex, kind, cutoff, fingerprint)
 	if err != nil {
 		return false, err
 	}
@@ -765,6 +791,29 @@ func (s *SQLiteStore) ConsumeReflectedGiteaEcho(ctx context.Context, giteaRepoID
 		return false, err
 	}
 	return rows > 0, nil
+}
+
+// DisarmExpiredEchoGuards clears echo guards that are older than the guard
+// window. It is safe to call lazily from webhook checks or periodically from a
+// maintenance loop.
+func (s *SQLiteStore) DisarmExpiredEchoGuards(ctx context.Context, now time.Time, window time.Duration) (int64, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if window <= 0 {
+		window = DefaultEchoGuardWindow
+	}
+	cutoff := now.UTC().Add(-window).Format(time.RFC3339)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE reflected_events
+		SET echo_pending = 0
+		WHERE echo_pending = 1
+			AND COALESCE(NULLIF(echo_armed_at, ''), created_at) < ?
+	`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // WasReflectedGiteaObject reports whether a Gitea repo/index/kind was created

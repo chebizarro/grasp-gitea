@@ -22,6 +22,7 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -165,7 +166,7 @@ func TestReflectorReflectsIssueCommentStatusAndDedupes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get reflected issue row: %v", err)
 	}
-	if ref.GiteaRepoID != mapping.GiteaRepoID || ref.GiteaIndex != 1 || ref.Kind != relay.KindIssue {
+	if ref.GiteaRepoID != mapping.GiteaRepoID || ref.GiteaIndex != 1 || ref.Kind != relay.KindIssue || ref.EchoFingerprint != echofp.Issue("Nostr issue title", "issue body") {
 		t.Fatalf("unexpected reflected issue row: %+v", ref)
 	}
 
@@ -343,14 +344,14 @@ func TestReflectorPRUpdateMovesExistingHeadBranchAndRecordsEchoGuard(t *testing.
 	if err != nil {
 		t.Fatalf("get reflected PR update row: %v", err)
 	}
-	if ref.GiteaRepoID != mapping.GiteaRepoID || ref.GiteaIndex != 7 || ref.HeadBranch != headBranch || ref.Kind != relay.KindPRUpdate {
+	if ref.GiteaRepoID != mapping.GiteaRepoID || ref.GiteaIndex != 7 || ref.HeadBranch != headBranch || ref.Kind != relay.KindPRUpdate || ref.EchoFingerprint != echofp.PRUpdate(newTip) {
 		t.Fatalf("unexpected reflected PR update row: %+v", ref)
 	}
-	consumed, err := st.ConsumeReflectedGiteaEcho(ctx, mapping.GiteaRepoID, 7, relay.KindPRUpdate)
+	matched, err := st.CheckReflectedGiteaEcho(ctx, mapping.GiteaRepoID, 7, relay.KindPRUpdate, echofp.PRUpdate(newTip), time.Now().UTC(), store.DefaultEchoGuardWindow)
 	if err != nil {
-		t.Fatalf("consume reflected PR-update echo: %v", err)
+		t.Fatalf("check reflected PR-update echo: %v", err)
 	}
-	if !consumed {
+	if !matched {
 		t.Fatal("expected PR-update reflected row to arm echo guard")
 	}
 }
