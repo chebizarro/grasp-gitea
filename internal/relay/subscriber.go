@@ -25,6 +25,7 @@ func subscriptionFilters() []nostr.Filter {
 	return []nostr.Filter{{Kinds: []int{
 		KindRepositoryAnnouncement,
 		KindRepositoryState,
+		KindUserGraspList,
 		KindNIP22Comment,
 		KindPatch,
 		KindIssue,

@@ -90,6 +90,17 @@ type OutboundQueueCounts struct {
 	Dead      int64 `json:"dead"`
 }
 
+// UserGraspList stores the latest owner-signed kind:10317 event observed for
+// a provisioned repository owner. CreatedAt is the Nostr event created_at value
+// and is used for NIP-01 replaceable-event ordering.
+type UserGraspList struct {
+	Pubkey            string `json:"pubkey"`
+	EventJSON         string `json:"event_json"`
+	EventID           string `json:"event_id"`
+	CreatedAt         int64  `json:"created_at"`
+	LastRepublishedID string `json:"last_republished_id,omitempty"`
+}
+
 type Mapping struct {
 	Npub              string    `json:"npub"`
 	RepoID            string    `json:"repo_id"`
@@ -240,6 +251,13 @@ func Open(path string) (*SQLiteStore, error) {
 			last_error TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			published_event_id TEXT NOT NULL DEFAULT ''
+		);`,
+		`CREATE TABLE IF NOT EXISTS user_grasp_list (
+			pubkey TEXT PRIMARY KEY,
+			event_json TEXT NOT NULL,
+			event_id TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			last_republished_id TEXT NOT NULL DEFAULT ''
 		);`,
 	}
 
@@ -775,6 +793,21 @@ func (s *SQLiteStore) MappingExists(ctx context.Context, npub string, repoID str
 	return true, nil
 }
 
+// HasProvisionedOwnerPubkey reports whether pubkey owns at least one fully
+// provisioned repository mapping. It is used to avoid amplifying arbitrary
+// kind:10317 user GRASP lists from unknown pubkeys.
+func (s *SQLiteStore) HasProvisionedOwnerPubkey(ctx context.Context, pubkey string) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM mappings WHERE pubkey = ? AND hook_installed = 1 LIMIT 1`, pubkey).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *SQLiteStore) ProvisionCountSince(ctx context.Context, pubkey string, since time.Time) (int, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM mappings WHERE pubkey = ? AND created_at >= ?`, pubkey, since.UTC().Format(time.RFC3339)).Scan(&count)
@@ -1182,6 +1215,51 @@ func (s *SQLiteStore) ListIdentityLinks(ctx context.Context) ([]NostrIdentityLin
 		links = append(links, link)
 	}
 	return links, rows.Err()
+}
+
+// --- User GRASP list cache methods ---
+
+// UpsertUserGraspListEvent stores a kind:10317 event if it is the first event
+// for the owner pubkey or has a newer created_at than the cached event. It
+// returns true only when the cache was inserted or replaced.
+func (s *SQLiteStore) UpsertUserGraspListEvent(ctx context.Context, list UserGraspList) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO user_grasp_list(pubkey, event_json, event_id, created_at, last_republished_id)
+		VALUES(?, ?, ?, ?, '')
+		ON CONFLICT(pubkey) DO UPDATE SET
+			event_json = excluded.event_json,
+			event_id = excluded.event_id,
+			created_at = excluded.created_at
+		WHERE user_grasp_list.created_at < excluded.created_at
+	`, list.Pubkey, list.EventJSON, list.EventID, list.CreatedAt)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// GetUserGraspList returns the cached kind:10317 event for an owner pubkey.
+func (s *SQLiteStore) GetUserGraspList(ctx context.Context, pubkey string) (UserGraspList, error) {
+	var list UserGraspList
+	err := s.db.QueryRowContext(ctx, `
+		SELECT pubkey, event_json, event_id, created_at, last_republished_id
+		FROM user_grasp_list WHERE pubkey = ?
+	`, pubkey).Scan(&list.Pubkey, &list.EventJSON, &list.EventID, &list.CreatedAt, &list.LastRepublishedID)
+	if err != nil {
+		return UserGraspList{}, err
+	}
+	return list, nil
+}
+
+// RecordUserGraspListRepublished records the event ID last rebroadcast from
+// the owner-signed kind:10317 cache.
+func (s *SQLiteStore) RecordUserGraspListRepublished(ctx context.Context, pubkey, eventID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE user_grasp_list SET last_republished_id = ? WHERE pubkey = ?`, eventID, pubkey)
+	return err
 }
 
 // --- Mirror republish methods ---

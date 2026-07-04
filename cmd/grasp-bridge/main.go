@@ -116,18 +116,16 @@ func main() {
 	logger.Info("refs/nostr lifecycle reaper started", "ttl", refsnostr.DefaultAcceptanceTTL.String(), "interval", refsnostr.DefaultSweepInterval.String())
 
 	// Create the publisher. Bridge signing requires BRIDGE_NSEC, but Phase-B
-	// outbox publishing only needs relay URLs because events are already signed.
-	var publisherSvc *publisher.Service
-	if cfg.MirrorPublishEnabled() || (signerSvc != nil && signerSvc.Enabled()) {
-		publisherSvc, err = publisher.New(cfg.BridgeNsec, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
-		if err != nil {
-			logger.Error("failed to create publisher", "error", err)
-			os.Exit(1)
-		}
-		if cfg.CIEnabled && publisherSvc.Enabled() {
-			publisherSvc.SetCIConfig(true, cfg.CITriggerRepos)
-			logger.Info("CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
-		}
+	// outbox publishing and owner-signed 10317 rebroadcast only need relay URLs
+	// because events are already signed.
+	publisherSvc, err := publisher.New(cfg.BridgeNsec, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
+	if err != nil {
+		logger.Error("failed to create publisher", "error", err)
+		os.Exit(1)
+	}
+	if cfg.CIEnabled && publisherSvc.Enabled() {
+		publisherSvc.SetCIConfig(true, cfg.CITriggerRepos)
+		logger.Info("CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
 	}
 
 	var outboxDone chan struct{}
@@ -163,7 +161,7 @@ func main() {
 	}
 
 	// Wire webhook handler for NIP-34 events (PRs, issues, patches, labels)
-	if publisherSvc != nil && cfg.GiteaWebhookSecret != "" {
+	if (publisherSvc.Enabled() || (signerSvc != nil && signerSvc.Enabled())) && cfg.GiteaWebhookSecret != "" {
 		webhookHandler := webhook.New(publisherSvc, st, cfg.GiteaWebhookSecret, logger)
 		webhookHandler.SetRepositoriesDir(cfg.GiteaRepositoriesDir)
 		if signerSvc != nil && signerSvc.Enabled() {
@@ -203,6 +201,12 @@ func main() {
 					logger.Warn("failed to forward event to embedded relay", "event", ev.ID, "error", forwardErr)
 				}
 			}
+		}
+		if ev.Kind == relay.KindUserGraspList {
+			if err := publisherSvc.HandleUserGraspListEvent(ctx, ev, sourceRelay); err != nil {
+				return err
+			}
+			return nil
 		}
 		if reflectErr := reflectorSvc.HandleEvent(ctx, ev, sourceRelay); reflectErr != nil {
 			return reflectErr

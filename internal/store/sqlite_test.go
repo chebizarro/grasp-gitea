@@ -837,6 +837,123 @@ func TestDeleteExpiredNIP46Sessions(t *testing.T) {
 	}
 }
 
+func TestUserGraspListCacheReplaceableSemantics(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	owner, err := st.HasProvisionedOwnerPubkey(ctx, "owner-pubkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner {
+		t.Fatal("owner pubkey should not be provisioned before mapping exists")
+	}
+
+	if err := st.UpsertMapping(ctx, Mapping{
+		Npub:          "npub1owner",
+		RepoID:        "repo1",
+		Pubkey:        "owner-pubkey",
+		Owner:         "owner",
+		RepoName:      "repo1",
+		GiteaRepoID:   1,
+		CloneURL:      "https://example.com/owner/repo1.git",
+		SourceEvent:   "seed",
+		HookInstalled: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	owner, err = st.HasProvisionedOwnerPubkey(ctx, "owner-pubkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner {
+		t.Fatal("unhooked mapping should not count as provisioned owner")
+	}
+	if err := st.SetHookInstalled(ctx, "npub1owner", "repo1", true); err != nil {
+		t.Fatal(err)
+	}
+	owner, err = st.HasProvisionedOwnerPubkey(ctx, "owner-pubkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !owner {
+		t.Fatal("hooked mapping should count as provisioned owner")
+	}
+
+	inserted, err := st.UpsertUserGraspListEvent(ctx, UserGraspList{
+		Pubkey:    "owner-pubkey",
+		EventJSON: `{"id":"old"}`,
+		EventID:   "old",
+		CreatedAt: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("first user GRASP list insert returned false")
+	}
+	if err := st.RecordUserGraspListRepublished(ctx, "owner-pubkey", "old"); err != nil {
+		t.Fatal(err)
+	}
+
+	replaced, err := st.UpsertUserGraspListEvent(ctx, UserGraspList{
+		Pubkey:    "owner-pubkey",
+		EventJSON: `{"id":"new"}`,
+		EventID:   "new",
+		CreatedAt: 200,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replaced {
+		t.Fatal("newer user GRASP list did not replace cached row")
+	}
+	got, err := st.GetUserGraspList(ctx, "owner-pubkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.EventID != "new" || got.CreatedAt != 200 || got.EventJSON != `{"id":"new"}` {
+		t.Fatalf("cached newer row mismatch: %+v", got)
+	}
+	if got.LastRepublishedID != "old" {
+		t.Fatalf("last republished id should remain old until rebroadcast, got %q", got.LastRepublishedID)
+	}
+
+	ignored, err := st.UpsertUserGraspListEvent(ctx, UserGraspList{
+		Pubkey:    "owner-pubkey",
+		EventJSON: `{"id":"older"}`,
+		EventID:   "older",
+		CreatedAt: 150,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ignored {
+		t.Fatal("older user GRASP list unexpectedly replaced cached row")
+	}
+	got, err = st.GetUserGraspList(ctx, "owner-pubkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.EventID != "new" || got.CreatedAt != 200 {
+		t.Fatalf("older event changed cache: %+v", got)
+	}
+	if err := st.RecordUserGraspListRepublished(ctx, "owner-pubkey", "new"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetUserGraspList(ctx, "owner-pubkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastRepublishedID != "new" {
+		t.Fatalf("last republished id = %q, want new", got.LastRepublishedID)
+	}
+}
+
 func TestUpsertIdentityLinkUpdatesExisting(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(t.TempDir() + "/test.db")

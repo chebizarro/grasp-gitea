@@ -88,6 +88,9 @@ func TestKindConstants(t *testing.T) {
 	if KindNIP22Comment != 1111 {
 		t.Errorf("KindNIP22Comment: expected 1111, got %d", KindNIP22Comment)
 	}
+	if KindUserGraspList != 10317 {
+		t.Errorf("KindUserGraspList: expected 10317, got %d", KindUserGraspList)
+	}
 }
 
 func TestSubscriptionFiltersIncludeCollaborationKinds(t *testing.T) {
@@ -102,6 +105,7 @@ func TestSubscriptionFiltersIncludeCollaborationKinds(t *testing.T) {
 	for _, want := range []int{
 		KindRepositoryAnnouncement,
 		KindRepositoryState,
+		KindUserGraspList,
 		KindNIP22Comment,
 		KindPatch,
 		KindIssue,
