@@ -33,6 +33,7 @@ func TestSnapshotInitiallyZero(t *testing.T) {
 	outboxRetried.Store(0)
 	outboxDeadLettered.Store(0)
 	bridgeSignedFallback.Store(0)
+	unlinkedActorSkipped.Store(0)
 
 	snap := Snapshot()
 	for key, val := range snap {
@@ -70,6 +71,7 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 	outboxRetried.Store(0)
 	outboxDeadLettered.Store(0)
 	bridgeSignedFallback.Store(0)
+	unlinkedActorSkipped.Store(0)
 
 	IncAnnouncementReceived()
 	IncAnnouncementReceived()
@@ -106,6 +108,8 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 	IncOutboxRetried()
 	IncOutboxDeadLettered()
 	IncBridgeSignedFallback()
+	IncUnlinkedActorSkipped()
+	IncUnlinkedActorSkipped()
 
 	snap := Snapshot()
 	expected := map[string]int64{
@@ -135,6 +139,7 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 		"outbox_retried":                  1,
 		"outbox_dead_lettered":            1,
 		"bridge_signed_fallback":          1,
+		"unlinked_actor_skipped":          2,
 	}
 	for key, want := range expected {
 		if got := snap[key]; got != want {
@@ -172,6 +177,7 @@ func TestSnapshotReturnsAllKeys(t *testing.T) {
 		"outbox_retried",
 		"outbox_dead_lettered",
 		"bridge_signed_fallback",
+		"unlinked_actor_skipped",
 	}
 	for _, key := range requiredKeys {
 		if _, ok := snap[key]; !ok {

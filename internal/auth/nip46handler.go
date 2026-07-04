@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
+	"github.com/sharegap/grasp-gitea/internal/signer"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -31,24 +32,16 @@ type NIP46Handler struct {
 	relayURLs       []string
 	publicURL       string
 	logger          *slog.Logger
-	// BunkerConnector is called asynchronously to connect to a bunker and
-	// sign a challenge event. Implementations should block until signing
-	// completes or the context expires. The interface is kept abstract so
-	// the actual NIP-46 SDK wiring can be swapped in without changing the
-	// handler. For testing, a mock connector is used.
-	BunkerConnector BunkerConnector
+	// GrantCreator is called asynchronously to connect to a bunker, verify the
+	// signer, and persist a reusable NIP-46 signing grant. The signer.Service
+	// satisfies this interface; tests provide fakes or a service with a fake
+	// bunker connector.
+	GrantCreator GrantCreator
 }
 
-// BunkerConnector abstracts the NIP-46 bunker signing flow.
-// Implementations connect to a bunker via relay, request a signature on a
-// challenge event, and return the signer's pubkey on success.
-type BunkerConnector interface {
-	// Connect initiates the NIP-46 flow. It should:
-	// 1. Parse the bunker URI to extract relay URL and bunker pubkey
-	// 2. Connect to the bunker via the relay
-	// 3. Request signing of a challenge event
-	// 4. Return the signer's verified pubkey
-	Connect(ctx context.Context, bunkerURI string) (signerPubkey string, err error)
+// GrantCreator abstracts durable NIP-46 signer authorization.
+type GrantCreator interface {
+	CreateGrant(ctx context.Context, bunkerURI string) (signer.GrantInfo, error)
 }
 
 // NewNIP46Handler creates a new handler for NIP-46 auth endpoints.
@@ -57,7 +50,7 @@ func NewNIP46Handler(
 	identitySvc *IdentityService,
 	relayURLs []string,
 	publicURL string,
-	connector BunkerConnector,
+	grantCreator GrantCreator,
 	logger *slog.Logger,
 ) *NIP46Handler {
 	return &NIP46Handler{
@@ -65,7 +58,7 @@ func NewNIP46Handler(
 		identityService: identitySvc,
 		relayURLs:       relayURLs,
 		publicURL:       publicURL,
-		BunkerConnector: connector,
+		GrantCreator:    grantCreator,
 		logger:          logger.With("component", "auth.nip46"),
 	}
 }
@@ -215,29 +208,38 @@ func (h *NIP46Handler) runBunkerFlow(sessionToken string, bunkerURI string) {
 	ctx, cancel := context.WithTimeout(context.Background(), NIP46SessionTTL)
 	defer cancel()
 
-	if h.BunkerConnector == nil {
-		h.logger.Error("no bunker connector configured")
-		h.store.UpdateNIP46SessionState(ctx, sessionToken, "error", "", "bunker connector not configured")
+	if h.GrantCreator == nil {
+		h.logger.Error("no signer grant creator configured")
+		h.store.UpdateNIP46SessionState(ctx, sessionToken, "error", "", "signer grant creator not configured")
 		metrics.IncNIP46SessionsFailed()
 		return
 	}
 
-	signerPubkey, err := h.BunkerConnector.Connect(ctx, bunkerURI)
+	grant, err := h.GrantCreator.CreateGrant(ctx, bunkerURI)
 	if err != nil {
-		h.logger.Warn("bunker connection failed", "session", sessionToken, "error", err)
+		h.logger.Warn("signer grant creation failed", "session", sessionToken, "error", err)
 		h.store.UpdateNIP46SessionState(ctx, sessionToken, "error", "", err.Error())
 		metrics.IncNIP46SessionsFailed()
 		return
 	}
 
-	if err := h.store.UpdateNIP46SessionState(ctx, sessionToken, "complete", signerPubkey, ""); err != nil {
+	if h.identityService != nil {
+		if _, err := h.identityService.ResolveOrCreate(ctx, grant.Pubkey, h.relayURLs); err != nil {
+			h.logger.Error("identity resolution failed after signer grant creation", "session", sessionToken, "pubkey", grant.Pubkey, "error", err)
+			h.store.UpdateNIP46SessionState(ctx, sessionToken, "error", "", "identity resolution failed")
+			metrics.IncNIP46SessionsFailed()
+			return
+		}
+	}
+
+	if err := h.store.UpdateNIP46SessionState(ctx, sessionToken, "complete", grant.Pubkey, ""); err != nil {
 		h.logger.Error("update session state failed", "session", sessionToken, "error", err)
 		metrics.IncNIP46SessionsFailed()
 		return
 	}
 
 	metrics.IncNIP46SessionsCompleted()
-	h.logger.Info("NIP-46 bunker login completed", "session", sessionToken, "signer_pubkey", signerPubkey)
+	h.logger.Info("NIP-46 bunker login completed", "session", sessionToken, "signer_pubkey", grant.Pubkey, "client_pubkey", grant.ClientPubkey)
 }
 
 // parseBunkerURI extracts the bunker pubkey from a bunker:// URI.

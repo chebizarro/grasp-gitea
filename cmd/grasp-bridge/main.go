@@ -130,8 +130,9 @@ func main() {
 	}
 
 	var outboxDone chan struct{}
+	var outboxWorker *outbox.Worker
 	if signerSvc != nil && signerSvc.Enabled() && publisherSvc != nil {
-		outboxWorker := outbox.New(st, signerSvc, publisherSvc, logger)
+		outboxWorker = outbox.New(st, signerSvc, publisherSvc, logger)
 		publisherSvc.SetOwnerStateSigning(signerSvc, outboxWorker)
 		outboxDone = make(chan struct{})
 		go func() {
@@ -150,7 +151,7 @@ func main() {
 		authSvc := auth.NewService(cfg, st, logger)
 		identitySvc := auth.NewIdentityService(st, giteaClient, nip05Resolver, logger)
 		nip07Handler := auth.NewNIP07Handler(authSvc, identitySvc, relayURLs, logger)
-		nip46Handler := auth.NewNIP46Handler(st, identitySvc, relayURLs, cfg.BridgePublicURL, nil, logger)
+		nip46Handler := auth.NewNIP46Handler(st, identitySvc, relayURLs, cfg.BridgePublicURL, signerSvc, logger)
 		nip55Handler := auth.NewNIP55Handler(authSvc, identitySvc, relayURLs, logger)
 		apiServer.AddRouteRegistrar(func(mux *http.ServeMux) {
 			nip07Handler.RegisterRoutes(mux)
@@ -161,8 +162,11 @@ func main() {
 	}
 
 	// Wire webhook handler for NIP-34 events (PRs, issues, patches, labels)
-	if publisherSvc != nil && publisherSvc.Enabled() && cfg.GiteaWebhookSecret != "" {
+	if publisherSvc != nil && cfg.GiteaWebhookSecret != "" {
 		webhookHandler := webhook.New(publisherSvc, st, cfg.GiteaWebhookSecret, logger)
+		if signerSvc != nil && signerSvc.Enabled() {
+			webhookHandler.SetActorSigning(signerSvc, outboxWorker, st)
+		}
 		apiServer.SetWebhookHandler(webhookHandler)
 		logger.Info("Gitea webhook handler enabled for NIP-34 events")
 	}

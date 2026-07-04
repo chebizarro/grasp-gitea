@@ -15,26 +15,47 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nbd-wtf/go-nostr"
+
 	"github.com/sharegap/grasp-gitea/internal/gitea"
+	"github.com/sharegap/grasp-gitea/internal/signer"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
-// mockBunkerConnector simulates a NIP-46 bunker for testing.
-type mockBunkerConnector struct {
+// mockGrantCreator simulates durable NIP-46 grant creation for testing.
+type mockGrantCreator struct {
 	signerPubkey string
 	err          error
 	delay        time.Duration
 }
 
-func (m *mockBunkerConnector) Connect(ctx context.Context, bunkerURI string) (string, error) {
+func (m *mockGrantCreator) CreateGrant(ctx context.Context, bunkerURI string) (signer.GrantInfo, error) {
 	if m.delay > 0 {
 		select {
 		case <-time.After(m.delay):
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return signer.GrantInfo{}, ctx.Err()
 		}
 	}
-	return m.signerPubkey, m.err
+	if m.err != nil {
+		return signer.GrantInfo{}, m.err
+	}
+	return signer.GrantInfo{Pubkey: m.signerPubkey, ClientPubkey: "client-pubkey", Relays: []string{"wss://relay.example.com"}}, nil
+}
+
+type fakeBunkerSigner struct {
+	pubkey string
+}
+
+func (f fakeBunkerSigner) Ping(context.Context) error { return nil }
+func (f fakeBunkerSigner) GetPublicKey(context.Context) (string, error) {
+	return f.pubkey, nil
+}
+func (f fakeBunkerSigner) SignEvent(_ context.Context, ev *nostr.Event) error {
+	ev.PubKey = f.pubkey
+	ev.ID = ev.GetID()
+	ev.Sig = "fake-signature"
+	return nil
 }
 
 type testNIP46Env struct {
@@ -42,10 +63,10 @@ type testNIP46Env struct {
 	store   *store.SQLiteStore
 	mux     *http.ServeMux
 	server  *httptest.Server
-	mock    *mockBunkerConnector
+	mock    *mockGrantCreator
 }
 
-func newTestNIP46Env(t *testing.T, connector *mockBunkerConnector) *testNIP46Env {
+func newTestNIP46Env(t *testing.T, connector *mockGrantCreator) *testNIP46Env {
 	t.Helper()
 
 	st, err := store.Open(t.TempDir() + "/test.db")
@@ -85,7 +106,7 @@ const testBunkerPubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbe
 const testBunkerURI = "bunker://deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef?relay=wss://relay.example.com"
 
 func TestNIP46InitSuccess(t *testing.T) {
-	mock := &mockBunkerConnector{signerPubkey: testBunkerPubkey, delay: 50 * time.Millisecond}
+	mock := &mockGrantCreator{signerPubkey: testBunkerPubkey, delay: 50 * time.Millisecond}
 	env := newTestNIP46Env(t, mock)
 
 	body := fmt.Sprintf(`{"bunker_uri":"%s","redirect_uri":"/dashboard"}`, testBunkerURI)
@@ -115,7 +136,7 @@ func TestNIP46InitSuccess(t *testing.T) {
 }
 
 func TestNIP46InitMissingBunkerURI(t *testing.T) {
-	mock := &mockBunkerConnector{signerPubkey: testBunkerPubkey}
+	mock := &mockGrantCreator{signerPubkey: testBunkerPubkey}
 	env := newTestNIP46Env(t, mock)
 
 	resp, err := http.Post(env.server.URL+"/auth/nip46/init", "application/json", bytes.NewBufferString(`{}`))
@@ -130,7 +151,7 @@ func TestNIP46InitMissingBunkerURI(t *testing.T) {
 }
 
 func TestNIP46InitInvalidBunkerURI(t *testing.T) {
-	mock := &mockBunkerConnector{signerPubkey: testBunkerPubkey}
+	mock := &mockGrantCreator{signerPubkey: testBunkerPubkey}
 	env := newTestNIP46Env(t, mock)
 
 	resp, err := http.Post(env.server.URL+"/auth/nip46/init", "application/json", bytes.NewBufferString(`{"bunker_uri":"not-a-bunker-uri"}`))
@@ -146,7 +167,7 @@ func TestNIP46InitInvalidBunkerURI(t *testing.T) {
 
 func TestNIP46StatusPending(t *testing.T) {
 	// Use a long delay so the session stays pending.
-	mock := &mockBunkerConnector{signerPubkey: testBunkerPubkey, delay: 10 * time.Second}
+	mock := &mockGrantCreator{signerPubkey: testBunkerPubkey, delay: 10 * time.Second}
 	env := newTestNIP46Env(t, mock)
 
 	// Init a session.
@@ -175,7 +196,7 @@ func TestNIP46StatusPending(t *testing.T) {
 
 func TestNIP46StatusComplete(t *testing.T) {
 	// Use a very short delay so the session completes quickly.
-	mock := &mockBunkerConnector{signerPubkey: testBunkerPubkey, delay: 10 * time.Millisecond}
+	mock := &mockGrantCreator{signerPubkey: testBunkerPubkey, delay: 10 * time.Millisecond}
 	env := newTestNIP46Env(t, mock)
 
 	body := fmt.Sprintf(`{"bunker_uri":"%s","redirect_uri":"/repos"}`, testBunkerURI)
@@ -209,9 +230,69 @@ func TestNIP46StatusComplete(t *testing.T) {
 	}
 }
 
+func TestNIP46LoginPersistsReusableGrantAndIdentityLink(t *testing.T) {
+	env := newTestNIP46Env(t, nil)
+	signerSvc, err := signer.NewService(env.store, []byte("12345678901234567890123456789012"), signer.WithConnector(
+		func(ctx context.Context, clientSecretKey string, bunkerURI string) (signer.BunkerSigner, error) {
+			if clientSecretKey == "" {
+				return nil, fmt.Errorf("empty client secret")
+			}
+			if bunkerURI != testBunkerURI {
+				return nil, fmt.Errorf("unexpected bunker URI %q", bunkerURI)
+			}
+			return fakeBunkerSigner{pubkey: testBunkerPubkey}, nil
+		},
+	))
+	if err != nil {
+		t.Fatalf("new signer service: %v", err)
+	}
+	env.handler.GrantCreator = signerSvc
+
+	body := fmt.Sprintf(`{"bunker_uri":"%s","redirect_uri":"/repos"}`, testBunkerURI)
+	initResp, err := http.Post(env.server.URL+"/auth/nip46/init", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var initResult nip46InitResponse
+	json.NewDecoder(initResp.Body).Decode(&initResult)
+	initResp.Body.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	statusResp, err := http.Get(env.server.URL + "/auth/nip46/status?session=" + initResult.SessionToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statusResp.Body.Close()
+
+	var status nip46StatusResponse
+	json.NewDecoder(statusResp.Body).Decode(&status)
+	if status.Status != "complete" {
+		t.Fatalf("expected complete status, got %q error=%q", status.Status, status.Error)
+	}
+	if status.Identity == nil || status.Identity.Pubkey != testBunkerPubkey {
+		t.Fatalf("identity = %#v, want pubkey %s", status.Identity, testBunkerPubkey)
+	}
+
+	grant, err := env.store.GetSignerGrant(context.Background(), testBunkerPubkey)
+	if err != nil {
+		t.Fatalf("GetSignerGrant: %v", err)
+	}
+	if grant.Status != "active" || len(grant.ClientSeckeyEnc) == 0 || len(grant.BunkerURIEnc) == 0 {
+		t.Fatalf("grant not active/encrypted: %#v", grant)
+	}
+	link, err := env.store.GetIdentityLinkByPubkey(context.Background(), testBunkerPubkey)
+	if err != nil {
+		t.Fatalf("GetIdentityLinkByPubkey: %v", err)
+	}
+	if link.GiteaUserID == 0 || link.GiteaUser == "" {
+		t.Fatalf("identity link missing Gitea user: %#v", link)
+	}
+}
+
 func TestNIP46StatusError(t *testing.T) {
 	// Connector returns an error.
-	mock := &mockBunkerConnector{err: fmt.Errorf("bunker connection refused"), delay: 10 * time.Millisecond}
+	mock := &mockGrantCreator{err: fmt.Errorf("bunker connection refused"), delay: 10 * time.Millisecond}
 	env := newTestNIP46Env(t, mock)
 
 	body := fmt.Sprintf(`{"bunker_uri":"%s"}`, testBunkerURI)
@@ -243,7 +324,7 @@ func TestNIP46StatusError(t *testing.T) {
 }
 
 func TestNIP46StatusNotFound(t *testing.T) {
-	mock := &mockBunkerConnector{signerPubkey: testBunkerPubkey}
+	mock := &mockGrantCreator{signerPubkey: testBunkerPubkey}
 	env := newTestNIP46Env(t, mock)
 
 	resp, err := http.Get(env.server.URL + "/auth/nip46/status?session=nonexistent")
@@ -258,7 +339,7 @@ func TestNIP46StatusNotFound(t *testing.T) {
 }
 
 func TestNIP46StatusMissingParam(t *testing.T) {
-	mock := &mockBunkerConnector{signerPubkey: testBunkerPubkey}
+	mock := &mockGrantCreator{signerPubkey: testBunkerPubkey}
 	env := newTestNIP46Env(t, mock)
 
 	resp, err := http.Get(env.server.URL + "/auth/nip46/status")

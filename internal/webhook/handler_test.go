@@ -23,6 +23,7 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -54,6 +55,41 @@ type fakePublisher struct {
 type ciPush struct {
 	repoID             int64
 	ref, before, after string
+}
+
+type fakeActorSigner struct {
+	enabled bool
+}
+
+func (f fakeActorSigner) Enabled() bool { return f.enabled }
+
+type queuedEvent struct {
+	kind         int
+	authorPubkey string
+	scope        string
+	dedupeKey    string
+	event        nostr.Event
+}
+
+type fakeOutbox struct {
+	mu     sync.Mutex
+	events []queuedEvent
+}
+
+func (f *fakeOutbox) Enqueue(_ context.Context, kind int, authorPubkey string, scope string, unsignedEvent *nostr.Event, dedupeKey string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := *unsignedEvent
+	f.events = append(f.events, queuedEvent{kind: kind, authorPubkey: authorPubkey, scope: scope, dedupeKey: dedupeKey, event: cp})
+	return nil
+}
+
+func (f *fakeOutbox) all() []queuedEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]queuedEvent, len(f.events))
+	copy(out, f.events)
+	return out
 }
 
 func (f *fakePublisher) PublishEvent(_ context.Context, ev *nostr.Event) error {
@@ -144,6 +180,33 @@ func seedMapping(t *testing.T, st *store.SQLiteStore) {
 	}
 	if err := st.UpsertMapping(context.Background(), m); err != nil {
 		t.Fatalf("seed mapping: %v", err)
+	}
+}
+
+const testActorPubkeyHex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+func seedActorGrant(t *testing.T, st *store.SQLiteStore, userID int64, login string, pubkey string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := st.UpsertIdentityLink(ctx, store.NostrIdentityLink{
+		Pubkey:      pubkey,
+		Npub:        "npub1actor",
+		GiteaUserID: userID,
+		GiteaUser:   login,
+		LastLoginAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed identity link: %v", err)
+	}
+	if err := st.UpsertSignerGrant(ctx, store.SignerGrant{
+		Pubkey:          pubkey,
+		ClientSeckeyEnc: []byte("encrypted-client-secret"),
+		BunkerURIEnc:    []byte("encrypted-bunker-uri"),
+		Relays:          `[]`,
+		Permissions:     `["sign_event"]`,
+		GrantedAt:       time.Now().UTC(),
+		Status:          "active",
+	}); err != nil {
+		t.Fatalf("seed signer grant: %v", err)
 	}
 }
 
@@ -293,6 +356,136 @@ func TestPR_OpenedEmitsHexTaggedEvents(t *testing.T) {
 	}
 	if a := statusEv.Tags.GetFirst([]string{"a", ""}); a == nil {
 		t.Errorf("status event missing 'a' repo coordinate tag")
+	}
+}
+
+func TestPR_LinkedContributorEnqueuesUnsignedActorEvents(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	seedActorGrant(t, st, 101, "alice", testActorPubkeyHex)
+	outbox := &fakeOutbox{}
+	h.SetActorSigning(fakeActorSigner{enabled: true}, outbox, st)
+
+	payload := PullRequestPayload{
+		Action:     "opened",
+		Number:     7,
+		Repository: Repository{ID: testGiteaID},
+		Sender:     User{ID: 101, Login: "alice"},
+	}
+	payload.PullRequest.Title = "Add feature"
+	payload.PullRequest.Body = "body text"
+	payload.PullRequest.State = "open"
+	payload.PullRequest.Head.Ref = "feature"
+	payload.PullRequest.Base.Ref = "main"
+
+	rr := post(t, h, "pull_request", payload, "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if len(fake.events) != 0 {
+		t.Fatalf("signer-enabled linked actor must not bridge-sign; published=%d", len(fake.events))
+	}
+	queued := outbox.all()
+	if len(queued) != 2 {
+		t.Fatalf("queued events = %d, want PR + status: %#v", len(queued), queued)
+	}
+	pr := queued[0]
+	if pr.kind != KindPROpen || pr.authorPubkey != testActorPubkeyHex {
+		t.Fatalf("queued PR = kind %d author %q, want kind %d author %s", pr.kind, pr.authorPubkey, KindPROpen, testActorPubkeyHex)
+	}
+	if pr.event.PubKey != testActorPubkeyHex || pr.event.Sig != "" {
+		t.Fatalf("queued PR event should be unsigned and authored by actor, got pubkey=%q sig=%q", pr.event.PubKey, pr.event.Sig)
+	}
+	assertTagsWellFormed(t, &pr.event)
+	status := queued[1]
+	if status.kind != KindStatusOpen || status.authorPubkey != testActorPubkeyHex {
+		t.Fatalf("queued status = kind %d author %q", status.kind, status.authorPubkey)
+	}
+	if e := status.event.Tags.GetFirst([]string{"e", ""}); e == nil || (*e)[1] != pr.event.ID {
+		t.Fatalf("queued status e tag = %v, want PR event id %q", e, pr.event.ID)
+	}
+	assertTagsWellFormed(t, &status.event)
+}
+
+func TestIssue_LinkedContributorEnqueuesUnsignedActorEvents(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	seedActorGrant(t, st, 202, "bob", testActorPubkeyHex)
+	outbox := &fakeOutbox{}
+	h.SetActorSigning(fakeActorSigner{enabled: true}, outbox, st)
+
+	payload := IssuePayload{
+		Action:     "opened",
+		Number:     3,
+		Repository: Repository{ID: testGiteaID},
+		Sender:     User{ID: 202, Login: "bob"},
+	}
+	payload.Issue.Title = "Bug report"
+	payload.Issue.Body = "details"
+	payload.Issue.State = "open"
+
+	post(t, h, "issues", payload, "")
+	if len(fake.events) != 0 {
+		t.Fatalf("signer-enabled linked issue must not bridge-sign; published=%d", len(fake.events))
+	}
+	queued := outbox.all()
+	if len(queued) != 2 {
+		t.Fatalf("queued events = %d, want issue + status", len(queued))
+	}
+	if queued[0].kind != KindIssue || queued[0].authorPubkey != testActorPubkeyHex || queued[0].event.PubKey != testActorPubkeyHex || queued[0].event.Sig != "" {
+		t.Fatalf("unexpected queued issue: %#v", queued[0])
+	}
+	assertTagsWellFormed(t, &queued[0].event)
+}
+
+func TestPR_UnlinkedContributorSkippedWhenSignerEnabled(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	outbox := &fakeOutbox{}
+	h.SetActorSigning(fakeActorSigner{enabled: true}, outbox, st)
+	before := metrics.Snapshot()["unlinked_actor_skipped"]
+
+	payload := PullRequestPayload{
+		Action:     "opened",
+		Number:     9,
+		Repository: Repository{ID: testGiteaID},
+		Sender:     User{ID: 303, Login: "carol"},
+	}
+	payload.PullRequest.State = "open"
+
+	post(t, h, "pull_request", payload, "")
+	if len(fake.events) != 0 {
+		t.Fatalf("unlinked signer-enabled actor must not bridge-sign; published=%d", len(fake.events))
+	}
+	if queued := outbox.all(); len(queued) != 0 {
+		t.Fatalf("unlinked actor should not enqueue, got %#v", queued)
+	}
+	after := metrics.Snapshot()["unlinked_actor_skipped"]
+	if after != before+1 {
+		t.Fatalf("unlinked_actor_skipped delta = %d, want 1 (before=%d after=%d)", after-before, before, after)
+	}
+}
+
+func TestPR_SignerDisabledKeepsLegacyBridgeSigning(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	outbox := &fakeOutbox{}
+	h.SetActorSigning(fakeActorSigner{enabled: false}, outbox, st)
+
+	payload := PullRequestPayload{
+		Action:     "opened",
+		Number:     10,
+		Repository: Repository{ID: testGiteaID},
+		Sender:     User{ID: 404, Login: "dave"},
+	}
+	payload.PullRequest.State = "open"
+
+	post(t, h, "pull_request", payload, "")
+	if fake.firstOfKind(KindPROpen) == nil || fake.firstOfKind(KindStatusOpen) == nil {
+		t.Fatalf("signer disabled should use legacy bridge publisher; got %v", fake.kinds())
+	}
+	if queued := outbox.all(); len(queued) != 0 {
+		t.Fatalf("signer disabled should not enqueue actor events, got %#v", queued)
 	}
 }
 

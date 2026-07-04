@@ -9,7 +9,7 @@ Phases (see §9). Each is implemented by a dedicated agent, verified, and commit
 - [x] **Phase A** (phase1-w24) — Persistent NIP-46 signer foundation ✅ `internal/signer` (encrypted grants + BunkerClient pool + SignWithGrant)
 - [x] **Phase B** (phase1-s0f) — Outbound signing queue ✅ `internal/outbox` (persistent, dedup, retry/backoff/dead-letter, admin endpoint)
 - [x] **Phase C** (phase1-tu6) — Owner-authored events (30618) user-signed ✅ enqueued owner-signed via outbox; `/signer/authorize`; bridge-signed fallback
-- [ ] **Phase D** (phase1-5ud) — Contributor signer grants
+- [x] **Phase D** (phase1-5ud) — Contributor signer grants ✅ NIP-46 login persists reusable grant; webhook events enqueued under acting user; unlinked → skip (no bridge-sign)
 - [ ] **Phase E** (phase1-xwx) — Full NIP-34 tag-schema compliance
 - [ ] **Phase F** (phase1-ki5) — Bidirectional sync (Nostr→Gitea)
 - [ ] **Phase G** (phase1-cmj) — Migration, compat & docs

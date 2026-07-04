@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -49,24 +50,48 @@ type Publisher interface {
 	FetchEvent(ctx context.Context, id string) (*nostr.Event, error)
 }
 
+type ActorSigner interface {
+	Enabled() bool
+}
+
+type ActorOutbox interface {
+	Enqueue(ctx context.Context, kind int, authorPubkey string, scope string, unsignedEvent *nostr.Event, dedupeKey string) error
+}
+
+type ActorIdentityLookup interface {
+	GetIdentityLinkByGiteaUserID(ctx context.Context, userID int64) (store.NostrIdentityLink, error)
+	GetSignerGrant(ctx context.Context, pubkey string) (store.SignerGrant, error)
+}
+
 // Handler handles inbound Gitea webhook events, maps them to NIP-34 Nostr
 // events, and publishes via the publisher.
 type Handler struct {
-	pub    Publisher
-	store  *store.SQLiteStore
-	secret string
-	logger *slog.Logger
+	pub         Publisher
+	store       *store.SQLiteStore
+	secret      string
+	logger      *slog.Logger
+	actorSigner ActorSigner
+	actorOutbox ActorOutbox
+	actorLookup ActorIdentityLookup
 }
 
 // New creates a webhook Handler.
 func New(pub *publisher.Service, st *store.SQLiteStore, secret string, logger *slog.Logger) *Handler {
-	h := &Handler{store: st, secret: secret, logger: logger}
+	h := &Handler{store: st, secret: secret, logger: logger, actorLookup: st}
 	// Guard against a typed-nil *publisher.Service being stored as a non-nil
 	// interface, which would defeat the h.pub == nil checks below.
 	if pub != nil {
 		h.pub = pub
 	}
 	return h
+}
+
+func (h *Handler) SetActorSigning(signer ActorSigner, outbox ActorOutbox, lookup ActorIdentityLookup) {
+	h.actorSigner = signer
+	h.actorOutbox = outbox
+	if lookup != nil {
+		h.actorLookup = lookup
+	}
 }
 
 // ServeHTTP handles POST /webhook/gitea.
@@ -249,7 +274,8 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		return nil
 	}
 
-	if err := h.publish(ctx, ev); err != nil {
+	emitted, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("pr:%d:%s", p.Number, p.Action))
+	if err != nil || !emitted {
 		return err
 	}
 
@@ -275,7 +301,8 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		},
 	}
 
-	return h.publish(ctx, statusEv)
+	_, err = h.publishActorEvent(ctx, p.Sender, mapping, statusEv, fmt.Sprintf("pr:%d:%s:status", p.Number, p.Action))
+	return err
 }
 
 // handleIssue publishes kind:1621 for issue open/close/edit, and kind:1985 for label events.
@@ -293,7 +320,7 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 	// Handle label events inline
 	if p.Action == "labeled" || p.Action == "unlabeled" {
 		issueRef := fmt.Sprintf("%s/%s/issue/%d", mapping.Npub, mapping.RepoID, p.Number)
-		return h.PublishNIP32Label(ctx, mapping, int(KindIssue), issueRef, p.Label.Name, "gitea/label")
+		return h.publishNIP32LabelForActor(ctx, p.Sender, mapping, int(KindIssue), issueRef, p.Label.Name, "gitea/label")
 	}
 
 	switch p.Action {
@@ -318,7 +345,8 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 		Content: p.Issue.Body,
 	}
 
-	if err := h.publish(ctx, ev); err != nil {
+	emitted, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("issue:%d:%s", p.Number, p.Action))
+	if err != nil || !emitted {
 		return err
 	}
 
@@ -340,7 +368,8 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 		},
 	}
 
-	return h.publish(ctx, statusEv)
+	_, err = h.publishActorEvent(ctx, p.Sender, mapping, statusEv, fmt.Sprintf("issue:%d:%s:status", p.Number, p.Action))
+	return err
 }
 
 // handleLabel publishes kind:1985 NIP-32 label events when Gitea labels are applied.
@@ -423,7 +452,7 @@ func (h *Handler) handlePatchPush(ctx context.Context, eventID string, p PushPay
 		}
 	}
 
-	if h.pub == nil {
+	if h.pub == nil && !h.actorSigningEnabled() {
 		return fmt.Errorf("publisher not configured")
 	}
 
@@ -446,7 +475,8 @@ func (h *Handler) handlePatchPush(ctx context.Context, eventID string, p PushPay
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Tags:      tags,
 	}
-	return h.publish(ctx, statusEv)
+	_, err := h.publishActorEvent(ctx, p.Sender, mapping, statusEv, fmt.Sprintf("patch:%s:applied:%s", eventID, p.After))
+	return err
 }
 
 // PublishNIP32Label publishes a kind:1985 NIP-32 label event that labels the
@@ -454,7 +484,18 @@ func (h *Handler) handlePatchPush(ctx context.Context, eventID string, p PushPay
 // coordinate (30617:<hex-pubkey>:<repo-id>) and records the human-readable
 // target (e.g. "npub/repo/issue/N") in an "r" tag for context.
 func (h *Handler) PublishNIP32Label(ctx context.Context, mapping store.Mapping, targetKind int, targetRef string, label string, namespace string) error {
-	ev := &nostr.Event{
+	ev := h.buildNIP32LabelEvent(mapping, targetKind, targetRef, label, namespace)
+	return h.publish(ctx, ev)
+}
+
+func (h *Handler) publishNIP32LabelForActor(ctx context.Context, actor User, mapping store.Mapping, targetKind int, targetRef string, label string, namespace string) error {
+	ev := h.buildNIP32LabelEvent(mapping, targetKind, targetRef, label, namespace)
+	_, err := h.publishActorEvent(ctx, actor, mapping, ev, fmt.Sprintf("label:%d:%s:%s:%s", targetKind, targetRef, namespace, label))
+	return err
+}
+
+func (h *Handler) buildNIP32LabelEvent(mapping store.Mapping, targetKind int, targetRef string, label string, namespace string) *nostr.Event {
+	return &nostr.Event{
 		Kind:      KindNIP32Label,
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Tags: nostr.Tags{
@@ -465,8 +506,6 @@ func (h *Handler) PublishNIP32Label(ctx context.Context, mapping store.Mapping, 
 			{"p", mapping.Pubkey},
 		},
 	}
-
-	return h.publish(ctx, ev)
 }
 
 // NOTE: kind:30617 repository announcements are NOT minted by the bridge.
@@ -478,6 +517,79 @@ func (h *Handler) PublishNIP32Label(ctx context.Context, mapping store.Mapping, 
 func (h *Handler) publishRepoState(ctx context.Context, mapping store.Mapping, repo Repository) error {
 	// Delegate to publisher service for kind:30618
 	return h.pub.RepublishForGiteaRepo(ctx, repo.ID)
+}
+
+func (h *Handler) publishActorEvent(ctx context.Context, actor User, mapping store.Mapping, ev *nostr.Event, scopeSuffix string) (bool, error) {
+	if !h.actorSigningEnabled() {
+		return true, h.publish(ctx, ev)
+	}
+	if ev == nil {
+		return false, fmt.Errorf("event is required")
+	}
+	if h.actorOutbox == nil {
+		return false, fmt.Errorf("actor outbox not configured")
+	}
+
+	authorPubkey, ok, err := h.resolveActorGrant(ctx, actor)
+	if err != nil || !ok {
+		return false, err
+	}
+
+	ev.PubKey = authorPubkey
+	ev.Sig = ""
+	ev.ID = ev.GetID()
+	scope := fmt.Sprintf("repo:%d:%s", mapping.GiteaRepoID, scopeSuffix)
+	dedupeKey := fmt.Sprintf("webhook:%s:%d:%s", scope, ev.Kind, ev.ID)
+	if err := h.actorOutbox.Enqueue(ctx, ev.Kind, authorPubkey, scope, ev, dedupeKey); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (h *Handler) actorSigningEnabled() bool {
+	return h.actorSigner != nil && h.actorSigner.Enabled()
+}
+
+func (h *Handler) resolveActorGrant(ctx context.Context, actor User) (string, bool, error) {
+	if h.actorLookup == nil {
+		h.skipUnlinkedActor(actor, "identity lookup not configured")
+		return "", false, nil
+	}
+	if actor.ID == 0 {
+		h.skipUnlinkedActor(actor, "missing Gitea sender id")
+		return "", false, nil
+	}
+
+	link, err := h.actorLookup.GetIdentityLinkByGiteaUserID(ctx, actor.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		h.skipUnlinkedActor(actor, "no identity link")
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("lookup actor identity link for user %d: %w", actor.ID, err)
+	}
+
+	grant, err := h.actorLookup.GetSignerGrant(ctx, link.Pubkey)
+	if errors.Is(err, sql.ErrNoRows) {
+		h.skipUnlinkedActor(actor, "no signer grant")
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("lookup actor signer grant for user %d pubkey %s: %w", actor.ID, link.Pubkey, err)
+	}
+	if grant.Status != "active" || grant.RevokedAt != nil {
+		h.skipUnlinkedActor(actor, "signer grant inactive")
+		return "", false, nil
+	}
+	return link.Pubkey, true, nil
+}
+
+func (h *Handler) skipUnlinkedActor(actor User, reason string) {
+	// Phase D fallback: pre-link collaboration events are intentionally not
+	// backfilled here; Phase G/follow-up migration can define any replay policy.
+	metrics.IncUnlinkedActorSkipped()
+	h.logger.Warn("webhook: signer enabled but actor is not linked; skipping collaboration event without bridge-signing",
+		"gitea_user_id", actor.ID, "gitea_user", actor.Login, "reason", reason)
 }
 
 func (h *Handler) publish(ctx context.Context, ev *nostr.Event) error {
