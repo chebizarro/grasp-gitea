@@ -21,6 +21,20 @@ type Subscriber struct {
 	wg      sync.WaitGroup
 }
 
+func subscriptionFilters() []nostr.Filter {
+	return []nostr.Filter{{Kinds: []int{
+		KindRepositoryAnnouncement,
+		KindRepositoryState,
+		KindNIP22Comment,
+		KindPatch,
+		KindIssue,
+		KindStatusOpen,
+		KindStatusApplied,
+		KindStatusClosed,
+		KindStatusDraft,
+	}}}
+}
+
 // New creates a Subscriber that will connect to the given relay URLs.
 func New(relays []string, handler Handler, logger *slog.Logger) *Subscriber {
 	return &Subscriber{relays: relays, handler: handler, logger: logger}
@@ -58,7 +72,7 @@ func (s *Subscriber) watchRelay(ctx context.Context, relayURL string) {
 			continue
 		}
 
-		sub, err := relay.Subscribe(ctx, []nostr.Filter{{Kinds: []int{KindRepositoryAnnouncement, KindRepositoryState}}})
+		sub, err := relay.Subscribe(ctx, subscriptionFilters())
 		if err != nil {
 			s.logger.Error("failed to subscribe relay", "relay", relayURL, "error", err)
 			relay.Close()
@@ -83,7 +97,7 @@ func (s *Subscriber) watchRelay(ctx context.Context, relayURL string) {
 						continue
 					}
 					if err := s.handler(ctx, ev, relayURL); err != nil {
-						s.logger.Warn("announcement handling failed", "relay", relayURL, "event", ev.ID, "error", err)
+						s.logger.Warn("relay event handling failed", "relay", relayURL, "event", ev.ID, "kind", ev.Kind, "error", err)
 					}
 				}
 			}

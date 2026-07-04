@@ -108,6 +108,43 @@ func TestMappingExists(t *testing.T) {
 	}
 }
 
+func TestGetProvisionedMappingByRepoAddr(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.UpsertMapping(ctx, Mapping{
+		Npub:          "npub1pending",
+		RepoID:        "repo1",
+		Pubkey:        "pub1",
+		Owner:         "org1",
+		RepoName:      "repo1",
+		GiteaRepoID:   1,
+		CloneURL:      "url",
+		SourceEvent:   "ev",
+		HookInstalled: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetProvisionedMappingByRepoAddr(ctx, "pub1", "repo1"); err != sql.ErrNoRows {
+		t.Fatalf("expected unhooked mapping to be ignored, got %v", err)
+	}
+
+	if err := st.SetHookInstalled(ctx, "npub1pending", "repo1", true); err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.GetProvisionedMappingByRepoAddr(ctx, "pub1", "repo1")
+	if err != nil {
+		t.Fatalf("get provisioned mapping: %v", err)
+	}
+	if m.Owner != "org1" || !m.HookInstalled {
+		t.Fatalf("unexpected mapping: %+v", m)
+	}
+}
+
 func TestEventProcessed(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(t.TempDir() + "/test.db")
@@ -134,6 +171,113 @@ func TestEventProcessed(t *testing.T) {
 	}
 	if !processed {
 		t.Error("expected event to be processed")
+	}
+}
+
+func TestReflectedEvents(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	inserted, err := st.RecordReflectedEvent(ctx, ReflectedEvent{
+		NostrEventID: "ev1",
+		GiteaRepoID:  42,
+		GiteaIndex:   7,
+		Kind:         1621,
+	})
+	if err != nil {
+		t.Fatalf("record reflected event: %v", err)
+	}
+	if !inserted {
+		t.Fatal("expected first insert to report inserted")
+	}
+	inserted, err = st.RecordReflectedEvent(ctx, ReflectedEvent{
+		NostrEventID: "ev1",
+		GiteaRepoID:  42,
+		GiteaIndex:   7,
+		Kind:         1621,
+	})
+	if err != nil {
+		t.Fatalf("record duplicate reflected event: %v", err)
+	}
+	if inserted {
+		t.Fatal("expected duplicate insert to report false")
+	}
+
+	ref, err := st.GetReflectedEvent(ctx, "ev1")
+	if err != nil {
+		t.Fatalf("get reflected event: %v", err)
+	}
+	if ref.GiteaRepoID != 42 || ref.GiteaIndex != 7 || ref.Kind != 1621 {
+		t.Fatalf("unexpected reflected event: %+v", ref)
+	}
+	ok, err := st.WasReflectedGiteaObject(ctx, 42, 7, 1621)
+	if err != nil {
+		t.Fatalf("was reflected: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected reflected object lookup to match")
+	}
+	ok, err = st.WasReflectedGiteaObject(ctx, 42, 7, 1111)
+	if err != nil {
+		t.Fatalf("was reflected other kind: %v", err)
+	}
+	if ok {
+		t.Fatal("did not expect other kind to match")
+	}
+
+	consumed, err := st.ConsumeReflectedGiteaEcho(ctx, 42, 7, 1621)
+	if err != nil {
+		t.Fatalf("consume echo: %v", err)
+	}
+	if !consumed {
+		t.Fatal("expected first echo consume to match")
+	}
+	consumed, err = st.ConsumeReflectedGiteaEcho(ctx, 42, 7, 1621)
+	if err != nil {
+		t.Fatalf("consume echo again: %v", err)
+	}
+	if consumed {
+		t.Fatal("expected echo guard to be one-shot")
+	}
+}
+
+func TestNostrObjectMappingDoesNotArmEchoGuard(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	inserted, err := st.RecordNostrObjectMapping(ctx, ReflectedEvent{
+		NostrEventID: "gitea-origin-event",
+		GiteaRepoID:  42,
+		GiteaIndex:   9,
+		Kind:         1621,
+	})
+	if err != nil {
+		t.Fatalf("record nostr object mapping: %v", err)
+	}
+	if !inserted {
+		t.Fatal("expected mapping insert")
+	}
+	ref, err := st.GetReflectedEvent(ctx, "gitea-origin-event")
+	if err != nil {
+		t.Fatalf("get mapping: %v", err)
+	}
+	if ref.GiteaIndex != 9 {
+		t.Fatalf("unexpected mapping: %+v", ref)
+	}
+	consumed, err := st.ConsumeReflectedGiteaEcho(ctx, 42, 9, 1621)
+	if err != nil {
+		t.Fatalf("consume echo: %v", err)
+	}
+	if consumed {
+		t.Fatal("Gitea-origin mapping must not arm echo guard")
 	}
 }
 

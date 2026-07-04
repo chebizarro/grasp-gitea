@@ -126,6 +126,17 @@ type PendingNostrRef struct {
 	FirstSeenAt time.Time `json:"first_seen_at"`
 }
 
+// ReflectedEvent records a Nostr-originated collaboration event that the bridge
+// materialised into a Gitea object. Webhook handling consults these rows to
+// avoid echoing bridge-created objects back to Nostr.
+type ReflectedEvent struct {
+	NostrEventID string    `json:"nostr_event_id"`
+	GiteaRepoID  int64     `json:"gitea_repo_id"`
+	GiteaIndex   int64     `json:"gitea_index"`
+	Kind         int       `json:"kind"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
 type SQLiteStore struct {
 	db *sql.DB
 }
@@ -156,6 +167,15 @@ func Open(path string) (*SQLiteStore, error) {
 			pubkey TEXT NOT NULL,
 			kind INTEGER NOT NULL,
 			seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS reflected_events (
+			nostr_event_id TEXT PRIMARY KEY,
+			gitea_repo_id INTEGER NOT NULL,
+			gitea_index INTEGER NOT NULL,
+			kind INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			echo_pending INTEGER NOT NULL DEFAULT 1,
+			echo_consumed_at TEXT NOT NULL DEFAULT ''
 		);`,
 		`CREATE TABLE IF NOT EXISTS pending_nostr_refs (
 			event_id TEXT NOT NULL,
@@ -248,9 +268,15 @@ func Open(path string) (*SQLiteStore, error) {
 	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_state_event_id TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_state_published_at TEXT NOT NULL DEFAULT ''`)
 
+	// Migration: add reflected-event echo guard columns. Existing rows are treated
+	// as pending bridge-origin echoes because they predate one-shot consumption.
+	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_pending INTEGER NOT NULL DEFAULT 1`)
+	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_consumed_at TEXT NOT NULL DEFAULT ''`)
+
 	// Index for looking up mappings by Gitea repo ID (used by mirror sync callback).
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_mappings_gitea_repo_id ON mappings(gitea_repo_id)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_nostr_refs_first_seen_at ON pending_nostr_refs(first_seen_at)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_reflected_events_gitea_object ON reflected_events(gitea_repo_id, gitea_index, kind)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbound_events_due ON outbound_events(state, next_attempt_at, id)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbound_events_created_at ON outbound_events(created_at)`)
 
@@ -632,6 +658,111 @@ func (s *SQLiteStore) MarkEventProcessed(ctx context.Context, eventID string, pu
 	return err
 }
 
+// RecordReflectedEvent records a Nostr event that was reflected into Gitea.
+// It returns true when a new row was inserted; duplicate Nostr event IDs are a no-op.
+func (s *SQLiteStore) RecordReflectedEvent(ctx context.Context, ref ReflectedEvent) (bool, error) {
+	if ref.CreatedAt.IsZero() {
+		ref.CreatedAt = time.Now().UTC()
+	}
+	res, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO reflected_events(nostr_event_id, gitea_repo_id, gitea_index, kind, created_at, echo_pending, echo_consumed_at)
+		VALUES(?, ?, ?, ?, ?, 1, '')
+	`, ref.NostrEventID, ref.GiteaRepoID, ref.GiteaIndex, ref.Kind, ref.CreatedAt.UTC().Format(time.RFC3339))
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// RecordNostrObjectMapping records a Nostr event ID to Gitea object mapping
+// without arming the webhook echo guard. This is used for Gitea-origin events
+// that were published to Nostr and may later be referenced by Nostr comments or
+// status events.
+func (s *SQLiteStore) RecordNostrObjectMapping(ctx context.Context, ref ReflectedEvent) (bool, error) {
+	if ref.CreatedAt.IsZero() {
+		ref.CreatedAt = time.Now().UTC()
+	}
+	res, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO reflected_events(nostr_event_id, gitea_repo_id, gitea_index, kind, created_at, echo_pending, echo_consumed_at)
+		VALUES(?, ?, ?, ?, ?, 0, '')
+	`, ref.NostrEventID, ref.GiteaRepoID, ref.GiteaIndex, ref.Kind, ref.CreatedAt.UTC().Format(time.RFC3339))
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// GetReflectedEvent returns the reflected Gitea object for a Nostr event ID.
+func (s *SQLiteStore) GetReflectedEvent(ctx context.Context, nostrEventID string) (ReflectedEvent, error) {
+	var ref ReflectedEvent
+	var createdAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT nostr_event_id, gitea_repo_id, gitea_index, kind, created_at
+		FROM reflected_events WHERE nostr_event_id = ?
+	`, nostrEventID).Scan(&ref.NostrEventID, &ref.GiteaRepoID, &ref.GiteaIndex, &ref.Kind, &createdAt)
+	if err != nil {
+		return ReflectedEvent{}, err
+	}
+	parsed, parseErr := time.Parse(time.RFC3339, createdAt)
+	if parseErr != nil {
+		return ReflectedEvent{}, fmt.Errorf("parse reflected event created_at for %s: %w", nostrEventID, parseErr)
+	}
+	ref.CreatedAt = parsed
+	return ref, nil
+}
+
+// ConsumeReflectedGiteaEcho consumes one pending echo guard for a Gitea
+// repo/index/kind. It returns true only once for each Nostr-origin reflected
+// write, preventing the immediate Gitea webhook echo without suppressing future
+// Gitea-origin activity on the same object.
+func (s *SQLiteStore) ConsumeReflectedGiteaEcho(ctx context.Context, giteaRepoID int64, giteaIndex int64, kind int) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE reflected_events
+		SET echo_consumed_at = ?
+		WHERE nostr_event_id = (
+			SELECT nostr_event_id FROM reflected_events
+			WHERE gitea_repo_id = ? AND gitea_index = ? AND kind = ?
+				AND echo_pending = 1 AND echo_consumed_at = ''
+			ORDER BY created_at ASC
+			LIMIT 1
+		)
+	`, time.Now().UTC().Format(time.RFC3339), giteaRepoID, giteaIndex, kind)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// WasReflectedGiteaObject reports whether a Gitea repo/index/kind was created
+// or updated by the bridge while reflecting a Nostr event.
+func (s *SQLiteStore) WasReflectedGiteaObject(ctx context.Context, giteaRepoID int64, giteaIndex int64, kind int) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM reflected_events
+		WHERE gitea_repo_id = ? AND gitea_index = ? AND kind = ?
+		LIMIT 1
+	`, giteaRepoID, giteaIndex, kind).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *SQLiteStore) MappingExists(ctx context.Context, npub string, repoID string) (bool, error) {
 	var exists int
 	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM mappings WHERE npub = ? AND repo_id = ? LIMIT 1`, npub, repoID).Scan(&exists)
@@ -805,6 +936,16 @@ func (s *SQLiteStore) DeletePendingNostrRef(ctx context.Context, giteaRepoID int
 }
 
 func (s *SQLiteStore) GetMapping(ctx context.Context, npub string, repoID string) (Mapping, error) {
+	return s.getMappingWhere(ctx, "npub = ? AND repo_id = ?", npub, repoID)
+}
+
+// GetProvisionedMappingByRepoAddr looks up a fully provisioned repository by
+// the components of a NIP-34 repo coordinate: 30617:<pubkey>:<repo-id>.
+func (s *SQLiteStore) GetProvisionedMappingByRepoAddr(ctx context.Context, pubkey string, repoID string) (Mapping, error) {
+	return s.getMappingWhere(ctx, "pubkey = ? AND repo_id = ? AND hook_installed = 1", pubkey, repoID)
+}
+
+func (s *SQLiteStore) getMappingWhere(ctx context.Context, where string, args ...any) (Mapping, error) {
 	var m Mapping
 	var hookVal int
 	var createdAt, updatedAt string
@@ -815,8 +956,8 @@ func (s *SQLiteStore) GetMapping(ctx context.Context, npub string, repoID string
 			last_republished_announcement_id, last_republished_announcement_at,
 			last_state_digest, last_state_event_id, last_state_published_at,
 			created_at, updated_at
-		FROM mappings WHERE npub = ? AND repo_id = ? LIMIT 1
-	`, npub, repoID).Scan(
+		FROM mappings WHERE `+where+` LIMIT 1
+	`, args...).Scan(
 		&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID,
 		&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal,
 		&m.AnnouncementEventJSON, &m.AnnouncementEventID,

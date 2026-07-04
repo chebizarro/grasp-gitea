@@ -6,6 +6,7 @@ package gitea
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,15 +22,24 @@ type fakeUser struct {
 
 // fakeGitea is a minimal Gitea API simulator for tests.
 type fakeGitea struct {
-	mu    sync.Mutex
-	orgs  map[string]bool
-	repos map[string]int64
-	users map[string]fakeUser
-	next  int64
+	mu       sync.Mutex
+	orgs     map[string]bool
+	repos    map[string]int64
+	users    map[string]fakeUser
+	issues   map[string]map[int64]Issue
+	comments map[string]map[int64][]IssueComment
+	next     int64
 }
 
 func newFakeGitea() *fakeGitea {
-	return &fakeGitea{orgs: map[string]bool{}, repos: map[string]int64{}, users: map[string]fakeUser{}, next: 1}
+	return &fakeGitea{
+		orgs:     map[string]bool{},
+		repos:    map[string]int64{},
+		users:    map[string]fakeUser{},
+		issues:   map[string]map[int64]Issue{},
+		comments: map[string]map[int64][]IssueComment{},
+		next:     1,
+	}
 }
 
 func (f *fakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -78,6 +88,75 @@ func (f *fakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"id": id, "name": parts[1],
 				"owner": map[string]any{"username": parts[0]},
 			})
+			return
+		}
+	}
+
+	// POST /api/v1/repos/:owner/:repo/issues
+	if r.Method == http.MethodPost && strings.HasPrefix(path, "/api/v1/repos/") && strings.HasSuffix(path, "/issues") {
+		parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(path, "/api/v1/repos/"), "/issues"), "/")
+		if len(parts) == 2 {
+			key := parts[0] + "/" + parts[1]
+			if _, ok := f.repos[key]; !ok {
+				http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+				return
+			}
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			idx := f.next
+			f.next++
+			if f.issues[key] == nil {
+				f.issues[key] = map[int64]Issue{}
+			}
+			issue := Issue{ID: idx, Index: idx, Number: idx, Title: body["title"].(string), Body: body["body"].(string), State: "open"}
+			f.issues[key][idx] = issue
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(issue)
+			return
+		}
+	}
+
+	// POST /api/v1/repos/:owner/:repo/issues/:index/comments
+	if r.Method == http.MethodPost && strings.HasPrefix(path, "/api/v1/repos/") && strings.HasSuffix(path, "/comments") {
+		parts := strings.Split(strings.TrimPrefix(path, "/api/v1/repos/"), "/")
+		if len(parts) == 5 && parts[2] == "issues" && parts[4] == "comments" {
+			key := parts[0] + "/" + parts[1]
+			idx := int64(0)
+			fmt.Sscan(parts[3], &idx)
+			if _, ok := f.issues[key][idx]; !ok {
+				http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+				return
+			}
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			comment := IssueComment{ID: int64(len(f.comments[key][idx]) + 1), Body: body["body"].(string)}
+			if f.comments[key] == nil {
+				f.comments[key] = map[int64][]IssueComment{}
+			}
+			f.comments[key][idx] = append(f.comments[key][idx], comment)
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(comment)
+			return
+		}
+	}
+
+	// PATCH /api/v1/repos/:owner/:repo/issues/:index
+	if r.Method == http.MethodPatch && strings.HasPrefix(path, "/api/v1/repos/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/api/v1/repos/"), "/")
+		if len(parts) == 4 && parts[2] == "issues" {
+			key := parts[0] + "/" + parts[1]
+			idx := int64(0)
+			fmt.Sscan(parts[3], &idx)
+			issue, ok := f.issues[key][idx]
+			if !ok {
+				http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+				return
+			}
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			issue.State, _ = body["state"].(string)
+			f.issues[key][idx] = issue
+			json.NewEncoder(w).Encode(issue)
 			return
 		}
 	}
@@ -415,5 +494,38 @@ func TestIsNotFoundExported(t *testing.T) {
 	}
 	if IsNotFound(&HTTPError{StatusCode: 500}) {
 		t.Error("500 should not be not-found")
+	}
+}
+
+func TestIssueAPIs(t *testing.T) {
+	g := newFakeGitea()
+	g.repos["org1/repo1"] = 10
+	ts := httptest.NewServer(g)
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "tok")
+	ctx := context.Background()
+	issue, err := c.CreateIssue(ctx, "org1", "repo1", "from nostr", "body")
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if issue.Index == 0 || issue.Title != "from nostr" || issue.State != "open" {
+		t.Fatalf("unexpected issue: %+v", issue)
+	}
+
+	comment, err := c.CreateIssueComment(ctx, "org1", "repo1", issue.Index, "comment body")
+	if err != nil {
+		t.Fatalf("CreateIssueComment: %v", err)
+	}
+	if comment.Body != "comment body" {
+		t.Fatalf("comment body = %q", comment.Body)
+	}
+
+	updated, err := c.SetIssueState(ctx, "org1", "repo1", issue.Index, "closed")
+	if err != nil {
+		t.Fatalf("SetIssueState: %v", err)
+	}
+	if updated.State != "closed" {
+		t.Fatalf("state = %q", updated.State)
 	}
 }

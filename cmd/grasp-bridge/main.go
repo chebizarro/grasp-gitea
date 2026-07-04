@@ -24,6 +24,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
+	"github.com/sharegap/grasp-gitea/internal/reflector"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/signer"
@@ -172,6 +173,8 @@ func main() {
 		logger.Info("Gitea webhook handler enabled for NIP-34 events")
 	}
 
+	reflectorSvc := reflector.New(st, giteaClient, cfg.GiteaRepositoriesDir, logger)
+
 	// Per-repo lock serialises state-event processing (CI + proactive
 	// sync) across relay goroutines so ref reads in the CI handler
 	// cannot race with ref writes from proactive sync.
@@ -200,6 +203,9 @@ func main() {
 					logger.Warn("failed to forward event to embedded relay", "event", ev.ID, "error", forwardErr)
 				}
 			}
+		}
+		if reflectErr := reflectorSvc.HandleEvent(ctx, ev, sourceRelay); reflectErr != nil {
+			return reflectErr
 		}
 		if ev.Kind == relay.KindRepositoryState {
 			// Derive a stable repo key from the event to serialise

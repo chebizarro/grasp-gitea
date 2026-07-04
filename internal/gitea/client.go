@@ -41,6 +41,20 @@ type Repository struct {
 	HTMLURL  string `json:"html_url"`
 }
 
+type Issue struct {
+	ID     int64  `json:"id"`
+	Index  int64  `json:"index"`
+	Number int64  `json:"number,omitempty"`
+	Title  string `json:"title"`
+	Body   string `json:"body,omitempty"`
+	State  string `json:"state"`
+}
+
+type IssueComment struct {
+	ID   int64  `json:"id"`
+	Body string `json:"body"`
+}
+
 func NewClient(baseURL string, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -129,6 +143,39 @@ func (c *Client) GetUser(ctx context.Context, login string) (User, error) {
 	return parseUser(resp)
 }
 
+// CreateIssue creates a Gitea issue in owner/repo.
+func (c *Client) CreateIssue(ctx context.Context, owner string, repo string, title string, body string) (Issue, error) {
+	payload := map[string]any{
+		"title": title,
+		"body":  body,
+	}
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/issues", payload)
+	if err != nil {
+		return Issue{}, err
+	}
+	return parseIssue(resp)
+}
+
+// CreateIssueComment creates a comment on a Gitea issue or pull request index.
+func (c *Client) CreateIssueComment(ctx context.Context, owner string, repo string, index int64, body string) (IssueComment, error) {
+	payload := map[string]any{"body": body}
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/issues/"+fmt.Sprint(index)+"/comments", payload)
+	if err != nil {
+		return IssueComment{}, err
+	}
+	return parseIssueComment(resp)
+}
+
+// SetIssueState updates a Gitea issue or pull request state ("open" or "closed").
+func (c *Client) SetIssueState(ctx context.Context, owner string, repo string, index int64, state string) (Issue, error) {
+	payload := map[string]any{"state": state}
+	resp, err := c.doJSON(ctx, http.MethodPatch, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/issues/"+fmt.Sprint(index), payload)
+	if err != nil {
+		return Issue{}, err
+	}
+	return parseIssue(resp)
+}
+
 // DeleteBareRef deletes ref from a bare repository using git update-ref -d.
 func DeleteBareRef(ctx context.Context, repoPath string, ref string) error {
 	if repoPath == "" {
@@ -215,6 +262,28 @@ type HTTPError struct {
 
 func (e *HTTPError) Error() string {
 	return fmt.Sprintf("gitea API status=%d body=%s", e.StatusCode, e.Body)
+}
+
+func parseIssue(resp []byte) (Issue, error) {
+	var issue Issue
+	if err := json.Unmarshal(resp, &issue); err != nil {
+		return Issue{}, fmt.Errorf("decode gitea issue: %w", err)
+	}
+	if issue.Index == 0 && issue.Number != 0 {
+		issue.Index = issue.Number
+	}
+	if issue.Number == 0 && issue.Index != 0 {
+		issue.Number = issue.Index
+	}
+	return issue, nil
+}
+
+func parseIssueComment(resp []byte) (IssueComment, error) {
+	var comment IssueComment
+	if err := json.Unmarshal(resp, &comment); err != nil {
+		return IssueComment{}, fmt.Errorf("decode gitea issue comment: %w", err)
+	}
+	return comment, nil
 }
 
 func parseRepo(resp []byte) (Repository, error) {

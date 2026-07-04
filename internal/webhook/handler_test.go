@@ -737,6 +737,35 @@ func TestIssue_OpenedEmitsNIP34Schema(t *testing.T) {
 	forbidTag(t, issueEv, "action")
 }
 
+func TestIssueOpenedSkipsBridgeReflectedObject(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
+		NostrEventID: "nostr-issue-event",
+		GiteaRepoID:  testGiteaID,
+		GiteaIndex:   3,
+		Kind:         KindIssue,
+	}); err != nil {
+		t.Fatalf("record reflected event: %v", err)
+	}
+
+	payload := IssuePayload{Action: "opened", Number: 3, Repository: Repository{ID: testGiteaID}}
+	payload.Issue.Title = "Reflected issue"
+	payload.Issue.Body = "already came from Nostr"
+	post(t, h, "issues", payload, "")
+
+	if got := fake.kinds(); len(got) != 0 {
+		t.Fatalf("bridge-reflected issue webhook echoed to Nostr: %v", got)
+	}
+
+	// The guard is one-shot: later genuine Gitea activity on the same issue/kind
+	// is not suppressed forever by the reflected_events mapping row.
+	post(t, h, "issues", payload, "")
+	if got := fake.kinds(); len(got) != 1 || got[0] != KindIssue {
+		t.Fatalf("expected second webhook to publish after guard consumption, got %v", got)
+	}
+}
+
 func TestIssue_LabeledEmitsNIP32Label(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)

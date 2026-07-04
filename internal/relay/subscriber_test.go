@@ -89,3 +89,29 @@ func TestKindConstants(t *testing.T) {
 		t.Errorf("KindNIP22Comment: expected 1111, got %d", KindNIP22Comment)
 	}
 }
+
+func TestSubscriptionFiltersIncludeCollaborationKinds(t *testing.T) {
+	filters := subscriptionFilters()
+	if len(filters) != 1 {
+		t.Fatalf("expected one filter, got %d", len(filters))
+	}
+	got := map[int]bool{}
+	for _, kind := range filters[0].Kinds {
+		got[kind] = true
+	}
+	for _, want := range []int{
+		KindRepositoryAnnouncement,
+		KindRepositoryState,
+		KindNIP22Comment,
+		KindPatch,
+		KindIssue,
+		KindStatusOpen,
+		KindStatusApplied,
+		KindStatusClosed,
+		KindStatusDraft,
+	} {
+		if !got[want] {
+			t.Fatalf("subscription filter missing kind %d", want)
+		}
+	}
+}

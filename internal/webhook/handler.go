@@ -278,6 +278,9 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 			return err
 		}
 		h.rememberThread("pr", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID, Pubkey: ev.PubKey, Kind: KindPROpen})
+		if err := h.recordNostrObjectMapping(ctx, mapping, ev.ID, p.Number, KindPROpen, "PR root"); err != nil {
+			return err
+		}
 		if p.PullRequest.Draft {
 			return h.publishPRStatus(ctx, p, mapping, threadRef{EventID: ev.ID, Pubkey: ev.PubKey, Kind: KindPROpen}, KindStatusDraft, euc)
 		}
@@ -323,6 +326,10 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 		return h.publishNIP32LabelForActor(ctx, p.Sender, mapping, int(KindIssue), issueRef, p.Label.Name, "gitea/label")
 	}
 
+	if h.shouldSkipReflectedIssueWebhook(ctx, mapping, p) {
+		return nil
+	}
+
 	euc := h.eucForRepo(ctx, mapping, p.Repository, p.Repository.DefaultBranch)
 
 	switch p.Action {
@@ -334,6 +341,9 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 		}
 		if p.Action == "opened" {
 			h.rememberThread("issue", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID, Pubkey: ev.PubKey, Kind: KindIssue})
+			if err := h.recordNostrObjectMapping(ctx, mapping, ev.ID, p.Number, KindIssue, "issue root"); err != nil {
+				return err
+			}
 		}
 		return nil
 	case "closed", "reopened":
@@ -365,6 +375,14 @@ func (h *Handler) handleIssueComment(ctx context.Context, body []byte) error {
 
 	mapping, err := h.store.GetMappingByGiteaRepoID(ctx, p.Repository.ID)
 	if err != nil {
+		return nil
+	}
+
+	commentIndex := p.Issue.Number
+	if commentIndex == 0 {
+		commentIndex = p.PullRequest.Number
+	}
+	if h.wasReflected(ctx, mapping.GiteaRepoID, commentIndex, KindComment, "comment") {
 		return nil
 	}
 
@@ -571,6 +589,64 @@ func (h *Handler) warnMissingThread(action string, mapping store.Mapping, number
 	if h.logger != nil {
 		h.logger.Warn("webhook: missing root Nostr event id; skipping threaded event", "action", action, "repo", mapping.Owner+"/"+mapping.RepoName, "number", number)
 	}
+}
+
+func (h *Handler) shouldSkipReflectedIssueWebhook(ctx context.Context, mapping store.Mapping, p IssuePayload) bool {
+	index := p.Number
+	if index == 0 {
+		index = p.Issue.Number
+	}
+	if index == 0 {
+		return false
+	}
+
+	kind := 0
+	scope := "issue"
+	switch p.Action {
+	case "opened", "edited":
+		kind = KindIssue
+	case "closed":
+		kind = KindStatusClosed
+		scope = "issue status"
+	case "reopened":
+		kind = KindStatusOpen
+		scope = "issue status"
+	default:
+		return false
+	}
+	return h.wasReflected(ctx, mapping.GiteaRepoID, index, kind, scope)
+}
+
+func (h *Handler) wasReflected(ctx context.Context, repoID int64, index int64, kind int, scope string) bool {
+	if h.store == nil || repoID == 0 || index == 0 || kind == 0 {
+		return false
+	}
+	reflected, err := h.store.ConsumeReflectedGiteaEcho(ctx, repoID, index, kind)
+	if err != nil {
+		if h.logger != nil {
+			h.logger.Warn("webhook: reflected-event guard lookup failed", "repo_id", repoID, "index", index, "kind", kind, "error", err)
+		}
+		return false
+	}
+	if reflected && h.logger != nil {
+		h.logger.Info("webhook: skipping bridge-reflected object to prevent Nostr echo", "scope", scope, "repo_id", repoID, "index", index, "kind", kind)
+	}
+	return reflected
+}
+
+func (h *Handler) recordNostrObjectMapping(ctx context.Context, mapping store.Mapping, eventID string, index int64, kind int, scope string) error {
+	if h.store == nil || eventID == "" || index == 0 {
+		return nil
+	}
+	if _, err := h.store.RecordNostrObjectMapping(ctx, store.ReflectedEvent{
+		NostrEventID: eventID,
+		GiteaRepoID:  mapping.GiteaRepoID,
+		GiteaIndex:   index,
+		Kind:         kind,
+	}); err != nil {
+		return fmt.Errorf("record %s Nostr/Gitea mapping: %w", scope, err)
+	}
+	return nil
 }
 
 func (h *Handler) eucForRepo(ctx context.Context, mapping store.Mapping, repo Repository, defaultBranch string) string {
