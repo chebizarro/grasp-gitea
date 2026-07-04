@@ -41,6 +41,9 @@ const (
 	KindStatusClosed  = 1632
 	KindStatusDraft   = 1633
 	KindNIP32Label    = 1985
+
+	pendingActorEventsMaxPerUser = 500
+	pendingActorEventsMaxAge     = 30 * 24 * time.Hour
 )
 
 // Publisher is the subset of *publisher.Service that the webhook handler needs
@@ -887,15 +890,26 @@ func (h *Handler) publishActorEvent(ctx context.Context, actor User, mapping sto
 		return false, fmt.Errorf("actor outbox not configured")
 	}
 
+	scope := fmt.Sprintf("repo:%d:%s", mapping.GiteaRepoID, scopeSuffix)
+	pendingID := ev.GetID()
+	pendingDedupeKey := fmt.Sprintf("webhook:%s:%d:%s", scope, ev.Kind, pendingID)
+
 	authorPubkey, ok, err := h.resolveActorGrant(ctx, actor)
-	if err != nil || !ok {
+	if err != nil {
 		return false, err
+	}
+	if !ok {
+		if actor.ID != 0 && h.store != nil {
+			if err := h.persistPendingActorEvent(ctx, actor, ev, scope, pendingDedupeKey); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
 	}
 
 	ev.PubKey = authorPubkey
 	ev.Sig = ""
 	ev.ID = ev.GetID()
-	scope := fmt.Sprintf("repo:%d:%s", mapping.GiteaRepoID, scopeSuffix)
 	dedupeKey := fmt.Sprintf("webhook:%s:%d:%s", scope, ev.Kind, ev.ID)
 	if err := h.actorOutbox.Enqueue(ctx, ev.Kind, authorPubkey, scope, ev, dedupeKey); err != nil {
 		return false, err
@@ -941,11 +955,34 @@ func (h *Handler) resolveActorGrant(ctx context.Context, actor User) (string, bo
 	return link.Pubkey, true, nil
 }
 
+func (h *Handler) persistPendingActorEvent(ctx context.Context, actor User, ev *nostr.Event, scope string, dedupeKey string) error {
+	pending := *ev
+	pending.PubKey = ""
+	pending.Sig = ""
+	pending.ID = ""
+	b, err := json.Marshal(&pending)
+	if err != nil {
+		return fmt.Errorf("marshal pending actor event for user %d: %w", actor.ID, err)
+	}
+	_, trimmed, err := h.store.SavePendingActorEvent(ctx, store.PendingActorEvent{
+		GiteaUserID:       actor.ID,
+		Kind:              pending.Kind,
+		UnsignedEventJSON: string(b),
+		Scope:             scope,
+		DedupeKey:         dedupeKey,
+	}, time.Now().UTC(), pendingActorEventsMaxPerUser, pendingActorEventsMaxAge)
+	if err != nil {
+		return fmt.Errorf("persist pending actor event for user %d: %w", actor.ID, err)
+	}
+	if trimmed > 0 && h.logger != nil {
+		h.logger.Warn("webhook: trimmed pending actor event backlog", "gitea_user_id", actor.ID, "trimmed", trimmed, "max_per_user", pendingActorEventsMaxPerUser, "max_age", pendingActorEventsMaxAge.String())
+	}
+	return nil
+}
+
 func (h *Handler) skipUnlinkedActor(actor User, reason string) {
-	// Phase D fallback: pre-link collaboration events are intentionally not
-	// backfilled here; Phase G/follow-up migration can define any replay policy.
 	metrics.IncUnlinkedActorSkipped()
-	h.logger.Warn("webhook: signer enabled but actor is not linked; skipping collaboration event without bridge-signing",
+	h.logger.Warn("webhook: signer enabled but actor is not linked; queuing collaboration event for backfill when possible",
 		"gitea_user_id", actor.ID, "gitea_user", actor.Login, "reason", reason)
 }
 

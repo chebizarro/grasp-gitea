@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -1022,6 +1023,74 @@ func TestUserGraspListCacheReplaceableSemantics(t *testing.T) {
 	}
 	if got.LastRepublishedID != "new" {
 		t.Fatalf("last republished id = %q, want new", got.LastRepublishedID)
+	}
+}
+
+func TestPendingActorEventsSaveListDeleteAndTrim(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	base := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		inserted, trimmed, err := st.SavePendingActorEvent(ctx, PendingActorEvent{
+			GiteaUserID:       77,
+			Kind:              1618,
+			UnsignedEventJSON: fmt.Sprintf(`{"content":"event-%d"}`, i),
+			Scope:             "repo:42:pr",
+			DedupeKey:         fmt.Sprintf("pending-%d", i),
+		}, base.Add(time.Duration(i)*time.Minute), 2, 30*24*time.Hour)
+		if err != nil {
+			t.Fatalf("SavePendingActorEvent %d: %v", i, err)
+		}
+		if !inserted {
+			t.Fatalf("SavePendingActorEvent %d inserted=false", i)
+		}
+		if i < 2 && trimmed != 0 {
+			t.Fatalf("SavePendingActorEvent %d trimmed=%d, want 0", i, trimmed)
+		}
+		if i == 2 && trimmed != 1 {
+			t.Fatalf("SavePendingActorEvent final trimmed=%d, want 1", trimmed)
+		}
+	}
+
+	rows, err := st.ListPendingActorEvents(ctx, 77, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("pending rows = %d, want 2", len(rows))
+	}
+	if rows[0].DedupeKey != "pending-1" || rows[1].DedupeKey != "pending-2" {
+		t.Fatalf("trim should keep newest rows in old-to-new order, got %#v", rows)
+	}
+
+	inserted, trimmed, err := st.SavePendingActorEvent(ctx, PendingActorEvent{
+		GiteaUserID:       77,
+		Kind:              1618,
+		UnsignedEventJSON: `{"content":"dup"}`,
+		Scope:             "repo:42:pr",
+		DedupeKey:         "pending-2",
+	}, base.Add(10*time.Minute), 2, 30*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted || trimmed != 0 {
+		t.Fatalf("duplicate inserted=%v trimmed=%d, want false/0", inserted, trimmed)
+	}
+
+	if err := st.DeletePendingActorEvent(ctx, rows[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = st.ListPendingActorEvents(ctx, 77, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].DedupeKey != "pending-2" {
+		t.Fatalf("after delete rows = %#v", rows)
 	}
 }
 

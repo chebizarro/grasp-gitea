@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,6 +42,32 @@ func (m *mockGrantCreator) CreateGrant(ctx context.Context, bunkerURI string) (s
 		return signer.GrantInfo{}, m.err
 	}
 	return signer.GrantInfo{Pubkey: m.signerPubkey, ClientPubkey: "client-pubkey", Relays: []string{"wss://relay.example.com"}}, nil
+}
+
+type mockActorBackfiller struct {
+	mu          sync.Mutex
+	calls       int
+	giteaUserID int64
+	pubkey      string
+	err         error
+}
+
+func (m *mockActorBackfiller) EnqueuePending(_ context.Context, giteaUserID int64, pubkey string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls++
+	m.giteaUserID = giteaUserID
+	m.pubkey = pubkey
+	if m.err != nil {
+		return 0, m.err
+	}
+	return 1, nil
+}
+
+func (m *mockActorBackfiller) snapshot() (int, int64, string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls, m.giteaUserID, m.pubkey
 }
 
 type fakeBunkerSigner struct {
@@ -227,6 +254,26 @@ func TestNIP46StatusComplete(t *testing.T) {
 	}
 	if status.RedirectURI != "/repos" {
 		t.Errorf("expected redirect_uri='/repos', got %q", status.RedirectURI)
+	}
+}
+
+func TestNIP46RunBunkerFlowTriggersPendingActorBackfill(t *testing.T) {
+	mock := &mockGrantCreator{signerPubkey: testBunkerPubkey}
+	env := newTestNIP46Env(t, mock)
+	backfiller := &mockActorBackfiller{}
+	env.handler.SetActorEventBackfiller(backfiller)
+
+	env.handler.runBunkerFlow("backfill-session", testBunkerURI)
+
+	calls, giteaUserID, pubkey := backfiller.snapshot()
+	if calls != 1 {
+		t.Fatalf("backfiller calls = %d, want 1", calls)
+	}
+	if giteaUserID != 100 {
+		t.Fatalf("backfill gitea_user_id = %d, want 100", giteaUserID)
+	}
+	if pubkey != testBunkerPubkey {
+		t.Fatalf("backfill pubkey = %q, want %q", pubkey, testBunkerPubkey)
 	}
 }
 

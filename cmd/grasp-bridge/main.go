@@ -130,6 +130,7 @@ func main() {
 
 	var outboxDone chan struct{}
 	var outboxWorker *outbox.Worker
+	var actorBackfiller *webhook.ActorBackfiller
 	if signerSvc != nil && signerSvc.Enabled() && publisherSvc != nil {
 		outboxWorker = outbox.New(st, signerSvc, publisherSvc, logger)
 		publisherSvc.SetOwnerStateSigning(signerSvc, outboxWorker)
@@ -138,6 +139,7 @@ func main() {
 			defer close(outboxDone)
 			outboxWorker.Run(ctx)
 		}()
+		actorBackfiller = webhook.NewActorBackfiller(st, outboxWorker, logger)
 		logger.Info("outbound signing queue worker started")
 	}
 
@@ -151,6 +153,9 @@ func main() {
 		identitySvc := auth.NewIdentityService(st, giteaClient, nip05Resolver, logger)
 		nip07Handler := auth.NewNIP07Handler(authSvc, identitySvc, relayURLs, logger)
 		nip46Handler := auth.NewNIP46Handler(st, identitySvc, relayURLs, cfg.BridgePublicURL, signerSvc, logger)
+		if actorBackfiller != nil {
+			nip46Handler.SetActorEventBackfiller(actorBackfiller)
+		}
 		nip55Handler := auth.NewNIP55Handler(authSvc, identitySvc, relayURLs, logger)
 		apiServer.AddRouteRegistrar(func(mux *http.ServeMux) {
 			nip07Handler.RegisterRoutes(mux)

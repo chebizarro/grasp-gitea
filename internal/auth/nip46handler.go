@@ -37,11 +37,18 @@ type NIP46Handler struct {
 	// satisfies this interface; tests provide fakes or a service with a fake
 	// bunker connector.
 	GrantCreator GrantCreator
+	Backfiller   ActorEventBackfiller
 }
 
 // GrantCreator abstracts durable NIP-46 signer authorization.
 type GrantCreator interface {
 	CreateGrant(ctx context.Context, bunkerURI string) (signer.GrantInfo, error)
+}
+
+// ActorEventBackfiller enqueues pre-link actor events after a signer pubkey is
+// resolved to a Gitea user identity link.
+type ActorEventBackfiller interface {
+	EnqueuePending(ctx context.Context, giteaUserID int64, pubkey string) (int, error)
 }
 
 // NewNIP46Handler creates a new handler for NIP-46 auth endpoints.
@@ -61,6 +68,11 @@ func NewNIP46Handler(
 		GrantCreator:    grantCreator,
 		logger:          logger.With("component", "auth.nip46"),
 	}
+}
+
+// SetActorEventBackfiller wires the optional pre-link actor event backfill hook.
+func (h *NIP46Handler) SetActorEventBackfiller(backfiller ActorEventBackfiller) {
+	h.Backfiller = backfiller
 }
 
 // RegisterRoutes adds the NIP-46 auth routes to the given mux.
@@ -224,11 +236,24 @@ func (h *NIP46Handler) runBunkerFlow(sessionToken string, bunkerURI string) {
 	}
 
 	if h.identityService != nil {
-		if _, err := h.identityService.ResolveOrCreate(ctx, grant.Pubkey, h.relayURLs); err != nil {
+		identity, err := h.identityService.ResolveOrCreate(ctx, grant.Pubkey, h.relayURLs)
+		if err != nil {
 			h.logger.Error("identity resolution failed after signer grant creation", "session", sessionToken, "pubkey", grant.Pubkey, "error", err)
 			h.store.UpdateNIP46SessionState(ctx, sessionToken, "error", "", "identity resolution failed")
 			metrics.IncNIP46SessionsFailed()
 			return
+		}
+		if h.Backfiller != nil {
+			count, err := h.Backfiller.EnqueuePending(ctx, identity.GiteaUserID, grant.Pubkey)
+			if err != nil {
+				h.logger.Error("pending actor event backfill failed after signer grant creation", "session", sessionToken, "pubkey", grant.Pubkey, "gitea_user_id", identity.GiteaUserID, "error", err)
+				h.store.UpdateNIP46SessionState(ctx, sessionToken, "error", "", "pending actor event backfill failed")
+				metrics.IncNIP46SessionsFailed()
+				return
+			}
+			if count > 0 {
+				h.logger.Info("pending actor events queued after NIP-46 link", "session", sessionToken, "pubkey", grant.Pubkey, "gitea_user_id", identity.GiteaUserID, "count", count)
+			}
 		}
 	}
 

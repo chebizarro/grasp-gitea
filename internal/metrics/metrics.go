@@ -29,6 +29,7 @@ var outboxRetried atomic.Int64
 var outboxDeadLettered atomic.Int64
 var bridgeSignedFallback atomic.Int64
 var unlinkedActorSkipped atomic.Int64
+var actorEventsBackfilled atomic.Int64
 
 func IncAnnouncementReceived() {
 	announcementEventsReceived.Add(1)
@@ -141,6 +142,10 @@ func IncUnlinkedActorSkipped() {
 	unlinkedActorSkipped.Add(1)
 }
 
+func IncActorEventsBackfilled() {
+	actorEventsBackfilled.Add(1)
+}
+
 func Snapshot() map[string]int64 {
 	return map[string]int64{
 		"announcement_events_received":    announcementEventsReceived.Load(),
@@ -170,5 +175,6 @@ func Snapshot() map[string]int64 {
 		"outbox_dead_lettered":            outboxDeadLettered.Load(),
 		"bridge_signed_fallback":          bridgeSignedFallback.Load(),
 		"unlinked_actor_skipped":          unlinkedActorSkipped.Load(),
+		"actor_events_backfilled":         actorEventsBackfilled.Load(),
 	}
 }

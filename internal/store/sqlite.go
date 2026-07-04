@@ -90,6 +90,19 @@ type OutboundQueueCounts struct {
 	Dead      int64 `json:"dead"`
 }
 
+// PendingActorEvent is an unsigned collaboration event that could not be
+// attributed at webhook time because the acting Gitea user had not linked an
+// active NIP-46 signer grant yet.
+type PendingActorEvent struct {
+	ID                int64     `json:"id"`
+	GiteaUserID       int64     `json:"gitea_user_id"`
+	Kind              int       `json:"kind"`
+	UnsignedEventJSON string    `json:"unsigned_event_json"`
+	Scope             string    `json:"scope"`
+	DedupeKey         string    `json:"dedupe_key"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
 // UserGraspList stores the latest owner-signed kind:10317 event observed for
 // a provisioned repository owner. CreatedAt is the Nostr event created_at value
 // and is used for NIP-01 replaceable-event ordering.
@@ -260,6 +273,15 @@ func Open(path string) (*SQLiteStore, error) {
 			created_at TEXT NOT NULL,
 			published_event_id TEXT NOT NULL DEFAULT ''
 		);`,
+		`CREATE TABLE IF NOT EXISTS pending_actor_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			gitea_user_id INTEGER NOT NULL,
+			kind INTEGER NOT NULL,
+			unsigned_event_json TEXT NOT NULL,
+			scope TEXT NOT NULL,
+			dedupe_key TEXT NOT NULL UNIQUE,
+			created_at TEXT NOT NULL
+		);`,
 		`CREATE TABLE IF NOT EXISTS user_grasp_list (
 			pubkey TEXT PRIMARY KEY,
 			event_json TEXT NOT NULL,
@@ -310,6 +332,7 @@ func Open(path string) (*SQLiteStore, error) {
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_reflected_events_echo_guard ON reflected_events(echo_pending, echo_armed_at)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbound_events_due ON outbound_events(state, next_attempt_at, id)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbound_events_created_at ON outbound_events(created_at)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_actor_events_user_created ON pending_actor_events(gitea_user_id, created_at, id)`)
 
 	return &SQLiteStore{db: db}, nil
 }
@@ -570,6 +593,138 @@ func truncateError(err error) string {
 		return msg[:1000]
 	}
 	return msg
+}
+
+// SavePendingActorEvent stores an unsigned actor event for later enqueue once
+// the Gitea user links an active signer grant. Duplicate dedupe keys are no-ops.
+// It trims rows for the same user older than maxAge and oldest rows beyond
+// maxPerUser. It returns whether a row was inserted and how many old rows were
+// trimmed.
+func (s *SQLiteStore) SavePendingActorEvent(ctx context.Context, ev PendingActorEvent, now time.Time, maxPerUser int, maxAge time.Duration) (bool, int64, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if ev.GiteaUserID == 0 {
+		return false, 0, fmt.Errorf("gitea_user_id is required")
+	}
+	if strings.TrimSpace(ev.DedupeKey) == "" {
+		return false, 0, fmt.Errorf("dedupe_key is required")
+	}
+	if maxPerUser <= 0 {
+		maxPerUser = 500
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, 0, err
+	}
+	defer tx.Rollback()
+
+	var trimmed int64
+	if maxAge > 0 {
+		cutoff := now.Add(-maxAge).UTC().Format(time.RFC3339)
+		res, err := tx.ExecContext(ctx, `DELETE FROM pending_actor_events WHERE gitea_user_id = ? AND created_at < ?`, ev.GiteaUserID, cutoff)
+		if err != nil {
+			return false, 0, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return false, 0, err
+		}
+		trimmed += n
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO pending_actor_events(gitea_user_id, kind, unsigned_event_json, scope, dedupe_key, created_at)
+		VALUES(?, ?, ?, ?, ?, ?)
+	`, ev.GiteaUserID, ev.Kind, ev.UnsignedEventJSON, ev.Scope, ev.DedupeKey, now.UTC().Format(time.RFC3339))
+	if err != nil {
+		return false, 0, err
+	}
+	insertedRows, err := res.RowsAffected()
+	if err != nil {
+		return false, 0, err
+	}
+
+	res, err = tx.ExecContext(ctx, `
+		DELETE FROM pending_actor_events
+		WHERE gitea_user_id = ?
+			AND id NOT IN (
+				SELECT id FROM pending_actor_events
+				WHERE gitea_user_id = ?
+				ORDER BY created_at DESC, id DESC
+				LIMIT ?
+			)
+	`, ev.GiteaUserID, ev.GiteaUserID, maxPerUser)
+	if err != nil {
+		return false, 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, 0, err
+	}
+	trimmed += n
+
+	if err := tx.Commit(); err != nil {
+		return false, 0, err
+	}
+	return insertedRows > 0, trimmed, nil
+}
+
+// ListPendingActorEvents returns pending actor rows for one Gitea user ordered
+// from oldest to newest so backfill preserves webhook order.
+func (s *SQLiteStore) ListPendingActorEvents(ctx context.Context, giteaUserID int64, limit int) ([]PendingActorEvent, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.db.QueryContext(ctx, pendingActorEventSelectSQL()+`
+		WHERE gitea_user_id = ?
+		ORDER BY created_at ASC, id ASC
+		LIMIT ?
+	`, giteaUserID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PendingActorEvent
+	for rows.Next() {
+		ev, err := scanPendingActorEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// DeletePendingActorEvent deletes one pending actor row after it has been
+// enqueued to the outbound signing queue.
+func (s *SQLiteStore) DeletePendingActorEvent(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM pending_actor_events WHERE id = ?`, id)
+	return err
+}
+
+func pendingActorEventSelectSQL() string {
+	return `SELECT id, gitea_user_id, kind, unsigned_event_json, scope, dedupe_key, created_at FROM pending_actor_events `
+}
+
+type pendingActorEventScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanPendingActorEvent(scanner pendingActorEventScanner) (PendingActorEvent, error) {
+	var ev PendingActorEvent
+	var createdAt string
+	if err := scanner.Scan(&ev.ID, &ev.GiteaUserID, &ev.Kind, &ev.UnsignedEventJSON, &ev.Scope, &ev.DedupeKey, &createdAt); err != nil {
+		return PendingActorEvent{}, err
+	}
+	parsed, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return PendingActorEvent{}, fmt.Errorf("parse pending actor event created_at for %d: %w", ev.ID, err)
+	}
+	ev.CreatedAt = parsed
+	return ev, nil
 }
 
 // UpsertSignerGrant creates or replaces a durable NIP-46 signer grant.

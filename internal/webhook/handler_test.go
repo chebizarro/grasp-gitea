@@ -489,7 +489,7 @@ func TestIssue_LinkedContributorEnqueuesUnsignedActorEvents(t *testing.T) {
 	forbidTag(t, &queued[0].event, "action")
 }
 
-func TestPR_UnlinkedContributorSkippedWhenSignerEnabled(t *testing.T) {
+func TestPR_UnlinkedContributorPersistsPendingWhenSignerEnabled(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)
 	outbox := &fakeOutbox{}
@@ -511,9 +511,82 @@ func TestPR_UnlinkedContributorSkippedWhenSignerEnabled(t *testing.T) {
 	if queued := outbox.all(); len(queued) != 0 {
 		t.Fatalf("unlinked actor should not enqueue, got %#v", queued)
 	}
+	pending, err := st.ListPendingActorEvents(context.Background(), 303, 10)
+	if err != nil {
+		t.Fatalf("ListPendingActorEvents: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending rows = %d, want 1", len(pending))
+	}
+	row := pending[0]
+	if row.Kind != KindPROpen || row.Scope != "repo:42:pr:9:opened" || row.DedupeKey == "" {
+		t.Fatalf("unexpected pending row: %#v", row)
+	}
+	if !strings.Contains(row.DedupeKey, "webhook:repo:42:pr:9:opened") {
+		t.Fatalf("pending dedupe key %q missing webhook scope", row.DedupeKey)
+	}
+	var stored nostr.Event
+	if err := json.Unmarshal([]byte(row.UnsignedEventJSON), &stored); err != nil {
+		t.Fatalf("unmarshal pending event: %v", err)
+	}
+	if stored.PubKey != "" || stored.Sig != "" || stored.ID != "" {
+		t.Fatalf("pending event should be unsigned/no author, got pubkey=%q sig=%q id=%q", stored.PubKey, stored.Sig, stored.ID)
+	}
+	requireTag(t, &stored, "a", fmt.Sprintf("30617:%s:%s", testPubkeyHex, testRepoID))
 	after := metrics.Snapshot()["unlinked_actor_skipped"]
 	if after != before+1 {
 		t.Fatalf("unlinked_actor_skipped delta = %d, want 1 (before=%d after=%d)", after-before, before, after)
+	}
+}
+
+func TestActorBackfillerEnqueuesPendingRowsAndDeletesThem(t *testing.T) {
+	_, _, st := newTestHandler(t, "")
+	ctx := context.Background()
+	unsigned := nostr.Event{Kind: KindIssue, CreatedAt: nostr.Timestamp(123), Tags: nostr.Tags{{"subject", "Backfill me"}}, Content: "body"}
+	b, err := json.Marshal(unsigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.SavePendingActorEvent(ctx, store.PendingActorEvent{
+		GiteaUserID:       202,
+		Kind:              KindIssue,
+		UnsignedEventJSON: string(b),
+		Scope:             "repo:42:issue:3:opened",
+		DedupeKey:         "pending-issue-key",
+	}, time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC), 500, 30*24*time.Hour); err != nil {
+		t.Fatalf("SavePendingActorEvent: %v", err)
+	}
+
+	outbox := &fakeOutbox{}
+	backfiller := NewActorBackfiller(st, outbox, testLogger())
+	before := metrics.Snapshot()["actor_events_backfilled"]
+	count, err := backfiller.EnqueuePending(ctx, 202, testActorPubkeyHex)
+	if err != nil {
+		t.Fatalf("EnqueuePending: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("backfilled count = %d, want 1", count)
+	}
+	queued := outbox.all()
+	if len(queued) != 1 {
+		t.Fatalf("queued = %#v, want one", queued)
+	}
+	if queued[0].kind != KindIssue || queued[0].authorPubkey != testActorPubkeyHex || queued[0].dedupeKey != "pending-issue-key" {
+		t.Fatalf("unexpected queued event: %#v", queued[0])
+	}
+	if queued[0].event.PubKey != testActorPubkeyHex || queued[0].event.Sig != "" || queued[0].event.ID == "" {
+		t.Fatalf("backfilled event should be authored/unsigned/id computed, got pubkey=%q sig=%q id=%q", queued[0].event.PubKey, queued[0].event.Sig, queued[0].event.ID)
+	}
+	pending, err := st.ListPendingActorEvents(ctx, 202, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending rows after backfill = %#v, want empty", pending)
+	}
+	after := metrics.Snapshot()["actor_events_backfilled"]
+	if after != before+1 {
+		t.Fatalf("actor_events_backfilled delta = %d, want 1", after-before)
 	}
 }
 
