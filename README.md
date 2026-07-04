@@ -8,6 +8,8 @@ Phase 1 + Phase 2 + Phase 3 implementation currently provides:
 - automatic Gitea org/repo provisioning for clone URLs matching `CLONE_PREFIX`
 - automatic repo archival when a later announcement removes this server from `clone` tags
 - proactive sync listener for repository state events (best-effort local ref update)
+- user-signed NIP-34 publishing: owner/contributor events are built unsigned, queued, and signed through the user's NIP-46 bunker grant when `SIGNER_MASTER_KEY` is configured
+- transition fallback to legacy bridge-signed publishing when the signer subsystem is disabled; unlinked contributor actors are skipped rather than bridge-signed
 - SQLite mapping store for `{npub}/{repo-id} -> gitea repo`
 - pre-receive companion hook installation into provisioned repositories via Gitea's `hooks/pre-receive.d/` chain
 - `grasp-pre-receive` hook binary that validates pushed refs against latest kind `30618`
@@ -22,6 +24,8 @@ Phase 1 + Phase 2 + Phase 3 implementation currently provides:
   - `GET /health`
   - `GET /metrics`
   - `GET /mappings`
+  - `GET /outbound-events` (admin view of pending/retry/dead-letter user-signed queue items)
+  - `POST /signer/authorize` (admin-authorized NIP-46 bunker grant creation)
   - `POST /provision`
 
 ## Quick start
@@ -49,7 +53,44 @@ LISTEN=:8090
 DB_PATH=./mappings.db
 PUBKEY_ALLOWLIST=
 PROVISION_RATE_LIMIT=10
+ADMIN_API_TOKEN=<admin bearer token>
+BRIDGE_PUBLIC_URL=https://bridge.example.com
+CHALLENGE_TTL=5m
+BRIDGE_NSEC=<operator nsec or hex key>
+GITEA_WEBHOOK_SECRET=<webhook HMAC secret>
+SIGNER_MASTER_KEY=<32-byte base64 or hex key, optional>
+PROACTIVE_SYNC_INTERVAL=1h
+GRASP05_ARCHIVE_MODE=false
 ```
+
+`SIGNER_MASTER_KEY` enables the persistent NIP-46 signer subsystem. With it set, owner and contributor events are unsigned templates until the outbound queue obtains the user's bunker signature. Without it, the bridge intentionally remains in legacy bridge-signed transition mode for bridge-originated owner state; contributor events from unlinked actors are skipped and counted as `unlinked_actor_skipped`.
+
+## User-signed NIP-34 model
+
+- Repository announcements (`kind:30617`) remain owner-signed and are cached/rebroadcast verbatim.
+- Repository state (`kind:30618`) is owner-signed through the owner's NIP-46 grant and the outbound queue; if the signer subsystem is disabled, the bridge-signed fallback remains available for compatibility.
+- Contributor-authored webhook events (`1617`, `1618`, `1619`, `1621`, `1630`-`1633`, `1985`, and NIP-22 `1111` comments) are signed by the acting user's linked grant. If the actor has not linked a signer, the event is skipped, not bridge-signed, and `unlinked_actor_skipped` is incremented.
+- CI workflow-run events (`kind:5401`) remain operator-signed by `BRIDGE_NSEC` because they are executor attestations, not user-authored NIP-34 content.
+
+### Signer and queue admin endpoints
+
+`POST /signer/authorize` creates a persistent signer grant from a NIP-46 bunker URI. It requires the admin bearer token and accepts:
+
+```json
+{"bunker_uri":"bunker://..."}
+```
+
+The response includes the authorized user pubkey, bridge client pubkey, relays, and grant timestamp. Grants are encrypted at rest with `SIGNER_MASTER_KEY`.
+
+`GET /outbound-events?limit=50` returns the admin queue view for unsigned templates waiting on user signatures, retrying after offline signers, or dead-lettered after repeated failure. See [`docs/user-signed-operations.md`](docs/user-signed-operations.md) for the short operations runbook.
+
+## Compatibility and limitations
+
+- Events emitted before this migration and signed by historical `BRIDGE_NSEC` are not re-signed.
+- Events created before a contributor links a signer are not backfilled; unlinked webhook actors are skipped (`phase1-5ud`).
+- Full patch-apply from Nostr to a branch is deferred; Phase F records refs/nostr tips and reflects supported issue/comment/status state only (`phase1-ki5`).
+- `maintainers` on `30617` is owner-driven; the bridge honors owner announcements and will not add maintainers itself.
+- Kind `10317` owner-list cache/rebroadcast is tracked separately (`phase1-kyg`).
 
 ## Hook behavior
 

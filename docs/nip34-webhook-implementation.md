@@ -2,56 +2,82 @@
 
 ## Overview
 
-This implementation adds full NIP-34 event support for Gitea webhooks, enabling the bridge to publish events for pull requests, issues, patches, and labels to Nostr relays.
+The webhook bridge converts Gitea activity into NIP-34/NIP-22 Nostr events. The current model is user-signed by default when the signer subsystem is enabled: webhook handlers build unsigned event templates, enqueue them in the outbound signing queue, and publish only after the relevant user's NIP-46 bunker grant signs the event.
 
-## What Was Added
+CI workflow-run events (`kind:5401`) are the exception: they remain operator-signed by `BRIDGE_NSEC` because they are executor attestations, not user-authored NIP-34 content.
 
-### New Event Kinds Supported
+## Signing model
 
-| Kind  | Description                | Use Case                        |
-|-------|----------------------------|---------------------------------|
-| 1617  | Patch                      | Push to `refs/nostr/<event-id>` |
-| 1618  | PR Open                    | Pull request opened             |
-| 1619  | PR Update                  | PR updated/closed/synchronized  |
-| 1621  | Issue                      | Issue opened/edited/closed      |
-| 1630  | Status: Open               | PR/Issue opened                 |
-| 1631  | Status: Applied            | PR merged                       |
-| 1632  | Status: Closed             | PR/Issue closed                 |
-| 1633  | Status: Draft              | PR marked as draft              |
-| 1985  | NIP-32 Label               | Issue/PR labeled                |
-
-### New Files
-
-1. **`internal/webhook/types.go`** - Gitea webhook payload types
-2. **`internal/webhook/handler.go`** - Main webhook handler with event processing
-3. **`internal/webhook/README.md`** - Documentation and setup guide
-
-### Modified Files
-
-1. **`internal/relay/kinds.go`** - Added NIP-34 event kind constants
-2. **`internal/publisher/service.go`** - Added `PublishEvent()` method for webhook events
-3. **`internal/api/server.go`** - Added webhook handler wiring
-4. **`internal/config/config.go`** - Added `GiteaWebhookSecret` configuration
-5. **`internal/metrics/metrics.go`** - Added webhook event metrics
-6. **`cmd/grasp-bridge/main.go`** - Initialized webhook handler
-7. **`.env.example`** - Documented new environment variables
+| Event family | Author/signing path | Notes |
+|---|---|---|
+| `30617` repository announcement | Owner-signed upstream; bridge caches/rebroadcasts verbatim | Still owner-authored. The bridge does not add `maintainers` tags. |
+| `30618` repository state | Owner grant → outbound queue → NIP-46 signer → relay | If the signer subsystem is disabled, legacy bridge-signed transition fallback remains intentional. |
+| Contributor webhook events (`1617`, `1618`, `1619`, `1621`, `1630`-`1633`, `1985`) | Acting user's grant → outbound queue → NIP-46 signer → relay | Unlinked actors are skipped, not bridge-signed, and counted by `unlinked_actor_skipped`. |
+| NIP-22 comments (`1111`) | Acting user's grant → outbound queue → NIP-46 signer → relay | Used for comment/review threading. |
+| CI workflow run (`5401`) | Operator key (`BRIDGE_NSEC`) | GRASP extension / executor attestation. |
 
 ## Configuration
 
-### Environment Variables
-
 ```bash
-# Required: Bridge signing key for publishing events
+# Required for relay publishing / operator attestations / transition fallback
 BRIDGE_NSEC=nsec1... or hex private key
 
 # Required: HMAC secret shared with Gitea webhook
 GITEA_WEBHOOK_SECRET=your-secret-here
 
-# Optional: Relay URLs to publish to
+# Optional: relay URLs to publish to
 RELAY_URLS=wss://relay1.example.com,wss://relay2.example.com
+
+# Optional: admin API bearer token for /signer/authorize and /outbound-events
+ADMIN_API_TOKEN=admin-secret
+
+# Optional but recommended: enables user-signed NIP-46 grants.
+# Must decode to exactly 32 bytes from base64 or hex.
+SIGNER_MASTER_KEY=base64-or-hex-32-byte-key
+
+# Optional: proactive state sync cadence and archive behavior
+PROACTIVE_SYNC_INTERVAL=1h
+GRASP05_ARCHIVE_MODE=false
 ```
 
-### Gitea System Webhook Setup
+When `SIGNER_MASTER_KEY` is empty, the persistent signer service is disabled and the bridge runs in legacy bridge-signed transition mode where applicable. This fallback is intentional for migration compatibility and should not be removed from code during documentation-only work.
+
+## Signer authorization
+
+`POST /signer/authorize` creates a persistent NIP-46 signer grant from a bunker URI. The request must be authenticated with the admin bearer token.
+
+Request:
+
+```json
+{"bunker_uri":"bunker://..."}
+```
+
+Success response includes:
+
+```json
+{
+  "ok": true,
+  "pubkey": "<authorized user pubkey>",
+  "client_pubkey": "<bridge NIP-46 client pubkey>",
+  "relays": ["wss://relay.example"],
+  "granted_at": "..."
+}
+```
+
+The grant stores the bridge's reusable NIP-46 client credentials and bunker URI encrypted at rest with `SIGNER_MASTER_KEY`. Owners use this flow for owner-authored repository state. Contributors link their own signer grants through the NIP-46 login/linking flow before their Gitea-authored collaboration events can be published.
+
+## Outbound signing queue
+
+`GET /outbound-events?limit=50` is the admin queue inspection endpoint. It shows queued unsigned templates and their state, attempts, next retry time, last error, and published event id when available.
+
+Queue behavior:
+
+- Events are deduplicated before publish.
+- Offline bunkers cause retry/backoff instead of silent drops.
+- Repeated failures surface as dead-lettered queue entries and metrics.
+- Metrics include `outbox_queue_depth`, `outbox_published`, `outbox_retried`, `outbox_dead_lettered`, `bridge_signed_fallback`, and `unlinked_actor_skipped`.
+
+## Gitea system webhook setup
 
 1. Navigate to **Site Administration → System Webhooks**
 2. Click **Add Webhook → Gitea**
@@ -63,155 +89,83 @@ RELAY_URLS=wss://relay1.example.com,wss://relay2.example.com
    - **Trigger On**: Select all events (Push, Create, Delete, Pull Request, Issues, Label)
    - **Active**: ✓
 
-## Event Flow
+## Event flow
 
-```
-Gitea Event → /webhook/gitea → Handler → Publisher → Nostr Relays
-                     ↓
-               HMAC Verification
-                     ↓
-               Event Transformation
-                     ↓
-               Bridge Signing
-                     ↓
-               Metrics Tracking
-```
-
-## Security
-
-- **HMAC Signature Verification**: All webhook requests are verified using HMAC-SHA256
-- **Bridge Signing**: All events are signed with the bridge's private key (`BRIDGE_NSEC`)
-- **Secret Management**: Webhook secret should be a strong random value (32+ characters)
-
-## Metrics
-
-The implementation tracks:
-- `webhook_events_received` - Total webhook events received from Gitea
-- `webhook_events_published` - Successfully published NIP-34 events to relays
-- `webhook_events_failed` - Failed event publications
-
-## Event Examples
-
-### Pull Request Open (kind:1618)
-
-```json
-{
-  "kind": 1618,
-  "pubkey": "bridge_pubkey",
-  "created_at": 1234567890,
-  "tags": [
-    ["a", "npub1.../repo-id"],
-    ["p", "npub1..."],
-    ["r", "npub1.../repo-id/pull/42"],
-    ["title", "Fix authentication bug"],
-    ["head", "feature/auth-fix"],
-    ["base", "main"]
-  ],
-  "content": "This PR fixes the authentication timeout issue...",
-  "sig": "..."
-}
+```text
+Gitea Event → /webhook/gitea → HMAC Verification → Event Builder
+                                                        ↓
+                                              Actor/owner grant lookup
+                                                        ↓
+                                unsigned event template → outbound queue
+                                                        ↓
+                                           NIP-46 user signing grant
+                                                        ↓
+                                                publish to relays
 ```
 
-### Issue (kind:1621)
+If `SIGNER_MASTER_KEY` is unset, signer/outbox user-signing is disabled and bridge-signed transition fallbacks remain in effect where implemented. If a contributor actor has not linked a signer while user-signing is enabled, their event is skipped and `unlinked_actor_skipped` is incremented; it is not later backfilled automatically.
 
-```json
-{
-  "kind": 1621,
-  "pubkey": "bridge_pubkey",
-  "created_at": 1234567890,
-  "tags": [
-    ["a", "npub1.../repo-id"],
-    ["p", "npub1..."],
-    ["r", "npub1.../repo-id/issue/123"],
-    ["title", "Add dark mode support"],
-    ["action", "opened"]
-  ],
-  "content": "We should add dark mode to improve UX...",
-  "sig": "..."
-}
-```
+## Supported webhook events
 
-### Status Event (kind:1630)
+### Push events
 
-```json
-{
-  "kind": 1630,
-  "pubkey": "bridge_pubkey",
-  "created_at": 1234567890,
-  "tags": [
-    ["e", "event_id_of_pr_or_issue"],
-    ["p", "npub1..."]
-  ],
-  "content": "",
-  "sig": "..."
-}
-```
+- Regular push → `kind:30618` repository state, owner-signed through the owner grant when enabled.
+- Patch push (`refs/nostr/<event-id>`) → `kind:1617` patch acknowledgement flow; full patch-apply to a branch is deferred.
 
-### NIP-32 Label (kind:1985)
+### Branch/tag events
 
-```json
-{
-  "kind": 1985,
-  "pubkey": "bridge_pubkey",
-  "created_at": 1234567890,
-  "tags": [
-    ["L", "gitea/label"],
-    ["l", "bug", "gitea/label"],
-    ["a", "1621:npub1.../npub1.../repo-id/issue/123"],
-    ["p", "npub1..."]
-  ],
-  "content": "",
-  "sig": "..."
-}
-```
+- Create/delete → `kind:30618` repository state.
 
-## Supported Webhook Events
+### Pull request events
 
-### Push Events
-- **Regular push** → Publishes `kind:30618` (repository state)
-- **Patch push** (`refs/nostr/<event-id>`) → Handles `kind:1617` (patch acknowledgement)
+- Opened → `kind:1618` PR open + `kind:1630/1633` status.
+- Edited/synchronized → `kind:1619` PR update.
+- Closed/reopened → status events (`1631` applied or `1632` closed / `1630` reopened) with NIP-34 threading.
 
-### Branch/Tag Events
-- **Create** → Publishes `kind:30618` (repository state)
-- **Delete** → Publishes `kind:30618` (repository state)
+PR events use the NIP-34 tag schema (`subject`, `c`, `clone`, `branch-name`, euc `r`, and `E`/`P` references on updates) rather than the older bridge-local `title`/`head`/`base`/`action` shape.
 
-### Pull Request Events
-- **Opened** → `kind:1618` (PR open) + `kind:1630/1633` (status)
-- **Closed** → `kind:1619` (PR update) + `kind:1631/1632` (status)
-- **Reopened** → `kind:1619` (PR update) + `kind:1630` (status)
-- **Edited** → `kind:1619` (PR update)
-- **Synchronized** → `kind:1619` (PR update)
+### Issue and comment events
 
-### Issue Events
-- **Opened** → `kind:1621` (issue) + `kind:1630` (status)
-- **Closed** → `kind:1621` (issue) + `kind:1632` (status)
-- **Reopened** → `kind:1621` (issue) + `kind:1630` (status)
-- **Edited** → `kind:1621` (issue)
-- **Labeled** → `kind:1985` (NIP-32 label)
-- **Unlabeled** → `kind:1985` (NIP-32 label)
+- Opened/edited → `kind:1621` issue.
+- Closed/reopened → `kind:1632`/`kind:1630` status.
+- Comments/review discussion → NIP-22 `kind:1111` comments.
+- Labeled/unlabeled → `kind:1985` NIP-32 label.
+
+## Nostr → Gitea reflection
+
+The bridge also reflects supported Nostr-originated collaboration events into Gitea with echo-loop prevention:
+
+- `1621` issues → Gitea issues.
+- `1111` comments → Gitea comments.
+- `1630`/`1632` status changes → Gitea state updates.
+- Patch refs / Nostr tips are recorded, but full patch-apply to a branch is deferred (`phase1-ki5`).
+
+## Compatibility and known limitations
+
+- Historical events already published under `BRIDGE_NSEC` are not re-signed.
+- Events created before a contributor links a signer are not backfilled (`phase1-5ud`).
+- Unlinked contributor actors are skipped and counted by `unlinked_actor_skipped`; the bridge does not forge their content with `BRIDGE_NSEC`.
+- Legacy bridge-signed fallbacks remain intentional for transition compatibility when the signer subsystem is disabled.
+- `maintainers` on `30617` is owner-driven; the bridge honors owner announcements and will not add maintainers itself.
+- Full patch-apply from Nostr to a branch remains deferred; Phase F records refs/nostr tips and reflects supported issue/comment/status state only (`phase1-ki5`).
+- Kind `10317` owner-list cache/rebroadcast is separate work (`phase1-kyg`).
 
 ## Testing
 
-To test the webhook handler:
+For a documentation-level smoke test:
 
-1. Set up environment variables
-2. Start grasp-bridge
-3. Configure Gitea system webhook
-4. Create a test PR or issue in a provisioned repository
-5. Check logs for webhook events
-6. Verify events on Nostr relays using a relay explorer
-
-## Future Enhancements
-
-- [x] Fetch pre-published `kind:1617` patch events from relays
-- [x] Emit `kind:1631` (applied) status for merged patches
-- [x] Resolve `kind:10317` user GRASP lists as owner-signed only; bridge-originated publishing is intentionally unsupported. See [kind:10317 User GRASP List Design Finding](kind10317-user-grasp-list-design.md).
-- [ ] Webhook event replay/recovery mechanism
-- [ ] Rate limiting for webhook endpoints
-- [ ] Webhook event queue for reliability
+1. Set the environment variables above.
+2. Start `grasp-bridge`.
+3. Configure the Gitea system webhook.
+4. Authorize an owner signer with `POST /signer/authorize` if user-signing is enabled.
+5. Link contributor signers before expecting contributor-authored webhook events to publish.
+6. Create a test PR, issue, comment, label, or push in a provisioned repository.
+7. Inspect `/metrics`, `/outbound-events`, logs, and relay output.
 
 ## References
 
 - [NIP-34: git stuff](https://github.com/nostr-protocol/nips/blob/master/34.md)
+- [NIP-22: Comments](https://github.com/nostr-protocol/nips/blob/master/22.md)
 - [NIP-32: Labeling](https://github.com/nostr-protocol/nips/blob/master/32.md)
+- [NIP-46: Nostr Connect](https://github.com/nostr-protocol/nips/blob/master/46.md)
 - [Gitea Webhooks Documentation](https://docs.gitea.com/usage/webhooks)
