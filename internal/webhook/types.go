@@ -8,11 +8,12 @@ import "time"
 // Gitea webhook payload types
 
 type Repository struct {
-	ID       int64  `json:"id"`
-	Name     string `json:"name"`
-	FullName string `json:"full_name"`
-	HTMLURL  string `json:"html_url"`
-	CloneURL string `json:"clone_url"`
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	FullName      string `json:"full_name"`
+	HTMLURL       string `json:"html_url"`
+	CloneURL      string `json:"clone_url"`
+	DefaultBranch string `json:"default_branch"`
 }
 
 type User struct {
@@ -69,22 +70,24 @@ type DeletePayload struct {
 }
 
 type PullRequest struct {
-	ID        int64     `json:"id"`
-	Number    int64     `json:"number"`
-	User      User      `json:"user"`
-	Title     string    `json:"title"`
-	Body      string    `json:"body"`
-	State     string    `json:"state"` // "open", "closed"
-	HTMLURL   string    `json:"html_url"`
-	DiffURL   string    `json:"diff_url"`
-	PatchURL  string    `json:"patch_url"`
-	Mergeable bool      `json:"mergeable"`
-	Merged    bool      `json:"merged"`
-	MergedAt  time.Time `json:"merged_at"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	ClosedAt  time.Time `json:"closed_at"`
-	Head      struct {
+	ID             int64     `json:"id"`
+	Number         int64     `json:"number"`
+	User           User      `json:"user"`
+	Title          string    `json:"title"`
+	Body           string    `json:"body"`
+	State          string    `json:"state"` // "open", "closed"
+	HTMLURL        string    `json:"html_url"`
+	DiffURL        string    `json:"diff_url"`
+	PatchURL       string    `json:"patch_url"`
+	Mergeable      bool      `json:"mergeable"`
+	Merged         bool      `json:"merged"`
+	MergedAt       time.Time `json:"merged_at"`
+	MergedCommitID string    `json:"merge_commit_sha"`
+	MergeBase      string    `json:"merge_base"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	ClosedAt       time.Time `json:"closed_at"`
+	Head           struct {
 		Ref  string     `json:"ref"`
 		SHA  string     `json:"sha"`
 		Repo Repository `json:"repo"`
@@ -131,6 +134,27 @@ type IssuePayload struct {
 	Repository Repository `json:"repository"`
 	Sender     User       `json:"sender"`
 	Label      Label      `json:"label"` // Only present for labeled/unlabeled actions
+}
+
+type Comment struct {
+	ID        int64     `json:"id"`
+	HTMLURL   string    `json:"html_url"`
+	PRURL     string    `json:"pull_request_url"`
+	IssueURL  string    `json:"issue_url"`
+	User      User      `json:"user"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type IssueCommentPayload struct {
+	Action      string      `json:"action"` // "created", "edited", "deleted"
+	Issue       Issue       `json:"issue"`
+	PullRequest PullRequest `json:"pull_request"`
+	Comment     Comment     `json:"comment"`
+	Repository  Repository  `json:"repository"`
+	Sender      User        `json:"sender"`
+	IsPull      bool        `json:"is_pull"`
 }
 
 type LabelPayload struct {

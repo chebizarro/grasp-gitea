@@ -164,6 +164,7 @@ func main() {
 	// Wire webhook handler for NIP-34 events (PRs, issues, patches, labels)
 	if publisherSvc != nil && cfg.GiteaWebhookSecret != "" {
 		webhookHandler := webhook.New(publisherSvc, st, cfg.GiteaWebhookSecret, logger)
+		webhookHandler.SetRepositoriesDir(cfg.GiteaRepositoriesDir)
 		if signerSvc != nil && signerSvc.Enabled() {
 			webhookHandler.SetActorSigning(signerSvc, outboxWorker, st)
 		}

@@ -15,7 +15,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -28,6 +30,7 @@ import (
 )
 
 const (
+	KindComment       = 1111
 	KindPatch         = 1617
 	KindPROpen        = 1618
 	KindPRUpdate      = 1619
@@ -66,13 +69,30 @@ type ActorIdentityLookup interface {
 // Handler handles inbound Gitea webhook events, maps them to NIP-34 Nostr
 // events, and publishes via the publisher.
 type Handler struct {
-	pub         Publisher
-	store       *store.SQLiteStore
-	secret      string
-	logger      *slog.Logger
-	actorSigner ActorSigner
-	actorOutbox ActorOutbox
-	actorLookup ActorIdentityLookup
+	pub             Publisher
+	store           *store.SQLiteStore
+	secret          string
+	logger          *slog.Logger
+	actorSigner     ActorSigner
+	actorOutbox     ActorOutbox
+	actorLookup     ActorIdentityLookup
+	repositoriesDir string
+
+	eucMu    sync.Mutex
+	eucCache map[int64]string
+
+	threadMu sync.Mutex
+	threads  map[string]threadRef
+}
+
+// threadRef records the event id and author for an issue/PR root event seen by
+// this process. It lets follow-up Gitea webhooks emit NIP-34 status and NIP-22
+// comment tags with the required event-id/pubkey references without changing
+// the store schema in this phase.
+type threadRef struct {
+	EventID string
+	Pubkey  string
+	Kind    int
 }
 
 // New creates a webhook Handler.
@@ -92,6 +112,10 @@ func (h *Handler) SetActorSigning(signer ActorSigner, outbox ActorOutbox, lookup
 	if lookup != nil {
 		h.actorLookup = lookup
 	}
+}
+
+func (h *Handler) SetRepositoriesDir(dir string) {
+	h.repositoriesDir = dir
 }
 
 // ServeHTTP handles POST /webhook/gitea.
@@ -134,6 +158,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		publishErr = h.handlePR(ctx, body)
 	case "issues":
 		publishErr = h.handleIssue(ctx, body)
+	case "issue_comment":
+		publishErr = h.handleIssueComment(ctx, body)
 	case "label":
 		publishErr = h.handleLabel(ctx, body)
 	default:
@@ -227,7 +253,10 @@ func (h *Handler) handleDelete(ctx context.Context, body []byte) error {
 	return h.publishRepoState(ctx, mapping, p.Repository)
 }
 
-// handlePR publishes kind:1618 (PR open), kind:1619 (PR update/close), and status events.
+// handlePR publishes NIP-34 PR roots (kind:1618), tip-change updates
+// (kind:1619), and status events (kinds:1630-1633). Kind:1619 is reserved
+// for synchronized/tip-advancing updates only; close/reopen/edit lifecycle
+// actions are represented as status events.
 func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 	var p PullRequestPayload
 	if err := json.Unmarshal(body, &p); err != nil {
@@ -239,73 +268,44 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		return nil
 	}
 
-	repoAddr := repoAddr(mapping)
-	prRef := fmt.Sprintf("%s/%s/pull/%d", mapping.Npub, mapping.RepoID, p.Number)
+	euc := h.eucForRepo(ctx, mapping, p.Repository, p.PullRequest.Base.Ref)
 
-	var ev *nostr.Event
 	switch p.Action {
 	case "opened":
-		ev = &nostr.Event{
-			Kind:      KindPROpen,
-			CreatedAt: nostr.Timestamp(time.Now().Unix()),
-			Tags: nostr.Tags{
-				{"a", repoAddr},
-				{"p", mapping.Pubkey},
-				{"r", prRef},
-				{"title", p.PullRequest.Title},
-				{"head", p.PullRequest.Head.Ref},
-				{"base", p.PullRequest.Base.Ref},
-			},
-			Content: p.PullRequest.Body,
+		ev := h.buildPROpenEvent(mapping, p, euc)
+		emitted, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("pr:%d:opened", p.Number))
+		if err != nil || !emitted {
+			return err
 		}
-	case "closed", "reopened", "edited", "synchronized":
-		ev = &nostr.Event{
-			Kind:      KindPRUpdate,
-			CreatedAt: nostr.Timestamp(time.Now().Unix()),
-			Tags: nostr.Tags{
-				{"a", repoAddr},
-				{"p", mapping.Pubkey},
-				{"r", prRef},
-				{"action", p.Action},
-			},
-			Content: p.PullRequest.Body,
+		h.rememberThread("pr", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID, Pubkey: ev.PubKey, Kind: KindPROpen})
+		if p.PullRequest.Draft {
+			return h.publishPRStatus(ctx, p, mapping, threadRef{EventID: ev.ID, Pubkey: ev.PubKey, Kind: KindPROpen}, KindStatusDraft, euc)
 		}
+		return nil
+	case "synchronized":
+		root, ok := h.lookupThread("pr", mapping.GiteaRepoID, p.Number)
+		if !ok || root.EventID == "" || root.Pubkey == "" {
+			h.warnMissingThread("PR update", mapping, p.Number)
+			return nil
+		}
+		ev := h.buildPRUpdateEvent(mapping, p, root, euc)
+		_, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("pr:%d:synchronized:%s", p.Number, p.PullRequest.Head.SHA))
+		return err
+	case "closed", "reopened", "edited":
+		root, ok := h.lookupThread("pr", mapping.GiteaRepoID, p.Number)
+		if !ok || root.EventID == "" {
+			h.warnMissingThread("PR status", mapping, p.Number)
+			return nil
+		}
+		return h.publishPRStatus(ctx, p, mapping, root, prStatusKind(p.PullRequest), euc)
 	default:
 		return nil
 	}
-
-	emitted, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("pr:%d:%s", p.Number, p.Action))
-	if err != nil || !emitted {
-		return err
-	}
-
-	// Emit status event
-	var statusKind int
-	if p.PullRequest.Draft {
-		statusKind = KindStatusDraft
-	} else if p.PullRequest.State == "open" {
-		statusKind = KindStatusOpen
-	} else if p.PullRequest.Merged {
-		statusKind = KindStatusApplied
-	} else {
-		statusKind = KindStatusClosed
-	}
-
-	statusEv := &nostr.Event{
-		Kind:      statusKind,
-		CreatedAt: nostr.Timestamp(time.Now().Unix()),
-		Tags: nostr.Tags{
-			{"e", ev.ID},
-			{"a", repoAddr},
-			{"p", mapping.Pubkey},
-		},
-	}
-
-	_, err = h.publishActorEvent(ctx, p.Sender, mapping, statusEv, fmt.Sprintf("pr:%d:%s:status", p.Number, p.Action))
-	return err
 }
 
-// handleIssue publishes kind:1621 for issue open/close/edit, and kind:1985 for label events.
+// handleIssue publishes NIP-34 issue roots (kind:1621), labels, and lifecycle
+// status events. Issue root events use subject tags and intentionally do not
+// carry the old non-spec r/action tags.
 func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 	var p IssuePayload
 	if err := json.Unmarshal(body, &p); err != nil {
@@ -323,53 +323,293 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 		return h.publishNIP32LabelForActor(ctx, p.Sender, mapping, int(KindIssue), issueRef, p.Label.Name, "gitea/label")
 	}
 
+	euc := h.eucForRepo(ctx, mapping, p.Repository, p.Repository.DefaultBranch)
+
 	switch p.Action {
-	case "opened", "edited", "closed", "reopened":
-		// handle below
+	case "opened", "edited":
+		ev := h.buildIssueEvent(mapping, p)
+		emitted, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("issue:%d:%s", p.Number, p.Action))
+		if err != nil || !emitted {
+			return err
+		}
+		if p.Action == "opened" {
+			h.rememberThread("issue", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID, Pubkey: ev.PubKey, Kind: KindIssue})
+		}
+		return nil
+	case "closed", "reopened":
+		root, ok := h.lookupThread("issue", mapping.GiteaRepoID, p.Number)
+		if !ok || root.EventID == "" {
+			h.warnMissingThread("issue status", mapping, p.Number)
+			return nil
+		}
+		statusKind := KindStatusClosed
+		if p.Issue.State == "open" || p.Action == "reopened" {
+			statusKind = KindStatusOpen
+		}
+		statusEv := h.buildStatusEvent(mapping, root, statusKind, "", euc)
+		_, err := h.publishActorEvent(ctx, p.Sender, mapping, statusEv, fmt.Sprintf("issue:%d:%s:status", p.Number, p.Action))
+		return err
 	default:
 		return nil
 	}
+}
 
-	repoAddr := repoAddr(mapping)
-
-	ev := &nostr.Event{
-		Kind:      KindIssue,
-		CreatedAt: nostr.Timestamp(time.Now().Unix()),
-		Tags: nostr.Tags{
-			{"a", repoAddr},
-			{"p", mapping.Pubkey},
-			{"r", fmt.Sprintf("%s/%s/issue/%d", mapping.Npub, mapping.RepoID, p.Number)},
-			{"title", p.Issue.Title},
-			{"action", p.Action},
-		},
-		Content: p.Issue.Body,
+func (h *Handler) handleIssueComment(ctx context.Context, body []byte) error {
+	var p IssueCommentPayload
+	if err := json.Unmarshal(body, &p); err != nil {
+		return fmt.Errorf("parse issue_comment payload: %w", err)
+	}
+	if p.Action != "created" && p.Action != "edited" {
+		return nil
 	}
 
-	emitted, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("issue:%d:%s", p.Number, p.Action))
-	if err != nil || !emitted {
-		return err
+	mapping, err := h.store.GetMappingByGiteaRepoID(ctx, p.Repository.ID)
+	if err != nil {
+		return nil
 	}
 
-	// Emit status event
-	var statusKind int
-	if p.Issue.State == "open" {
-		statusKind = KindStatusOpen
-	} else {
-		statusKind = KindStatusClosed
+	threadKind := "issue"
+	rootKind := KindIssue
+	number := p.Issue.Number
+	if p.IsPull || p.PullRequest.Number != 0 {
+		threadKind = "pr"
+		rootKind = KindPROpen
+		if p.PullRequest.Number != 0 {
+			number = p.PullRequest.Number
+		}
 	}
 
-	statusEv := &nostr.Event{
-		Kind:      statusKind,
-		CreatedAt: nostr.Timestamp(time.Now().Unix()),
-		Tags: nostr.Tags{
-			{"e", ev.ID},
-			{"a", repoAddr},
-			{"p", mapping.Pubkey},
-		},
+	root, ok := h.lookupThread(threadKind, mapping.GiteaRepoID, number)
+	if !ok || root.EventID == "" || root.Pubkey == "" {
+		h.warnMissingThread("comment", mapping, number)
+		return nil
 	}
+	root.Kind = rootKind
 
-	_, err = h.publishActorEvent(ctx, p.Sender, mapping, statusEv, fmt.Sprintf("issue:%d:%s:status", p.Number, p.Action))
+	ev := h.buildCommentEvent(root, p.Comment)
+	_, err = h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("comment:%s:%d:%d:%s", threadKind, number, p.Comment.ID, p.Action))
 	return err
+}
+
+func (h *Handler) buildPROpenEvent(mapping store.Mapping, p PullRequestPayload, euc string) *nostr.Event {
+	tags := nostr.Tags{{"a", repoAddr(mapping)}}
+	if euc != "" {
+		tags = append(tags, nostr.Tag{"r", euc})
+	}
+	tags = append(tags, nostr.Tag{"p", mapping.Pubkey})
+	if p.PullRequest.Title != "" {
+		tags = append(tags, nostr.Tag{"subject", p.PullRequest.Title})
+	}
+	if p.PullRequest.Head.SHA != "" {
+		tags = append(tags, nostr.Tag{"c", p.PullRequest.Head.SHA})
+	}
+	if clone := prCloneURL(mapping, p); clone != "" {
+		tags = append(tags, nostr.Tag{"clone", clone})
+	}
+	if p.PullRequest.Head.Ref != "" {
+		tags = append(tags, nostr.Tag{"branch-name", p.PullRequest.Head.Ref})
+	}
+
+	return &nostr.Event{
+		Kind:      KindPROpen,
+		CreatedAt: eventTimestamp(p.PullRequest.CreatedAt),
+		Tags:      tags,
+		Content:   p.PullRequest.Body,
+	}
+}
+
+func (h *Handler) buildPRUpdateEvent(mapping store.Mapping, p PullRequestPayload, root threadRef, euc string) *nostr.Event {
+	tags := nostr.Tags{{"a", repoAddr(mapping)}}
+	if euc != "" {
+		tags = append(tags, nostr.Tag{"r", euc})
+	}
+	tags = append(tags,
+		nostr.Tag{"p", mapping.Pubkey},
+		nostr.Tag{"E", root.EventID},
+		nostr.Tag{"P", root.Pubkey},
+	)
+	if p.PullRequest.Head.SHA != "" {
+		tags = append(tags, nostr.Tag{"c", p.PullRequest.Head.SHA})
+	}
+	if clone := prCloneURL(mapping, p); clone != "" {
+		tags = append(tags, nostr.Tag{"clone", clone})
+	}
+	if p.PullRequest.MergeBase != "" {
+		tags = append(tags, nostr.Tag{"merge-base", p.PullRequest.MergeBase})
+	}
+
+	return &nostr.Event{
+		Kind:      KindPRUpdate,
+		CreatedAt: eventTimestamp(p.PullRequest.UpdatedAt),
+		Tags:      tags,
+	}
+}
+
+func (h *Handler) buildIssueEvent(mapping store.Mapping, p IssuePayload) *nostr.Event {
+	tags := nostr.Tags{
+		{"a", repoAddr(mapping)},
+		{"p", mapping.Pubkey},
+	}
+	if p.Issue.Title != "" {
+		tags = append(tags, nostr.Tag{"subject", p.Issue.Title})
+	}
+	return &nostr.Event{
+		Kind:      KindIssue,
+		CreatedAt: eventTimestamp(p.Issue.CreatedAt),
+		Tags:      tags,
+		Content:   p.Issue.Body,
+	}
+}
+
+func (h *Handler) publishPRStatus(ctx context.Context, p PullRequestPayload, mapping store.Mapping, root threadRef, statusKind int, euc string) error {
+	statusEv := h.buildStatusEvent(mapping, root, statusKind, "", euc)
+	if statusKind == KindStatusApplied {
+		if p.PullRequest.MergedCommitID != "" {
+			statusEv.Tags = append(statusEv.Tags,
+				nostr.Tag{"merge-commit", p.PullRequest.MergedCommitID},
+				nostr.Tag{"r", p.PullRequest.MergedCommitID},
+			)
+		}
+	}
+	_, err := h.publishActorEvent(ctx, p.Sender, mapping, statusEv, fmt.Sprintf("pr:%d:%s:status", p.Number, p.Action))
+	return err
+}
+
+func (h *Handler) buildStatusEvent(mapping store.Mapping, root threadRef, kind int, content string, euc string) *nostr.Event {
+	tags := nostr.Tags{
+		{"e", root.EventID, "", "root"},
+		{"a", repoAddr(mapping)},
+		{"p", mapping.Pubkey},
+	}
+	if root.Pubkey != "" && root.Pubkey != mapping.Pubkey {
+		tags = append(tags, nostr.Tag{"p", root.Pubkey})
+	}
+	if euc != "" {
+		tags = append(tags, nostr.Tag{"r", euc})
+	}
+	return &nostr.Event{
+		Kind:      kind,
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Tags:      tags,
+		Content:   content,
+	}
+}
+
+func (h *Handler) buildCommentEvent(root threadRef, comment Comment) *nostr.Event {
+	return &nostr.Event{
+		Kind:      KindComment,
+		CreatedAt: eventTimestamp(comment.CreatedAt),
+		Tags: nostr.Tags{
+			{"E", root.EventID, "", root.Pubkey},
+			{"K", fmt.Sprint(root.Kind)},
+			{"P", root.Pubkey},
+			{"e", root.EventID, "", root.Pubkey},
+			{"k", fmt.Sprint(root.Kind)},
+			{"p", root.Pubkey},
+		},
+		Content: comment.Body,
+	}
+}
+
+func prStatusKind(pr PullRequest) int {
+	if pr.Draft {
+		return KindStatusDraft
+	}
+	if pr.State == "open" {
+		return KindStatusOpen
+	}
+	if pr.Merged {
+		return KindStatusApplied
+	}
+	return KindStatusClosed
+}
+
+func prCloneURL(mapping store.Mapping, p PullRequestPayload) string {
+	if p.PullRequest.Head.Repo.CloneURL != "" {
+		return p.PullRequest.Head.Repo.CloneURL
+	}
+	if p.Repository.CloneURL != "" {
+		return p.Repository.CloneURL
+	}
+	if mapping.AnnouncedCloneURL != "" {
+		return mapping.AnnouncedCloneURL
+	}
+	return mapping.CloneURL
+}
+
+func eventTimestamp(t time.Time) nostr.Timestamp {
+	if t.IsZero() {
+		return nostr.Timestamp(time.Now().Unix())
+	}
+	return nostr.Timestamp(t.Unix())
+}
+
+func threadKey(kind string, repoID int64, number int64) string {
+	return fmt.Sprintf("%s:%d:%d", kind, repoID, number)
+}
+
+func (h *Handler) rememberThread(kind string, repoID int64, number int64, ref threadRef) {
+	if ref.EventID == "" {
+		return
+	}
+	h.threadMu.Lock()
+	defer h.threadMu.Unlock()
+	if h.threads == nil {
+		h.threads = make(map[string]threadRef)
+	}
+	h.threads[threadKey(kind, repoID, number)] = ref
+}
+
+func (h *Handler) lookupThread(kind string, repoID int64, number int64) (threadRef, bool) {
+	h.threadMu.Lock()
+	defer h.threadMu.Unlock()
+	ref, ok := h.threads[threadKey(kind, repoID, number)]
+	return ref, ok
+}
+
+func (h *Handler) warnMissingThread(action string, mapping store.Mapping, number int64) {
+	if h.logger != nil {
+		h.logger.Warn("webhook: missing root Nostr event id; skipping threaded event", "action", action, "repo", mapping.Owner+"/"+mapping.RepoName, "number", number)
+	}
+}
+
+func (h *Handler) eucForRepo(ctx context.Context, mapping store.Mapping, repo Repository, defaultBranch string) string {
+	if h.repositoriesDir == "" {
+		return ""
+	}
+
+	h.eucMu.Lock()
+	if h.eucCache != nil {
+		if euc := h.eucCache[mapping.GiteaRepoID]; euc != "" {
+			h.eucMu.Unlock()
+			return euc
+		}
+	}
+	h.eucMu.Unlock()
+
+	branch := defaultBranch
+	if branch == "" {
+		branch = repo.DefaultBranch
+	}
+	if branch == "" {
+		branch = "HEAD"
+	}
+	repoPath := filepath.Join(h.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
+	euc, err := EarliestUniqueCommit(ctx, repoPath, branch)
+	if err != nil {
+		if h.logger != nil {
+			h.logger.Warn("webhook: failed to compute earliest unique commit", "repo", mapping.Owner+"/"+mapping.RepoName, "branch", branch, "error", err)
+		}
+		return ""
+	}
+
+	h.eucMu.Lock()
+	if h.eucCache == nil {
+		h.eucCache = make(map[int64]string)
+	}
+	h.eucCache[mapping.GiteaRepoID] = euc
+	h.eucMu.Unlock()
+	return euc
 }
 
 // handleLabel publishes kind:1985 NIP-32 label events when Gitea labels are applied.
@@ -456,18 +696,26 @@ func (h *Handler) handlePatchPush(ctx context.Context, eventID string, p PushPay
 		return fmt.Errorf("publisher not configured")
 	}
 
+	euc := h.eucForRepo(ctx, mapping, p.Repository, p.Repository.DefaultBranch)
 	tags := nostr.Tags{
-		{"e", eventID},
+		{"e", eventID, "", "root"},
 		{"a", repoAddr(mapping)},
 		{"p", mapping.Pubkey},
 	}
-	// Record the commit the patch landed as (NIP-34 applied-as-commits).
+	if euc != "" {
+		tags = append(tags, nostr.Tag{"r", euc})
+	}
+	// Record the commit the patch landed as (NIP-34 applied-as-commits) and add
+	// the companion r tag so clients can find status by applied commit id.
 	if p.After != "" && strings.Trim(p.After, "0") != "" {
-		tags = append(tags, nostr.Tag{"applied-as-commits", p.After})
+		tags = append(tags, nostr.Tag{"applied-as-commits", p.After}, nostr.Tag{"r", p.After})
 	}
 	// Attribute to the patch author when known and distinct from the maintainer.
-	if patch != nil && patch.PubKey != "" && patch.PubKey != mapping.Pubkey {
-		tags = append(tags, nostr.Tag{"p", patch.PubKey})
+	if patch != nil && patch.PubKey != "" {
+		tags = append(tags, nostr.Tag{"q", eventID, "", patch.PubKey})
+		if patch.PubKey != mapping.Pubkey {
+			tags = append(tags, nostr.Tag{"p", patch.PubKey})
+		}
 	}
 
 	statusEv := &nostr.Event{

@@ -16,6 +16,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -183,6 +186,49 @@ func seedMapping(t *testing.T, st *store.SQLiteStore) {
 	}
 }
 
+func setupBareRepo(t *testing.T, h *Handler) string {
+	t.Helper()
+	tmp := t.TempDir()
+	work := filepath.Join(tmp, "work")
+	reposDir := filepath.Join(tmp, "git", "repositories")
+	runGit(t, tmp, "init", "-b", "main", work)
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("root\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, work, "add", "README.md")
+	runGit(t, work, "commit", "-m", "root")
+	root := strings.TrimSpace(runGitOutput(t, work, "rev-parse", "HEAD"))
+	repoPath := filepath.Join(reposDir, "org1", "myrepo.git")
+	if err := os.MkdirAll(filepath.Dir(repoPath), 0o755); err != nil {
+		t.Fatalf("mkdir repos dir: %v", err)
+	}
+	runGit(t, tmp, "clone", "--bare", work, repoPath)
+	h.SetRepositoriesDir(reposDir)
+	return root
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	_ = runGitOutput(t, dir, args...)
+}
+
+func runGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Tester",
+		"GIT_AUTHOR_EMAIL=tester@example.com",
+		"GIT_COMMITTER_NAME=Tester",
+		"GIT_COMMITTER_EMAIL=tester@example.com",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+	return string(out)
+}
+
 const testActorPubkeyHex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 func seedActorGrant(t *testing.T, st *store.SQLiteStore, userID int64, login string, pubkey string) {
@@ -317,19 +363,25 @@ func TestPush_UnknownRepoIsNoOp(t *testing.T) {
 	}
 }
 
-func TestPR_OpenedEmitsHexTaggedEvents(t *testing.T) {
+func TestPR_OpenedEmitsNIP34Schema(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)
+	euc := setupBareRepo(t, h)
 
 	payload := PullRequestPayload{
-		Action:     "opened",
-		Number:     7,
-		Repository: Repository{ID: testGiteaID},
+		Action: "opened",
+		Number: 7,
+		Repository: Repository{
+			ID:            testGiteaID,
+			CloneURL:      "https://git.example/org1/myrepo.git",
+			DefaultBranch: "main",
+		},
 	}
 	payload.PullRequest.Title = "Add feature"
 	payload.PullRequest.Body = "body text"
 	payload.PullRequest.State = "open"
 	payload.PullRequest.Head.Ref = "feature"
+	payload.PullRequest.Head.SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	payload.PullRequest.Base.Ref = "main"
 
 	rr := post(t, h, "pull_request", payload, "")
@@ -342,20 +394,18 @@ func TestPR_OpenedEmitsHexTaggedEvents(t *testing.T) {
 		t.Fatalf("no kind %d (PR open) event; got kinds %v", KindPROpen, fake.kinds())
 	}
 	assertTagsWellFormed(t, prEv)
-
-	statusEv := fake.firstOfKind(KindStatusOpen)
-	if statusEv == nil {
-		t.Fatalf("no kind %d (status open) event; got kinds %v", KindStatusOpen, fake.kinds())
-	}
-	assertTagsWellFormed(t, statusEv)
-
-	// The status event must reference the PR event via an "e" tag and carry
-	// the repo "a" coordinate (regression guard for the missing-a-tag bug).
-	if e := statusEv.Tags.GetFirst([]string{"e", ""}); e == nil || (*e)[1] != prEv.ID {
-		t.Errorf("status 'e' tag = %v, want PR event id %q", e, prEv.ID)
-	}
-	if a := statusEv.Tags.GetFirst([]string{"a", ""}); a == nil {
-		t.Errorf("status event missing 'a' repo coordinate tag")
+	requireTag(t, prEv, "a", fmt.Sprintf("30617:%s:%s", testPubkeyHex, testRepoID))
+	requireTag(t, prEv, "p", testPubkeyHex)
+	requireTag(t, prEv, "r", euc)
+	requireTag(t, prEv, "subject", "Add feature")
+	requireTag(t, prEv, "c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	requireTag(t, prEv, "clone", "https://git.example/org1/myrepo.git")
+	requireTag(t, prEv, "branch-name", "feature")
+	forbidTag(t, prEv, "title")
+	forbidTag(t, prEv, "head")
+	forbidTag(t, prEv, "base")
+	if fake.firstOfKind(KindPRUpdate) != nil {
+		t.Fatalf("opened PR must not emit kind %d", KindPRUpdate)
 	}
 }
 
@@ -386,8 +436,8 @@ func TestPR_LinkedContributorEnqueuesUnsignedActorEvents(t *testing.T) {
 		t.Fatalf("signer-enabled linked actor must not bridge-sign; published=%d", len(fake.events))
 	}
 	queued := outbox.all()
-	if len(queued) != 2 {
-		t.Fatalf("queued events = %d, want PR + status: %#v", len(queued), queued)
+	if len(queued) != 1 {
+		t.Fatalf("queued events = %d, want PR open only: %#v", len(queued), queued)
 	}
 	pr := queued[0]
 	if pr.kind != KindPROpen || pr.authorPubkey != testActorPubkeyHex {
@@ -397,14 +447,10 @@ func TestPR_LinkedContributorEnqueuesUnsignedActorEvents(t *testing.T) {
 		t.Fatalf("queued PR event should be unsigned and authored by actor, got pubkey=%q sig=%q", pr.event.PubKey, pr.event.Sig)
 	}
 	assertTagsWellFormed(t, &pr.event)
-	status := queued[1]
-	if status.kind != KindStatusOpen || status.authorPubkey != testActorPubkeyHex {
-		t.Fatalf("queued status = kind %d author %q", status.kind, status.authorPubkey)
-	}
-	if e := status.event.Tags.GetFirst([]string{"e", ""}); e == nil || (*e)[1] != pr.event.ID {
-		t.Fatalf("queued status e tag = %v, want PR event id %q", e, pr.event.ID)
-	}
-	assertTagsWellFormed(t, &status.event)
+	requireTag(t, &pr.event, "subject", "Add feature")
+	forbidTag(t, &pr.event, "title")
+	forbidTag(t, &pr.event, "head")
+	forbidTag(t, &pr.event, "base")
 }
 
 func TestIssue_LinkedContributorEnqueuesUnsignedActorEvents(t *testing.T) {
@@ -429,13 +475,17 @@ func TestIssue_LinkedContributorEnqueuesUnsignedActorEvents(t *testing.T) {
 		t.Fatalf("signer-enabled linked issue must not bridge-sign; published=%d", len(fake.events))
 	}
 	queued := outbox.all()
-	if len(queued) != 2 {
-		t.Fatalf("queued events = %d, want issue + status", len(queued))
+	if len(queued) != 1 {
+		t.Fatalf("queued events = %d, want issue root", len(queued))
 	}
 	if queued[0].kind != KindIssue || queued[0].authorPubkey != testActorPubkeyHex || queued[0].event.PubKey != testActorPubkeyHex || queued[0].event.Sig != "" {
 		t.Fatalf("unexpected queued issue: %#v", queued[0])
 	}
 	assertTagsWellFormed(t, &queued[0].event)
+	requireTag(t, &queued[0].event, "subject", "Bug report")
+	forbidTag(t, &queued[0].event, "title")
+	forbidTag(t, &queued[0].event, "r")
+	forbidTag(t, &queued[0].event, "action")
 }
 
 func TestPR_UnlinkedContributorSkippedWhenSignerEnabled(t *testing.T) {
@@ -481,7 +531,7 @@ func TestPR_SignerDisabledKeepsLegacyBridgeSigning(t *testing.T) {
 	payload.PullRequest.State = "open"
 
 	post(t, h, "pull_request", payload, "")
-	if fake.firstOfKind(KindPROpen) == nil || fake.firstOfKind(KindStatusOpen) == nil {
+	if fake.firstOfKind(KindPROpen) == nil {
 		t.Fatalf("signer disabled should use legacy bridge publisher; got %v", fake.kinds())
 	}
 	if queued := outbox.all(); len(queued) != 0 {
@@ -492,18 +542,178 @@ func TestPR_SignerDisabledKeepsLegacyBridgeSigning(t *testing.T) {
 func TestPR_MergedEmitsAppliedStatus(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)
+	euc := setupBareRepo(t, h)
 
-	payload := PullRequestPayload{Action: "closed", Number: 8, Repository: Repository{ID: testGiteaID}}
+	open := PullRequestPayload{Action: "opened", Number: 8, Repository: Repository{ID: testGiteaID, DefaultBranch: "main"}}
+	open.PullRequest.Title = "Merge me"
+	open.PullRequest.State = "open"
+	open.PullRequest.Head.Ref = "feature"
+	open.PullRequest.Head.SHA = "1111111111111111111111111111111111111111"
+	open.PullRequest.Base.Ref = "main"
+	post(t, h, "pull_request", open, "")
+	prEv := fake.firstOfKind(KindPROpen)
+	if prEv == nil {
+		t.Fatalf("open PR missing; got %v", fake.kinds())
+	}
+
+	payload := PullRequestPayload{Action: "closed", Number: 8, Repository: Repository{ID: testGiteaID, DefaultBranch: "main"}}
 	payload.PullRequest.State = "closed"
 	payload.PullRequest.Merged = true
-
+	payload.PullRequest.MergedCommitID = "2222222222222222222222222222222222222222"
 	post(t, h, "pull_request", payload, "")
-	if fake.firstOfKind(KindStatusApplied) == nil {
+	status := fake.firstOfKind(KindStatusApplied)
+	if status == nil {
 		t.Fatalf("merged PR should emit kind %d (applied); got %v", KindStatusApplied, fake.kinds())
+	}
+	requireTag(t, status, "e", prEv.ID, "", "root")
+	requireTag(t, status, "a", fmt.Sprintf("30617:%s:%s", testPubkeyHex, testRepoID))
+	requireTag(t, status, "p", testPubkeyHex)
+	requireTag(t, status, "r", euc)
+	requireTag(t, status, "merge-commit", "2222222222222222222222222222222222222222")
+	requireTag(t, status, "r", "2222222222222222222222222222222222222222")
+}
+
+func TestPR_SynchronizedEmitsTipUpdateAndCloseEmitsStatus(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	seedActorGrant(t, st, 101, "alice", testActorPubkeyHex)
+	euc := setupBareRepo(t, h)
+	outbox := &fakeOutbox{}
+	h.SetActorSigning(fakeActorSigner{enabled: true}, outbox, st)
+
+	open := PullRequestPayload{
+		Action: "opened",
+		Number: 7,
+		Repository: Repository{
+			ID:            testGiteaID,
+			CloneURL:      "https://git.example/org1/myrepo.git",
+			DefaultBranch: "main",
+		},
+		Sender: User{ID: 101, Login: "alice"},
+	}
+	open.PullRequest.Title = "Add feature"
+	open.PullRequest.Head.Ref = "feature"
+	open.PullRequest.Head.SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	open.PullRequest.Base.Ref = "main"
+	post(t, h, "pull_request", open, "")
+
+	queued := outbox.all()
+	if len(queued) != 1 || queued[0].kind != KindPROpen {
+		t.Fatalf("open queued = %#v, want one PR open", queued)
+	}
+	root := queued[0].event
+
+	syncPayload := open
+	syncPayload.Action = "synchronized"
+	syncPayload.PullRequest.Head.SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	syncPayload.PullRequest.MergeBase = "cccccccccccccccccccccccccccccccccccccccc"
+	post(t, h, "pull_request", syncPayload, "")
+
+	queued = outbox.all()
+	if len(queued) != 2 {
+		t.Fatalf("after synchronized queued = %d, want open + update: %#v", len(queued), queued)
+	}
+	update := queued[1].event
+	if update.Kind != KindPRUpdate {
+		t.Fatalf("synchronized emitted kind %d, want %d", update.Kind, KindPRUpdate)
+	}
+	requireTag(t, &update, "a", fmt.Sprintf("30617:%s:%s", testPubkeyHex, testRepoID))
+	requireTag(t, &update, "p", testPubkeyHex)
+	requireTag(t, &update, "r", euc)
+	requireTag(t, &update, "E", root.ID)
+	requireTag(t, &update, "P", testActorPubkeyHex)
+	requireTag(t, &update, "c", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	requireTag(t, &update, "clone", "https://git.example/org1/myrepo.git")
+	requireTag(t, &update, "merge-base", "cccccccccccccccccccccccccccccccccccccccc")
+	forbidTag(t, &update, "action")
+
+	closePayload := open
+	closePayload.Action = "closed"
+	closePayload.PullRequest.State = "closed"
+	post(t, h, "pull_request", closePayload, "")
+
+	queued = outbox.all()
+	if len(queued) != 3 {
+		t.Fatalf("after close queued = %d, want open + update + status: %#v", len(queued), queued)
+	}
+	status := queued[2].event
+	if status.Kind != KindStatusClosed {
+		t.Fatalf("close emitted kind %d, want %d", status.Kind, KindStatusClosed)
+	}
+	requireTag(t, &status, "e", root.ID, "", "root")
+	requireTag(t, &status, "a", fmt.Sprintf("30617:%s:%s", testPubkeyHex, testRepoID))
+	requireTag(t, &status, "p", testPubkeyHex)
+	requireTag(t, &status, "p", testActorPubkeyHex)
+	requireTag(t, &status, "r", euc)
+	updates := 0
+	for _, q := range queued {
+		if q.kind == KindPRUpdate {
+			updates++
+		}
+	}
+	if updates != 1 {
+		t.Fatalf("PRUpdate count = %d, want exactly one synchronized update", updates)
+	}
+	if len(fake.events) != 0 {
+		t.Fatalf("actor path should not bridge-sign, got %d events", len(fake.events))
 	}
 }
 
-func TestIssue_OpenedEmitsHexTaggedEvents(t *testing.T) {
+func TestIssueCommentEmitsNIP22ThreadedComment(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	seedActorGrant(t, st, 202, "bob", testActorPubkeyHex)
+	outbox := &fakeOutbox{}
+	h.SetActorSigning(fakeActorSigner{enabled: true}, outbox, st)
+
+	issue := IssuePayload{
+		Action:     "opened",
+		Number:     3,
+		Repository: Repository{ID: testGiteaID},
+		Sender:     User{ID: 202, Login: "bob"},
+	}
+	issue.Issue.Number = 3
+	issue.Issue.Title = "Bug report"
+	issue.Issue.Body = "details"
+	post(t, h, "issues", issue, "")
+	queued := outbox.all()
+	if len(queued) != 1 || queued[0].kind != KindIssue {
+		t.Fatalf("issue open queued = %#v", queued)
+	}
+	root := queued[0].event
+
+	comment := IssueCommentPayload{
+		Action:     "created",
+		Issue:      Issue{Number: 3},
+		Comment:    Comment{ID: 55, Body: "plain comment"},
+		Repository: Repository{ID: testGiteaID},
+		Sender:     User{ID: 202, Login: "bob"},
+	}
+	post(t, h, "issue_comment", comment, "")
+
+	queued = outbox.all()
+	if len(queued) != 2 {
+		t.Fatalf("queued = %d, want issue + comment: %#v", len(queued), queued)
+	}
+	cm := queued[1].event
+	if cm.Kind != KindComment {
+		t.Fatalf("comment kind = %d, want %d", cm.Kind, KindComment)
+	}
+	if cm.Content != "plain comment" {
+		t.Fatalf("comment content = %q", cm.Content)
+	}
+	requireTag(t, &cm, "E", root.ID, "", testActorPubkeyHex)
+	requireTag(t, &cm, "K", fmt.Sprint(KindIssue))
+	requireTag(t, &cm, "P", testActorPubkeyHex)
+	requireTag(t, &cm, "e", root.ID, "", testActorPubkeyHex)
+	requireTag(t, &cm, "k", fmt.Sprint(KindIssue))
+	requireTag(t, &cm, "p", testActorPubkeyHex)
+	if len(fake.events) != 0 {
+		t.Fatalf("actor path should not bridge-sign, got %d events", len(fake.events))
+	}
+}
+
+func TestIssue_OpenedEmitsNIP34Schema(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)
 
@@ -519,9 +729,12 @@ func TestIssue_OpenedEmitsHexTaggedEvents(t *testing.T) {
 		t.Fatalf("no kind %d (issue) event; got %v", KindIssue, fake.kinds())
 	}
 	assertTagsWellFormed(t, issueEv)
-	if fake.firstOfKind(KindStatusOpen) == nil {
-		t.Fatalf("open issue should emit kind %d status; got %v", KindStatusOpen, fake.kinds())
-	}
+	requireTag(t, issueEv, "a", fmt.Sprintf("30617:%s:%s", testPubkeyHex, testRepoID))
+	requireTag(t, issueEv, "p", testPubkeyHex)
+	requireTag(t, issueEv, "subject", "Bug report")
+	forbidTag(t, issueEv, "title")
+	forbidTag(t, issueEv, "r")
+	forbidTag(t, issueEv, "action")
 }
 
 func TestIssue_LabeledEmitsNIP32Label(t *testing.T) {
@@ -576,6 +789,19 @@ func TestNoNpubInSemanticTags(t *testing.T) {
 	}
 }
 
+func TestEarliestUniqueCommitReturnsRootCommit(t *testing.T) {
+	h, _, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	want := setupBareRepo(t, h)
+	got, err := EarliestUniqueCommit(context.Background(), filepath.Join(h.repositoriesDir, "org1", "myrepo.git"), "main")
+	if err != nil {
+		t.Fatalf("EarliestUniqueCommit: %v", err)
+	}
+	if got != want {
+		t.Fatalf("EarliestUniqueCommit = %s, want root %s", got, want)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // refs/nostr/<event-id> patch-push handling (phase1-cwt)
 // ---------------------------------------------------------------------------
@@ -604,6 +830,42 @@ func firstTagValue(ev *nostr.Event, key string) string {
 	return vs[0]
 }
 
+func requireTag(t *testing.T, ev *nostr.Event, key string, want ...string) nostr.Tag {
+	t.Helper()
+	for _, tag := range ev.Tags {
+		if len(tag) == 0 || tag[0] != key {
+			continue
+		}
+		if len(want) == 0 {
+			return tag
+		}
+		if len(tag) < 1+len(want) {
+			continue
+		}
+		matched := true
+		for i, v := range want {
+			if tag[i+1] != v {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return tag
+		}
+	}
+	t.Fatalf("kind %d missing tag %q with values %v in %#v", ev.Kind, key, want, ev.Tags)
+	return nil
+}
+
+func forbidTag(t *testing.T, ev *nostr.Event, key string) {
+	t.Helper()
+	for _, tag := range ev.Tags {
+		if len(tag) > 0 && tag[0] == key {
+			t.Fatalf("kind %d unexpectedly has %q tag: %#v", ev.Kind, key, tag)
+		}
+	}
+}
+
 func patchPush(eventID string) PushPayload {
 	return PushPayload{
 		Ref:        "refs/nostr/" + eventID,
@@ -615,6 +877,7 @@ func patchPush(eventID string) PushPayload {
 func TestPatchPush_EmitsAppliedStatus(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)
+	euc := setupBareRepo(t, h)
 	fake.fetchResult = nil // patch not found on relays
 
 	rr := post(t, h, "push", patchPush(testPatchEventID), "")
@@ -631,12 +894,12 @@ func TestPatchPush_EmitsAppliedStatus(t *testing.T) {
 		t.Fatalf("expected kind %d (applied) status; got %v", KindStatusApplied, fake.kinds())
 	}
 	assertTagsWellFormed(t, ev)
-	if got := firstTagValue(ev, "e"); got != testPatchEventID {
-		t.Errorf("'e' tag = %q, want patch id %q", got, testPatchEventID)
-	}
+	requireTag(t, ev, "e", testPatchEventID, "", "root")
+	requireTag(t, ev, "r", euc)
 	if got := firstTagValue(ev, "applied-as-commits"); got != testCommitSHA {
 		t.Errorf("'applied-as-commits' = %q, want %q", got, testCommitSHA)
 	}
+	requireTag(t, ev, "r", testCommitSHA)
 	if got := firstTagValue(ev, "p"); got != testPubkeyHex {
 		t.Errorf("'p' tag = %q, want maintainer hex %q", got, testPubkeyHex)
 	}

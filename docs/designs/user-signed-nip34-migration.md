@@ -10,7 +10,7 @@ Phases (see §9). Each is implemented by a dedicated agent, verified, and commit
 - [x] **Phase B** (phase1-s0f) — Outbound signing queue ✅ `internal/outbox` (persistent, dedup, retry/backoff/dead-letter, admin endpoint)
 - [x] **Phase C** (phase1-tu6) — Owner-authored events (30618) user-signed ✅ enqueued owner-signed via outbox; `/signer/authorize`; bridge-signed fallback
 - [x] **Phase D** (phase1-5ud) — Contributor signer grants ✅ NIP-46 login persists reusable grant; webhook events enqueued under acting user; unlinked → skip (no bridge-sign)
-- [ ] **Phase E** (phase1-xwx) — Full NIP-34 tag-schema compliance
+- [x] **Phase E** (phase1-xwx) — Full NIP-34 tag-schema compliance ✅ subject/c/clone/branch-name/euc-r; 1619 tip-only + E/P; status e-markers; NIP-22 1111 comments
 - [ ] **Phase F** (phase1-ki5) — Bidirectional sync (Nostr→Gitea)
 - [ ] **Phase G** (phase1-cmj) — Migration, compat & docs
 - [ ] **10317** (phase1-kyg) — owner-signed grasp-list cache + rebroadcast
