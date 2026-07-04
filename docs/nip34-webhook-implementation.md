@@ -138,7 +138,7 @@ The bridge also reflects supported Nostr-originated collaboration events into Gi
 - `1621` issues → Gitea issues.
 - `1111` comments → Gitea comments.
 - `1630`/`1632` status changes → Gitea state updates.
-- Nostr patches/PRs (1617/1618) are reflected as Gitea pull requests via tip fetch or `git am` apply → head branch → Gitea PR (`phase1-2gq`).
+- Nostr patches/PRs (1617/1618) are reflected as Gitea pull requests via tip fetch or `git am` apply → head branch → Gitea PR (`phase1-2gq`); Nostr PR updates (1619) fetch the new tip and move the stored PR head branch, which Gitea reflects on its next branch-sync. Force-updates are expected for rebased PR revisions.
 
 ## Compatibility and known limitations
 
@@ -147,7 +147,7 @@ The bridge also reflects supported Nostr-originated collaboration events into Gi
 - Unlinked contributor actors are skipped and counted by `unlinked_actor_skipped`; the bridge does not forge their content with `BRIDGE_NSEC`.
 - Legacy bridge-signed fallbacks remain intentional for transition compatibility when the signer subsystem is disabled.
 - `maintainers` on `30617` is owner-driven; the bridge honors owner announcements and will not add maintainers itself.
-- Nostr→Gitea reflection covers issues/comments/status (`phase1-ki5`) and patches/PRs → Gitea pull requests (`phase1-2gq`). PR-update (1619) tip updates remain a follow-up.
+- Nostr→Gitea reflection covers issues/comments/status (`phase1-ki5`), patches/PRs → Gitea pull requests (`phase1-2gq`), and PR-update (1619) tip updates (`phase1-ooy`).
 - Kind `10317` owner-list cache/rebroadcast is separate work (`phase1-kyg`).
 
 ## Testing

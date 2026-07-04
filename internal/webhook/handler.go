@@ -268,12 +268,18 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		return nil
 	}
 
-	if p.Action == "opened" {
+	if p.Action == "opened" || p.Action == "synchronized" {
 		index := p.Number
 		if index == 0 {
 			index = p.PullRequest.Number
 		}
-		if h.wasReflected(ctx, mapping.GiteaRepoID, index, KindPROpen, "pr") {
+		kind := KindPROpen
+		scope := "pr"
+		if p.Action == "synchronized" {
+			kind = KindPRUpdate
+			scope = "pr-update"
+		}
+		if h.wasReflected(ctx, mapping.GiteaRepoID, index, kind, scope) {
 			return nil
 		}
 	}

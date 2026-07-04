@@ -91,6 +91,9 @@ func TestKindConstants(t *testing.T) {
 	if KindUserGraspList != 10317 {
 		t.Errorf("KindUserGraspList: expected 10317, got %d", KindUserGraspList)
 	}
+	if KindPRUpdate != 1619 {
+		t.Errorf("KindPRUpdate: expected 1619, got %d", KindPRUpdate)
+	}
 }
 
 func TestSubscriptionFiltersIncludeCollaborationKinds(t *testing.T) {
@@ -109,6 +112,7 @@ func TestSubscriptionFiltersIncludeCollaborationKinds(t *testing.T) {
 		KindNIP22Comment,
 		KindPatch,
 		KindPROpen,
+		KindPRUpdate,
 		KindIssue,
 		KindStatusOpen,
 		KindStatusApplied,

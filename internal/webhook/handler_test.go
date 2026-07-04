@@ -797,6 +797,37 @@ func TestPROpenedSkipsBridgeReflectedObject(t *testing.T) {
 	}
 }
 
+func TestPRSynchronizedSkipsBridgeReflectedUpdateOnce(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	h.rememberThread("pr", testGiteaID, 7, threadRef{EventID: "root-pr-event", Pubkey: testActorPubkeyHex, Kind: KindPROpen})
+	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
+		NostrEventID: "nostr-pr-update-event",
+		GiteaRepoID:  testGiteaID,
+		GiteaIndex:   7,
+		HeadBranch:   "nostr-pr",
+		Kind:         KindPRUpdate,
+	}); err != nil {
+		t.Fatalf("record reflected PR update event: %v", err)
+	}
+
+	payload := PullRequestPayload{Action: "synchronized", Number: 7, Repository: Repository{ID: testGiteaID}}
+	payload.PullRequest.Number = 7
+	payload.PullRequest.Head.SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	payload.PullRequest.Head.Ref = "nostr-pr"
+	payload.PullRequest.Base.Ref = "main"
+	post(t, h, "pull_request", payload, "")
+
+	if got := fake.kinds(); len(got) != 0 {
+		t.Fatalf("bridge-reflected PR-update webhook echoed to Nostr: %v", got)
+	}
+
+	post(t, h, "pull_request", payload, "")
+	if got := fake.kinds(); len(got) != 1 || got[0] != KindPRUpdate {
+		t.Fatalf("expected second synchronized webhook to publish after guard consumption, got %v", got)
+	}
+}
+
 func TestIssue_LabeledEmitsNIP32Label(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)

@@ -144,6 +144,7 @@ type ReflectedEvent struct {
 	NostrEventID string    `json:"nostr_event_id"`
 	GiteaRepoID  int64     `json:"gitea_repo_id"`
 	GiteaIndex   int64     `json:"gitea_index"`
+	HeadBranch   string    `json:"gitea_head_branch,omitempty"`
 	Kind         int       `json:"kind"`
 	CreatedAt    time.Time `json:"created_at"`
 }
@@ -183,6 +184,7 @@ func Open(path string) (*SQLiteStore, error) {
 			nostr_event_id TEXT PRIMARY KEY,
 			gitea_repo_id INTEGER NOT NULL,
 			gitea_index INTEGER NOT NULL,
+			gitea_head_branch TEXT NOT NULL DEFAULT '',
 			kind INTEGER NOT NULL,
 			created_at TEXT NOT NULL,
 			echo_pending INTEGER NOT NULL DEFAULT 1,
@@ -286,8 +288,10 @@ func Open(path string) (*SQLiteStore, error) {
 	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_state_event_id TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_state_published_at TEXT NOT NULL DEFAULT ''`)
 
-	// Migration: add reflected-event echo guard columns. Existing rows are treated
-	// as pending bridge-origin echoes because they predate one-shot consumption.
+	// Migration: add reflected-event head branch and echo guard columns. Existing
+	// rows keep an empty head branch and are treated as pending bridge-origin
+	// echoes because they predate one-shot consumption.
+	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN gitea_head_branch TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_pending INTEGER NOT NULL DEFAULT 1`)
 	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_consumed_at TEXT NOT NULL DEFAULT ''`)
 
@@ -683,9 +687,9 @@ func (s *SQLiteStore) RecordReflectedEvent(ctx context.Context, ref ReflectedEve
 		ref.CreatedAt = time.Now().UTC()
 	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO reflected_events(nostr_event_id, gitea_repo_id, gitea_index, kind, created_at, echo_pending, echo_consumed_at)
-		VALUES(?, ?, ?, ?, ?, 1, '')
-	`, ref.NostrEventID, ref.GiteaRepoID, ref.GiteaIndex, ref.Kind, ref.CreatedAt.UTC().Format(time.RFC3339))
+		INSERT OR IGNORE INTO reflected_events(nostr_event_id, gitea_repo_id, gitea_index, gitea_head_branch, kind, created_at, echo_pending, echo_consumed_at)
+		VALUES(?, ?, ?, ?, ?, ?, 1, '')
+	`, ref.NostrEventID, ref.GiteaRepoID, ref.GiteaIndex, ref.HeadBranch, ref.Kind, ref.CreatedAt.UTC().Format(time.RFC3339))
 	if err != nil {
 		return false, err
 	}
@@ -705,9 +709,9 @@ func (s *SQLiteStore) RecordNostrObjectMapping(ctx context.Context, ref Reflecte
 		ref.CreatedAt = time.Now().UTC()
 	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO reflected_events(nostr_event_id, gitea_repo_id, gitea_index, kind, created_at, echo_pending, echo_consumed_at)
-		VALUES(?, ?, ?, ?, ?, 0, '')
-	`, ref.NostrEventID, ref.GiteaRepoID, ref.GiteaIndex, ref.Kind, ref.CreatedAt.UTC().Format(time.RFC3339))
+		INSERT OR IGNORE INTO reflected_events(nostr_event_id, gitea_repo_id, gitea_index, gitea_head_branch, kind, created_at, echo_pending, echo_consumed_at)
+		VALUES(?, ?, ?, ?, ?, ?, 0, '')
+	`, ref.NostrEventID, ref.GiteaRepoID, ref.GiteaIndex, ref.HeadBranch, ref.Kind, ref.CreatedAt.UTC().Format(time.RFC3339))
 	if err != nil {
 		return false, err
 	}
@@ -723,9 +727,9 @@ func (s *SQLiteStore) GetReflectedEvent(ctx context.Context, nostrEventID string
 	var ref ReflectedEvent
 	var createdAt string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT nostr_event_id, gitea_repo_id, gitea_index, kind, created_at
+		SELECT nostr_event_id, gitea_repo_id, gitea_index, gitea_head_branch, kind, created_at
 		FROM reflected_events WHERE nostr_event_id = ?
-	`, nostrEventID).Scan(&ref.NostrEventID, &ref.GiteaRepoID, &ref.GiteaIndex, &ref.Kind, &createdAt)
+	`, nostrEventID).Scan(&ref.NostrEventID, &ref.GiteaRepoID, &ref.GiteaIndex, &ref.HeadBranch, &ref.Kind, &createdAt)
 	if err != nil {
 		return ReflectedEvent{}, err
 	}

@@ -5,6 +5,7 @@ package reflector
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -284,10 +285,113 @@ func TestReflectorTipPatchCreatesPullRequest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("get reflected PR row: %v", err)
 			}
-			if ref.GiteaRepoID != mapping.GiteaRepoID || ref.GiteaIndex != 1 || ref.Kind != relay.KindPROpen {
+			if ref.GiteaRepoID != mapping.GiteaRepoID || ref.GiteaIndex != 1 || ref.HeadBranch != "feature/tip" || ref.Kind != relay.KindPROpen {
 				t.Fatalf("unexpected reflected row: %+v", ref)
 			}
 		})
+	}
+}
+
+func TestReflectorPRUpdateMovesExistingHeadBranchAndRecordsEchoGuard(t *testing.T) {
+	ctx := context.Background()
+	st, mapping, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rootID := "reflected-pr-root"
+	headBranch := "feature/tip"
+	if err := gitFetch(ctx, repo.repoPath, repo.workDir, "+"+repo.tip+":refs/heads/"+headBranch); err != nil {
+		t.Fatalf("seed PR head branch: %v", err)
+	}
+	if _, err := st.RecordReflectedEvent(ctx, store.ReflectedEvent{
+		NostrEventID: rootID,
+		GiteaRepoID:  mapping.GiteaRepoID,
+		GiteaIndex:   7,
+		HeadBranch:   headBranch,
+		Kind:         relay.KindPROpen,
+	}); err != nil {
+		t.Fatalf("record reflected root PR: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(repo.workDir, "README.md"), []byte("root\nfeature\nrevision\n"), 0o644); err != nil {
+		t.Fatalf("write revised README: %v", err)
+	}
+	reflectorGit(t, repo.workDir, "add", "README.md")
+	reflectorGit(t, repo.workDir, "commit", "-m", "revision")
+	newTip := strings.TrimSpace(reflectorGitOutput(t, repo.workDir, "rev-parse", "HEAD"))
+
+	actorPriv := nostr.GeneratePrivateKey()
+	updateEv := signedEvent(t, actorPriv, relay.KindPRUpdate, nostr.Tags{
+		{"a", coord},
+		{"E", rootID},
+		{"P", mapping.Pubkey},
+		{"c", newTip},
+		{"clone", repo.workDir},
+	}, "")
+
+	if err := r.HandleEvent(ctx, updateEv, "wss://relay.test"); err != nil {
+		t.Fatalf("reflect PR update: %v", err)
+	}
+	gotTip := strings.TrimSpace(reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "rev-parse", "refs/heads/"+headBranch))
+	if gotTip != newTip {
+		t.Fatalf("head branch tip = %s, want %s", gotTip, newTip)
+	}
+	ref, err := st.GetReflectedEvent(ctx, updateEv.ID)
+	if err != nil {
+		t.Fatalf("get reflected PR update row: %v", err)
+	}
+	if ref.GiteaRepoID != mapping.GiteaRepoID || ref.GiteaIndex != 7 || ref.HeadBranch != headBranch || ref.Kind != relay.KindPRUpdate {
+		t.Fatalf("unexpected reflected PR update row: %+v", ref)
+	}
+	consumed, err := st.ConsumeReflectedGiteaEcho(ctx, mapping.GiteaRepoID, 7, relay.KindPRUpdate)
+	if err != nil {
+		t.Fatalf("consume reflected PR-update echo: %v", err)
+	}
+	if !consumed {
+		t.Fatal("expected PR-update reflected row to arm echo guard")
+	}
+}
+
+func TestReflectorPRUpdateUnknownRootIsIgnored(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	headBranch := "feature/tip"
+	if err := gitFetch(ctx, repo.repoPath, repo.workDir, "+"+repo.tip+":refs/heads/"+headBranch); err != nil {
+		t.Fatalf("seed PR head branch: %v", err)
+	}
+	actorPriv := nostr.GeneratePrivateKey()
+	updateEv := signedEvent(t, actorPriv, relay.KindPRUpdate, nostr.Tags{
+		{"a", coord},
+		{"E", "unknown-root"},
+		{"c", repo.tip},
+		{"clone", repo.workDir},
+	}, "")
+
+	if err := r.HandleEvent(ctx, updateEv, "wss://relay.test"); err != nil {
+		t.Fatalf("unknown-root PR update should be ignored: %v", err)
+	}
+	gotTip := strings.TrimSpace(reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "rev-parse", "refs/heads/"+headBranch))
+	if gotTip != repo.tip {
+		t.Fatalf("head branch changed to %s, want unchanged %s", gotTip, repo.tip)
+	}
+	if _, err := st.GetReflectedEvent(ctx, updateEv.ID); err != sql.ErrNoRows {
+		t.Fatalf("unexpected reflected row for ignored PR update: %v", err)
+	}
+	processed, err := st.EventProcessed(ctx, updateEv.ID)
+	if err != nil {
+		t.Fatalf("check processed: %v", err)
+	}
+	if processed {
+		t.Fatal("ignored unknown-root PR update should not be marked processed")
 	}
 }
 

@@ -186,6 +186,7 @@ func TestReflectedEvents(t *testing.T) {
 		NostrEventID: "ev1",
 		GiteaRepoID:  42,
 		GiteaIndex:   7,
+		HeadBranch:   "feature/tip",
 		Kind:         1621,
 	})
 	if err != nil {
@@ -211,7 +212,7 @@ func TestReflectedEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get reflected event: %v", err)
 	}
-	if ref.GiteaRepoID != 42 || ref.GiteaIndex != 7 || ref.Kind != 1621 {
+	if ref.GiteaRepoID != 42 || ref.GiteaIndex != 7 || ref.HeadBranch != "feature/tip" || ref.Kind != 1621 {
 		t.Fatalf("unexpected reflected event: %+v", ref)
 	}
 	ok, err := st.WasReflectedGiteaObject(ctx, 42, 7, 1621)

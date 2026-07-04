@@ -114,6 +114,8 @@ func (r *Reflector) HandleEvent(ctx context.Context, ev *nostr.Event, relayURL s
 		success = true
 	case relay.KindPatch, relay.KindPROpen:
 		success, err = r.reflectPatch(ctx, mapping, ev)
+	case relay.KindPRUpdate:
+		success, err = r.reflectPRUpdate(ctx, mapping, ev)
 	}
 	if err != nil {
 		return err
@@ -286,12 +288,80 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 		NostrEventID: ev.ID,
 		GiteaRepoID:  mapping.GiteaRepoID,
 		GiteaIndex:   index,
+		HeadBranch:   branch,
 		Kind:         relay.KindPROpen,
 	}); err != nil {
 		return false, fmt.Errorf("record reflected patch PR: %w", err)
 	}
 	r.logger.Info("reflector: created Gitea PR from Nostr patch", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "index", index, "head", branch, "base", base)
 	return true, nil
+}
+
+func (r *Reflector) reflectPRUpdate(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {
+	rootID := prUpdateRootEventID(ev.Tags)
+	if rootID == "" {
+		r.logger.Info("reflector: PR update missing root PR event tag", "event", ev.ID)
+		return false, nil
+	}
+	root, err := r.store.GetReflectedEvent(ctx, rootID)
+	if errors.Is(err, sql.ErrNoRows) {
+		r.logger.Info("reflector: PR update root is not reflected yet", "event", ev.ID, "root", rootID)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lookup reflected PR update root: %w", err)
+	}
+	if root.GiteaRepoID != mapping.GiteaRepoID || root.GiteaIndex == 0 || root.Kind != relay.KindPROpen || root.HeadBranch == "" {
+		r.logger.Info("reflector: PR update root does not reference a reflected PR for this repo", "event", ev.ID, "root", rootID, "root_repo", root.GiteaRepoID, "root_index", root.GiteaIndex, "root_kind", root.Kind, "head_branch", root.HeadBranch)
+		return false, nil
+	}
+	if r.repositoriesDir == "" {
+		r.logger.Warn("reflector: repository directory unavailable; cannot reflect PR update", "event", ev.ID, "root", rootID)
+		return false, nil
+	}
+
+	tip := tagValue(ev.Tags, "c")
+	if !validSHA.MatchString(tip) {
+		r.logger.Info("reflector: PR update missing usable c-tip", "event", ev.ID, "tip", tip)
+		return false, nil
+	}
+	clones := tagValues(ev.Tags, "clone")
+	if len(clones) == 0 {
+		r.logger.Info("reflector: PR update has no clone URLs", "event", ev.ID, "tip", tip)
+		return false, nil
+	}
+
+	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
+	refspec := "+" + tip + ":" + refsnostr.RefPrefix + ev.ID
+	var errs []string
+	for _, cloneURL := range clones {
+		if err := gitFetch(ctx, repoPath, cloneURL, refspec); err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		// A PR update is a new revision of the existing PR branch. Rebased PRs are
+		// expected to force-move this ref; Gitea observes the changed head on its
+		// next branch synchronization.
+		if err := updateBareRef(ctx, repoPath, "refs/heads/"+root.HeadBranch, tip); err != nil {
+			r.logger.Warn("reflector: failed to update PR head branch for PR update", "event", ev.ID, "root", rootID, "branch", root.HeadBranch, "tip", tip, "error", err)
+			return false, nil
+		}
+		if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
+			NostrEventID: ev.ID,
+			GiteaRepoID:  mapping.GiteaRepoID,
+			GiteaIndex:   root.GiteaIndex,
+			HeadBranch:   root.HeadBranch,
+			Kind:         relay.KindPRUpdate,
+		}); err != nil {
+			return false, fmt.Errorf("record reflected PR update: %w", err)
+		}
+		r.logger.Info("reflector: updated Gitea PR head from Nostr PR update", "event", ev.ID, "root", rootID, "repo", mapping.Owner+"/"+mapping.RepoName, "index", root.GiteaIndex, "head", root.HeadBranch, "tip", tip)
+		return true, nil
+	}
+	if len(errs) > 0 {
+		r.logger.Warn("reflector: failed to fetch PR update tip from clone URLs", "event", ev.ID, "root", rootID, "tip", tip, "error", strings.Join(errs, "; "))
+	}
+	return false, nil
 }
 
 func (r *Reflector) materializeTipBranch(ctx context.Context, mapping store.Mapping, ev *nostr.Event, repoPath string, tip string, branch string) error {
@@ -573,6 +643,7 @@ func isCollaborationKind(kind int) bool {
 	case relay.KindNIP22Comment,
 		relay.KindPatch,
 		relay.KindPROpen,
+		relay.KindPRUpdate,
 		relay.KindIssue,
 		relay.KindStatusOpen,
 		relay.KindStatusApplied,
@@ -601,6 +672,20 @@ func rootEventID(tags nostr.Tags) string {
 			if len(tag) >= 4 && tag[3] != "" && tag[3] != "root" {
 				continue
 			}
+			return tag[1]
+		}
+	}
+	return ""
+}
+
+func prUpdateRootEventID(tags nostr.Tags) string {
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == "E" {
+			return tag[1]
+		}
+	}
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == "e" && (len(tag) < 4 || tag[3] == "" || tag[3] == "root") {
 			return tag[1]
 		}
 	}
