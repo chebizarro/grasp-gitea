@@ -218,14 +218,7 @@ func tagValue(tags nostr.Tags, key string) string {
 }
 
 func (h *NIP07Handler) methodGuard(expected string, next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != expected {
-			w.Header().Set("Allow", expected)
-			h.writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		next(w, r)
-	}
+	return corsMethodGuard(expected, h.writeJSON, next)
 }
 
 func (h *NIP07Handler) writeJSON(w http.ResponseWriter, status int, payload any) {

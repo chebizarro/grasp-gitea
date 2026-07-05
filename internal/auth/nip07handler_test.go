@@ -159,6 +159,33 @@ func TestChallengeEndpointWrongMethod(t *testing.T) {
 	}
 }
 
+func TestChallengeEndpointPreflightCORS(t *testing.T) {
+	env := newTestNIP07Env(t)
+
+	req, err := http.NewRequest(http.MethodOptions, env.server.URL+"/auth/nip07/challenge", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Origin", "https://git.sharegap.net")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("OPTIONS challenge: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("expected CORS allow origin '*', got %q", got)
+	}
+	if got := resp.Header.Get("Allow"); got != "POST, OPTIONS" {
+		t.Fatalf("expected Allow POST, OPTIONS, got %q", got)
+	}
+}
+
 func TestVerifyEndpointFullFlow(t *testing.T) {
 	env := newTestNIP07Env(t)
 	ctx := context.Background()

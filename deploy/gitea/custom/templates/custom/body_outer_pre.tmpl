@@ -1,0 +1,6 @@
+{{/*
+Inject the Nostr login affordance without replacing upstream Gitea's
+signin_inner.tmpl. The script only renders on /user/login and keeps the normal
+username/password/OAuth options intact.
+*/}}
+<script defer src="/assets/js/grasp-nostr-login.js"></script>
