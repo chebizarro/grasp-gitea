@@ -44,7 +44,7 @@ func mergeRelayURLs(configured []string, embeddedURL string) []string {
 
 func newServerSigner(ctx context.Context, cfg config.Config, logger *slog.Logger) (publisher.ServerSigner, error) {
 	if cfg.SignetBunkerURL != "" {
-		signer, err := publisher.NewSignetBunkerServerSigner(ctx, cfg.SignetBunkerURL)
+		signer, err := publisher.NewSignetBunkerServerSigner(ctx, cfg.SignetBunkerURL, cfg.RelayURLs...)
 		if err != nil {
 			return nil, err
 		}
