@@ -36,8 +36,11 @@ type Config struct {
 	// It is decoded from SIGNER_MASTER_KEY (base64 or hex) and must be 32 bytes.
 	SignerMasterKey []byte
 
-	// Mirror republish: bridge signs NIP-34 state events with this key.
+	// Server/operator signing. SIGNET_BUNKER_URL is the production path;
+	// BridgeNsec is retained only as an explicit development fallback.
+	SignetBunkerURL     string
 	BridgeNsec          string
+	Environment         string
 	MirrorCallbackToken string
 
 	// Gitea webhook handler for NIP-34 events (PRs, issues, patches, labels)
@@ -72,7 +75,9 @@ func Load() (Config, error) {
 		ChallengeTTL:          durationEnv("CHALLENGE_TTL", 5*time.Minute),
 		ProactiveSyncInterval: normalizeProactiveSyncInterval(durationEnv("PROACTIVE_SYNC_INTERVAL", time.Hour)),
 		SignerMasterKey:       nil,
+		SignetBunkerURL:       strings.TrimSpace(os.Getenv("SIGNET_BUNKER_URL")),
 		BridgeNsec:            strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
+		Environment:           firstEnv("GRASP_ENV", "APP_ENV", "ENVIRONMENT"),
 		MirrorCallbackToken:   strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
 		GiteaWebhookSecret:    strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
 		CIEnabled:             boolEnv("CI_ENABLED", false),
@@ -111,7 +116,12 @@ func (c Config) AllowlistEnabled() bool {
 // MirrorPublishEnabled reports whether the bridge is configured to republish
 // NIP-34 events on mirror sync callbacks.
 func (c Config) MirrorPublishEnabled() bool {
-	return c.BridgeNsec != ""
+	return c.SignetBunkerURL != "" || c.BridgeNsec != ""
+}
+
+func (c Config) Production() bool {
+	env := strings.ToLower(strings.TrimSpace(c.Environment))
+	return env == "prod" || env == "production"
 }
 
 // SignerEnabled reports whether persistent NIP-46 signer grants can be used.
@@ -149,6 +159,15 @@ func intEnv(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func firstEnv(keys ...string) string {
+	for _, key := range keys {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func csvEnv(key string) []string {

@@ -44,7 +44,7 @@ Watch these metrics:
 
 - `30617` announcements remain owner-signed and are rebroadcast verbatim.
 - `30618` state is owner-signed through the queue when user-signing is enabled.
-- CI `5401` events remain operator-signed by `BRIDGE_NSEC`.
+- CI `5401` events remain operator-signed via `SIGNET_BUNKER_URL`; `BRIDGE_NSEC` is development fallback only.
 - Contributor events from unlinked actors are skipped and counted as `unlinked_actor_skipped`; they are not bridge-signed and are not backfilled after the actor links a signer.
 - Historical `BRIDGE_NSEC`-signed events are not re-signed.
 - Nostr patches/PRs (1617/1618) are reflected as Gitea pull requests (tip fetch or `git am` apply → head branch → Gitea PR) (`phase1-2gq`); issue/comment/status reflection is also supported (`phase1-ki5`). PR-update (1619) tip updates remain a follow-up.

@@ -39,7 +39,7 @@ Live relay exercise is operator-gated because it publishes real events to `relay
 1. Ensure bridge env on edge-01 includes:
    - `RELAY_URLS=wss://relay.sharegap.net`
    - `HOOK_RELAY_URL=wss://relay.sharegap.net`
-   - `BRIDGE_NSEC` or the current transition signing key
+   - `SIGNET_BUNKER_URL` for server/operator signing (production); `BRIDGE_NSEC` only for development fallback
    - `GITEA_WEBHOOK_SECRET`
    - `CI_ENABLED=true`
    - `CI_TRIGGER_REPOS=*` or the target `owner/repo`
@@ -62,7 +62,7 @@ Live relay exercise is operator-gated because it publishes real events to `relay
 
 ## WS3 fast-follow TODO — Signet signing
 
-TODO: migrate `GRASP_SERVER_NSEC` / bridge signing to a Signet-minted key over NIP-46 so the bridge no longer holds a long-lived nsec.
+Server/operator signing now uses `SIGNET_BUNKER_URL` over NIP-46 in production so the bridge no longer holds a long-lived nsec; live verification requires a provisioned Signet daemon/bunker.
 
 ## WS4 — fleet-internal Hive-CI check-runner
 

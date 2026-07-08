@@ -56,7 +56,9 @@ PROVISION_RATE_LIMIT=10
 ADMIN_API_TOKEN=<admin bearer token>
 BRIDGE_PUBLIC_URL=https://bridge.example.com
 CHALLENGE_TTL=5m
-BRIDGE_NSEC=<operator nsec or hex key>
+SIGNET_BUNKER_URL=<Signet/NIP-46 bunker URL>
+# Development-only fallback; do not set in production without SIGNET_BUNKER_URL.
+BRIDGE_NSEC=<operator nsec>
 GITEA_WEBHOOK_SECRET=<webhook HMAC secret>
 SIGNER_MASTER_KEY=<32-byte base64 or hex key, optional>
 PROACTIVE_SYNC_INTERVAL=1h
@@ -70,7 +72,7 @@ GRASP05_ARCHIVE_MODE=false
 - Repository announcements (`kind:30617`) remain owner-signed and are cached/rebroadcast verbatim.
 - Repository state (`kind:30618`) is owner-signed through the owner's NIP-46 grant and the outbound queue; if the signer subsystem is disabled, the bridge-signed fallback remains available for compatibility.
 - Contributor-authored webhook events (`1617`, `1618`, `1619`, `1621`, `1630`-`1633`, `1985`, and NIP-22 `1111` comments) are signed by the acting user's linked grant. If the actor has not linked a signer, the event is skipped, not bridge-signed, and `unlinked_actor_skipped` is incremented.
-- CI workflow-run events (`kind:5401`) remain operator-signed by `BRIDGE_NSEC` because they are executor attestations, not user-authored NIP-34 content.
+- CI workflow-run events (`kind:5401`) remain operator-signed as executor attestations, using `SIGNET_BUNKER_URL` in production; `BRIDGE_NSEC` is development fallback only.
 
 ### Signer and queue admin endpoints
 

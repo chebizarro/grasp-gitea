@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/relay"
@@ -34,7 +33,8 @@ type Service struct {
 	repositoriesDir string
 	relayURLs       []string
 
-	bridgePrivKey string
+	bridgeSigner  ServerSigner
+	bridgePrivKey string // legacy dev/test fallback
 	bridgePubKey  string
 
 	ownerStateSigner StateSigner
@@ -58,48 +58,53 @@ type StateOutbox interface {
 	Enqueue(ctx context.Context, kind int, authorPubkey string, scope string, unsignedEvent *nostr.Event, dedupeKey string) error
 }
 
+// ServerSigner signs bridge/operator-authored outbound events without exposing
+// the private key to the publisher. Production should provide a Signet/NIP-46
+// implementation; local nsec signing is retained only as an explicit dev fallback.
+type ServerSigner interface {
+	PublicKey() string
+	SignEvent(ctx context.Context, ev *nostr.Event) error
+}
+
 // New creates a publisher service. If bridgeNsec is empty, bridge-signed
 // publishing is disabled, but owner-signed outbox publishing can still be wired
-// with SetOwnerStateSigning.
+// with SetOwnerStateSigning. This legacy constructor is the dev/test fallback.
 func New(bridgeNsec string, st *store.SQLiteStore, relayURLs []string, repositoriesDir string, logger *slog.Logger) (*Service, error) {
+	var signer ServerSigner
+	if bridgeNsec != "" {
+		local, err := NewLocalServerSigner(bridgeNsec)
+		if err != nil {
+			return nil, err
+		}
+		signer = local
+	}
+	return NewWithServerSigner(signer, st, relayURLs, repositoriesDir, logger), nil
+}
+
+// NewWithServerSigner creates a publisher with an already-constructed bridge
+// signer, typically backed by Signet/NIP-46.
+func NewWithServerSigner(signer ServerSigner, st *store.SQLiteStore, relayURLs []string, repositoriesDir string, logger *slog.Logger) *Service {
 	s := &Service{
 		store:           st,
 		logger:          logger,
 		repositoriesDir: repositoriesDir,
 		relayURLs:       relayURLs,
+		bridgeSigner:    signer,
 		repoLocks:       make(map[int64]*sync.Mutex),
 	}
-
-	if bridgeNsec == "" {
-		return s, nil
+	if signer != nil {
+		s.bridgePubKey = signer.PublicKey()
+		if local, ok := signer.(*localServerSigner); ok {
+			s.bridgePrivKey = local.privKey
+		}
+		logger.Info("publisher initialized", "bridge_pubkey", s.bridgePubKey)
 	}
-
-	typ, v, err := nip19.Decode(bridgeNsec)
-	if err != nil {
-		return nil, fmt.Errorf("decode BRIDGE_NSEC: %w", err)
-	}
-	if typ != "nsec" {
-		return nil, fmt.Errorf("BRIDGE_NSEC must be an nsec, got %s", typ)
-	}
-	privKey, ok := v.(string)
-	if !ok || privKey == "" {
-		return nil, fmt.Errorf("invalid decoded nsec value")
-	}
-
-	pubKey, err := nostr.GetPublicKey(privKey)
-	if err != nil {
-		return nil, fmt.Errorf("derive public key from BRIDGE_NSEC: %w", err)
-	}
-
-	s.bridgePrivKey = privKey
-	s.bridgePubKey = pubKey
-	logger.Info("publisher initialized", "bridge_pubkey", pubKey)
-	return s, nil
+	return s
 }
 
-// Enabled reports whether the publisher has a bridge signing key configured.
+// Enabled reports whether the publisher has a bridge/server signer configured.
 func (s *Service) Enabled() bool {
-	return s.bridgePrivKey != ""
+	return s != nil && (s.bridgeSigner != nil || s.bridgePrivKey != "")
 }
 
 // SetOwnerStateSigning wires the Phase-B outbox and signer availability check
@@ -232,8 +237,8 @@ func (s *Service) publishBridgeSignedState(ctx context.Context, mapping *store.M
 	stateEvent.PubKey = s.bridgePubKey
 	stateEvent.ID = ""
 	stateEvent.Sig = ""
-	if err := stateEvent.Sign(s.bridgePrivKey); err != nil {
-		return fmt.Errorf("sign state event with bridge key: %w", err)
+	if err := s.signOutbound(ctx, stateEvent); err != nil {
+		return fmt.Errorf("sign state event with bridge signer: %w", err)
 	}
 
 	metrics.IncBridgeSignedFallback()
@@ -324,13 +329,26 @@ func (s *Service) PublishEvent(ctx context.Context, ev *nostr.Event) error {
 		return fmt.Errorf("publisher not enabled")
 	}
 
-	// Set pubkey and sign with bridge key
+	// Set pubkey and sign with the configured server signer.
 	ev.PubKey = s.bridgePubKey
-	if err := ev.Sign(s.bridgePrivKey); err != nil {
+	if err := s.signOutbound(ctx, ev); err != nil {
 		return fmt.Errorf("sign event: %w", err)
 	}
 
 	return s.publishToRelays(ctx, ev)
+}
+
+func (s *Service) signOutbound(ctx context.Context, ev *nostr.Event) error {
+	if !s.Enabled() {
+		return fmt.Errorf("publisher not enabled")
+	}
+	ev.PubKey = s.bridgePubKey
+	ev.ID = ""
+	ev.Sig = ""
+	if s.bridgeSigner != nil {
+		return s.bridgeSigner.SignEvent(ctx, ev)
+	}
+	return ev.Sign(s.bridgePrivKey)
 }
 
 // PublishSigned publishes an already-signed event to all configured relays.

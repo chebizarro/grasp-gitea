@@ -374,7 +374,7 @@ func (s *Service) buildWorkflowRunEvent(ownerPubkey, repoID, commitSHA, branch, 
 		Content: "",
 	}
 
-	if err := ev.Sign(s.bridgePrivKey); err != nil {
+	if err := s.signOutbound(context.Background(), ev); err != nil {
 		return nil, fmt.Errorf("sign workflow run event: %w", err)
 	}
 	return ev, nil

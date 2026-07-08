@@ -42,6 +42,25 @@ func mergeRelayURLs(configured []string, embeddedURL string) []string {
 	return result
 }
 
+func newServerSigner(ctx context.Context, cfg config.Config, logger *slog.Logger) (publisher.ServerSigner, error) {
+	if cfg.SignetBunkerURL != "" {
+		signer, err := publisher.NewSignetBunkerServerSigner(ctx, cfg.SignetBunkerURL)
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("Signet NIP-46 server signer ready", "server_pubkey", signer.PublicKey())
+		return signer, nil
+	}
+	if cfg.BridgeNsec == "" {
+		return nil, nil
+	}
+	if cfg.Production() {
+		return nil, errors.New("SIGNET_BUNKER_URL is required in production; BRIDGE_NSEC is dev fallback only")
+	}
+	logger.Warn("using BRIDGE_NSEC development fallback for server signing; configure SIGNET_BUNKER_URL for production")
+	return publisher.NewLocalServerSigner(cfg.BridgeNsec)
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -115,14 +134,16 @@ func main() {
 	}()
 	logger.Info("refs/nostr lifecycle reaper started", "ttl", refsnostr.DefaultAcceptanceTTL.String(), "interval", refsnostr.DefaultSweepInterval.String())
 
-	// Create the publisher. Bridge signing requires BRIDGE_NSEC, but Phase-B
-	// outbox publishing and owner-signed 10317 rebroadcast only need relay URLs
-	// because events are already signed.
-	publisherSvc, err := publisher.New(cfg.BridgeNsec, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
+	// Create the publisher. Server/operator signing prefers Signet over NIP-46
+	// so the bridge does not hold an nsec. BRIDGE_NSEC remains only as an
+	// explicit dev fallback and is rejected when GRASP_ENV/APP_ENV/ENVIRONMENT
+	// is production.
+	serverSigner, err := newServerSigner(ctx, cfg, logger)
 	if err != nil {
-		logger.Error("failed to create publisher", "error", err)
+		logger.Error("failed to create server signer", "error", err)
 		os.Exit(1)
 	}
+	publisherSvc := publisher.NewWithServerSigner(serverSigner, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
 	if cfg.CIEnabled && publisherSvc.Enabled() {
 		publisherSvc.SetCIConfig(true, cfg.CITriggerRepos)
 		logger.Info("CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)

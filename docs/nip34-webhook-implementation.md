@@ -4,7 +4,7 @@
 
 The webhook bridge converts Gitea activity into NIP-34/NIP-22 Nostr events. The current model is user-signed by default when the signer subsystem is enabled: webhook handlers build unsigned event templates, enqueue them in the outbound signing queue, and publish only after the relevant user's NIP-46 bunker grant signs the event.
 
-CI workflow-run events (`kind:5401`) are the exception: they remain operator-signed by `BRIDGE_NSEC` because they are executor attestations, not user-authored NIP-34 content.
+CI workflow-run events (`kind:5401`) are the exception: they remain operator-signed because they are executor attestations, but production signing goes through the Signet/NIP-46 `SIGNET_BUNKER_URL` path so the bridge holds no nsec.
 
 ## Signing model
 
@@ -14,13 +14,15 @@ CI workflow-run events (`kind:5401`) are the exception: they remain operator-sig
 | `30618` repository state | Owner grant → outbound queue → NIP-46 signer → relay | If the signer subsystem is disabled, legacy bridge-signed transition fallback remains intentional. |
 | Contributor webhook events (`1617`, `1618`, `1619`, `1621`, `1630`-`1633`, `1985`) | Acting user's grant → outbound queue → NIP-46 signer → relay | Unlinked actors are skipped, not bridge-signed, and counted by `unlinked_actor_skipped`. |
 | NIP-22 comments (`1111`) | Acting user's grant → outbound queue → NIP-46 signer → relay | Used for comment/review threading. |
-| CI workflow run (`5401`) | Operator key (`BRIDGE_NSEC`) | GRASP extension / executor attestation. |
+| CI workflow run (`5401`) | Operator Signet bunker (`SIGNET_BUNKER_URL`) | GRASP extension / executor attestation; `BRIDGE_NSEC` is dev fallback only. |
 
 ## Configuration
 
 ```bash
-# Required for relay publishing / operator attestations / transition fallback
-BRIDGE_NSEC=nsec1... or hex private key
+# Production server/operator signing (bridge holds no nsec)
+SIGNET_BUNKER_URL=bunker://...
+# Development-only fallback; rejected when GRASP_ENV/APP_ENV/ENVIRONMENT=production
+BRIDGE_NSEC=nsec1...
 
 # Required: HMAC secret shared with Gitea webhook
 GITEA_WEBHOOK_SECRET=your-secret-here
@@ -145,7 +147,7 @@ The bridge also reflects supported Nostr-originated collaboration events into Gi
 - Historical events already published under `BRIDGE_NSEC` are not re-signed.
 - Events created before a contributor links a signer are not backfilled (`phase1-5ud`).
 - Unlinked contributor actors are skipped and counted by `unlinked_actor_skipped`; the bridge does not forge their content with `BRIDGE_NSEC`.
-- Legacy bridge-signed fallbacks remain intentional for transition compatibility when the signer subsystem is disabled.
+- Legacy bridge-signed fallback is development-only and rejected when `GRASP_ENV`, `APP_ENV`, or `ENVIRONMENT` is `production`.
 - `maintainers` on `30617` is owner-driven; the bridge honors owner announcements and will not add maintainers itself.
 - Nostr→Gitea reflection covers issues/comments/status (`phase1-ki5`), patches/PRs → Gitea pull requests (`phase1-2gq`), and PR-update (1619) tip updates (`phase1-ooy`).
 - Kind `10317` owner-list cache/rebroadcast is separate work (`phase1-kyg`).
