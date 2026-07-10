@@ -143,6 +143,7 @@ func TestReflectorReflectsIssueCommentStatusAndDedupes(t *testing.T) {
 	defer ts.Close()
 
 	r := New(st, gitea.NewClient(ts.URL, "tok"), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.SetStatusSyncEnabled(true)
 	actorPriv := nostr.GeneratePrivateKey()
 
 	issueEv := signedEvent(t, actorPriv, relay.KindIssue, nostr.Tags{
@@ -194,6 +195,16 @@ func TestReflectorReflectsIssueCommentStatusAndDedupes(t *testing.T) {
 	fake.mu.Lock()
 	if got := fake.issues[1].State; got != "closed" {
 		t.Fatalf("issue state = %q", got)
+	}
+	fake.mu.Unlock()
+
+	openEv := signedEvent(t, actorPriv, relay.KindStatusOpen, nostr.Tags{{"a", coord}, {"e", issueEv.ID, "", "root"}}, "")
+	if err := r.HandleEvent(ctx, openEv, "wss://relay.test"); err != nil {
+		t.Fatalf("reflect open status: %v", err)
+	}
+	fake.mu.Lock()
+	if got := fake.issues[1].State; got != "open" {
+		t.Fatalf("issue state after open = %q", got)
 	}
 	fake.mu.Unlock()
 

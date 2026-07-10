@@ -50,38 +50,42 @@ type Config struct {
 	// for repos that have CI workflows configured.
 	CIEnabled      bool
 	CITriggerRepos []string // ["*"] or ["owner/repo-id", ...]
+
+	// NIP34StatusSyncEnabled updates Gitea issue state from inbound NIP-34 status events.
+	NIP34StatusSyncEnabled bool
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		GiteaURL:              envOrDefault("GITEA_URL", "http://gitea:3000"),
-		GiteaAdminToken:       strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
-		ClonePrefix:           strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
-		RelayURLs:             csvEnv("RELAY_URLS"),
-		Listen:                envOrDefault("LISTEN", ":8090"),
-		DBPath:                envOrDefault("DB_PATH", "./mappings.db"),
-		PubkeyAllowlist:       parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
-		ProvisionRateLimit:    intEnv("PROVISION_RATE_LIMIT", 0),
-		HookRelayURL:          envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),
-		HookBinaryPath:        envOrDefault("HOOK_BINARY_PATH", "/usr/local/bin/grasp-pre-receive"),
-		GiteaRepositoriesDir:  envOrDefault("GITEA_REPOSITORIES_PATH", "/gitea-data/git/repositories"),
-		EmbeddedRelay:         boolEnv("EMBEDDED_RELAY", false),
-		EmbeddedRelayPort:     intEnv("EMBEDDED_RELAY_PORT", 3334),
-		EmbeddedRelayDB:       envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
-		ArchiveMode:           boolEnv("GRASP05_ARCHIVE_MODE", false),
-		AdminAPIToken:         strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
-		AuthEnabled:           boolEnv("AUTH_ENABLED", false),
-		BridgePublicURL:       strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
-		ChallengeTTL:          durationEnv("CHALLENGE_TTL", 5*time.Minute),
-		ProactiveSyncInterval: normalizeProactiveSyncInterval(durationEnv("PROACTIVE_SYNC_INTERVAL", time.Hour)),
-		SignerMasterKey:       nil,
-		SignetBunkerURL:       strings.TrimSpace(os.Getenv("SIGNET_BUNKER_URL")),
-		BridgeNsec:            strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
-		Environment:           firstEnv("GRASP_ENV", "APP_ENV", "ENVIRONMENT"),
-		MirrorCallbackToken:   strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
-		GiteaWebhookSecret:    strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
-		CIEnabled:             boolEnv("CI_ENABLED", false),
-		CITriggerRepos:        csvEnv("CI_TRIGGER_REPOS"),
+		GiteaURL:               envOrDefault("GITEA_URL", "http://gitea:3000"),
+		GiteaAdminToken:        strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
+		ClonePrefix:            strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
+		RelayURLs:              csvEnv("RELAY_URLS"),
+		Listen:                 envOrDefault("LISTEN", ":8090"),
+		DBPath:                 envOrDefault("DB_PATH", "./mappings.db"),
+		PubkeyAllowlist:        parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
+		ProvisionRateLimit:     intEnv("PROVISION_RATE_LIMIT", 0),
+		HookRelayURL:           envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),
+		HookBinaryPath:         envOrDefault("HOOK_BINARY_PATH", "/usr/local/bin/grasp-pre-receive"),
+		GiteaRepositoriesDir:   envOrDefault("GITEA_REPOSITORIES_PATH", "/gitea-data/git/repositories"),
+		EmbeddedRelay:          boolEnv("EMBEDDED_RELAY", false),
+		EmbeddedRelayPort:      intEnv("EMBEDDED_RELAY_PORT", 3334),
+		EmbeddedRelayDB:        envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
+		ArchiveMode:            boolEnv("GRASP05_ARCHIVE_MODE", false),
+		AdminAPIToken:          strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
+		AuthEnabled:            boolEnv("AUTH_ENABLED", false),
+		BridgePublicURL:        strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
+		ChallengeTTL:           durationEnv("CHALLENGE_TTL", 5*time.Minute),
+		ProactiveSyncInterval:  normalizeProactiveSyncInterval(durationEnv("PROACTIVE_SYNC_INTERVAL", time.Hour)),
+		SignerMasterKey:        nil,
+		SignetBunkerURL:        strings.TrimSpace(os.Getenv("SIGNET_BUNKER_URL")),
+		BridgeNsec:             strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
+		Environment:            firstEnv("GRASP_ENV", "APP_ENV", "ENVIRONMENT"),
+		MirrorCallbackToken:    strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
+		GiteaWebhookSecret:     strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
+		CIEnabled:              boolEnv("CI_ENABLED", false),
+		CITriggerRepos:         csvEnv("CI_TRIGGER_REPOS"),
+		NIP34StatusSyncEnabled: boolEnv("NIP34_STATUS_SYNC_ENABLED", false),
 	}
 
 	signerMasterKey, err := parseSignerMasterKey(os.Getenv("SIGNER_MASTER_KEY"))

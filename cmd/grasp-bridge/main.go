@@ -198,6 +198,7 @@ func main() {
 	}
 
 	reflectorSvc := reflector.New(st, giteaClient, cfg.GiteaRepositoriesDir, logger)
+	reflectorSvc.SetStatusSyncEnabled(cfg.NIP34StatusSyncEnabled)
 
 	// Per-repo lock serialises state-event processing (CI + proactive
 	// sync) across relay goroutines so ref reads in the CI handler

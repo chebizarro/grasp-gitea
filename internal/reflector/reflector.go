@@ -51,10 +51,11 @@ type GiteaClient interface {
 
 // Reflector reflects verified Nostr collaboration events into Gitea.
 type Reflector struct {
-	store           Store
-	gitea           GiteaClient
-	repositoriesDir string
-	logger          *slog.Logger
+	store             Store
+	gitea             GiteaClient
+	repositoriesDir   string
+	logger            *slog.Logger
+	statusSyncEnabled bool
 }
 
 func New(st Store, g GiteaClient, repositoriesDir string, logger *slog.Logger) *Reflector {
@@ -62,6 +63,12 @@ func New(st Store, g GiteaClient, repositoriesDir string, logger *slog.Logger) *
 		logger = slog.Default()
 	}
 	return &Reflector{store: st, gitea: g, repositoriesDir: repositoriesDir, logger: logger}
+}
+
+func (r *Reflector) SetStatusSyncEnabled(enabled bool) {
+	if r != nil {
+		r.statusSyncEnabled = enabled
+	}
 }
 
 // HandleEvent verifies, scopes, deduplicates, and reflects a Nostr event. Events
@@ -108,11 +115,8 @@ func (r *Reflector) HandleEvent(ctx context.Context, ev *nostr.Event, relayURL s
 		success, err = r.reflectIssue(ctx, mapping, ev)
 	case relay.KindNIP22Comment:
 		success, err = r.reflectComment(ctx, mapping, ev)
-	case relay.KindStatusOpen, relay.KindStatusClosed:
+	case relay.KindStatusOpen, relay.KindStatusApplied, relay.KindStatusClosed, relay.KindStatusDraft:
 		success, err = r.reflectIssueStatus(ctx, mapping, ev)
-	case relay.KindStatusApplied, relay.KindStatusDraft:
-		r.logger.Info("reflector: status kind has no Phase F Gitea state action", "event", ev.ID, "kind", ev.Kind)
-		success = true
 	case relay.KindPatch, relay.KindPROpen:
 		success, err = r.reflectPatch(ctx, mapping, ev)
 	case relay.KindPRUpdate:
@@ -206,6 +210,10 @@ func (r *Reflector) reflectComment(ctx context.Context, mapping store.Mapping, e
 }
 
 func (r *Reflector) reflectIssueStatus(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {
+	if !r.statusSyncEnabled {
+		r.logger.Debug("reflector: NIP-34 status sync disabled", "event", ev.ID, "kind", ev.Kind)
+		return false, nil
+	}
 	rootID := rootEventID(ev.Tags)
 	if rootID == "" {
 		return false, nil
@@ -221,7 +229,7 @@ func (r *Reflector) reflectIssueStatus(ctx context.Context, mapping store.Mappin
 		return false, nil
 	}
 	state := "open"
-	if ev.Kind == relay.KindStatusClosed {
+	if ev.Kind == relay.KindStatusClosed || ev.Kind == relay.KindStatusApplied {
 		state = "closed"
 	}
 	if _, err := r.gitea.SetIssueState(ctx, mapping.Owner, mapping.RepoName, root.GiteaIndex, state); err != nil {
