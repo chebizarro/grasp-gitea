@@ -43,6 +43,28 @@ type reflectorPR struct {
 	Body string
 }
 
+type reflectorFakePublisher struct {
+	mu     sync.Mutex
+	events []*nostr.Event
+}
+
+func (p *reflectorFakePublisher) PublishEvent(ctx context.Context, ev *nostr.Event) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	clone := *ev
+	clone.Tags = append(nostr.Tags(nil), ev.Tags...)
+	p.events = append(p.events, &clone)
+	return nil
+}
+
+func (p *reflectorFakePublisher) published() []*nostr.Event {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]*nostr.Event, len(p.events))
+	copy(out, p.events)
+	return out
+}
+
 func newReflectorFakeGitea() *reflectorFakeGitea {
 	return &reflectorFakeGitea{next: 1, issues: map[int64]gitea.Issue{}, pulls: map[int64]reflectorPR{}, comments: map[int64][]string{}}
 }
@@ -497,6 +519,8 @@ func TestReflectorGarbagePatchFallsBackAndCleansWorktree(t *testing.T) {
 	defer ts.Close()
 
 	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rejectionPub := &reflectorFakePublisher{}
+	r.SetPatchRejectionPublisher(rejectionPub)
 	actorPriv := nostr.GeneratePrivateKey()
 	garbage := "From bad patch\n\ndiff --git a/README.md b/README.md\nthis is not a valid patch\n"
 	ev := signedEvent(t, actorPriv, relay.KindPatch, nostr.Tags{
@@ -520,6 +544,16 @@ func TestReflectorGarbagePatchFallsBackAndCleansWorktree(t *testing.T) {
 	}
 	if ref.GiteaIndex != 0 || ref.Kind != relay.KindPatch {
 		t.Fatalf("unexpected fallback reflected row: %+v", ref)
+	}
+	rejections := rejectionPub.published()
+	if len(rejections) != 1 {
+		t.Fatalf("expected 1 rejection event, got %d", len(rejections))
+	}
+	if rejections[0].Kind != relay.KindStatusClosed || tagValue(rejections[0].Tags, "status") != "rejected" || tagValue(rejections[0].Tags, "e") != ev.ID {
+		t.Fatalf("unexpected rejection event: %+v", rejections[0])
+	}
+	if !strings.Contains(rejections[0].Content, "apply patch content failed") {
+		t.Fatalf("rejection content missing reason: %s", rejections[0].Content)
 	}
 	worktrees := reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "worktree", "list", "--porcelain")
 	if got := strings.Count(worktrees, "worktree "); got != 1 {

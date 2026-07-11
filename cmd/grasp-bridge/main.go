@@ -18,6 +18,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/auth"
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
+	"github.com/sharegap/grasp-gitea/internal/hiveci"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/outbox"
@@ -148,6 +149,12 @@ func main() {
 		publisherSvc.SetCIConfig(true, cfg.CITriggerRepos)
 		logger.Info("CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
 	}
+	hiveRunner := hiveci.New(hiveci.Config{Enabled: cfg.HiveCIEnabled, ActPath: cfg.HiveCIActPath}, st, serverSigner, relayURLs, cfg.GiteaRepositoriesDir, logger)
+	if cfg.HiveCIEnabled && !hiveRunner.Enabled() {
+		logger.Warn("Hive-CI requested but disabled; check server signer, repositories path, and act path")
+	} else if hiveRunner.Enabled() {
+		logger.Info("Hive-CI Tier A runner enabled", "act_path", cfg.HiveCIActPath)
+	}
 
 	var outboxDone chan struct{}
 	var outboxWorker *outbox.Worker
@@ -199,6 +206,9 @@ func main() {
 
 	reflectorSvc := reflector.New(st, giteaClient, cfg.GiteaRepositoriesDir, logger)
 	reflectorSvc.SetStatusSyncEnabled(cfg.NIP34StatusSyncEnabled)
+	if publisherSvc != nil && publisherSvc.Enabled() {
+		reflectorSvc.SetPatchRejectionPublisher(publisherSvc)
+	}
 
 	// Per-repo lock serialises state-event processing (CI + proactive
 	// sync) across relay goroutines so ref reads in the CI handler
@@ -259,6 +269,11 @@ func main() {
 			}
 
 			unlock()
+		}
+		if hiveRunner != nil {
+			if hiveErr := hiveRunner.HandleEvent(ctx, ev, sourceRelay); hiveErr != nil {
+				logger.Warn("Hive-CI runner failed", "event", ev.ID, "kind", ev.Kind, "error", hiveErr)
+			}
 		}
 		return nil
 	}

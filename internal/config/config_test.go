@@ -255,6 +255,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ProactiveSyncInterval != time.Hour {
 		t.Errorf("default ProactiveSyncInterval: got %v", cfg.ProactiveSyncInterval)
 	}
+	if cfg.HiveCIEnabled {
+		t.Error("default HiveCIEnabled should be false")
+	}
+	if cfg.HiveCIActPath != "/usr/bin/act" {
+		t.Errorf("default HiveCIActPath: got %q", cfg.HiveCIActPath)
+	}
 	if cfg.SignerEnabled() {
 		t.Error("signer should be disabled by default")
 	}
@@ -324,6 +330,8 @@ func TestLoadOverridesAllFields(t *testing.T) {
 		"GRASP05_ARCHIVE_MODE":    "true",
 		"ADMIN_API_TOKEN":         "admin-secret",
 		"PROACTIVE_SYNC_INTERVAL": "30m",
+		"HIVE_CI_ENABLED":         "true",
+		"HIVE_CI_ACT_PATH":        "/opt/bin/act",
 	})
 
 	cfg, err := Load()
@@ -360,6 +368,12 @@ func TestLoadOverridesAllFields(t *testing.T) {
 	}
 	if cfg.ProactiveSyncInterval != 30*time.Minute {
 		t.Errorf("ProactiveSyncInterval: got %v", cfg.ProactiveSyncInterval)
+	}
+	if !cfg.HiveCIEnabled {
+		t.Error("HiveCIEnabled should be true")
+	}
+	if cfg.HiveCIActPath != "/opt/bin/act" {
+		t.Errorf("HiveCIActPath: got %q", cfg.HiveCIActPath)
 	}
 }
 

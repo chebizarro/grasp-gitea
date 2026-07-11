@@ -4,6 +4,8 @@ const (
 	KindRepositoryAnnouncement = 30617
 	KindRepositoryState        = 30618
 	KindWorkflowRun            = 5401
+	KindCheckRunResult         = 30315
+	KindCASAudit               = 4903
 	KindPatch                  = 1617
 	KindPROpen                 = 1618
 	KindPRUpdate               = 1619

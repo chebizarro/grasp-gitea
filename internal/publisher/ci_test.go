@@ -183,6 +183,7 @@ func TestWorkflowRunEventKindConstant(t *testing.T) {
 
 func TestWorkflowDirsContainsExpectedPaths(t *testing.T) {
 	expected := map[string]bool{
+		".gitea/workflows":  false,
 		".github/workflows": false,
 		".hive/workflows":   false,
 	}
@@ -272,5 +273,3 @@ func assertTag(t *testing.T, ev *nostr.Event, key, expectedValue string) {
 		t.Errorf("tag %q: expected %q, got %q", key, expectedValue, v)
 	}
 }
-
-

@@ -291,10 +291,11 @@ func (s *Service) HandleWebhookPushCI(ctx context.Context, giteaRepoID int64, re
 // workflowDirs lists the directories scanned for CI workflow definitions.
 // Each entry is checked in order; all discovered workflows are returned.
 //
+//   - .gitea/workflows  — Gitea / Forgejo Actions workflows
 //   - .github/workflows — GitHub Actions and compatible runners
-//     (Gitea Actions, Forgejo Actions, etc.)
-//   - .hive/workflows   — Nostr / Hive CI pipelines
+//   - .hive/workflows   — legacy Nostr / Hive CI pipelines
 var workflowDirs = []string{
+	".gitea/workflows",
 	".github/workflows",
 	".hive/workflows",
 }

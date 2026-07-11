@@ -8,6 +8,7 @@ package reflector
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -49,13 +50,18 @@ type GiteaClient interface {
 	CreatePullRequest(ctx context.Context, owner string, repo string, head string, base string, title string, body string) (gitea.PullRequest, error)
 }
 
+type PatchRejectionPublisher interface {
+	PublishEvent(ctx context.Context, ev *nostr.Event) error
+}
+
 // Reflector reflects verified Nostr collaboration events into Gitea.
 type Reflector struct {
-	store             Store
-	gitea             GiteaClient
-	repositoriesDir   string
-	logger            *slog.Logger
-	statusSyncEnabled bool
+	store                   Store
+	gitea                   GiteaClient
+	repositoriesDir         string
+	logger                  *slog.Logger
+	statusSyncEnabled       bool
+	patchRejectionPublisher PatchRejectionPublisher
 }
 
 func New(st Store, g GiteaClient, repositoriesDir string, logger *slog.Logger) *Reflector {
@@ -68,6 +74,12 @@ func New(st Store, g GiteaClient, repositoriesDir string, logger *slog.Logger) *
 func (r *Reflector) SetStatusSyncEnabled(enabled bool) {
 	if r != nil {
 		r.statusSyncEnabled = enabled
+	}
+}
+
+func (r *Reflector) SetPatchRejectionPublisher(pub PatchRejectionPublisher) {
+	if r != nil {
+		r.patchRejectionPublisher = pub
 	}
 }
 
@@ -264,22 +276,22 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 	base, err := resolveBaseBranch(ctx, repoPath)
 	if err != nil {
 		r.logger.Warn("reflector: failed to resolve base branch for patch PR; recording only", "event", ev.ID, "error", err)
-		return r.recordPatchOnly(ctx, mapping, ev, tip)
+		return r.recordPatchRejection(ctx, mapping, ev, tip, "resolve base branch failed: "+err.Error())
 	}
 
 	if validSHA.MatchString(tip) {
 		if err := r.materializeTipBranch(ctx, mapping, ev, repoPath, tip, branch); err != nil {
-			r.logger.Warn("reflector: failed to materialize patch tip; recording only", "event", ev.ID, "tip", tip, "error", err)
-			return r.recordPatchOnly(ctx, mapping, ev, tip)
+			r.logger.Warn("reflector: failed to materialize patch tip; rejecting patch", "event", ev.ID, "tip", tip, "error", err)
+			return r.recordPatchRejection(ctx, mapping, ev, tip, "materialize patch tip failed: "+err.Error())
 		}
 	} else {
 		if !looksLikeFormatPatch(ev.Content) {
-			r.logger.Info("reflector: patch missing usable c-tip and content is not git format-patch; recording only", "event", ev.ID, "tip", tip)
-			return r.recordPatchOnly(ctx, mapping, ev, "")
+			r.logger.Info("reflector: patch missing usable c-tip and content is not git format-patch; rejecting patch", "event", ev.ID, "tip", tip)
+			return r.recordPatchRejection(ctx, mapping, ev, "", "patch content is not a git format-patch and no usable c tip was provided")
 		}
 		if err := applyPatchContentBranch(ctx, repoPath, base, branch, ev.Content); err != nil {
-			r.logger.Warn("reflector: failed to apply patch content; recording only", "event", ev.ID, "error", err)
-			return r.recordPatchOnly(ctx, mapping, ev, "")
+			r.logger.Warn("reflector: failed to apply patch content; rejecting patch", "event", ev.ID, "error", err)
+			return r.recordPatchRejection(ctx, mapping, ev, "", "apply patch content failed: "+err.Error())
 		}
 	}
 
@@ -287,16 +299,16 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 	body := patchBody(ev)
 	pr, err := r.gitea.CreatePullRequest(ctx, mapping.Owner, mapping.RepoName, branch, base, title, body)
 	if err != nil {
-		r.logger.Warn("reflector: failed to create Gitea PR for patch; recording only", "event", ev.ID, "branch", branch, "base", base, "error", err)
-		return r.recordPatchOnly(ctx, mapping, ev, tip)
+		r.logger.Warn("reflector: failed to create Gitea PR for patch; rejecting patch", "event", ev.ID, "branch", branch, "base", base, "error", err)
+		return r.recordPatchRejection(ctx, mapping, ev, tip, "create pull request failed: "+err.Error())
 	}
 	index := pr.Index
 	if index == 0 {
 		index = pr.Number
 	}
 	if index == 0 {
-		r.logger.Warn("reflector: created Gitea PR returned no index; recording only", "event", ev.ID)
-		return r.recordPatchOnly(ctx, mapping, ev, tip)
+		r.logger.Warn("reflector: created Gitea PR returned no index; rejecting patch", "event", ev.ID)
+		return r.recordPatchRejection(ctx, mapping, ev, tip, "create pull request returned no index")
 	}
 	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
 		NostrEventID:    ev.ID,
@@ -410,6 +422,54 @@ func (r *Reflector) materializeTipBranch(ctx context.Context, mapping store.Mapp
 	return fmt.Errorf("fetch patch tip to refs/nostr failed: %s", strings.Join(errs, "; "))
 }
 
+func (r *Reflector) recordPatchRejection(ctx context.Context, mapping store.Mapping, ev *nostr.Event, tip string, reason string) (bool, error) {
+	if err := r.publishPatchRejection(ctx, mapping, ev, reason); err != nil {
+		return false, err
+	}
+	return r.recordPatchOnly(ctx, mapping, ev, tip)
+}
+
+func (r *Reflector) publishPatchRejection(ctx context.Context, mapping store.Mapping, ev *nostr.Event, reason string) error {
+	if r.patchRejectionPublisher == nil {
+		r.logger.Warn("reflector: patch rejection publisher unavailable", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "reason", reason)
+		return nil
+	}
+	aTag := tagValue(ev.Tags, "a")
+	if aTag == "" {
+		aTag = fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement, mapping.Pubkey, mapping.RepoID)
+	}
+	payload := map[string]any{
+		"schema_version": "grasp.patch_rejection.v1",
+		"event_id":       ev.ID,
+		"event_kind":     ev.Kind,
+		"repo":           mapping.Owner + "/" + mapping.RepoName,
+		"repo_id":        mapping.RepoID,
+		"reason":         reason,
+	}
+	content, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal patch rejection: %w", err)
+	}
+	rejection := &nostr.Event{
+		CreatedAt: nostr.Now(),
+		Kind:      relay.KindStatusClosed,
+		Tags: nostr.Tags{
+			{"a", aTag},
+			{"e", ev.ID, "", "root"},
+			{"p", ev.PubKey},
+			{"K", fmt.Sprint(ev.Kind)},
+			{"status", "rejected"},
+			{"reason", reason},
+		},
+		Content: string(content),
+	}
+	if err := r.patchRejectionPublisher.PublishEvent(ctx, rejection); err != nil {
+		return fmt.Errorf("publish patch rejection: %w", err)
+	}
+	r.logger.Info("reflector: published NIP-34 patch rejection", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "reason", reason)
+	return nil
+}
+
 func (r *Reflector) recordPatchOnly(ctx context.Context, mapping store.Mapping, ev *nostr.Event, tip string) (bool, error) {
 	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
 		NostrEventID: ev.ID,
@@ -419,7 +479,7 @@ func (r *Reflector) recordPatchOnly(ctx context.Context, mapping store.Mapping, 
 	}); err != nil {
 		return false, fmt.Errorf("record reflected patch: %w", err)
 	}
-	r.logger.Info("reflector: recorded patch tip under refs/nostr when available; full patch apply/merge is deferred", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "tip", tip)
+	r.logger.Info("reflector: recorded patch without PR creation", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "tip", tip)
 	return true, nil
 }
 

@@ -51,6 +51,10 @@ type Config struct {
 	CIEnabled      bool
 	CITriggerRepos []string // ["*"] or ["owner/repo-id", ...]
 
+	// Hive-CI Tier A runs act locally and publishes signed check/audit results.
+	HiveCIEnabled bool
+	HiveCIActPath string
+
 	// NIP34StatusSyncEnabled updates Gitea issue state from inbound NIP-34 status events.
 	NIP34StatusSyncEnabled bool
 }
@@ -85,6 +89,8 @@ func Load() (Config, error) {
 		GiteaWebhookSecret:     strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
 		CIEnabled:              boolEnv("CI_ENABLED", false),
 		CITriggerRepos:         csvEnv("CI_TRIGGER_REPOS"),
+		HiveCIEnabled:          boolEnv("HIVE_CI_ENABLED", false),
+		HiveCIActPath:          envOrDefault("HIVE_CI_ACT_PATH", "/usr/bin/act"),
 		NIP34StatusSyncEnabled: boolEnv("NIP34_STATUS_SYNC_ENABLED", false),
 	}
 
