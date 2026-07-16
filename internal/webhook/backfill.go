@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -66,9 +66,13 @@ func (b *ActorBackfiller) EnqueuePending(ctx context.Context, giteaUserID int64,
 		if err := json.Unmarshal([]byte(row.UnsignedEventJSON), &ev); err != nil {
 			return count, fmt.Errorf("unmarshal pending actor event %d: %w", row.ID, err)
 		}
-		ev.Kind = row.Kind
-		ev.PubKey = linkedPubkey
-		ev.Sig = ""
+		linkedPK, err := nostr.PubKeyFromHexCheap(linkedPubkey)
+		if err != nil {
+			return count, fmt.Errorf("invalid linked pubkey %q: %w", linkedPubkey, err)
+		}
+		ev.Kind = nostr.Kind(row.Kind)
+		ev.PubKey = linkedPK
+		ev.Sig = [64]byte{}
 		ev.ID = ev.GetID()
 		if err := b.outbox.Enqueue(ctx, row.Kind, linkedPubkey, row.Scope, &ev, row.DedupeKey); err != nil {
 			return count, fmt.Errorf("enqueue pending actor event %d: %w", row.ID, err)

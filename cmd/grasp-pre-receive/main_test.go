@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/nbd-wtf/go-nostr/nip34"
+	"fiatjaf.com/nostr/nip34"
 )
 
 func TestValidateRefAgainstState(t *testing.T) {

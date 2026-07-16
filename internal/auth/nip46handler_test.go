@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/signer"
@@ -75,13 +75,13 @@ type fakeBunkerSigner struct {
 }
 
 func (f fakeBunkerSigner) Ping(context.Context) error { return nil }
-func (f fakeBunkerSigner) GetPublicKey(context.Context) (string, error) {
-	return f.pubkey, nil
+func (f fakeBunkerSigner) GetPublicKey(context.Context) (nostr.PubKey, error) {
+	return nostr.MustPubKeyFromHex(f.pubkey), nil
 }
 func (f fakeBunkerSigner) SignEvent(_ context.Context, ev *nostr.Event) error {
-	ev.PubKey = f.pubkey
+	ev.PubKey = nostr.MustPubKeyFromHex(f.pubkey)
 	ev.ID = ev.GetID()
-	ev.Sig = "fake-signature"
+	ev.Sig = [64]byte{1}
 	return nil
 }
 

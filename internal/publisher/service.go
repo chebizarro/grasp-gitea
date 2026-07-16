@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/relay"
@@ -33,9 +33,10 @@ type Service struct {
 	repositoriesDir string
 	relayURLs       []string
 
-	bridgeSigner  ServerSigner
-	bridgePrivKey string // legacy dev/test fallback
-	bridgePubKey  string
+	bridgeSigner      ServerSigner
+	bridgePrivKey     string // legacy dev/test fallback
+	bridgePubKey      string
+	bridgePubKeyBytes nostr.PubKey
 
 	ownerStateSigner StateSigner
 	ownerStateOutbox StateOutbox
@@ -94,8 +95,11 @@ func NewWithServerSigner(signer ServerSigner, st *store.SQLiteStore, relayURLs [
 	}
 	if signer != nil {
 		s.bridgePubKey = signer.PublicKey()
+		if pk, err := nostr.PubKeyFromHex(s.bridgePubKey); err == nil {
+			s.bridgePubKeyBytes = pk
+		}
 		if local, ok := signer.(*localServerSigner); ok {
-			s.bridgePrivKey = local.privKey
+			s.bridgePrivKey = local.privKey.Hex()
 		}
 		logger.Info("publisher initialized", "bridge_pubkey", s.bridgePubKey)
 	}
@@ -234,9 +238,9 @@ func (s *Service) publishBridgeSignedState(ctx context.Context, mapping *store.M
 	}
 
 	stateEvent := cloneStateEvent(unsigned)
-	stateEvent.PubKey = s.bridgePubKey
-	stateEvent.ID = ""
-	stateEvent.Sig = ""
+	stateEvent.PubKey = s.bridgePubKeyBytes
+	stateEvent.ID = nostr.ID{}
+	stateEvent.Sig = [64]byte{}
 	if err := s.signOutbound(ctx, stateEvent); err != nil {
 		return fmt.Errorf("sign state event with bridge signer: %w", err)
 	}
@@ -248,13 +252,13 @@ func (s *Service) publishBridgeSignedState(ctx context.Context, mapping *store.M
 		return fmt.Errorf("publish state event: %w", err)
 	}
 
-	if err := s.store.RecordStatePublished(ctx, mapping.Npub, mapping.RepoID, digest, stateEvent.ID, now); err != nil {
+	if err := s.store.RecordStatePublished(ctx, mapping.Npub, mapping.RepoID, digest, stateEvent.ID.Hex(), now); err != nil {
 		s.logger.Warn("failed to record state publish", "error", err)
 	}
 
 	s.logger.Info("published bridge-signed NIP-34 state event",
 		"owner", mapping.Owner, "repo", mapping.RepoID,
-		"event_id", stateEvent.ID, "digest", digest,
+		"event_id", stateEvent.ID.Hex(), "digest", digest,
 		"branches", len(branches), "tags", len(tags))
 	return nil
 }
@@ -282,17 +286,26 @@ func (s *Service) republishAnnouncement(ctx context.Context, mapping *store.Mapp
 		return err
 	}
 
-	if err := s.store.RecordAnnouncementRepublished(ctx, mapping.Npub, mapping.RepoID, ev.ID, now); err != nil {
+	if err := s.store.RecordAnnouncementRepublished(ctx, mapping.Npub, mapping.RepoID, ev.ID.Hex(), now); err != nil {
 		s.logger.Warn("failed to record announcement republish", "error", err)
 	}
 
 	s.logger.Info("republished owner-signed announcement",
-		"owner", mapping.Owner, "repo", mapping.RepoID, "event_id", ev.ID)
+		"owner", mapping.Owner, "repo", mapping.RepoID, "event_id", ev.ID.Hex())
 	return nil
 }
 
 // buildStateEvent creates a new unsigned owner-authored NIP-34 repository state event.
 func (s *Service) buildStateEvent(ownerPubkey string, repoID string, head string, branches map[string]string, tags map[string]string) (*nostr.Event, error) {
+	var ownerPK nostr.PubKey
+	if ownerPubkey != "" {
+		pk, err := nostr.PubKeyFromHex(ownerPubkey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid owner pubkey %q: %w", ownerPubkey, err)
+		}
+		ownerPK = pk
+	}
+
 	// Build tags in deterministic order.
 	eventTags := make(nostr.Tags, 0, 3+len(branches)+len(tags))
 	eventTags = append(eventTags, nostr.Tag{"d", repoID})
@@ -315,7 +328,7 @@ func (s *Service) buildStateEvent(ownerPubkey string, repoID string, head string
 	}
 
 	return &nostr.Event{
-		PubKey:    ownerPubkey,
+		PubKey:    ownerPK,
 		CreatedAt: nostr.Now(),
 		Kind:      relay.KindRepositoryState,
 		Tags:      eventTags,
@@ -330,7 +343,7 @@ func (s *Service) PublishEvent(ctx context.Context, ev *nostr.Event) error {
 	}
 
 	// Set pubkey and sign with the configured server signer.
-	ev.PubKey = s.bridgePubKey
+	ev.PubKey = s.bridgePubKeyBytes
 	if err := s.signOutbound(ctx, ev); err != nil {
 		return fmt.Errorf("sign event: %w", err)
 	}
@@ -342,13 +355,17 @@ func (s *Service) signOutbound(ctx context.Context, ev *nostr.Event) error {
 	if !s.Enabled() {
 		return fmt.Errorf("publisher not enabled")
 	}
-	ev.PubKey = s.bridgePubKey
-	ev.ID = ""
-	ev.Sig = ""
+	ev.PubKey = s.bridgePubKeyBytes
+	ev.ID = nostr.ID{}
+	ev.Sig = [64]byte{}
 	if s.bridgeSigner != nil {
 		return s.bridgeSigner.SignEvent(ctx, ev)
 	}
-	return ev.Sign(s.bridgePrivKey)
+	sk, err := nostr.SecretKeyFromHex(s.bridgePrivKey)
+	if err != nil {
+		return fmt.Errorf("invalid bridge private key: %w", err)
+	}
+	return ev.Sign(sk)
 }
 
 // PublishSigned publishes an already-signed event to all configured relays.
@@ -370,25 +387,31 @@ func (s *Service) FetchEvent(ctx context.Context, id string) (*nostr.Event, erro
 		return nil, fmt.Errorf("no relay URLs configured")
 	}
 
+	eid, err := nostr.IDFromHex(id)
+	if err != nil {
+		return nil, fmt.Errorf("invalid event id %q: %w", id, err)
+	}
+
 	var queried int
 	for _, url := range s.relayURLs {
 		qCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		r, err := nostr.RelayConnect(qCtx, url)
+		r, err := nostr.RelayConnect(qCtx, url, nostr.RelayOptions{})
 		if err != nil {
 			cancel()
 			s.logger.Warn("relay connect failed for fetch", "relay", url, "error", err)
 			continue
 		}
-		events, err := r.QuerySync(qCtx, nostr.Filter{IDs: []string{id}, Limit: 1})
+		queried++
+		var found *nostr.Event
+		for ev := range r.QueryEvents(nostr.Filter{IDs: []nostr.ID{eid}, Limit: 1}) {
+			e := ev
+			found = &e
+			break
+		}
 		r.Close()
 		cancel()
-		if err != nil {
-			s.logger.Warn("relay query failed", "relay", url, "event", id, "error", err)
-			continue
-		}
-		queried++
-		if len(events) > 0 {
-			return events[0], nil
+		if found != nil {
+			return found, nil
 		}
 	}
 
@@ -408,7 +431,7 @@ func (s *Service) publishToRelays(ctx context.Context, ev *nostr.Event) error {
 	var succeeded int
 	for _, url := range s.relayURLs {
 		pubCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		r, err := nostr.RelayConnect(pubCtx, url)
+		r, err := nostr.RelayConnect(pubCtx, url, nostr.RelayOptions{})
 		if err != nil {
 			cancel()
 			s.logger.Warn("relay connect failed", "relay", url, "error", err)
@@ -418,14 +441,14 @@ func (s *Service) publishToRelays(ctx context.Context, ev *nostr.Event) error {
 		r.Close()
 		cancel()
 		if err != nil {
-			s.logger.Warn("relay publish failed", "relay", url, "event", ev.ID, "error", err)
+			s.logger.Warn("relay publish failed", "relay", url, "event", ev.ID.Hex(), "error", err)
 			continue
 		}
 		succeeded++
 	}
 
 	if succeeded == 0 {
-		return fmt.Errorf("event %s rejected by all %d relays", ev.ID, len(s.relayURLs))
+		return fmt.Errorf("event %s rejected by all %d relays", ev.ID.Hex(), len(s.relayURLs))
 	}
 	return nil
 }

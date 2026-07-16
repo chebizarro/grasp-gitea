@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 )
 
 func testLogger() *slog.Logger {
@@ -97,15 +97,12 @@ func TestKindConstants(t *testing.T) {
 }
 
 func TestSubscriptionFiltersIncludeCollaborationKinds(t *testing.T) {
-	filters := subscriptionFilters()
-	if len(filters) != 1 {
-		t.Fatalf("expected one filter, got %d", len(filters))
-	}
-	got := map[int]bool{}
-	for _, kind := range filters[0].Kinds {
+	filter := subscriptionFilter()
+	got := map[nostr.Kind]bool{}
+	for _, kind := range filter.Kinds {
 		got[kind] = true
 	}
-	for _, want := range []int{
+	for _, want := range []nostr.Kind{
 		KindRepositoryAnnouncement,
 		KindRepositoryState,
 		KindUserGraspList,

@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -61,7 +61,7 @@ func TestHandleStateEventMissingDTag(t *testing.T) {
 	// nostr.KindRepositoryState = 30618
 	ev := &nostr.Event{
 		Kind:   nostr.KindRepositoryState,
-		PubKey: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+		PubKey: nostr.MustPubKeyFromHex("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"),
 		Tags:   nostr.Tags{},
 	}
 	// Signature validation will fail before d tag check, so we need to test
@@ -84,7 +84,7 @@ func TestHandleStateEventUnprovisionedRepo(t *testing.T) {
 	// is correct by checking that an event with invalid sig returns error.
 	ev := &nostr.Event{
 		Kind:   nostr.KindRepositoryState,
-		PubKey: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+		PubKey: nostr.MustPubKeyFromHex("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"),
 		Tags:   nostr.Tags{{"d", "myrepo"}},
 	}
 	err := svc.HandleStateEvent(context.Background(), ev)
@@ -263,7 +263,7 @@ func (q *fakeRelayQueries) query(_ context.Context, _ string, filter nostr.Filte
 
 func filterHasKind(filter nostr.Filter, kind int) bool {
 	for _, k := range filter.Kinds {
-		if k == kind {
+		if k == nostr.Kind(kind) {
 			return true
 		}
 	}
@@ -288,15 +288,16 @@ func TestSyncOnceFetchesMissingStateObjectsAndPRTips(t *testing.T) {
 		t.Fatalf("create bare repo dir: %v", err)
 	}
 
-	ownerPriv := nostr.GeneratePrivateKey()
-	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
 	if err != nil {
 		t.Fatalf("owner public key: %v", err)
 	}
-	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	ownerPK, err := nostr.PubKeyFromHex(ownerPub)
 	if err != nil {
-		t.Fatalf("owner npub: %v", err)
+		t.Fatalf("owner pubkey: %v", err)
 	}
+	ownerNpub := nip19.EncodeNpub(ownerPK)
 
 	cloneURL := "https://git.example.com/alice/project.git"
 	relayURL := "wss://relay.example.com"
@@ -359,7 +360,7 @@ func TestSyncOnceFetchesMissingStateObjectsAndPRTips(t *testing.T) {
 	if got := git.fetches[0].refspecs; len(got) != 1 || got[0] != stateSHA {
 		t.Errorf("state fetch refspecs = %v, want [%s]", got, stateSHA)
 	}
-	wantPRRefspec := "+" + prSHA + ":refs/nostr/" + prEvent.ID
+	wantPRRefspec := "+" + prSHA + ":refs/nostr/" + prEvent.ID.Hex()
 	if got := git.fetches[1].refspecs; len(got) != 1 || got[0] != wantPRRefspec {
 		t.Errorf("PR fetch refspecs = %v, want [%s]", got, wantPRRefspec)
 	}
@@ -377,15 +378,16 @@ func TestSyncOnceIgnoresStateEventThatOnlyTagsOwner(t *testing.T) {
 		t.Fatalf("create bare repo dir: %v", err)
 	}
 
-	ownerPriv := nostr.GeneratePrivateKey()
-	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
 	if err != nil {
 		t.Fatalf("owner public key: %v", err)
 	}
-	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	ownerPK, err := nostr.PubKeyFromHex(ownerPub)
 	if err != nil {
-		t.Fatalf("owner npub: %v", err)
+		t.Fatalf("owner pubkey: %v", err)
 	}
+	ownerNpub := nip19.EncodeNpub(ownerPK)
 	announcement := signedTestEvent(t, ownerPriv, relay.KindRepositoryAnnouncement, nostr.Tags{
 		{"d", repoID},
 		{"clone", "https://git.example.com/alice/project.git"},
@@ -396,7 +398,7 @@ func TestSyncOnceIgnoresStateEventThatOnlyTagsOwner(t *testing.T) {
 		t.Fatalf("marshal announcement: %v", err)
 	}
 
-	attackerPriv := nostr.GeneratePrivateKey()
+	attackerPriv := nostr.Generate().Hex()
 	spoofedState := signedTestEvent(t, attackerPriv, relay.KindRepositoryState, nostr.Tags{
 		{"d", repoID},
 		{"p", ownerPub},
@@ -437,10 +439,10 @@ func TestQueryRelayHistoryPaginatesWithUntil(t *testing.T) {
 	var calls int
 	svc.queryRelay = func(_ context.Context, _ string, filter nostr.Filter) ([]*nostr.Event, error) {
 		calls++
-		if filter.Until == nil {
+		if filter.Until == 0 {
 			return []*nostr.Event{{CreatedAt: 30}, {CreatedAt: 20}}, nil
 		}
-		if *filter.Until == 19 {
+		if filter.Until == 19 {
 			return []*nostr.Event{{CreatedAt: 10}}, nil
 		}
 		return nil, nil
@@ -501,18 +503,18 @@ func TestNormalizeSyncIntervalClampsAboveOneHour(t *testing.T) {
 
 func signedTestEvent(t *testing.T, priv string, kind int, tags nostr.Tags) *nostr.Event {
 	t.Helper()
-	pub, err := nostr.GetPublicKey(priv)
+	pub, err := derivePubHex(priv)
 	if err != nil {
 		t.Fatalf("public key: %v", err)
 	}
 	ev := &nostr.Event{
-		PubKey:    pub,
+		PubKey:    nostr.MustPubKeyFromHex(pub),
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
-		Kind:      kind,
+		Kind:      nostr.Kind(kind),
 		Tags:      tags,
 		Content:   "",
 	}
-	if err := ev.Sign(priv); err != nil {
+	if err := ev.Sign(mustSK(priv)); err != nil {
 		t.Fatalf("sign event: %v", err)
 	}
 	return ev

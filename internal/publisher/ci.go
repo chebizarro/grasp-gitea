@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
-	"github.com/nbd-wtf/go-nostr/nip34"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
+	"fiatjaf.com/nostr/nip34"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/relay"
@@ -113,7 +113,7 @@ func (s *Service) HandleStateEventCI(ctx context.Context, ev *nostr.Event, sourc
 
 	// Dedup: skip if we already processed this exact event (e.g. seen
 	// from a second relay).
-	if s.ciDedup.MarkSeen(ev.ID) {
+	if s.ciDedup.MarkSeen(ev.ID.Hex()) {
 		return nil
 	}
 
@@ -359,7 +359,7 @@ func (s *Service) buildWorkflowRunEvent(ownerPubkey, repoID, commitSHA, branch, 
 		relay.KindRepositoryAnnouncement, ownerPubkey, repoID)
 
 	ev := &nostr.Event{
-		PubKey:    s.bridgePubKey,
+		PubKey:    s.bridgePubKeyBytes,
 		CreatedAt: nostr.Now(),
 		Kind:      relay.KindWorkflowRun,
 		Tags: nostr.Tags{
@@ -387,11 +387,11 @@ func (s *Service) buildWorkflowRunEvent(ownerPubkey, repoID, commitSHA, branch, 
 
 // evTagValue extracts the first value for a tag key from nostr tags.
 func evTagValue(tags nostr.Tags, key string) string {
-	v := tags.GetFirst([]string{key, ""})
-	if v == nil || len(*v) < 2 {
+	v := tags.Find(key)
+	if v == nil || len(v) < 2 {
 		return ""
 	}
-	return (*v)[1]
+	return v[1]
 }
 
 func (s *Service) resolveStateEventMapping(ctx context.Context, ev *nostr.Event, repoID string) (store.Mapping, error) {
@@ -399,8 +399,8 @@ func (s *Service) resolveStateEventMapping(ctx context.Context, ev *nostr.Event,
 	if ownerPubkey := evTagValue(ev.Tags, "p"); ownerPubkey != "" {
 		candidatePubkeys = append(candidatePubkeys, ownerPubkey)
 	}
-	if ev != nil && ev.PubKey != "" {
-		candidatePubkeys = append(candidatePubkeys, ev.PubKey)
+	if ev != nil && ev.PubKey != (nostr.PubKey{}) {
+		candidatePubkeys = append(candidatePubkeys, ev.PubKey.Hex())
 	}
 
 	seen := map[string]bool{}
@@ -409,10 +409,11 @@ func (s *Service) resolveStateEventMapping(ctx context.Context, ev *nostr.Event,
 			continue
 		}
 		seen[pubkey] = true
-		npub, err := nip19.EncodePublicKey(pubkey)
+		pk, err := nostr.PubKeyFromHex(pubkey)
 		if err != nil {
 			continue
 		}
+		npub := nip19.EncodeNpub(pk)
 		mapping, err := s.store.GetMapping(ctx, npub, repoID)
 		if err == nil {
 			return mapping, nil

@@ -8,9 +8,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/fiatjaf/khatru"
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/khatru"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/relay"
@@ -26,14 +26,15 @@ func (f fakeHostedRepoChecker) MappingExists(_ context.Context, npub string, rep
 }
 
 func TestEmbeddedRelayPolicyAcceptsIssueReferencingHostedRepo(t *testing.T) {
-	pubkey, err := nostr.GetPublicKey(embeddedRelayTestSecretKey)
+	pubkey, err := derivePubHex(embeddedRelayTestSecretKey)
 	if err != nil {
 		t.Fatalf("derive pubkey: %v", err)
 	}
-	npub, err := nip19.EncodePublicKey(pubkey)
+	pk, err := nostr.PubKeyFromHex(pubkey)
 	if err != nil {
-		t.Fatalf("encode npub: %v", err)
+		t.Fatalf("owner pubkey: %v", err)
 	}
+	npub := nip19.EncodeNpub(pk)
 
 	policy := makeEmbeddedRelayRejectPolicy(fakeHostedRepoChecker{npub + "\x00" + "repo1": {}}, nil)
 	ev := &nostr.Event{
@@ -47,7 +48,7 @@ func TestEmbeddedRelayPolicyAcceptsIssueReferencingHostedRepo(t *testing.T) {
 }
 
 func TestEmbeddedRelayPolicyRejectsIssueWithoutHostedRepoReference(t *testing.T) {
-	pubkey, err := nostr.GetPublicKey(embeddedRelayTestSecretKey)
+	pubkey, err := derivePubHex(embeddedRelayTestSecretKey)
 	if err != nil {
 		t.Fatalf("derive pubkey: %v", err)
 	}
@@ -69,7 +70,7 @@ func TestEmbeddedRelayPolicyRejectsIssueWithoutHostedRepoReference(t *testing.T)
 func TestEmbeddedRelayPolicyAcceptsStatusReferencingStoredPatch(t *testing.T) {
 	policy := makeEmbeddedRelayRejectPolicy(nil, func(_ context.Context, eventID string) (*nostr.Event, error) {
 		if eventID == "patch-event" {
-			return &nostr.Event{ID: eventID, Kind: relay.KindPatch}, nil
+			return &nostr.Event{Kind: relay.KindPatch}, nil
 		}
 		return nil, nil
 	})

@@ -9,20 +9,15 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/relay"
 )
 
 func genNsec(t *testing.T) string {
 	t.Helper()
-	sk := nostr.GeneratePrivateKey()
-	nsec, err := nip19.EncodePrivateKey(sk)
-	if err != nil {
-		t.Fatalf("encode nsec: %v", err)
-	}
-	return nsec
+	return nip19.EncodeNsec(nostr.Generate())
 }
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -156,10 +151,10 @@ func TestBuildStateEventSignedAndStructured(t *testing.T) {
 	// State events are owner-authored templates. They stay unsigned here so the
 	// outbox can sign them with the owner's grant; bridge signing is only a
 	// transition fallback in RepublishForGiteaRepo.
-	if ev.PubKey != owner {
+	if ev.PubKey.Hex() != owner {
 		t.Errorf("state event pubkey = %q, want owner pubkey %q", ev.PubKey, owner)
 	}
-	if ev.ID != "" || ev.Sig != "" {
+	if ev.ID != (nostr.ID{}) || ev.Sig != [64]byte{} {
 		t.Errorf("state event should be unsigned, got id=%q sig=%q", ev.ID, ev.Sig)
 	}
 
@@ -209,10 +204,10 @@ func TestBuildStateEventOmitsEmptyOwnerAndHead(t *testing.T) {
 	if v, _ := firstVal(ev, "d"); v != "repo" {
 		t.Errorf("d tag = %q, want repo", v)
 	}
-	if ev.PubKey != "" {
+	if ev.PubKey != (nostr.PubKey{}) {
 		t.Errorf("empty owner pubkey should leave event pubkey empty, got %q", ev.PubKey)
 	}
-	if ev.ID != "" || ev.Sig != "" {
+	if ev.ID != (nostr.ID{}) || ev.Sig != [64]byte{} {
 		t.Errorf("state event should be unsigned, got id=%q sig=%q", ev.ID, ev.Sig)
 	}
 }

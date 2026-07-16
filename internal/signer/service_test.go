@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -30,11 +30,11 @@ func (f *fakeBunkerSigner) Ping(ctx context.Context) error {
 	return f.pingErr
 }
 
-func (f *fakeBunkerSigner) GetPublicKey(ctx context.Context) (string, error) {
+func (f *fakeBunkerSigner) GetPublicKey(ctx context.Context) (nostr.PubKey, error) {
 	if f.getErr != nil {
-		return "", f.getErr
+		return nostr.PubKey{}, f.getErr
 	}
-	return f.pubkey, nil
+	return nostr.PubKeyFromHex(f.pubkey)
 }
 
 func (f *fakeBunkerSigner) SignEvent(ctx context.Context, evt *nostr.Event) error {
@@ -42,13 +42,17 @@ func (f *fakeBunkerSigner) SignEvent(ctx context.Context, evt *nostr.Event) erro
 	if f.signErr != nil {
 		return f.signErr
 	}
-	return evt.Sign(f.secret)
+	sk, err := nostr.SecretKeyFromHex(f.secret)
+	if err != nil {
+		return err
+	}
+	return evt.Sign(sk)
 }
 
 func TestCreateGrantPersistsEncryptedGrant(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStore(t)
-	signerSecret := nostr.GeneratePrivateKey()
+	signerSecret := nostr.Generate().Hex()
 	signerPubkey := mustPubkey(t, signerSecret)
 	bunkerURI := "bunker://" + signerPubkey + "?relay=wss://relay.example&secret=connect-secret"
 
@@ -118,9 +122,9 @@ func TestCreateGrantPersistsEncryptedGrant(t *testing.T) {
 func TestCreateGrantRejectsSignerPubkeyMismatch(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStore(t)
-	expectedSecret := nostr.GeneratePrivateKey()
+	expectedSecret := nostr.Generate().Hex()
 	expectedPubkey := mustPubkey(t, expectedSecret)
-	actualSecret := nostr.GeneratePrivateKey()
+	actualSecret := nostr.Generate().Hex()
 	actualPubkey := mustPubkey(t, actualSecret)
 	bunkerURI := "bunker://" + expectedPubkey + "?relay=wss://relay.example"
 
@@ -146,7 +150,7 @@ func TestCreateGrantRejectsSignerPubkeyMismatch(t *testing.T) {
 func TestSignWithGrantSignsViaPooledSigner(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStore(t)
-	signerSecret := nostr.GeneratePrivateKey()
+	signerSecret := nostr.Generate().Hex()
 	signerPubkey := mustPubkey(t, signerSecret)
 	bunkerURI := "bunker://" + signerPubkey + "?relay=wss://relay.example"
 	fake := &fakeBunkerSigner{pubkey: signerPubkey, secret: signerSecret}
@@ -173,14 +177,10 @@ func TestSignWithGrantSignsViaPooledSigner(t *testing.T) {
 	if fake.signCount != 1 {
 		t.Fatalf("fake signer sign count = %d, want 1", fake.signCount)
 	}
-	if event.PubKey != signerPubkey {
+	if event.PubKey.Hex() != signerPubkey {
 		t.Fatalf("event pubkey = %s, want %s", event.PubKey, signerPubkey)
 	}
-	ok, err := event.CheckSignature()
-	if err != nil {
-		t.Fatalf("CheckSignature() error: %v", err)
-	}
-	if !ok {
+	if !event.VerifySignature() {
 		t.Fatal("signed event signature did not verify")
 	}
 }
@@ -193,7 +193,7 @@ func TestSignWithGrantNoGrantErrorsCleanly(t *testing.T) {
 		return nil, nil
 	})
 
-	missingPubkey := mustPubkey(t, nostr.GeneratePrivateKey())
+	missingPubkey := mustPubkey(t, nostr.Generate().Hex())
 	err := svc.SignWithGrant(ctx, missingPubkey, &nostr.Event{Kind: nostr.KindTextNote, CreatedAt: nostr.Now()})
 	if !errors.Is(err, ErrNoGrant) {
 		t.Fatalf("SignWithGrant() error = %v, want ErrNoGrant", err)
@@ -213,7 +213,7 @@ func TestDisabledSubsystemIsSafeNoop(t *testing.T) {
 	if _, err := svc.CreateGrant(ctx, "bunker://ignored"); !errors.Is(err, ErrDisabled) {
 		t.Fatalf("CreateGrant disabled error = %v, want ErrDisabled", err)
 	}
-	if err := svc.SignWithGrant(ctx, mustPubkey(t, nostr.GeneratePrivateKey()), &nostr.Event{}); !errors.Is(err, ErrDisabled) {
+	if err := svc.SignWithGrant(ctx, mustPubkey(t, nostr.Generate().Hex()), &nostr.Event{}); !errors.Is(err, ErrDisabled) {
 		t.Fatalf("SignWithGrant disabled error = %v, want ErrDisabled", err)
 	}
 }
@@ -239,9 +239,9 @@ func newTestService(t *testing.T, st *store.SQLiteStore, connector BunkerConnect
 
 func mustPubkey(t *testing.T, secret string) string {
 	t.Helper()
-	pubkey, err := nostr.GetPublicKey(secret)
+	sk, err := nostr.SecretKeyFromHex(secret)
 	if err != nil {
-		t.Fatalf("GetPublicKey() error: %v", err)
+		t.Fatalf("SecretKeyFromHex() error: %v", err)
 	}
-	return pubkey
+	return sk.Public().Hex()
 }

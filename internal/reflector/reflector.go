@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
@@ -87,14 +87,14 @@ func (r *Reflector) SetPatchRejectionPublisher(pub PatchRejectionPublisher) {
 // for unknown or not-yet-provisioned repositories are ignored without marking
 // them processed so they can be handled after provisioning catches up.
 func (r *Reflector) HandleEvent(ctx context.Context, ev *nostr.Event, relayURL string) error {
-	if ev == nil || !isCollaborationKind(ev.Kind) {
+	if ev == nil || !isCollaborationKind(int(ev.Kind)) {
 		return nil
 	}
 	if r == nil || r.store == nil || r.gitea == nil {
 		return fmt.Errorf("reflector not configured")
 	}
 
-	processed, err := r.store.EventProcessed(ctx, ev.ID)
+	processed, err := r.store.EventProcessed(ctx, ev.ID.Hex())
 	if err != nil {
 		return fmt.Errorf("check processed event: %w", err)
 	}
@@ -106,8 +106,8 @@ func (r *Reflector) HandleEvent(ctx context.Context, ev *nostr.Event, relayURL s
 		return fmt.Errorf("collaboration event cryptographic validation failed: %w", err)
 	}
 
-	if _, err := r.store.GetReflectedEvent(ctx, ev.ID); err == nil {
-		return r.store.MarkEventProcessed(ctx, ev.ID, ev.PubKey, ev.Kind)
+	if _, err := r.store.GetReflectedEvent(ctx, ev.ID.Hex()); err == nil {
+		return r.store.MarkEventProcessed(ctx, ev.ID.Hex(), ev.PubKey.Hex(), int(ev.Kind))
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("check reflected event: %w", err)
 	}
@@ -117,7 +117,7 @@ func (r *Reflector) HandleEvent(ctx context.Context, ev *nostr.Event, relayURL s
 		return err
 	}
 	if !ok {
-		r.logger.Debug("reflector: ignoring event for unknown repo", "event", ev.ID, "kind", ev.Kind, "relay", relayURL)
+		r.logger.Debug("reflector: ignoring event for unknown repo", "event", ev.ID.Hex(), "kind", int(ev.Kind), "relay", relayURL)
 		return nil
 	}
 
@@ -138,7 +138,7 @@ func (r *Reflector) HandleEvent(ctx context.Context, ev *nostr.Event, relayURL s
 		return err
 	}
 	if success {
-		if err := r.store.MarkEventProcessed(ctx, ev.ID, ev.PubKey, ev.Kind); err != nil {
+		if err := r.store.MarkEventProcessed(ctx, ev.ID.Hex(), ev.PubKey.Hex(), int(ev.Kind)); err != nil {
 			return fmt.Errorf("mark event processed: %w", err)
 		}
 	}
@@ -178,15 +178,15 @@ func (r *Reflector) reflectIssue(ctx context.Context, mapping store.Mapping, ev 
 		return false, fmt.Errorf("create Gitea issue returned no index")
 	}
 	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
-		NostrEventID:    ev.ID,
+		NostrEventID:    ev.ID.Hex(),
 		GiteaRepoID:     mapping.GiteaRepoID,
 		GiteaIndex:      index,
-		Kind:            ev.Kind,
+		Kind:            int(ev.Kind),
 		EchoFingerprint: echofp.Issue(title, ev.Content),
 	}); err != nil {
 		return false, fmt.Errorf("record reflected issue: %w", err)
 	}
-	r.logger.Info("reflector: created Gitea issue from Nostr", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "index", index)
+	r.logger.Info("reflector: created Gitea issue from Nostr", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "index", index)
 	return true, nil
 }
 
@@ -209,21 +209,21 @@ func (r *Reflector) reflectComment(ctx context.Context, mapping store.Mapping, e
 		return false, fmt.Errorf("create Gitea issue comment: %w", err)
 	}
 	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
-		NostrEventID:    ev.ID,
+		NostrEventID:    ev.ID.Hex(),
 		GiteaRepoID:     mapping.GiteaRepoID,
 		GiteaIndex:      root.GiteaIndex,
-		Kind:            ev.Kind,
+		Kind:            int(ev.Kind),
 		EchoFingerprint: echofp.Comment(ev.Content),
 	}); err != nil {
 		return false, fmt.Errorf("record reflected comment: %w", err)
 	}
-	r.logger.Info("reflector: created Gitea comment from Nostr", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "index", root.GiteaIndex)
+	r.logger.Info("reflector: created Gitea comment from Nostr", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "index", root.GiteaIndex)
 	return true, nil
 }
 
 func (r *Reflector) reflectIssueStatus(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {
 	if !r.statusSyncEnabled {
-		r.logger.Debug("reflector: NIP-34 status sync disabled", "event", ev.ID, "kind", ev.Kind)
+		r.logger.Debug("reflector: NIP-34 status sync disabled", "event", ev.ID.Hex(), "kind", ev.Kind)
 		return false, nil
 	}
 	rootID := rootEventID(ev.Tags)
@@ -248,26 +248,26 @@ func (r *Reflector) reflectIssueStatus(ctx context.Context, mapping store.Mappin
 		return false, fmt.Errorf("set Gitea issue state: %w", err)
 	}
 	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
-		NostrEventID:    ev.ID,
+		NostrEventID:    ev.ID.Hex(),
 		GiteaRepoID:     mapping.GiteaRepoID,
 		GiteaIndex:      root.GiteaIndex,
-		Kind:            ev.Kind,
+		Kind:            int(ev.Kind),
 		EchoFingerprint: echofp.IssueStatus(state),
 	}); err != nil {
 		return false, fmt.Errorf("record reflected status: %w", err)
 	}
-	r.logger.Info("reflector: updated Gitea issue state from Nostr", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "index", root.GiteaIndex, "state", state)
+	r.logger.Info("reflector: updated Gitea issue state from Nostr", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "index", root.GiteaIndex, "state", state)
 	return true, nil
 }
 
 func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {
 	tip := tagValue(ev.Tags, "c")
 	if r.repositoriesDir == "" {
-		r.logger.Info("reflector: repository directory unavailable; recording patch without PR creation", "event", ev.ID, "tip", tip)
+		r.logger.Info("reflector: repository directory unavailable; recording patch without PR creation", "event", ev.ID.Hex(), "tip", tip)
 		return r.recordPatchOnly(ctx, mapping, ev, tip)
 	}
-	if !validEventID.MatchString(ev.ID) {
-		r.logger.Info("reflector: patch missing usable event id; recording without PR creation", "event", ev.ID, "tip", tip)
+	if !validEventID.MatchString(ev.ID.Hex()) {
+		r.logger.Info("reflector: patch missing usable event id; recording without PR creation", "event", ev.ID.Hex(), "tip", tip)
 		return r.recordPatchOnly(ctx, mapping, ev, tip)
 	}
 
@@ -275,22 +275,22 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 	branch := patchBranchNameForRepo(ctx, repoPath, ev)
 	base, err := resolveBaseBranch(ctx, repoPath)
 	if err != nil {
-		r.logger.Warn("reflector: failed to resolve base branch for patch PR; recording only", "event", ev.ID, "error", err)
+		r.logger.Warn("reflector: failed to resolve base branch for patch PR; recording only", "event", ev.ID.Hex(), "error", err)
 		return r.recordPatchRejection(ctx, mapping, ev, tip, "resolve base branch failed: "+err.Error())
 	}
 
 	if validSHA.MatchString(tip) {
 		if err := r.materializeTipBranch(ctx, mapping, ev, repoPath, tip, branch); err != nil {
-			r.logger.Warn("reflector: failed to materialize patch tip; rejecting patch", "event", ev.ID, "tip", tip, "error", err)
+			r.logger.Warn("reflector: failed to materialize patch tip; rejecting patch", "event", ev.ID.Hex(), "tip", tip, "error", err)
 			return r.recordPatchRejection(ctx, mapping, ev, tip, "materialize patch tip failed: "+err.Error())
 		}
 	} else {
 		if !looksLikeFormatPatch(ev.Content) {
-			r.logger.Info("reflector: patch missing usable c-tip and content is not git format-patch; rejecting patch", "event", ev.ID, "tip", tip)
+			r.logger.Info("reflector: patch missing usable c-tip and content is not git format-patch; rejecting patch", "event", ev.ID.Hex(), "tip", tip)
 			return r.recordPatchRejection(ctx, mapping, ev, "", "patch content is not a git format-patch and no usable c tip was provided")
 		}
 		if err := applyPatchContentBranch(ctx, repoPath, base, branch, ev.Content); err != nil {
-			r.logger.Warn("reflector: failed to apply patch content; rejecting patch", "event", ev.ID, "error", err)
+			r.logger.Warn("reflector: failed to apply patch content; rejecting patch", "event", ev.ID.Hex(), "error", err)
 			return r.recordPatchRejection(ctx, mapping, ev, "", "apply patch content failed: "+err.Error())
 		}
 	}
@@ -299,7 +299,7 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 	body := patchBody(ev)
 	pr, err := r.gitea.CreatePullRequest(ctx, mapping.Owner, mapping.RepoName, branch, base, title, body)
 	if err != nil {
-		r.logger.Warn("reflector: failed to create Gitea PR for patch; rejecting patch", "event", ev.ID, "branch", branch, "base", base, "error", err)
+		r.logger.Warn("reflector: failed to create Gitea PR for patch; rejecting patch", "event", ev.ID.Hex(), "branch", branch, "base", base, "error", err)
 		return r.recordPatchRejection(ctx, mapping, ev, tip, "create pull request failed: "+err.Error())
 	}
 	index := pr.Index
@@ -307,11 +307,11 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 		index = pr.Number
 	}
 	if index == 0 {
-		r.logger.Warn("reflector: created Gitea PR returned no index; rejecting patch", "event", ev.ID)
+		r.logger.Warn("reflector: created Gitea PR returned no index; rejecting patch", "event", ev.ID.Hex())
 		return r.recordPatchRejection(ctx, mapping, ev, tip, "create pull request returned no index")
 	}
 	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
-		NostrEventID:    ev.ID,
+		NostrEventID:    ev.ID.Hex(),
 		GiteaRepoID:     mapping.GiteaRepoID,
 		GiteaIndex:      index,
 		HeadBranch:      branch,
@@ -320,46 +320,46 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 	}); err != nil {
 		return false, fmt.Errorf("record reflected patch PR: %w", err)
 	}
-	r.logger.Info("reflector: created Gitea PR from Nostr patch", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "index", index, "head", branch, "base", base)
+	r.logger.Info("reflector: created Gitea PR from Nostr patch", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "index", index, "head", branch, "base", base)
 	return true, nil
 }
 
 func (r *Reflector) reflectPRUpdate(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {
 	rootID := prUpdateRootEventID(ev.Tags)
 	if rootID == "" {
-		r.logger.Info("reflector: PR update missing root PR event tag", "event", ev.ID)
+		r.logger.Info("reflector: PR update missing root PR event tag", "event", ev.ID.Hex())
 		return false, nil
 	}
 	root, err := r.store.GetReflectedEvent(ctx, rootID)
 	if errors.Is(err, sql.ErrNoRows) {
-		r.logger.Info("reflector: PR update root is not reflected yet", "event", ev.ID, "root", rootID)
+		r.logger.Info("reflector: PR update root is not reflected yet", "event", ev.ID.Hex(), "root", rootID)
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("lookup reflected PR update root: %w", err)
 	}
 	if root.GiteaRepoID != mapping.GiteaRepoID || root.GiteaIndex == 0 || root.Kind != relay.KindPROpen || root.HeadBranch == "" {
-		r.logger.Info("reflector: PR update root does not reference a reflected PR for this repo", "event", ev.ID, "root", rootID, "root_repo", root.GiteaRepoID, "root_index", root.GiteaIndex, "root_kind", root.Kind, "head_branch", root.HeadBranch)
+		r.logger.Info("reflector: PR update root does not reference a reflected PR for this repo", "event", ev.ID.Hex(), "root", rootID, "root_repo", root.GiteaRepoID, "root_index", root.GiteaIndex, "root_kind", root.Kind, "head_branch", root.HeadBranch)
 		return false, nil
 	}
 	if r.repositoriesDir == "" {
-		r.logger.Warn("reflector: repository directory unavailable; cannot reflect PR update", "event", ev.ID, "root", rootID)
+		r.logger.Warn("reflector: repository directory unavailable; cannot reflect PR update", "event", ev.ID.Hex(), "root", rootID)
 		return false, nil
 	}
 
 	tip := tagValue(ev.Tags, "c")
 	if !validSHA.MatchString(tip) {
-		r.logger.Info("reflector: PR update missing usable c-tip", "event", ev.ID, "tip", tip)
+		r.logger.Info("reflector: PR update missing usable c-tip", "event", ev.ID.Hex(), "tip", tip)
 		return false, nil
 	}
 	clones := tagValues(ev.Tags, "clone")
 	if len(clones) == 0 {
-		r.logger.Info("reflector: PR update has no clone URLs", "event", ev.ID, "tip", tip)
+		r.logger.Info("reflector: PR update has no clone URLs", "event", ev.ID.Hex(), "tip", tip)
 		return false, nil
 	}
 
 	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
-	refspec := "+" + tip + ":" + refsnostr.RefPrefix + ev.ID
+	refspec := "+" + tip + ":" + refsnostr.RefPrefix + ev.ID.Hex()
 	var errs []string
 	for _, cloneURL := range clones {
 		if err := gitFetch(ctx, repoPath, cloneURL, refspec); err != nil {
@@ -370,11 +370,11 @@ func (r *Reflector) reflectPRUpdate(ctx context.Context, mapping store.Mapping, 
 		// expected to force-move this ref; Gitea observes the changed head on its
 		// next branch synchronization.
 		if err := updateBareRef(ctx, repoPath, "refs/heads/"+root.HeadBranch, tip); err != nil {
-			r.logger.Warn("reflector: failed to update PR head branch for PR update", "event", ev.ID, "root", rootID, "branch", root.HeadBranch, "tip", tip, "error", err)
+			r.logger.Warn("reflector: failed to update PR head branch for PR update", "event", ev.ID.Hex(), "root", rootID, "branch", root.HeadBranch, "tip", tip, "error", err)
 			return false, nil
 		}
 		if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
-			NostrEventID:    ev.ID,
+			NostrEventID:    ev.ID.Hex(),
 			GiteaRepoID:     mapping.GiteaRepoID,
 			GiteaIndex:      root.GiteaIndex,
 			HeadBranch:      root.HeadBranch,
@@ -383,11 +383,11 @@ func (r *Reflector) reflectPRUpdate(ctx context.Context, mapping store.Mapping, 
 		}); err != nil {
 			return false, fmt.Errorf("record reflected PR update: %w", err)
 		}
-		r.logger.Info("reflector: updated Gitea PR head from Nostr PR update", "event", ev.ID, "root", rootID, "repo", mapping.Owner+"/"+mapping.RepoName, "index", root.GiteaIndex, "head", root.HeadBranch, "tip", tip)
+		r.logger.Info("reflector: updated Gitea PR head from Nostr PR update", "event", ev.ID.Hex(), "root", rootID, "repo", mapping.Owner+"/"+mapping.RepoName, "index", root.GiteaIndex, "head", root.HeadBranch, "tip", tip)
 		return true, nil
 	}
 	if len(errs) > 0 {
-		r.logger.Warn("reflector: failed to fetch PR update tip from clone URLs", "event", ev.ID, "root", rootID, "tip", tip, "error", strings.Join(errs, "; "))
+		r.logger.Warn("reflector: failed to fetch PR update tip from clone URLs", "event", ev.ID.Hex(), "root", rootID, "tip", tip, "error", strings.Join(errs, "; "))
 	}
 	return false, nil
 }
@@ -397,7 +397,7 @@ func (r *Reflector) materializeTipBranch(ctx context.Context, mapping store.Mapp
 	if len(clones) == 0 {
 		return fmt.Errorf("patch has no clone URLs")
 	}
-	refspec := "+" + tip + ":" + refsnostr.RefPrefix + ev.ID
+	refspec := "+" + tip + ":" + refsnostr.RefPrefix + ev.ID.Hex()
 	var errs []string
 	for _, cloneURL := range clones {
 		if err := gitFetch(ctx, repoPath, cloneURL, refspec); err != nil {
@@ -408,7 +408,7 @@ func (r *Reflector) materializeTipBranch(ctx context.Context, mapping store.Mapp
 			return err
 		}
 		if err := r.store.RecordPendingNostrRef(ctx, store.PendingNostrRef{
-			EventID:     ev.ID,
+			EventID:     ev.ID.Hex(),
 			TipSHA:      tip,
 			GiteaRepoID: mapping.GiteaRepoID,
 			Owner:       mapping.Owner,
@@ -431,7 +431,7 @@ func (r *Reflector) recordPatchRejection(ctx context.Context, mapping store.Mapp
 
 func (r *Reflector) publishPatchRejection(ctx context.Context, mapping store.Mapping, ev *nostr.Event, reason string) error {
 	if r.patchRejectionPublisher == nil {
-		r.logger.Warn("reflector: patch rejection publisher unavailable", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "reason", reason)
+		r.logger.Warn("reflector: patch rejection publisher unavailable", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "reason", reason)
 		return nil
 	}
 	aTag := tagValue(ev.Tags, "a")
@@ -440,8 +440,8 @@ func (r *Reflector) publishPatchRejection(ctx context.Context, mapping store.Map
 	}
 	payload := map[string]any{
 		"schema_version": "grasp.patch_rejection.v1",
-		"event_id":       ev.ID,
-		"event_kind":     ev.Kind,
+		"event_id":       ev.ID.Hex(),
+		"event_kind":     int(ev.Kind),
 		"repo":           mapping.Owner + "/" + mapping.RepoName,
 		"repo_id":        mapping.RepoID,
 		"reason":         reason,
@@ -455,9 +455,9 @@ func (r *Reflector) publishPatchRejection(ctx context.Context, mapping store.Map
 		Kind:      relay.KindStatusClosed,
 		Tags: nostr.Tags{
 			{"a", aTag},
-			{"e", ev.ID, "", "root"},
-			{"p", ev.PubKey},
-			{"K", fmt.Sprint(ev.Kind)},
+			{"e", ev.ID.Hex(), "", "root"},
+			{"p", ev.PubKey.Hex()},
+			{"K", fmt.Sprint(int(ev.Kind))},
 			{"status", "rejected"},
 			{"reason", reason},
 		},
@@ -466,20 +466,20 @@ func (r *Reflector) publishPatchRejection(ctx context.Context, mapping store.Map
 	if err := r.patchRejectionPublisher.PublishEvent(ctx, rejection); err != nil {
 		return fmt.Errorf("publish patch rejection: %w", err)
 	}
-	r.logger.Info("reflector: published NIP-34 patch rejection", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "reason", reason)
+	r.logger.Info("reflector: published NIP-34 patch rejection", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "reason", reason)
 	return nil
 }
 
 func (r *Reflector) recordPatchOnly(ctx context.Context, mapping store.Mapping, ev *nostr.Event, tip string) (bool, error) {
 	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
-		NostrEventID: ev.ID,
+		NostrEventID: ev.ID.Hex(),
 		GiteaRepoID:  mapping.GiteaRepoID,
 		GiteaIndex:   0,
-		Kind:         ev.Kind,
+		Kind:         int(ev.Kind),
 	}); err != nil {
 		return false, fmt.Errorf("record reflected patch: %w", err)
 	}
-	r.logger.Info("reflector: recorded patch without PR creation", "event", ev.ID, "repo", mapping.Owner+"/"+mapping.RepoName, "tip", tip)
+	r.logger.Info("reflector: recorded patch without PR creation", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "tip", tip)
 	return true, nil
 }
 
@@ -625,8 +625,8 @@ func patchBranchNameForRepo(ctx context.Context, repoPath string, ev *nostr.Even
 }
 
 func patchFallbackBranchName(ev *nostr.Event) string {
-	if ev != nil && len(ev.ID) >= 12 {
-		return "nostr-pr-" + ev.ID[:12]
+	if ev != nil && len(ev.ID.Hex()) >= 12 {
+		return "nostr-pr-" + ev.ID.Hex()[:12]
 	}
 	return "nostr-pr"
 }
@@ -694,15 +694,15 @@ func patchTitle(ev *nostr.Event) string {
 		}
 		return line
 	}
-	if ev != nil && len(ev.ID) >= 12 {
-		return "Nostr PR " + ev.ID[:12]
+	if ev != nil && len(ev.ID.Hex()) >= 12 {
+		return "Nostr PR " + ev.ID.Hex()[:12]
 	}
 	return "Nostr PR"
 }
 
 func patchBody(ev *nostr.Event) string {
 	body := strings.TrimSpace(ev.Content)
-	footer := "Reflected from Nostr event " + ev.ID + "."
+	footer := "Reflected from Nostr event " + ev.ID.Hex() + "."
 	if body == "" {
 		return footer
 	}
@@ -779,18 +779,18 @@ func fallbackTitle(ev *nostr.Event) string {
 		}
 		return line
 	}
-	if ev != nil && len(ev.ID) >= 12 {
-		return "Nostr issue " + ev.ID[:12]
+	if ev != nil && len(ev.ID.Hex()) >= 12 {
+		return "Nostr issue " + ev.ID.Hex()[:12]
 	}
 	return "Nostr issue"
 }
 
 func tagValue(tags nostr.Tags, key string) string {
-	v := tags.GetFirst([]string{key, ""})
-	if v == nil || len(*v) < 2 {
+	v := tags.Find(key)
+	if v == nil || len(v) < 2 {
 		return ""
 	}
-	return (*v)[1]
+	return v[1]
 }
 
 func tagValues(tags nostr.Tags, key string) []string {

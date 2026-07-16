@@ -9,9 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
@@ -42,19 +41,19 @@ func (s *Service) HandleUserGraspListEvent(ctx context.Context, ev *nostr.Event,
 	if s == nil || s.store == nil {
 		return fmt.Errorf("user GRASP list cache unavailable")
 	}
-	if strings.TrimSpace(ev.ID) == "" || strings.TrimSpace(ev.PubKey) == "" {
+	if ev.ID == (nostr.ID{}) || ev.PubKey == (nostr.PubKey{}) {
 		return fmt.Errorf("invalid user GRASP list: missing id/pubkey")
 	}
 	if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
 		return fmt.Errorf("user GRASP list cryptographic validation failed: %w", err)
 	}
 
-	knownOwner, err := s.store.HasProvisionedOwnerPubkey(ctx, ev.PubKey)
+	knownOwner, err := s.store.HasProvisionedOwnerPubkey(ctx, ev.PubKey.Hex())
 	if err != nil {
 		return fmt.Errorf("lookup provisioned owner pubkey: %w", err)
 	}
 	if !knownOwner {
-		s.logger.Debug("ignoring user GRASP list from unknown pubkey", "pubkey", ev.PubKey, "event", ev.ID, "relay", sourceRelay)
+		s.logger.Debug("ignoring user GRASP list from unknown pubkey", "pubkey", ev.PubKey.Hex(), "event", ev.ID.Hex(), "relay", sourceRelay)
 		return nil
 	}
 
@@ -63,9 +62,9 @@ func (s *Service) HandleUserGraspListEvent(ctx context.Context, ev *nostr.Event,
 		return fmt.Errorf("marshal user GRASP list event: %w", err)
 	}
 	cached, err := s.store.UpsertUserGraspListEvent(ctx, store.UserGraspList{
-		Pubkey:    ev.PubKey,
+		Pubkey:    ev.PubKey.Hex(),
 		EventJSON: string(raw),
-		EventID:   ev.ID,
+		EventID:   ev.ID.Hex(),
 		CreatedAt: int64(ev.CreatedAt),
 	})
 	if err != nil {
@@ -74,17 +73,17 @@ func (s *Service) HandleUserGraspListEvent(ctx context.Context, ev *nostr.Event,
 
 	shouldRepublish := cached
 	if !shouldRepublish {
-		current, err := s.store.GetUserGraspList(ctx, ev.PubKey)
+		current, err := s.store.GetUserGraspList(ctx, ev.PubKey.Hex())
 		if err != nil && err != sql.ErrNoRows {
 			return fmt.Errorf("read cached user GRASP list event: %w", err)
 		}
-		shouldRepublish = err == nil && current.EventID == ev.ID && current.LastRepublishedID != ev.ID
+		shouldRepublish = err == nil && current.EventID == ev.ID.Hex() && current.LastRepublishedID != ev.ID.Hex()
 	}
 	if !shouldRepublish {
 		return nil
 	}
 
-	if err := s.RepublishUserGraspList(ctx, ev.PubKey); err != nil {
+	if err := s.RepublishUserGraspList(ctx, ev.PubKey.Hex()); err != nil {
 		return fmt.Errorf("rebroadcast user GRASP list event: %w", err)
 	}
 	return nil
@@ -108,7 +107,7 @@ func (s *Service) RepublishUserGraspList(ctx context.Context, pubkey string) err
 	if err := json.Unmarshal([]byte(cached.EventJSON), &ev); err != nil {
 		return fmt.Errorf("unmarshal cached user GRASP list: %w", err)
 	}
-	if ev.ID != cached.EventID || ev.PubKey != cached.Pubkey || ev.Kind != relay.KindUserGraspList {
+	if ev.ID.Hex() != cached.EventID || ev.PubKey.Hex() != cached.Pubkey || ev.Kind != relay.KindUserGraspList {
 		return fmt.Errorf("cached user GRASP list metadata mismatch for %s", pubkey)
 	}
 	if err := nostrverify.ValidateEventIDAndSignature(&ev); err != nil {
@@ -118,10 +117,10 @@ func (s *Service) RepublishUserGraspList(ctx context.Context, pubkey string) err
 	if err := s.publishToRelays(ctx, &ev); err != nil {
 		return err
 	}
-	if err := s.store.RecordUserGraspListRepublished(ctx, cached.Pubkey, ev.ID); err != nil {
-		s.logger.Warn("failed to record user GRASP list republish", "pubkey", cached.Pubkey, "event", ev.ID, "error", err)
+	if err := s.store.RecordUserGraspListRepublished(ctx, cached.Pubkey, ev.ID.Hex()); err != nil {
+		s.logger.Warn("failed to record user GRASP list republish", "pubkey", cached.Pubkey, "event", ev.ID.Hex(), "error", err)
 	}
 
-	s.logger.Info("republished owner-signed user GRASP list", "pubkey", ev.PubKey, "event_id", ev.ID)
+	s.logger.Info("republished owner-signed user GRASP list", "pubkey", ev.PubKey.Hex(), "event_id", ev.ID.Hex())
 	return nil
 }

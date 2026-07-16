@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
@@ -166,7 +166,7 @@ func TestReflectorReflectsIssueCommentStatusAndDedupes(t *testing.T) {
 
 	r := New(st, gitea.NewClient(ts.URL, "tok"), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r.SetStatusSyncEnabled(true)
-	actorPriv := nostr.GeneratePrivateKey()
+	actorPriv := nostr.Generate().Hex()
 
 	issueEv := signedEvent(t, actorPriv, relay.KindIssue, nostr.Tags{
 		{"a", coord},
@@ -185,7 +185,7 @@ func TestReflectorReflectsIssueCommentStatusAndDedupes(t *testing.T) {
 	}
 	fake.mu.Unlock()
 
-	ref, err := st.GetReflectedEvent(ctx, issueEv.ID)
+	ref, err := st.GetReflectedEvent(ctx, issueEv.ID.Hex())
 	if err != nil {
 		t.Fatalf("get reflected issue row: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestReflectorReflectsIssueCommentStatusAndDedupes(t *testing.T) {
 
 	commentEv := signedEvent(t, actorPriv, relay.KindNIP22Comment, nostr.Tags{
 		{"a", coord},
-		{"E", issueEv.ID, "", "root"},
+		{"E", issueEv.ID.Hex(), "", "root"},
 		{"K", strconv.Itoa(relay.KindIssue)},
 	}, "comment body")
 	if err := r.HandleEvent(ctx, commentEv, "wss://relay.test"); err != nil {
@@ -209,7 +209,7 @@ func TestReflectorReflectsIssueCommentStatusAndDedupes(t *testing.T) {
 
 	statusEv := signedEvent(t, actorPriv, relay.KindStatusClosed, nostr.Tags{
 		{"a", coord},
-		{"e", issueEv.ID, "", "root"},
+		{"e", issueEv.ID.Hex(), "", "root"},
 	}, "")
 	if err := r.HandleEvent(ctx, statusEv, "wss://relay.test"); err != nil {
 		t.Fatalf("reflect status: %v", err)
@@ -220,7 +220,7 @@ func TestReflectorReflectsIssueCommentStatusAndDedupes(t *testing.T) {
 	}
 	fake.mu.Unlock()
 
-	openEv := signedEvent(t, actorPriv, relay.KindStatusOpen, nostr.Tags{{"a", coord}, {"e", issueEv.ID, "", "root"}}, "")
+	openEv := signedEvent(t, actorPriv, relay.KindStatusOpen, nostr.Tags{{"a", coord}, {"e", issueEv.ID.Hex(), "", "root"}}, "")
 	if err := r.HandleEvent(ctx, openEv, "wss://relay.test"); err != nil {
 		t.Fatalf("reflect open status: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestReflectorTipPatchCreatesPullRequest(t *testing.T) {
 			defer ts.Close()
 
 			r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
-			actorPriv := nostr.GeneratePrivateKey()
+			actorPriv := nostr.Generate().Hex()
 			ev := signedEvent(t, actorPriv, kind, nostr.Tags{
 				{"a", coord},
 				{"subject", "Tip PR"},
@@ -307,7 +307,7 @@ func TestReflectorTipPatchCreatesPullRequest(t *testing.T) {
 			if pr.Head != "feature/tip" || pr.Base != "main" || pr.Title != "Tip PR" {
 				t.Fatalf("unexpected PR request: %+v", pr)
 			}
-			if !strings.Contains(pr.Body, ev.ID) {
+			if !strings.Contains(pr.Body, ev.ID.Hex()) {
 				t.Fatalf("PR body missing source event id: %q", pr.Body)
 			}
 
@@ -315,7 +315,7 @@ func TestReflectorTipPatchCreatesPullRequest(t *testing.T) {
 			if gotTip != repo.tip {
 				t.Fatalf("head branch tip = %s, want %s", gotTip, repo.tip)
 			}
-			ref, err := st.GetReflectedEvent(ctx, ev.ID)
+			ref, err := st.GetReflectedEvent(ctx, ev.ID.Hex())
 			if err != nil {
 				t.Fatalf("get reflected PR row: %v", err)
 			}
@@ -357,7 +357,7 @@ func TestReflectorPRUpdateMovesExistingHeadBranchAndRecordsEchoGuard(t *testing.
 	reflectorGit(t, repo.workDir, "commit", "-m", "revision")
 	newTip := strings.TrimSpace(reflectorGitOutput(t, repo.workDir, "rev-parse", "HEAD"))
 
-	actorPriv := nostr.GeneratePrivateKey()
+	actorPriv := nostr.Generate().Hex()
 	updateEv := signedEvent(t, actorPriv, relay.KindPRUpdate, nostr.Tags{
 		{"a", coord},
 		{"E", rootID},
@@ -373,7 +373,7 @@ func TestReflectorPRUpdateMovesExistingHeadBranchAndRecordsEchoGuard(t *testing.
 	if gotTip != newTip {
 		t.Fatalf("head branch tip = %s, want %s", gotTip, newTip)
 	}
-	ref, err := st.GetReflectedEvent(ctx, updateEv.ID)
+	ref, err := st.GetReflectedEvent(ctx, updateEv.ID.Hex())
 	if err != nil {
 		t.Fatalf("get reflected PR update row: %v", err)
 	}
@@ -402,7 +402,7 @@ func TestReflectorPRUpdateUnknownRootIsIgnored(t *testing.T) {
 	if err := gitFetch(ctx, repo.repoPath, repo.workDir, "+"+repo.tip+":refs/heads/"+headBranch); err != nil {
 		t.Fatalf("seed PR head branch: %v", err)
 	}
-	actorPriv := nostr.GeneratePrivateKey()
+	actorPriv := nostr.Generate().Hex()
 	updateEv := signedEvent(t, actorPriv, relay.KindPRUpdate, nostr.Tags{
 		{"a", coord},
 		{"E", "unknown-root"},
@@ -417,10 +417,10 @@ func TestReflectorPRUpdateUnknownRootIsIgnored(t *testing.T) {
 	if gotTip != repo.tip {
 		t.Fatalf("head branch changed to %s, want unchanged %s", gotTip, repo.tip)
 	}
-	if _, err := st.GetReflectedEvent(ctx, updateEv.ID); err != sql.ErrNoRows {
+	if _, err := st.GetReflectedEvent(ctx, updateEv.ID.Hex()); err != sql.ErrNoRows {
 		t.Fatalf("unexpected reflected row for ignored PR update: %v", err)
 	}
-	processed, err := st.EventProcessed(ctx, updateEv.ID)
+	processed, err := st.EventProcessed(ctx, updateEv.ID.Hex())
 	if err != nil {
 		t.Fatalf("check processed: %v", err)
 	}
@@ -438,7 +438,7 @@ func TestReflectorExistingBranchNameFallsBackToEventBranch(t *testing.T) {
 	defer ts.Close()
 
 	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	actorPriv := nostr.GeneratePrivateKey()
+	actorPriv := nostr.Generate().Hex()
 	ev := signedEvent(t, actorPriv, relay.KindPROpen, nostr.Tags{
 		{"a", coord},
 		{"subject", "Do not overwrite main"},
@@ -450,7 +450,7 @@ func TestReflectorExistingBranchNameFallsBackToEventBranch(t *testing.T) {
 	if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err != nil {
 		t.Fatalf("reflect protected branch patch: %v", err)
 	}
-	wantHead := "nostr-pr-" + ev.ID[:12]
+	wantHead := "nostr-pr-" + ev.ID.Hex()[:12]
 	fake.mu.Lock()
 	pr := fake.pulls[1]
 	fake.mu.Unlock()
@@ -477,7 +477,7 @@ func TestReflectorContentPatchAppliesAndCreatesPullRequest(t *testing.T) {
 
 	patch := reflectorGitOutput(t, repo.workDir, "format-patch", "-1", "--stdout", "HEAD")
 	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	actorPriv := nostr.GeneratePrivateKey()
+	actorPriv := nostr.Generate().Hex()
 	ev := signedEvent(t, actorPriv, relay.KindPatch, nostr.Tags{
 		{"a", coord},
 		{"subject", "Content patch"},
@@ -501,7 +501,7 @@ func TestReflectorContentPatchAppliesAndCreatesPullRequest(t *testing.T) {
 	if !strings.Contains(readme, "feature") {
 		t.Fatalf("applied branch README = %q, want feature change", readme)
 	}
-	ref, err := st.GetReflectedEvent(ctx, ev.ID)
+	ref, err := st.GetReflectedEvent(ctx, ev.ID.Hex())
 	if err != nil {
 		t.Fatalf("get reflected content PR row: %v", err)
 	}
@@ -521,7 +521,7 @@ func TestReflectorGarbagePatchFallsBackAndCleansWorktree(t *testing.T) {
 	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	rejectionPub := &reflectorFakePublisher{}
 	r.SetPatchRejectionPublisher(rejectionPub)
-	actorPriv := nostr.GeneratePrivateKey()
+	actorPriv := nostr.Generate().Hex()
 	garbage := "From bad patch\n\ndiff --git a/README.md b/README.md\nthis is not a valid patch\n"
 	ev := signedEvent(t, actorPriv, relay.KindPatch, nostr.Tags{
 		{"a", coord},
@@ -538,7 +538,7 @@ func TestReflectorGarbagePatchFallsBackAndCleansWorktree(t *testing.T) {
 		t.Fatalf("garbage patch created PRs: %#v", fake.pulls)
 	}
 	fake.mu.Unlock()
-	ref, err := st.GetReflectedEvent(ctx, ev.ID)
+	ref, err := st.GetReflectedEvent(ctx, ev.ID.Hex())
 	if err != nil {
 		t.Fatalf("get reflected fallback row: %v", err)
 	}
@@ -549,7 +549,7 @@ func TestReflectorGarbagePatchFallsBackAndCleansWorktree(t *testing.T) {
 	if len(rejections) != 1 {
 		t.Fatalf("expected 1 rejection event, got %d", len(rejections))
 	}
-	if rejections[0].Kind != relay.KindStatusClosed || tagValue(rejections[0].Tags, "status") != "rejected" || tagValue(rejections[0].Tags, "e") != ev.ID {
+	if rejections[0].Kind != relay.KindStatusClosed || tagValue(rejections[0].Tags, "status") != "rejected" || tagValue(rejections[0].Tags, "e") != ev.ID.Hex() {
 		t.Fatalf("unexpected rejection event: %+v", rejections[0])
 	}
 	if !strings.Contains(rejections[0].Content, "apply patch content failed") {
@@ -569,7 +569,7 @@ func TestReflectorRejectsUnverifiedEvent(t *testing.T) {
 	defer ts.Close()
 
 	r := New(st, gitea.NewClient(ts.URL, "tok"), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
-	priv := nostr.GeneratePrivateKey()
+	priv := nostr.Generate().Hex()
 	ev := signedEvent(t, priv, relay.KindIssue, nostr.Tags{{"a", coord}, {"subject", "tampered"}}, "before")
 	ev.Content = "after"
 	if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err == nil {
@@ -591,8 +591,8 @@ func newReflectorTestStore(t *testing.T) (*store.SQLiteStore, store.Mapping, str
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	ownerPriv := nostr.GeneratePrivateKey()
-	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
 	if err != nil {
 		t.Fatalf("owner pubkey: %v", err)
 	}
@@ -675,18 +675,18 @@ func reflectorGitOutput(t *testing.T, dir string, args ...string) string {
 
 func signedEvent(t *testing.T, priv string, kind int, tags nostr.Tags, content string) *nostr.Event {
 	t.Helper()
-	pub, err := nostr.GetPublicKey(priv)
+	pub, err := derivePubHex(priv)
 	if err != nil {
 		t.Fatalf("pubkey: %v", err)
 	}
 	ev := &nostr.Event{
-		PubKey:    pub,
-		Kind:      kind,
+		PubKey:    nostr.MustPubKeyFromHex(pub),
+		Kind:      nostr.Kind(kind),
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Tags:      tags,
 		Content:   content,
 	}
-	if err := ev.Sign(priv); err != nil {
+	if err := ev.Sign(mustSK(priv)); err != nil {
 		t.Fatalf("sign event: %v", err)
 	}
 	return ev

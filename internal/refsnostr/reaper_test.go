@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -121,7 +121,7 @@ func TestReaperKeepsExpiredRefWithMatchingPR(t *testing.T) {
 
 func TestFetchEventForTipRejectsDifferingTip(t *testing.T) {
 	ev := &nostr.Event{
-		ID:   testEventID,
+		ID:   nostr.MustIDFromHex(testEventID),
 		Kind: relay.KindPROpen,
 		Tags: nostr.Tags{{"c", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
 	}

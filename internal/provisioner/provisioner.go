@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
@@ -78,7 +78,7 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		return nil
 	}
 
-	processed, err := s.store.EventProcessed(ctx, ev.ID)
+	processed, err := s.store.EventProcessed(ctx, ev.ID.Hex())
 	if err != nil {
 		metrics.IncAnnouncementRejected()
 		return err
@@ -87,7 +87,7 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		return nil
 	}
 
-	if strings.TrimSpace(ev.ID) == "" || strings.TrimSpace(ev.PubKey) == "" {
+	if ev.ID == (nostr.ID{}) || ev.PubKey == (nostr.PubKey{}) {
 		metrics.IncAnnouncementRejected()
 		return fmt.Errorf("invalid announcement: missing id/pubkey")
 	}
@@ -96,11 +96,7 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		return fmt.Errorf("announcement cryptographic validation failed: %w", err)
 	}
 
-	npub, err := nip19.EncodePublicKey(ev.PubKey)
-	if err != nil {
-		metrics.IncAnnouncementRejected()
-		return fmt.Errorf("encode npub from pubkey: %w", err)
-	}
+	npub := nip19.EncodeNpub(ev.PubKey)
 
 	repoID := getTagValue(ev.Tags, "d")
 	if repoID == "" {
@@ -131,8 +127,8 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 				metrics.IncAnnouncementRejected()
 				return fmt.Errorf("archive repo %s/%s after clone tag removal: %w", orgName, repoID, err)
 			}
-			_ = s.store.MarkEventProcessed(ctx, ev.ID, ev.PubKey, ev.Kind)
-			s.logger.Info("archived repository due to clone tag removal", "npub", npub, "org", orgName, "repo_id", repoID, "event", ev.ID)
+			_ = s.store.MarkEventProcessed(ctx, ev.ID.Hex(), ev.PubKey.Hex(), int(ev.Kind))
+			s.logger.Info("archived repository due to clone tag removal", "npub", npub, "org", orgName, "repo_id", repoID, "event", ev.ID.Hex())
 			return nil
 		}
 		return nil
@@ -146,17 +142,17 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		return fmt.Errorf("announcement %s does not list this service in relays tags", ev.ID)
 	}
 
-	if err := s.provisionFromAnnouncement(ctx, npub, ev.PubKey, repoID, cloneURL, ev.ID, relayURL); err != nil {
+	if err := s.provisionFromAnnouncement(ctx, npub, ev.PubKey.Hex(), repoID, cloneURL, ev.ID.Hex(), relayURL); err != nil {
 		metrics.IncAnnouncementRejected()
 		return err
 	}
 
 	// Cache the raw owner-signed announcement for later republishing (e.g. mirror sync).
 	if cacheErr := s.CacheAnnouncementEvent(ctx, ev); cacheErr != nil {
-		s.logger.Warn("failed to cache announcement event", "event", ev.ID, "error", cacheErr)
+		s.logger.Warn("failed to cache announcement event", "event", ev.ID.Hex(), "error", cacheErr)
 	}
 
-	if err := s.store.MarkEventProcessed(ctx, ev.ID, ev.PubKey, ev.Kind); err != nil {
+	if err := s.store.MarkEventProcessed(ctx, ev.ID.Hex(), ev.PubKey.Hex(), int(ev.Kind)); err != nil {
 		metrics.IncAnnouncementRejected()
 		return err
 	}
@@ -177,12 +173,12 @@ func (s *Service) ManualProvision(ctx context.Context, npub string, pubkey strin
 			metrics.IncManualProvisionFailures()
 			return Result{}, fmt.Errorf("expected npub, got %s", t)
 		}
-		decoded, ok := value.(string)
+		decoded, ok := value.(nostr.PubKey)
 		if !ok {
 			metrics.IncManualProvisionFailures()
 			return Result{}, fmt.Errorf("invalid decoded npub value")
 		}
-		pubkey = decoded
+		pubkey = decoded.Hex()
 	}
 
 	cloneURL := fmt.Sprintf("%s/%s/%s.git", s.cfg.ClonePrefix, npub, repoID)
@@ -275,10 +271,7 @@ func (s *Service) CacheAnnouncementEvent(ctx context.Context, ev *nostr.Event) e
 	if ev == nil || ev.Kind != relay.KindRepositoryAnnouncement {
 		return nil
 	}
-	npub, err := nip19.EncodePublicKey(ev.PubKey)
-	if err != nil {
-		return fmt.Errorf("encode npub: %w", err)
-	}
+	npub := nip19.EncodeNpub(ev.PubKey)
 	repoID := getTagValue(ev.Tags, "d")
 	if repoID == "" {
 		return nil
@@ -287,7 +280,7 @@ func (s *Service) CacheAnnouncementEvent(ctx context.Context, ev *nostr.Event) e
 	if err != nil {
 		return fmt.Errorf("marshal announcement event: %w", err)
 	}
-	return s.store.SetAnnouncementEvent(ctx, npub, repoID, string(raw), ev.ID)
+	return s.store.SetAnnouncementEvent(ctx, npub, repoID, string(raw), ev.ID.Hex())
 }
 
 // ReconcileHooks re-installs hooks for any mappings where provisioning
@@ -353,11 +346,11 @@ func (s *Service) validatePolicy(ctx context.Context, npub string, pubkey string
 }
 
 func getTagValue(tags nostr.Tags, key string) string {
-	v := tags.GetFirst([]string{key, ""})
-	if v == nil || len(*v) < 2 {
+	v := tags.Find(key)
+	if v == nil || len(v) < 2 {
 		return ""
 	}
-	return (*v)[1]
+	return v[1]
 }
 
 func findCloneForPrefix(tags nostr.Tags, clonePrefix string) (string, bool) {

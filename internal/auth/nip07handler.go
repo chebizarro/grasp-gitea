@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
@@ -99,7 +99,7 @@ func (h *NIP07Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
 	// 2. Validate NIP-98 semantics.
 	if err := h.validateNIP98(ev); err != nil {
 		metrics.IncAuthVerifyFailure()
-		h.logger.Warn("NIP-98 validation failed", "error", err, "pubkey", ev.PubKey)
+		h.logger.Warn("NIP-98 validation failed", "error", err, "pubkey", ev.PubKey.Hex())
 		h.writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 		return
 	}
@@ -130,17 +130,17 @@ func (h *NIP07Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 5. Resolve or create the Gitea user.
-	identity, err := h.identityService.ResolveOrCreate(r.Context(), ev.PubKey, h.relayURLs)
+	identity, err := h.identityService.ResolveOrCreate(r.Context(), ev.PubKey.Hex(), h.relayURLs)
 	if err != nil {
 		metrics.IncAuthVerifyFailure()
-		h.logger.Error("identity resolution failed", "pubkey", ev.PubKey, "error", err)
+		h.logger.Error("identity resolution failed", "pubkey", ev.PubKey.Hex(), "error", err)
 		h.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to resolve identity"})
 		return
 	}
 
 	metrics.IncAuthVerifySuccess()
 	h.logger.Info("NIP-07 login verified",
-		"pubkey", ev.PubKey, "gitea_user", identity.GiteaUser,
+		"pubkey", ev.PubKey.Hex(), "gitea_user", identity.GiteaUser,
 		"created", identity.Created)
 
 	resp := verifyResponse{

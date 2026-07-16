@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/relay"
@@ -208,7 +208,7 @@ func EventListsDifferentTip(ev *nostr.Event, tipSHA string) bool {
 }
 
 func EventIsAcceptedPRWithTip(ev *nostr.Event, eventID, tipSHA string) bool {
-	if ev == nil || ev.ID != eventID {
+	if ev == nil || ev.ID.Hex() != eventID {
 		return false
 	}
 	if ev.Kind != relay.KindPROpen && ev.Kind != relay.KindPRUpdate {

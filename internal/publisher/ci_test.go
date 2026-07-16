@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/relay"
 )
@@ -47,8 +47,8 @@ func TestIsRepoCIAllowed(t *testing.T) {
 }
 
 func TestBuildWorkflowRunEvent(t *testing.T) {
-	privKey := nostr.GeneratePrivateKey()
-	pubKey, err := nostr.GetPublicKey(privKey)
+	privKey := nostr.Generate().Hex()
+	pubKey, err := derivePubHex(privKey)
 	if err != nil {
 		t.Fatalf("get public key: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestBuildWorkflowRunEvent(t *testing.T) {
 	if ev.Kind != relay.KindWorkflowRun {
 		t.Errorf("expected kind %d, got %d", relay.KindWorkflowRun, ev.Kind)
 	}
-	if ev.PubKey != pubKey {
+	if ev.PubKey.Hex() != pubKey {
 		t.Errorf("expected pubkey %s, got %s", pubKey, ev.PubKey)
 	}
 	if ev.Content != "" {
@@ -92,15 +92,14 @@ func TestBuildWorkflowRunEvent(t *testing.T) {
 	assertTag(t, ev, "relay", relayHint)
 
 	// Verify signature.
-	ok, err := ev.CheckSignature()
-	if err != nil || !ok {
+	if !ev.VerifySignature() {
 		t.Error("event signature verification failed")
 	}
 }
 
 func TestBuildWorkflowRunEventDifferentBranch(t *testing.T) {
-	privKey := nostr.GeneratePrivateKey()
-	pubKey, _ := nostr.GetPublicKey(privKey)
+	privKey := nostr.Generate().Hex()
+	pubKey, _ := derivePubHex(privKey)
 	svc := &Service{bridgePrivKey: privKey, bridgePubKey: pubKey}
 
 	ev, err := svc.buildWorkflowRunEvent("aabb", "repo1", "ccdd", "develop", ".github/workflows/test.yml", "wss://r.test")
@@ -115,8 +114,8 @@ func TestBuildWorkflowRunEventDifferentBranch(t *testing.T) {
 }
 
 func TestBuildWorkflowRunEventHiveWorkflow(t *testing.T) {
-	privKey := nostr.GeneratePrivateKey()
-	pubKey, _ := nostr.GetPublicKey(privKey)
+	privKey := nostr.Generate().Hex()
+	pubKey, _ := derivePubHex(privKey)
 	svc := &Service{bridgePrivKey: privKey, bridgePubKey: pubKey}
 
 	ev, err := svc.buildWorkflowRunEvent(

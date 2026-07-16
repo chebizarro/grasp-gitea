@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip46"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip46"
 	"golang.org/x/crypto/nacl/secretbox"
 
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -38,7 +38,7 @@ const (
 // live remote signer.
 type BunkerSigner interface {
 	Ping(ctx context.Context) error
-	GetPublicKey(ctx context.Context) (string, error)
+	GetPublicKey(ctx context.Context) (nostr.PubKey, error)
 	SignEvent(ctx context.Context, evt *nostr.Event) error
 }
 
@@ -122,25 +122,21 @@ func (s *Service) CreateGrant(ctx context.Context, bunkerURI string) (GrantInfo,
 		return GrantInfo{}, err
 	}
 
-	clientSecretKey := nostr.GeneratePrivateKey()
-	clientPubkey, err := nostr.GetPublicKey(clientSecretKey)
-	if err != nil {
-		return GrantInfo{}, fmt.Errorf("derive client pubkey: %w", err)
-	}
+	clientSK := nostr.Generate()
+	clientSecretKey := clientSK.Hex()
+	clientPubkey := clientSK.Public().Hex()
 
 	bunker, err := s.connector(ctx, clientSecretKey, bunkerURI)
 	if err != nil {
 		return GrantInfo{}, fmt.Errorf("%w: connect bunker: %v", ErrSignerOffline, err)
 	}
-	signerPubkey, err := bunker.GetPublicKey(ctx)
+	signerPK, err := bunker.GetPublicKey(ctx)
 	if err != nil {
 		return GrantInfo{}, fmt.Errorf("%w: get signer pubkey: %v", ErrSignerOffline, err)
 	}
+	signerPubkey := signerPK.Hex()
 	if expectedPubkey != "" && signerPubkey != expectedPubkey {
 		return GrantInfo{}, fmt.Errorf("signer pubkey mismatch: bunker URI targets %s but signer reported %s", expectedPubkey, signerPubkey)
-	}
-	if !nostr.IsValidPublicKey(signerPubkey) {
-		return GrantInfo{}, fmt.Errorf("signer returned invalid pubkey %q", signerPubkey)
 	}
 	if err := bunker.Ping(ctx); err != nil {
 		return GrantInfo{}, fmt.Errorf("%w: ping signer: %v", ErrSignerOffline, err)
@@ -203,7 +199,11 @@ func (s *Service) SignWithGrant(ctx context.Context, pubkey string, evt *nostr.E
 }
 
 func connectNIP46Bunker(ctx context.Context, clientSecretKey string, bunkerURI string) (BunkerSigner, error) {
-	return nip46.ConnectBunker(ctx, clientSecretKey, bunkerURI, nil, func(string) {})
+	sk, err := nostr.SecretKeyFromHex(clientSecretKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid client secret key: %w", err)
+	}
+	return nip46.ConnectBunker(ctx, sk, bunkerURI, nil, func(string) {})
 }
 
 func (s *Service) signerForGrant(ctx context.Context, pubkey string) (BunkerSigner, error) {
@@ -244,10 +244,11 @@ func (s *Service) signerForGrant(ctx context.Context, pubkey string) (BunkerSign
 	if err != nil {
 		return nil, fmt.Errorf("%w: reconnect signer %s: %v", ErrSignerOffline, pubkey, err)
 	}
-	signerPubkey, err := bunker.GetPublicKey(ctx)
+	signerPK, err := bunker.GetPublicKey(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%w: verify signer %s: %v", ErrSignerOffline, pubkey, err)
 	}
+	signerPubkey := signerPK.Hex()
 	if signerPubkey != pubkey {
 		return nil, fmt.Errorf("signer grant pubkey mismatch: requested %s but signer reported %s", pubkey, signerPubkey)
 	}
@@ -320,7 +321,7 @@ func parseBunkerURI(raw string) (expectedPubkey string, relays []string, err err
 	if expectedPubkey == "" {
 		expectedPubkey = strings.TrimPrefix(u.Path, "/")
 	}
-	if !nostr.IsValidPublicKey(expectedPubkey) {
+	if _, err := nostr.PubKeyFromHex(expectedPubkey); err != nil {
 		return "", nil, fmt.Errorf("invalid bunker pubkey %q", expectedPubkey)
 	}
 	return expectedPubkey, append([]string(nil), u.Query()["relay"]...), nil

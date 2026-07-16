@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
@@ -27,7 +27,7 @@ const testSecretKey = "0123456789abcdef0123456789abcdef0123456789abcdef012345678
 // testPubkeyFromSecret derives the pubkey from the test secret key.
 func testPubkeyFromSecret(t *testing.T) string {
 	t.Helper()
-	pk, err := nostr.GetPublicKey(testSecretKey)
+	pk, err := derivePubHex(testSecretKey)
 	if err != nil {
 		t.Fatalf("get public key: %v", err)
 	}
@@ -96,7 +96,7 @@ func makeNIP98Event(t *testing.T, nonce string, url string, method string) *nost
 		},
 		Content: "",
 	}
-	if err := ev.Sign(testSecretKey); err != nil {
+	if err := ev.Sign(mustSK(testSecretKey)); err != nil {
 		t.Fatalf("sign event: %v", err)
 	}
 	return ev
@@ -220,7 +220,7 @@ func TestVerifyEndpointFullFlow(t *testing.T) {
 	if !result.OK {
 		t.Error("expected OK=true")
 	}
-	if result.Identity.Pubkey != ev.PubKey {
+	if result.Identity.Pubkey != ev.PubKey.Hex() {
 		t.Errorf("expected pubkey %s, got %s", ev.PubKey, result.Identity.Pubkey)
 	}
 	if result.Identity.GiteaUser == "" {
@@ -298,7 +298,7 @@ func TestVerifyEndpointWrongKind(t *testing.T) {
 			{"nonce", challenge.Nonce},
 		},
 	}
-	ev.Sign(testSecretKey)
+	ev.Sign(mustSK(testSecretKey))
 
 	reqBody, _ := json.Marshal(verifyRequest{SignedEvent: ev})
 	resp, err := http.Post(env.server.URL+"/auth/nip07/verify", "application/json", bytes.NewReader(reqBody))
@@ -355,7 +355,7 @@ func TestVerifyEndpointExpiredTimestamp(t *testing.T) {
 			{"nonce", challenge.Nonce},
 		},
 	}
-	ev.Sign(testSecretKey)
+	ev.Sign(mustSK(testSecretKey))
 
 	reqBody, _ := json.Marshal(verifyRequest{SignedEvent: ev})
 	resp, err := http.Post(env.server.URL+"/auth/nip07/verify", "application/json", bytes.NewReader(reqBody))
@@ -381,7 +381,7 @@ func TestVerifyEndpointMissingNonce(t *testing.T) {
 			{"method", "POST"},
 		},
 	}
-	ev.Sign(testSecretKey)
+	ev.Sign(mustSK(testSecretKey))
 
 	reqBody, _ := json.Marshal(verifyRequest{SignedEvent: ev})
 	resp, err := http.Post(env.server.URL+"/auth/nip07/verify", "application/json", bytes.NewReader(reqBody))

@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/api"
 	"github.com/sharegap/grasp-gitea/internal/auth"
@@ -252,10 +252,10 @@ func main() {
 			// Derive a stable repo key from the event to serialise
 			// CI + proactive-sync per repo.
 			dTag := ""
-			if t := ev.Tags.GetFirst([]string{"d", ""}); t != nil && len(*t) >= 2 {
-				dTag = (*t)[1]
+			if t := ev.Tags.Find("d"); t != nil && len(t) >= 2 {
+				dTag = t[1]
 			}
-			unlock := lockRepoState(ev.PubKey + "/" + dTag)
+			unlock := lockRepoState(ev.PubKey.Hex() + "/" + dTag)
 
 			// CI trigger runs before proactive sync so local refs
 			// still reflect the previous state for change detection.

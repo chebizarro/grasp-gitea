@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 )
 
 // Handler processes a nostr event received from a relay subscription.
@@ -21,8 +21,8 @@ type Subscriber struct {
 	wg      sync.WaitGroup
 }
 
-func subscriptionFilters() []nostr.Filter {
-	return []nostr.Filter{{Kinds: []int{
+func subscriptionFilter() nostr.Filter {
+	return nostr.Filter{Kinds: []nostr.Kind{
 		KindRepositoryAnnouncement,
 		KindRepositoryState,
 		KindUserGraspList,
@@ -35,7 +35,7 @@ func subscriptionFilters() []nostr.Filter {
 		KindStatusApplied,
 		KindStatusClosed,
 		KindStatusDraft,
-	}}}
+	}}
 }
 
 // New creates a Subscriber that will connect to the given relay URLs.
@@ -68,14 +68,14 @@ func (s *Subscriber) watchRelay(ctx context.Context, relayURL string) {
 		default:
 		}
 
-		relay, err := nostr.RelayConnect(ctx, relayURL)
+		relay, err := nostr.RelayConnect(ctx, relayURL, nostr.RelayOptions{})
 		if err != nil {
 			s.logger.Error("failed to connect relay", "relay", relayURL, "error", err)
 			sleepOrDone(ctx, 3*time.Second)
 			continue
 		}
 
-		sub, err := relay.Subscribe(ctx, subscriptionFilters())
+		sub, err := relay.Subscribe(ctx, subscriptionFilter(), nostr.SubscriptionOptions{})
 		if err != nil {
 			s.logger.Error("failed to subscribe relay", "relay", relayURL, "error", err)
 			relay.Close()
@@ -96,10 +96,7 @@ func (s *Subscriber) watchRelay(ctx context.Context, relayURL string) {
 						sleepOrDone(ctx, 2*time.Second)
 						return
 					}
-					if ev == nil {
-						continue
-					}
-					if err := s.handler(ctx, ev, relayURL); err != nil {
+					if err := s.handler(ctx, &ev, relayURL); err != nil {
 						s.logger.Warn("relay event handling failed", "relay", relayURL, "event", ev.ID, "kind", ev.Kind, "error", err)
 					}
 				}

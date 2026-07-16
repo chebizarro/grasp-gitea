@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
@@ -213,7 +213,7 @@ func TestNIP55CallbackWrongKind(t *testing.T) {
 			{"nonce", challenge.Nonce},
 		},
 	}
-	ev.Sign(testSecretKey)
+	ev.Sign(mustSK(testSecretKey))
 
 	reqBody, _ := json.Marshal(nip55CallbackRequest{SignedEvent: ev})
 	resp, err := http.Post(env.server.URL+"/auth/nip55/callback", "application/json", bytes.NewReader(reqBody))
@@ -242,7 +242,7 @@ func TestNIP55CallbackExpiredTimestamp(t *testing.T) {
 			{"nonce", challenge.Nonce},
 		},
 	}
-	ev.Sign(testSecretKey)
+	ev.Sign(mustSK(testSecretKey))
 
 	reqBody, _ := json.Marshal(nip55CallbackRequest{SignedEvent: ev})
 	resp, err := http.Post(env.server.URL+"/auth/nip55/callback", "application/json", bytes.NewReader(reqBody))

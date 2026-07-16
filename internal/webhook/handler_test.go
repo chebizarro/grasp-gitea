@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
@@ -101,8 +101,8 @@ func (f *fakePublisher) PublishEvent(_ context.Context, ev *nostr.Event) error {
 	defer f.mu.Unlock()
 	// Emulate signing: the real publisher sets ev.ID after signing, and the
 	// handler relies on ev.ID to build the follow-up status event's "e" tag.
-	if ev.ID == "" {
-		ev.ID = fmt.Sprintf("deadbeef%056x", len(f.events))
+	if ev.ID == (nostr.ID{}) {
+		ev.ID = nostr.MustIDFromHex(fmt.Sprintf("deadbeef%056x", len(f.events)))
 	}
 	if f.failPublish {
 		return fmt.Errorf("simulated relay failure")
@@ -138,7 +138,7 @@ func (f *fakePublisher) kinds() []int {
 	defer f.mu.Unlock()
 	out := make([]int, 0, len(f.events))
 	for _, ev := range f.events {
-		out = append(out, ev.Kind)
+		out = append(out, int(ev.Kind))
 	}
 	return out
 }
@@ -147,7 +147,7 @@ func (f *fakePublisher) firstOfKind(kind int) *nostr.Event {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, ev := range f.events {
-		if ev.Kind == kind {
+		if int(ev.Kind) == kind {
 			return ev
 		}
 	}
@@ -444,7 +444,7 @@ func TestPR_LinkedContributorEnqueuesUnsignedActorEvents(t *testing.T) {
 	if pr.kind != KindPROpen || pr.authorPubkey != testActorPubkeyHex {
 		t.Fatalf("queued PR = kind %d author %q, want kind %d author %s", pr.kind, pr.authorPubkey, KindPROpen, testActorPubkeyHex)
 	}
-	if pr.event.PubKey != testActorPubkeyHex || pr.event.Sig != "" {
+	if pr.event.PubKey.Hex() != testActorPubkeyHex || pr.event.Sig != [64]byte{} {
 		t.Fatalf("queued PR event should be unsigned and authored by actor, got pubkey=%q sig=%q", pr.event.PubKey, pr.event.Sig)
 	}
 	assertTagsWellFormed(t, &pr.event)
@@ -479,7 +479,7 @@ func TestIssue_LinkedContributorEnqueuesUnsignedActorEvents(t *testing.T) {
 	if len(queued) != 1 {
 		t.Fatalf("queued events = %d, want issue root", len(queued))
 	}
-	if queued[0].kind != KindIssue || queued[0].authorPubkey != testActorPubkeyHex || queued[0].event.PubKey != testActorPubkeyHex || queued[0].event.Sig != "" {
+	if queued[0].kind != KindIssue || queued[0].authorPubkey != testActorPubkeyHex || queued[0].event.PubKey.Hex() != testActorPubkeyHex || queued[0].event.Sig != [64]byte{} {
 		t.Fatalf("unexpected queued issue: %#v", queued[0])
 	}
 	assertTagsWellFormed(t, &queued[0].event)
@@ -529,7 +529,7 @@ func TestPR_UnlinkedContributorPersistsPendingWhenSignerEnabled(t *testing.T) {
 	if err := json.Unmarshal([]byte(row.UnsignedEventJSON), &stored); err != nil {
 		t.Fatalf("unmarshal pending event: %v", err)
 	}
-	if stored.PubKey != "" || stored.Sig != "" || stored.ID != "" {
+	if stored.PubKey != (nostr.PubKey{}) || stored.Sig != [64]byte{} || stored.ID != (nostr.ID{}) {
 		t.Fatalf("pending event should be unsigned/no author, got pubkey=%q sig=%q id=%q", stored.PubKey, stored.Sig, stored.ID)
 	}
 	requireTag(t, &stored, "a", fmt.Sprintf("30617:%s:%s", testPubkeyHex, testRepoID))
@@ -574,7 +574,7 @@ func TestActorBackfillerEnqueuesPendingRowsAndDeletesThem(t *testing.T) {
 	if queued[0].kind != KindIssue || queued[0].authorPubkey != testActorPubkeyHex || queued[0].dedupeKey != "pending-issue-key" {
 		t.Fatalf("unexpected queued event: %#v", queued[0])
 	}
-	if queued[0].event.PubKey != testActorPubkeyHex || queued[0].event.Sig != "" || queued[0].event.ID == "" {
+	if queued[0].event.PubKey.Hex() != testActorPubkeyHex || queued[0].event.Sig != [64]byte{} || queued[0].event.ID == (nostr.ID{}) {
 		t.Fatalf("backfilled event should be authored/unsigned/id computed, got pubkey=%q sig=%q id=%q", queued[0].event.PubKey, queued[0].event.Sig, queued[0].event.ID)
 	}
 	pending, err := st.ListPendingActorEvents(ctx, 202, 10)
@@ -639,7 +639,7 @@ func TestPR_MergedEmitsAppliedStatus(t *testing.T) {
 	if status == nil {
 		t.Fatalf("merged PR should emit kind %d (applied); got %v", KindStatusApplied, fake.kinds())
 	}
-	requireTag(t, status, "e", prEv.ID, "", "root")
+	requireTag(t, status, "e", prEv.ID.Hex(), "", "root")
 	requireTag(t, status, "a", fmt.Sprintf("30617:%s:%s", testPubkeyHex, testRepoID))
 	requireTag(t, status, "p", testPubkeyHex)
 	requireTag(t, status, "r", euc)
@@ -694,7 +694,7 @@ func TestPR_SynchronizedEmitsTipUpdateAndCloseEmitsStatus(t *testing.T) {
 	requireTag(t, &update, "a", fmt.Sprintf("30617:%s:%s", testPubkeyHex, testRepoID))
 	requireTag(t, &update, "p", testPubkeyHex)
 	requireTag(t, &update, "r", euc)
-	requireTag(t, &update, "E", root.ID)
+	requireTag(t, &update, "E", root.ID.Hex())
 	requireTag(t, &update, "P", testActorPubkeyHex)
 	requireTag(t, &update, "c", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 	requireTag(t, &update, "clone", "https://git.example/org1/myrepo.git")
@@ -714,7 +714,7 @@ func TestPR_SynchronizedEmitsTipUpdateAndCloseEmitsStatus(t *testing.T) {
 	if status.Kind != KindStatusClosed {
 		t.Fatalf("close emitted kind %d, want %d", status.Kind, KindStatusClosed)
 	}
-	requireTag(t, &status, "e", root.ID, "", "root")
+	requireTag(t, &status, "e", root.ID.Hex(), "", "root")
 	requireTag(t, &status, "a", fmt.Sprintf("30617:%s:%s", testPubkeyHex, testRepoID))
 	requireTag(t, &status, "p", testPubkeyHex)
 	requireTag(t, &status, "p", testActorPubkeyHex)
@@ -776,10 +776,10 @@ func TestIssueCommentEmitsNIP22ThreadedComment(t *testing.T) {
 	if cm.Content != "plain comment" {
 		t.Fatalf("comment content = %q", cm.Content)
 	}
-	requireTag(t, &cm, "E", root.ID, "", testActorPubkeyHex)
+	requireTag(t, &cm, "E", root.ID.Hex(), "", testActorPubkeyHex)
 	requireTag(t, &cm, "K", fmt.Sprint(KindIssue))
 	requireTag(t, &cm, "P", testActorPubkeyHex)
-	requireTag(t, &cm, "e", root.ID, "", testActorPubkeyHex)
+	requireTag(t, &cm, "e", root.ID.Hex(), "", testActorPubkeyHex)
 	requireTag(t, &cm, "k", fmt.Sprint(KindIssue))
 	requireTag(t, &cm, "p", testActorPubkeyHex)
 	if len(fake.events) != 0 {
@@ -1009,7 +1009,7 @@ func TestIssue_LabeledEmitsNIP32Label(t *testing.T) {
 		t.Fatalf("labeled issue should emit kind %d; got %v", KindNIP32Label, fake.kinds())
 	}
 	assertTagsWellFormed(t, labelEv)
-	if l := labelEv.Tags.GetFirst([]string{"l", ""}); l == nil || (*l)[1] != "enhancement" {
+	if l := labelEv.Tags.Find("l"); l == nil || len(l) < 2 || l[1] != "enhancement" {
 		t.Errorf("label 'l' tag = %v, want enhancement", l)
 	}
 }
@@ -1216,7 +1216,7 @@ func TestPatchPush_DifferingRelayTipRejected(t *testing.T) {
 func TestPatchPush_AttributesPatchAuthor(t *testing.T) {
 	h, fake, st := newTestHandler(t, "")
 	seedMapping(t, st)
-	fake.fetchResult = &nostr.Event{Kind: KindPatch, PubKey: testPatchAuthorHex}
+	fake.fetchResult = &nostr.Event{Kind: KindPatch, PubKey: nostr.MustPubKeyFromHex(testPatchAuthorHex)}
 
 	post(t, h, "push", patchPush(testPatchEventID), "")
 

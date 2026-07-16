@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip05"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip05"
 )
 
 // resolveTimeout is the per-relay timeout for NIP-05 resolution.
@@ -103,20 +103,25 @@ func (r *Resolver) cacheResult(pubkey string, orgName string) {
 // Returns ("", nil) if the profile exists but has no NIP-05 or it doesn't verify.
 // Returns ("", err) on connection/subscription failure.
 func resolveFromRelay(ctx context.Context, pubkey string, relayURL string) (string, error) {
+	pk, err := nostr.PubKeyFromHex(pubkey)
+	if err != nil {
+		return "", fmt.Errorf("invalid pubkey %q: %w", pubkey, err)
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, resolveTimeout)
 	defer cancel()
 
-	relay, err := nostr.RelayConnect(ctx, relayURL)
+	relay, err := nostr.RelayConnect(ctx, relayURL, nostr.RelayOptions{})
 	if err != nil {
 		return "", fmt.Errorf("connect to relay %s: %w", relayURL, err)
 	}
 	defer relay.Close()
 
-	sub, err := relay.Subscribe(ctx, nostr.Filters{{
-		Authors: []string{pubkey},
-		Kinds:   []int{0},
+	sub, err := relay.Subscribe(ctx, nostr.Filter{
+		Authors: []nostr.PubKey{pk},
+		Kinds:   []nostr.Kind{0},
 		Limit:   1,
-	}})
+	}, nostr.SubscriptionOptions{})
 	if err != nil {
 		return "", fmt.Errorf("subscribe for kind 0 on %s: %w", relayURL, err)
 	}
@@ -125,7 +130,7 @@ func resolveFromRelay(ctx context.Context, pubkey string, relayURL string) (stri
 	var ev *nostr.Event
 	select {
 	case e := <-sub.Events:
-		ev = e
+		ev = &e
 	case <-ctx.Done():
 		return "", fmt.Errorf("timeout waiting for kind 0 from %s", relayURL)
 	}
@@ -154,7 +159,7 @@ func resolveFromRelay(ctx context.Context, pubkey string, relayURL string) (stri
 	if err != nil {
 		return "", nil // verification failed, not a relay error
 	}
-	if pointer.PublicKey != pubkey {
+	if pointer.PublicKey != pk {
 		return "", nil // NIP-05 points to a different pubkey
 	}
 

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -29,8 +29,8 @@ type fakeSigner struct {
 
 func newFakeSigner(t *testing.T) fakeSigner {
 	t.Helper()
-	priv := nostr.GeneratePrivateKey()
-	pub, err := nostr.GetPublicKey(priv)
+	priv := nostr.Generate().Hex()
+	pub, err := derivePubHex(priv)
 	if err != nil {
 		t.Fatalf("pubkey: %v", err)
 	}
@@ -39,8 +39,12 @@ func newFakeSigner(t *testing.T) fakeSigner {
 
 func (s fakeSigner) PublicKey() string { return s.pub }
 func (s fakeSigner) SignEvent(ctx context.Context, ev *nostr.Event) error {
-	ev.PubKey = s.pub
-	return ev.Sign(s.priv)
+	pk, err := nostr.PubKeyFromHex(s.pub)
+	if err != nil {
+		return err
+	}
+	ev.PubKey = pk
+	return ev.Sign(mustSK(s.priv))
 }
 
 func TestRunnerRunsActForRepositoryStateAndPublishesCheckAndAudit(t *testing.T) {
@@ -75,7 +79,7 @@ func TestRunnerRunsActForRepositoryStateAndPublishesCheckAndAudit(t *testing.T) 
 		t.Fatalf("published kinds = %d/%d", published[0].Kind, published[1].Kind)
 	}
 	for _, ev := range published {
-		if ev.PubKey != signer.pub || ev.ID == "" || ev.Sig == "" {
+		if ev.PubKey.Hex() != signer.pub || ev.ID == (nostr.ID{}) || ev.Sig == [64]byte{} {
 			t.Fatalf("event not signed by HiveCI signer: %+v", ev)
 		}
 	}
@@ -140,8 +144,8 @@ func newHiveTestStore(t *testing.T) (*store.SQLiteStore, store.Mapping, string) 
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	ownerPriv := nostr.GeneratePrivateKey()
-	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
 	if err != nil {
 		t.Fatalf("owner pubkey: %v", err)
 	}
@@ -233,12 +237,12 @@ func hiveGitOutput(t *testing.T, dir string, args ...string) string {
 
 func signedHiveEvent(t *testing.T, priv string, kind int, tags nostr.Tags, content string) *nostr.Event {
 	t.Helper()
-	pub, err := nostr.GetPublicKey(priv)
+	pub, err := derivePubHex(priv)
 	if err != nil {
 		t.Fatalf("pubkey: %v", err)
 	}
-	ev := &nostr.Event{PubKey: pub, Kind: kind, CreatedAt: nostr.Timestamp(time.Now().Unix()), Tags: tags, Content: content}
-	if err := ev.Sign(priv); err != nil {
+	ev := &nostr.Event{PubKey: nostr.MustPubKeyFromHex(pub), Kind: nostr.Kind(kind), CreatedAt: nostr.Timestamp(time.Now().Unix()), Tags: tags, Content: content}
+	if err := ev.Sign(mustSK(priv)); err != nil {
 		t.Fatalf("sign event: %v", err)
 	}
 	return ev

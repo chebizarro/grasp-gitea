@@ -11,7 +11,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
@@ -169,16 +169,16 @@ func (h *NIP55Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 5. Resolve or create the Gitea user.
-	identity, err := h.identityService.ResolveOrCreate(r.Context(), ev.PubKey, h.relayURLs)
+	identity, err := h.identityService.ResolveOrCreate(r.Context(), ev.PubKey.Hex(), h.relayURLs)
 	if err != nil {
 		metrics.IncNIP55VerifyFailure()
-		h.logger.Error("NIP-55 callback: identity resolution failed", "pubkey", ev.PubKey, "error", err)
+		h.logger.Error("NIP-55 callback: identity resolution failed", "pubkey", ev.PubKey.Hex(), "error", err)
 		h.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to resolve identity"})
 		return
 	}
 
 	metrics.IncNIP55VerifySuccess()
-	h.logger.Info("NIP-55 login verified", "pubkey", ev.PubKey, "gitea_user", identity.GiteaUser)
+	h.logger.Info("NIP-55 login verified", "pubkey", ev.PubKey.Hex(), "gitea_user", identity.GiteaUser)
 
 	h.writeJSON(w, http.StatusOK, nip55CallbackResponse{
 		OK:          true,

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -55,8 +55,8 @@ func (s *fakeSigner) SignWithGrant(_ context.Context, pubkey string, ev *nostr.E
 	if idx := len(s.calls) - 1; idx < len(s.ids) && s.ids[idx] != "" {
 		id = s.ids[idx]
 	}
-	ev.ID = id
-	ev.Sig = "fake-signature"
+	ev.ID = fakeEventID(id)
+	ev.Sig = [64]byte{1}
 	return nil
 }
 
@@ -82,7 +82,7 @@ func TestDrainOnceSuccessSignsPublishesAndMarksPublished(t *testing.T) {
 	worker := New(st, signer, publisher, testLogger(), WithClock(clock), WithConfig(testConfig()))
 
 	unsigned := &nostr.Event{Content: "queued content", Tags: nostr.Tags{{"d", "repo"}}}
-	if err := worker.Enqueue(ctx, 30617, "author-pubkey", "repo:owner/name", unsigned, "success-key"); err != nil {
+	if err := worker.Enqueue(ctx, 30617, testAuthorPubkey, "repo:owner/name", unsigned, "success-key"); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
 
@@ -91,7 +91,7 @@ func TestDrainOnceSuccessSignsPublishesAndMarksPublished(t *testing.T) {
 	if len(signer.calls) != 1 {
 		t.Fatalf("expected 1 signer call, got %d", len(signer.calls))
 	}
-	if signer.calls[0].pubkey != "author-pubkey" || signer.calls[0].event.PubKey != "author-pubkey" {
+	if signer.calls[0].pubkey != testAuthorPubkey || signer.calls[0].event.PubKey.Hex() != testAuthorPubkey {
 		t.Fatalf("signer got wrong pubkey: call=%q event=%q", signer.calls[0].pubkey, signer.calls[0].event.PubKey)
 	}
 	if signer.calls[0].event.Kind != 30617 {
@@ -100,8 +100,8 @@ func TestDrainOnceSuccessSignsPublishesAndMarksPublished(t *testing.T) {
 	if len(publisher.published) != 1 {
 		t.Fatalf("expected 1 published event, got %d", len(publisher.published))
 	}
-	if publisher.published[0].ID != "event-success-id" {
-		t.Fatalf("published event ID = %q", publisher.published[0].ID)
+	if publisher.published[0].ID != fakeEventID("event-success-id") {
+		t.Fatalf("published event ID = %q", publisher.published[0].ID.Hex())
 	}
 
 	rows := recentOutboundEvents(t, st)
@@ -112,7 +112,7 @@ func TestDrainOnceSuccessSignsPublishesAndMarksPublished(t *testing.T) {
 	if row.State != store.OutboundStatePublished {
 		t.Fatalf("state = %q, want published", row.State)
 	}
-	if row.PublishedEventID != "event-success-id" {
+	if row.PublishedEventID != fakeEventID("event-success-id").Hex() {
 		t.Fatalf("published_event_id = %q", row.PublishedEventID)
 	}
 	if row.Attempts != 0 {
@@ -133,7 +133,7 @@ func TestDrainOnceRetryBackoffAndMaxAttemptsDeadLetter(t *testing.T) {
 	cfg.MaxAge = time.Hour
 	worker := New(st, signer, publisher, testLogger(), WithClock(clock), WithConfig(cfg))
 
-	if err := worker.Enqueue(ctx, 30617, "author-pubkey", "repo", &nostr.Event{Content: "retry me"}, "retry-key"); err != nil {
+	if err := worker.Enqueue(ctx, 30617, testAuthorPubkey, "repo", &nostr.Event{Content: "retry me"}, "retry-key"); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
 
@@ -193,7 +193,7 @@ func TestDrainOnceMaxAgeDeadLetter(t *testing.T) {
 	signer := &fakeSigner{err: errors.New("signer offline")}
 	worker := New(st, signer, &fakePublisher{}, testLogger(), WithClock(clock), WithConfig(testConfig()))
 
-	if err := worker.Enqueue(ctx, 30617, "author-pubkey", "repo", &nostr.Event{Content: "expire me"}, "ttl-key"); err != nil {
+	if err := worker.Enqueue(ctx, 30617, testAuthorPubkey, "repo", &nostr.Event{Content: "expire me"}, "ttl-key"); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
 	clock.Advance(testConfig().MaxAge)
@@ -218,7 +218,7 @@ func TestEnqueueDedupePublishesOnlyOnce(t *testing.T) {
 	worker := New(st, signer, publisher, testLogger(), WithClock(clock), WithConfig(testConfig()))
 
 	for i := 0; i < 2; i++ {
-		if err := worker.Enqueue(ctx, 30617, "author-pubkey", "repo", &nostr.Event{Content: fmt.Sprintf("content-%d", i)}, "same-key"); err != nil {
+		if err := worker.Enqueue(ctx, 30617, testAuthorPubkey, "repo", &nostr.Event{Content: fmt.Sprintf("content-%d", i)}, "same-key"); err != nil {
 			t.Fatalf("enqueue %d: %v", i, err)
 		}
 	}
@@ -237,7 +237,7 @@ func TestEnqueueDedupePublishesOnlyOnce(t *testing.T) {
 		t.Fatalf("publisher calls = %d, want 1", len(publisher.published))
 	}
 	row := onlyOutboundEvent(t, st)
-	if row.State != store.OutboundStatePublished || row.PublishedEventID != "deduped-event" {
+	if row.State != store.OutboundStatePublished || row.PublishedEventID != fakeEventID("deduped-event").Hex() {
 		t.Fatalf("row after drain = state %q published_event_id %q", row.State, row.PublishedEventID)
 	}
 }

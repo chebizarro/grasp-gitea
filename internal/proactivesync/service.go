@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
-	"github.com/nbd-wtf/go-nostr/nip34"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
+	"fiatjaf.com/nostr/nip34"
 
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
@@ -106,14 +106,15 @@ func (s *Service) HandleStateEvent(ctx context.Context, ev *nostr.Event) error {
 		return fmt.Errorf("state event missing d tag")
 	}
 
-	lookupPubkey := ev.PubKey
+	lookupPubkey := ev.PubKey.Hex()
 	if ownerPubkey := tagValue(ev.Tags, "p"); ownerPubkey != "" {
 		lookupPubkey = ownerPubkey
 	}
-	npub, err := nip19.EncodePublicKey(lookupPubkey)
+	lookupPK, err := nostr.PubKeyFromHex(lookupPubkey)
 	if err != nil {
-		return fmt.Errorf("encode pubkey to npub: %w", err)
+		return fmt.Errorf("invalid pubkey: %w", err)
 	}
+	npub := nip19.EncodeNpub(lookupPK)
 
 	// Look up the actual Gitea org name from the store, since repos are
 	// created under the NIP-05-resolved org name, not the raw npub.
@@ -229,7 +230,7 @@ func (s *Service) syncMapping(ctx context.Context, mapping store.Mapping) error 
 		prEvents := s.fetchPREvents(ctx, mapping, relayURLs)
 		for _, ev := range prEvents {
 			if err := s.fetchPRTip(ctx, repoPath, ev); err != nil {
-				s.logger.Warn("proactive sync PR tip fetch failed", "repo", repoPath, "event", ev.ID, "error", err)
+				s.logger.Warn("proactive sync PR tip fetch failed", "repo", repoPath, "event", ev.ID.Hex(), "error", err)
 			}
 		}
 	}
@@ -237,9 +238,14 @@ func (s *Service) syncMapping(ctx context.Context, mapping store.Mapping) error 
 }
 
 func (s *Service) fetchLatestStateEvent(ctx context.Context, mapping store.Mapping, relayURLs []string) *nostr.Event {
+	authorPK, err := nostr.PubKeyFromHex(mapping.Pubkey)
+	if err != nil {
+		s.logger.Warn("proactive sync invalid mapping pubkey", "repo_id", mapping.RepoID, "error", err)
+		return nil
+	}
 	filter := nostr.Filter{
-		Kinds:   []int{relay.KindRepositoryState},
-		Authors: []string{mapping.Pubkey},
+		Kinds:   []nostr.Kind{relay.KindRepositoryState},
+		Authors: []nostr.PubKey{authorPK},
 		Tags:    nostr.TagMap{"d": []string{mapping.RepoID}},
 		Limit:   stateQueryLimit,
 	}
@@ -268,7 +274,7 @@ func (s *Service) fetchLatestStateEvent(ctx context.Context, mapping store.Mappi
 func (s *Service) fetchPREvents(ctx context.Context, mapping store.Mapping, relayURLs []string) []*nostr.Event {
 	coord := repoCoordinate(mapping)
 	filter := nostr.Filter{
-		Kinds: []int{relay.KindPROpen, relay.KindPRUpdate},
+		Kinds: []nostr.Kind{relay.KindPROpen, relay.KindPRUpdate},
 		Tags:  nostr.TagMap{"a": []string{coord}},
 		Limit: prQueryLimit,
 	}
@@ -281,13 +287,13 @@ func (s *Service) fetchPREvents(ctx context.Context, mapping store.Mapping, rela
 			continue
 		}
 		for _, ev := range events {
-			if !prEventMatchesRepo(ev, coord) || seen[ev.ID] {
+			if !prEventMatchesRepo(ev, coord) || seen[ev.ID.Hex()] {
 				continue
 			}
 			if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
 				continue
 			}
-			seen[ev.ID] = true
+			seen[ev.ID.Hex()] = true
 			out = append(out, cloneEvent(ev))
 		}
 	}
@@ -299,7 +305,7 @@ func (s *Service) queryRelayHistory(ctx context.Context, relayURL string, base n
 		pageLimit = 100
 	}
 	var all []*nostr.Event
-	var until *nostr.Timestamp
+	var until nostr.Timestamp // 0 means no upper bound
 	for {
 		filter := base.Clone()
 		filter.Limit = pageLimit
@@ -327,11 +333,10 @@ func (s *Service) queryRelayHistory(ctx context.Context, relayURL string, base n
 				oldest = ev.CreatedAt
 			}
 		}
-		if oldest <= 0 || (until != nil && oldest >= *until) {
+		if oldest <= 0 || (until != 0 && oldest >= until) {
 			break
 		}
-		nextUntil := oldest - 1
-		until = &nextUntil
+		until = oldest - 1
 	}
 	return all, nil
 }
@@ -353,7 +358,7 @@ func (s *Service) fetchMissingStateObjects(ctx context.Context, repoPath string,
 }
 
 func (s *Service) fetchPRTip(ctx context.Context, repoPath string, ev *nostr.Event) error {
-	if ev == nil || !validNostrEventID.MatchString(ev.ID) {
+	if ev == nil || !validNostrEventID.MatchString(ev.ID.Hex()) {
 		return nil
 	}
 	tipSHA := tagValue(ev.Tags, "c")
@@ -364,7 +369,7 @@ func (s *Service) fetchPRTip(ctx context.Context, repoPath string, ev *nostr.Eve
 	if len(cloneURLs) == 0 {
 		return nil
 	}
-	ref := "refs/nostr/" + ev.ID
+	ref := "refs/nostr/" + ev.ID.Hex()
 	refspec := "+" + tipSHA + ":" + ref
 	var errs []string
 	for _, cloneURL := range cloneURLs {
@@ -403,7 +408,7 @@ func (s *Service) applyStateEvent(ctx context.Context, repoPath string, ev *nost
 		}
 	}
 
-	s.logger.Info("proactive sync applied state event", "repo", repoPath, "event", ev.ID)
+	s.logger.Info("proactive sync applied state event", "repo", repoPath, "event", ev.ID.Hex())
 	return nil
 }
 
@@ -432,8 +437,8 @@ func cachedAnnouncement(mapping store.Mapping) (*nostr.Event, error) {
 	if err := nostrverify.ValidateEventIDAndSignature(&ev); err != nil {
 		return nil, fmt.Errorf("cached announcement signature invalid: %w", err)
 	}
-	if ev.PubKey != mapping.Pubkey {
-		return nil, fmt.Errorf("cached announcement pubkey %s does not match mapping pubkey %s", ev.PubKey, mapping.Pubkey)
+	if ev.PubKey.Hex() != mapping.Pubkey {
+		return nil, fmt.Errorf("cached announcement pubkey %s does not match mapping pubkey %s", ev.PubKey.Hex(), mapping.Pubkey)
 	}
 	if tagValue(ev.Tags, "d") != mapping.RepoID {
 		return nil, fmt.Errorf("cached announcement d tag does not match repo id %s", mapping.RepoID)
@@ -498,7 +503,7 @@ func stateEventMatchesMapping(ev *nostr.Event, mapping store.Mapping) bool {
 	if tagValue(ev.Tags, "d") != mapping.RepoID {
 		return false
 	}
-	return ev.PubKey == mapping.Pubkey
+	return ev.PubKey.Hex() == mapping.Pubkey
 }
 
 func prEventMatchesRepo(ev *nostr.Event, coord string) bool {
@@ -521,11 +526,11 @@ func repoPathForMapping(repositoriesDir string, mapping store.Mapping) string {
 }
 
 func tagValue(tags nostr.Tags, key string) string {
-	v := tags.GetFirst([]string{key, ""})
-	if v == nil || len(*v) < 2 {
+	v := tags.Find(key)
+	if v == nil || len(v) < 2 {
 		return ""
 	}
-	return (*v)[1]
+	return v[1]
 }
 
 func tagValues(tags nostr.Tags, key string) []string {
@@ -595,10 +600,15 @@ func (execGitRunner) Fetch(ctx context.Context, repoPath string, remoteURL strin
 func queryRelaySync(ctx context.Context, relayURL string, filter nostr.Filter) ([]*nostr.Event, error) {
 	qCtx, cancel := context.WithTimeout(ctx, relayQueryTimeout)
 	defer cancel()
-	r, err := nostr.RelayConnect(qCtx, relayURL)
+	r, err := nostr.RelayConnect(qCtx, relayURL, nostr.RelayOptions{})
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	return r.QuerySync(qCtx, filter)
+	var events []*nostr.Event
+	for ev := range r.QueryEvents(filter) {
+		e := ev
+		events = append(events, &e)
+	}
+	return events, nil
 }

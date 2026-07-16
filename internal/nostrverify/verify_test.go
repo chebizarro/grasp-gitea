@@ -6,7 +6,7 @@ package nostrverify
 import (
 	"testing"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 )
 
 func TestValidateNilEvent(t *testing.T) {
@@ -18,8 +18,6 @@ func TestValidateNilEvent(t *testing.T) {
 
 func TestValidateInvalidID(t *testing.T) {
 	ev := &nostr.Event{
-		ID:      "bad",
-		PubKey:  "deadbeef",
 		Kind:    1,
 		Content: "test",
 	}

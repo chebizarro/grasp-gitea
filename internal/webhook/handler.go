@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
@@ -301,12 +301,12 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		if err != nil || !emitted {
 			return err
 		}
-		h.rememberThread("pr", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID, Pubkey: ev.PubKey, Kind: KindPROpen})
-		if err := h.recordNostrObjectMapping(ctx, mapping, ev.ID, p.Number, KindPROpen, "PR root"); err != nil {
+		h.rememberThread("pr", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID.Hex(), Pubkey: ev.PubKey.Hex(), Kind: KindPROpen})
+		if err := h.recordNostrObjectMapping(ctx, mapping, ev.ID.Hex(), p.Number, KindPROpen, "PR root"); err != nil {
 			return err
 		}
 		if p.PullRequest.Draft {
-			return h.publishPRStatus(ctx, p, mapping, threadRef{EventID: ev.ID, Pubkey: ev.PubKey, Kind: KindPROpen}, KindStatusDraft, euc)
+			return h.publishPRStatus(ctx, p, mapping, threadRef{EventID: ev.ID.Hex(), Pubkey: ev.PubKey.Hex(), Kind: KindPROpen}, KindStatusDraft, euc)
 		}
 		return nil
 	case "synchronized":
@@ -364,8 +364,8 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 			return err
 		}
 		if p.Action == "opened" {
-			h.rememberThread("issue", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID, Pubkey: ev.PubKey, Kind: KindIssue})
-			if err := h.recordNostrObjectMapping(ctx, mapping, ev.ID, p.Number, KindIssue, "issue root"); err != nil {
+			h.rememberThread("issue", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID.Hex(), Pubkey: ev.PubKey.Hex(), Kind: KindIssue})
+			if err := h.recordNostrObjectMapping(ctx, mapping, ev.ID.Hex(), p.Number, KindIssue, "issue root"); err != nil {
 				return err
 			}
 		}
@@ -530,7 +530,7 @@ func (h *Handler) buildStatusEvent(mapping store.Mapping, root threadRef, kind i
 		tags = append(tags, nostr.Tag{"r", euc})
 	}
 	return &nostr.Event{
-		Kind:      kind,
+		Kind:      nostr.Kind(kind),
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Tags:      tags,
 		Content:   content,
@@ -823,10 +823,10 @@ func (h *Handler) handlePatchPush(ctx context.Context, eventID string, p PushPay
 		tags = append(tags, nostr.Tag{"applied-as-commits", p.After}, nostr.Tag{"r", p.After})
 	}
 	// Attribute to the patch author when known and distinct from the maintainer.
-	if patch != nil && patch.PubKey != "" {
-		tags = append(tags, nostr.Tag{"q", eventID, "", patch.PubKey})
-		if patch.PubKey != mapping.Pubkey {
-			tags = append(tags, nostr.Tag{"p", patch.PubKey})
+	if patch != nil && patch.PubKey != (nostr.PubKey{}) {
+		tags = append(tags, nostr.Tag{"q", eventID, "", patch.PubKey.Hex()})
+		if patch.PubKey.Hex() != mapping.Pubkey {
+			tags = append(tags, nostr.Tag{"p", patch.PubKey.Hex()})
 		}
 	}
 
@@ -892,7 +892,7 @@ func (h *Handler) publishActorEvent(ctx context.Context, actor User, mapping sto
 
 	scope := fmt.Sprintf("repo:%d:%s", mapping.GiteaRepoID, scopeSuffix)
 	pendingID := ev.GetID()
-	pendingDedupeKey := fmt.Sprintf("webhook:%s:%d:%s", scope, ev.Kind, pendingID)
+	pendingDedupeKey := fmt.Sprintf("webhook:%s:%d:%s", scope, ev.Kind, pendingID.Hex())
 
 	authorPubkey, ok, err := h.resolveActorGrant(ctx, actor)
 	if err != nil {
@@ -907,11 +907,15 @@ func (h *Handler) publishActorEvent(ctx context.Context, actor User, mapping sto
 		return false, nil
 	}
 
-	ev.PubKey = authorPubkey
-	ev.Sig = ""
+	authorPK, err := nostr.PubKeyFromHexCheap(authorPubkey)
+	if err != nil {
+		return false, fmt.Errorf("invalid actor pubkey %q: %w", authorPubkey, err)
+	}
+	ev.PubKey = authorPK
+	ev.Sig = [64]byte{}
 	ev.ID = ev.GetID()
-	dedupeKey := fmt.Sprintf("webhook:%s:%d:%s", scope, ev.Kind, ev.ID)
-	if err := h.actorOutbox.Enqueue(ctx, ev.Kind, authorPubkey, scope, ev, dedupeKey); err != nil {
+	dedupeKey := fmt.Sprintf("webhook:%s:%d:%s", scope, ev.Kind, ev.ID.Hex())
+	if err := h.actorOutbox.Enqueue(ctx, int(ev.Kind), authorPubkey, scope, ev, dedupeKey); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -957,16 +961,16 @@ func (h *Handler) resolveActorGrant(ctx context.Context, actor User) (string, bo
 
 func (h *Handler) persistPendingActorEvent(ctx context.Context, actor User, ev *nostr.Event, scope string, dedupeKey string) error {
 	pending := *ev
-	pending.PubKey = ""
-	pending.Sig = ""
-	pending.ID = ""
+	pending.PubKey = nostr.PubKey{}
+	pending.Sig = [64]byte{}
+	pending.ID = nostr.ID{}
 	b, err := json.Marshal(&pending)
 	if err != nil {
 		return fmt.Errorf("marshal pending actor event for user %d: %w", actor.ID, err)
 	}
 	_, trimmed, err := h.store.SavePendingActorEvent(ctx, store.PendingActorEvent{
 		GiteaUserID:       actor.ID,
-		Kind:              pending.Kind,
+		Kind:              int(pending.Kind),
 		UnsignedEventJSON: string(b),
 		Scope:             scope,
 		DedupeKey:         dedupeKey,

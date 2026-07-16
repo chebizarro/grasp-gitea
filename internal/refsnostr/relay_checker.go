@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/relay"
 )
@@ -29,34 +29,40 @@ func (c *RelayChecker) HasAcceptedPRWithTip(ctx context.Context, eventID, tipSHA
 		return false, fmt.Errorf("no relay URLs configured")
 	}
 
+	eid, err := nostr.IDFromHex(eventID)
+	if err != nil {
+		return false, fmt.Errorf("invalid event id %q: %w", eventID, err)
+	}
+
 	var queried int
 	for _, relayURL := range c.RelayURLs {
 		qCtx, cancel := context.WithTimeout(ctx, c.timeout())
-		r, err := nostr.RelayConnect(qCtx, relayURL)
+		r, err := nostr.RelayConnect(qCtx, relayURL, nostr.RelayOptions{})
 		if err != nil {
 			cancel()
 			c.warn("relay connect failed for refs/nostr check", "relay", relayURL, "event_id", eventID, "error", err)
 			continue
 		}
-		events, err := r.QuerySync(qCtx, nostr.Filter{
-			IDs:   []string{eventID},
-			Kinds: []int{relay.KindPROpen, relay.KindPRUpdate},
+		queried++
+		found := false
+		for ev := range r.QueryEvents(nostr.Filter{
+			IDs:   []nostr.ID{eid},
+			Kinds: []nostr.Kind{relay.KindPROpen, relay.KindPRUpdate},
 			Tags: nostr.TagMap{
 				"c": []string{tipSHA},
 			},
 			Limit: 1,
-		})
+		}) {
+			e := ev
+			if EventIsAcceptedPRWithTip(&e, eventID, tipSHA) {
+				found = true
+				break
+			}
+		}
 		r.Close()
 		cancel()
-		if err != nil {
-			c.warn("relay query failed for refs/nostr check", "relay", relayURL, "event_id", eventID, "error", err)
-			continue
-		}
-		queried++
-		for _, ev := range events {
-			if EventIsAcceptedPRWithTip(ev, eventID, tipSHA) {
-				return true, nil
-			}
+		if found {
+			return true, nil
 		}
 	}
 

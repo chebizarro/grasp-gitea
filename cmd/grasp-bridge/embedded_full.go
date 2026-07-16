@@ -10,10 +10,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/fiatjaf/eventstore/lmdb"
-	"github.com/fiatjaf/khatru"
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/eventstore/lmdb"
+	"fiatjaf.com/nostr/khatru"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/relay"
@@ -33,7 +33,7 @@ func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Log
 	}
 
 	r := khatru.NewRelay()
-	db := lmdb.LMDBBackend{Path: cfg.EmbeddedRelayDB}
+	db := &lmdb.LMDBBackend{Path: cfg.EmbeddedRelayDB}
 	if err := db.Init(); err != nil {
 		return "", nil, fmt.Errorf("init embedded relay db: %w", err)
 	}
@@ -44,24 +44,24 @@ func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Log
 		return "", nil, fmt.Errorf("open embedded relay mapping store: %w", err)
 	}
 
-	r.StoreEvent = append(r.StoreEvent, db.SaveEvent)
-	r.QueryEvents = append(r.QueryEvents, db.QueryEvents)
-	r.CountEvents = append(r.CountEvents, db.CountEvents)
-	r.DeleteEvent = append(r.DeleteEvent, db.DeleteEvent)
-	r.ReplaceEvent = append(r.ReplaceEvent, db.ReplaceEvent)
+	r.UseEventstore(db, 500)
 
 	lookupStoredEvent := func(ctx context.Context, eventID string) (*nostr.Event, error) {
-		ch, err := db.QueryEvents(ctx, nostr.Filter{IDs: []string{eventID}, Limit: 1})
+		id, err := nostr.IDFromHex(eventID)
 		if err != nil {
 			return nil, err
 		}
-		for ev := range ch {
-			return ev, nil
+		for ev := range db.QueryEvents(nostr.Filter{IDs: []nostr.ID{id}, Limit: 1}, 1) {
+			e := ev
+			return &e, nil
 		}
 		return nil, nil
 	}
 
-	r.RejectEvent = append(r.RejectEvent, makeEmbeddedRelayRejectPolicy(repoStore, lookupStoredEvent))
+	policy := makeEmbeddedRelayRejectPolicy(repoStore, lookupStoredEvent)
+	r.OnEvent = func(ctx context.Context, event nostr.Event) (bool, string) {
+		return policy(ctx, &event)
+	}
 
 	addr := fmt.Sprintf(":%d", cfg.EmbeddedRelayPort)
 	httpServer := &http.Server{Addr: addr, Handler: graspNIP11Handler(r, cfg)}
@@ -93,7 +93,7 @@ func makeEmbeddedRelayRejectPolicy(repoChecker hostedRepoChecker, lookup storedE
 		if event.Kind == relay.KindRepositoryAnnouncement || event.Kind == relay.KindRepositoryState {
 			return false, ""
 		}
-		if !isEmbeddedRelayCollaborationKind(event.Kind) {
+		if !isEmbeddedRelayCollaborationKind(int(event.Kind)) {
 			return true, "only GRASP repository and collaboration events are accepted"
 		}
 		if referencesHostedRepo(ctx, event, repoChecker) {
@@ -144,10 +144,11 @@ func referencesHostedRepo(ctx context.Context, event *nostr.Event, repoChecker h
 		if len(parts) != 3 || parts[0] != fmt.Sprint(relay.KindRepositoryAnnouncement) || parts[1] == "" || parts[2] == "" {
 			continue
 		}
-		npub, err := nip19.EncodePublicKey(parts[1])
+		pk, err := nostr.PubKeyFromHex(parts[1])
 		if err != nil {
 			continue
 		}
+		npub := nip19.EncodeNpub(pk)
 		exists, err := repoChecker.MappingExists(ctx, npub, parts[2])
 		if err == nil && exists {
 			return true
@@ -165,7 +166,7 @@ func referencesStoredCollaboration(ctx context.Context, event *nostr.Event, look
 			continue
 		}
 		stored, err := lookup(ctx, tag[1])
-		if err == nil && stored != nil && isStoredCollaborationAnchorKind(stored.Kind) {
+		if err == nil && stored != nil && isStoredCollaborationAnchorKind(int(stored.Kind)) {
 			return true
 		}
 	}
@@ -187,10 +188,10 @@ func writeGRASPNIP11(w http.ResponseWriter, relayHandler *khatru.Relay, cfg conf
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	info := *relayHandler.Info
-	if len(relayHandler.DeleteEvent) > 0 {
+	if relayHandler.DeleteEvent != nil {
 		info.AddSupportedNIP(9)
 	}
-	if len(relayHandler.CountEvents) > 0 {
+	if relayHandler.Count != nil {
 		info.AddSupportedNIP(45)
 	}
 	if relayHandler.Negentropy {

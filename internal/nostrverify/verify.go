@@ -6,7 +6,7 @@ package nostrverify
 import (
 	"fmt"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 )
 
 // ValidateEventIDAndSignature checks that the event ID is correctly
@@ -20,11 +20,7 @@ func ValidateEventIDAndSignature(ev *nostr.Event) error {
 		return fmt.Errorf("invalid event id")
 	}
 
-	sigOK, err := ev.CheckSignature()
-	if err != nil {
-		return fmt.Errorf("check signature: %w", err)
-	}
-	if !sigOK {
+	if !ev.VerifySignature() {
 		return fmt.Errorf("invalid event signature")
 	}
 

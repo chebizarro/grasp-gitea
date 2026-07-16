@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -165,7 +165,7 @@ func (r *Runner) handlePullRequestEvent(ctx context.Context, ev *nostr.Event, so
 	}
 	commit := strings.TrimSpace(tagValue(ev.Tags, "c"))
 	if !validCommitSHA.MatchString(commit) {
-		r.logger.Debug("HiveCI: PR event has no usable c commit", "event", ev.ID, "kind", ev.Kind)
+		r.logger.Debug("HiveCI: PR event has no usable c commit", "event", ev.ID.Hex(), "kind", ev.Kind)
 		return nil
 	}
 	branch := firstNonEmpty(tagValue(ev.Tags, "branch-name"), tagValue(ev.Tags, "branch"), "pr")
@@ -183,7 +183,7 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 		return nil
 	}
 	for _, workflow := range workflows {
-		key := runKey(ev.ID, commit, workflow)
+		key := runKey(ev.ID.Hex(), commit, workflow)
 		if r.markStarted(key) {
 			continue
 		}
@@ -204,7 +204,7 @@ func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, ev *nos
 		Repository:    mapping.Owner + "/" + mapping.RepoName,
 		RepoID:        mapping.RepoID,
 		OwnerPubkey:   mapping.Pubkey,
-		SourceEventID: ev.ID,
+		SourceEventID: ev.ID.Hex(),
 		SourceRelay:   sourceRelay,
 		Trigger:       trigger,
 		Branch:        branch,
@@ -343,9 +343,13 @@ func (r *Runner) sign(ctx context.Context, ev *nostr.Event) error {
 	if r.signer == nil {
 		return fmt.Errorf("HiveCI signer not configured")
 	}
-	ev.PubKey = r.signer.PublicKey()
-	ev.ID = ""
-	ev.Sig = ""
+	pk, err := nostr.PubKeyFromHex(r.signer.PublicKey())
+	if err != nil {
+		return fmt.Errorf("invalid HiveCI signer pubkey: %w", err)
+	}
+	ev.PubKey = pk
+	ev.ID = nostr.ID{}
+	ev.Sig = [64]byte{}
 	return r.signer.SignEvent(ctx, ev)
 }
 
@@ -356,7 +360,7 @@ func (r *Runner) publishToRelays(ctx context.Context, ev *nostr.Event) error {
 	var succeeded int
 	for _, url := range r.relayURLs {
 		pubCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		relayConn, err := nostr.RelayConnect(pubCtx, url)
+		relayConn, err := nostr.RelayConnect(pubCtx, url, nostr.RelayOptions{})
 		if err != nil {
 			cancel()
 			r.logger.Warn("HiveCI relay connect failed", "relay", url, "error", err)
@@ -366,19 +370,19 @@ func (r *Runner) publishToRelays(ctx context.Context, ev *nostr.Event) error {
 		relayConn.Close()
 		cancel()
 		if err != nil {
-			r.logger.Warn("HiveCI relay publish failed", "relay", url, "event", ev.ID, "error", err)
+			r.logger.Warn("HiveCI relay publish failed", "relay", url, "event", ev.ID.Hex(), "error", err)
 			continue
 		}
 		succeeded++
 	}
 	if succeeded == 0 {
-		return fmt.Errorf("event %s rejected by all %d relays", ev.ID, len(r.relayURLs))
+		return fmt.Errorf("event %s rejected by all %d relays", ev.ID.Hex(), len(r.relayURLs))
 	}
 	return nil
 }
 
 func (r *Runner) mappingForState(ctx context.Context, ev *nostr.Event, repoID string) (store.Mapping, bool, error) {
-	candidates := []string{tagValue(ev.Tags, "p"), ev.PubKey}
+	candidates := []string{tagValue(ev.Tags, "p"), ev.PubKey.Hex()}
 	seen := map[string]struct{}{}
 	for _, pubkey := range candidates {
 		pubkey = strings.TrimSpace(pubkey)
@@ -504,11 +508,11 @@ func parseRepoAddr(addr string) (pubkey string, repoID string, ok bool) {
 }
 
 func tagValue(tags nostr.Tags, key string) string {
-	v := tags.GetFirst([]string{key, ""})
-	if v == nil || len(*v) < 2 {
+	v := tags.Find(key)
+	if v == nil || len(v) < 2 {
 		return ""
 	}
-	return (*v)[1]
+	return v[1]
 }
 
 func firstNonEmpty(values ...string) string {

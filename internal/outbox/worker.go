@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -177,8 +177,12 @@ func (w *Worker) Enqueue(ctx context.Context, kind int, authorPubkey string, sco
 	if authorPubkey == "" {
 		return fmt.Errorf("author pubkey is required")
 	}
-	unsignedEvent.Kind = kind
-	unsignedEvent.PubKey = authorPubkey
+	authorPK, err := nostr.PubKeyFromHex(authorPubkey)
+	if err != nil {
+		return fmt.Errorf("invalid author pubkey %q: %w", authorPubkey, err)
+	}
+	unsignedEvent.Kind = nostr.Kind(kind)
+	unsignedEvent.PubKey = authorPK
 	b, err := json.Marshal(unsignedEvent)
 	if err != nil {
 		return fmt.Errorf("marshal unsigned event: %w", err)
@@ -244,11 +248,15 @@ func (w *Worker) process(ctx context.Context, row store.OutboundEvent) error {
 	if err := json.Unmarshal([]byte(row.UnsignedJSON), &ev); err != nil {
 		return w.fail(ctx, row, fmt.Errorf("unmarshal unsigned event: %w", err))
 	}
-	ev.Kind = row.Kind
-	ev.PubKey = row.AuthorPubkey
+	authorPK, err := nostr.PubKeyFromHex(row.AuthorPubkey)
+	if err != nil {
+		return w.fail(ctx, row, fmt.Errorf("invalid author pubkey %q: %w", row.AuthorPubkey, err))
+	}
+	ev.Kind = nostr.Kind(row.Kind)
+	ev.PubKey = authorPK
 
 	signCtx, signCancel := context.WithTimeout(ctx, w.cfg.SignTimeout)
-	err := w.signer.SignWithGrant(signCtx, row.AuthorPubkey, &ev)
+	err = w.signer.SignWithGrant(signCtx, row.AuthorPubkey, &ev)
 	signCancel()
 	if err != nil {
 		return w.fail(ctx, row, err)
@@ -261,7 +269,7 @@ func (w *Worker) process(ctx context.Context, row store.OutboundEvent) error {
 		return w.fail(ctx, row, err)
 	}
 
-	if err := w.store.MarkOutboundPublished(ctx, row.ID, ev.ID); err != nil {
+	if err := w.store.MarkOutboundPublished(ctx, row.ID, ev.ID.Hex()); err != nil {
 		return fmt.Errorf("mark outbound published: %w", err)
 	}
 	metrics.IncOutboxPublished()

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	appstore "github.com/sharegap/grasp-gitea/internal/store"
@@ -44,15 +44,16 @@ func TestHandleUserGraspListEventCachesAndRebroadcastsOwnerSignedEvent(t *testin
 	tr := newTestRelay(t)
 	st := newTestStore(t)
 
-	ownerPriv := nostr.GeneratePrivateKey()
-	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
 	if err != nil {
 		t.Fatalf("owner pubkey: %v", err)
 	}
-	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	ownerPK, err := nostr.PubKeyFromHex(ownerPub)
 	if err != nil {
-		t.Fatalf("owner npub: %v", err)
+		t.Fatalf("owner pubkey: %v", err)
 	}
+	ownerNpub := nip19.EncodeNpub(ownerPK)
 	seedMapping(t, ctx, st, appstore.Mapping{
 		Npub:          ownerNpub,
 		RepoID:        "repo1",
@@ -82,10 +83,10 @@ func TestHandleUserGraspListEventCachesAndRebroadcastsOwnerSignedEvent(t *testin
 	if err != nil {
 		t.Fatalf("get cached first 10317: %v", err)
 	}
-	if cached.EventID != first.ID || cached.EventJSON != string(firstJSON) || cached.CreatedAt != int64(first.CreatedAt) {
+	if cached.EventID != first.ID.Hex() || cached.EventJSON != string(firstJSON) || cached.CreatedAt != int64(first.CreatedAt) {
 		t.Fatalf("cached first event mismatch: %+v", cached)
 	}
-	if cached.LastRepublishedID != first.ID {
+	if cached.LastRepublishedID != first.ID.Hex() {
 		t.Fatalf("LastRepublishedID = %q, want %q", cached.LastRepublishedID, first.ID)
 	}
 	published := tr.savedEventsByKind(relay.KindUserGraspList)
@@ -102,7 +103,7 @@ func TestHandleUserGraspListEventCachesAndRebroadcastsOwnerSignedEvent(t *testin
 	if err != nil {
 		t.Fatalf("get cached newer 10317: %v", err)
 	}
-	if cached.EventID != newer.ID || cached.CreatedAt != int64(newer.CreatedAt) || cached.LastRepublishedID != newer.ID {
+	if cached.EventID != newer.ID.Hex() || cached.CreatedAt != int64(newer.CreatedAt) || cached.LastRepublishedID != newer.ID.Hex() {
 		t.Fatalf("cached newer event mismatch: %+v", cached)
 	}
 	published = tr.savedEventsByKind(relay.KindUserGraspList)
@@ -119,8 +120,8 @@ func TestHandleUserGraspListEventCachesAndRebroadcastsOwnerSignedEvent(t *testin
 	if err != nil {
 		t.Fatalf("get cached after older 10317: %v", err)
 	}
-	if cached.EventID != newer.ID {
-		t.Fatalf("older event replaced cache: got %q, want %q", cached.EventID, newer.ID)
+	if cached.EventID != newer.ID.Hex() {
+		t.Fatalf("older event replaced cache: got %q, want %q", cached.EventID, newer.ID.Hex())
 	}
 	if got := len(tr.savedEventsByKind(relay.KindUserGraspList)); got != 2 {
 		t.Fatalf("older event republished; saved count = %d, want 2", got)
@@ -138,8 +139,8 @@ func TestHandleUserGraspListEventIgnoresNonOwnerPubkey(t *testing.T) {
 		t.Fatalf("new publisher: %v", err)
 	}
 
-	unknownPriv := nostr.GeneratePrivateKey()
-	unknownPub, err := nostr.GetPublicKey(unknownPriv)
+	unknownPriv := nostr.Generate().Hex()
+	unknownPub, err := derivePubHex(unknownPriv)
 	if err != nil {
 		t.Fatalf("unknown pubkey: %v", err)
 	}
@@ -161,15 +162,16 @@ func TestHandleUserGraspListEventRejectsInvalidSignature(t *testing.T) {
 
 	tr := newTestRelay(t)
 	st := newTestStore(t)
-	ownerPriv := nostr.GeneratePrivateKey()
-	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
 	if err != nil {
 		t.Fatalf("owner pubkey: %v", err)
 	}
-	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	ownerPK, err := nostr.PubKeyFromHex(ownerPub)
 	if err != nil {
-		t.Fatalf("owner npub: %v", err)
+		t.Fatalf("owner pubkey: %v", err)
 	}
+	ownerNpub := nip19.EncodeNpub(ownerPK)
 	seedMapping(t, ctx, st, appstore.Mapping{
 		Npub:          ownerNpub,
 		RepoID:        "repo1",
@@ -201,18 +203,18 @@ func TestHandleUserGraspListEventRejectsInvalidSignature(t *testing.T) {
 
 func signedUserGraspList(t *testing.T, priv string, createdAt int64, graspURL string) *nostr.Event {
 	t.Helper()
-	pub, err := nostr.GetPublicKey(priv)
+	pub, err := derivePubHex(priv)
 	if err != nil {
 		t.Fatalf("derive pubkey: %v", err)
 	}
 	ev := &nostr.Event{
-		PubKey:    pub,
+		PubKey:    nostr.MustPubKeyFromHex(pub),
 		CreatedAt: nostr.Timestamp(createdAt),
 		Kind:      relay.KindUserGraspList,
 		Tags:      nostr.Tags{{"g", graspURL}},
 		Content:   "owner signed user GRASP list",
 	}
-	if err := ev.Sign(priv); err != nil {
+	if err := ev.Sign(mustSK(priv)); err != nil {
 		t.Fatalf("sign 10317: %v", err)
 	}
 	return ev

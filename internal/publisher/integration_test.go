@@ -18,10 +18,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fiatjaf/eventstore/slicestore"
-	"github.com/fiatjaf/khatru"
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/eventstore/slicestore"
+	"fiatjaf.com/nostr/khatru"
 
 	relaypkg "github.com/sharegap/grasp-gitea/internal/relay"
 	appstore "github.com/sharegap/grasp-gitea/internal/store"
@@ -36,12 +35,12 @@ func TestRepublishForGiteaRepoPublishesStateAndSkipsUnchanged(t *testing.T) {
 	repositoriesDir := t.TempDir()
 	repoPath := createBareRepoFixture(t, repositoriesDir, "alice", "project")
 
-	ownerPriv := nostr.GeneratePrivateKey()
-	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
 	if err != nil {
 		t.Fatalf("owner public key: %v", err)
 	}
-	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	ownerNpub, err := encodeNpubFromHex(ownerPub)
 	if err != nil {
 		t.Fatalf("owner npub: %v", err)
 	}
@@ -71,10 +70,10 @@ func TestRepublishForGiteaRepoPublishesStateAndSkipsUnchanged(t *testing.T) {
 		t.Fatalf("relay saved %d kind:%d events, want 1", len(savedStateEvents), relaypkg.KindRepositoryState)
 	}
 	stateEvent := savedStateEvents[0]
-	if ok, err := stateEvent.CheckSignature(); !ok || err != nil {
-		t.Fatalf("state event signature invalid: ok=%v err=%v", ok, err)
+	if !stateEvent.VerifySignature() {
+		t.Fatalf("state event signature invalid")
 	}
-	if stateEvent.PubKey != svc.bridgePubKey {
+	if stateEvent.PubKey.Hex() != svc.bridgePubKey {
 		t.Fatalf("state event pubkey = %q, want bridge pubkey %q", stateEvent.PubKey, svc.bridgePubKey)
 	}
 	if got, ok := firstVal(stateEvent, "d"); !ok || got != "project-repo-id" {
@@ -96,7 +95,7 @@ func TestRepublishForGiteaRepoPublishesStateAndSkipsUnchanged(t *testing.T) {
 	assertRefTag(t, stateEvent, "refs/tags/v1.0", tags["v1.0"])
 	assertRefTag(t, stateEvent, "HEAD", "ref: refs/heads/main")
 
-	queried := relay.query(t, nostr.Filter{Kinds: []int{relaypkg.KindRepositoryState}, Limit: 10})
+	queried := relay.query(t, nostr.Filter{Kinds: []nostr.Kind{relaypkg.KindRepositoryState}, Limit: 10})
 	if len(queried) != 1 {
 		t.Fatalf("relay query returned %d kind:%d events, want 1", len(queried), relaypkg.KindRepositoryState)
 	}
@@ -108,7 +107,7 @@ func TestRepublishForGiteaRepoPublishesStateAndSkipsUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get mapping after publish: %v", err)
 	}
-	if gotMapping.LastStateEventID != stateEvent.ID {
+	if gotMapping.LastStateEventID != stateEvent.ID.Hex() {
 		t.Fatalf("LastStateEventID = %q, want %q", gotMapping.LastStateEventID, stateEvent.ID)
 	}
 	if gotMapping.LastStateDigest == "" {
@@ -132,12 +131,12 @@ func TestRepublishForGiteaRepoEnqueuesOwnerSignedStateWhenGrantPresent(t *testin
 	repositoriesDir := t.TempDir()
 	createBareRepoFixture(t, repositoriesDir, "alice", "signed")
 
-	ownerPriv := nostr.GeneratePrivateKey()
-	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
 	if err != nil {
 		t.Fatalf("owner public key: %v", err)
 	}
-	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	ownerNpub, err := encodeNpubFromHex(ownerPub)
 	if err != nil {
 		t.Fatalf("owner npub: %v", err)
 	}
@@ -185,10 +184,10 @@ func TestRepublishForGiteaRepoEnqueuesOwnerSignedStateWhenGrantPresent(t *testin
 	if call.authorPubkey != ownerPub {
 		t.Fatalf("enqueued author = %q, want owner pubkey %q", call.authorPubkey, ownerPub)
 	}
-	if call.event.PubKey != ownerPub {
+	if call.event.PubKey.Hex() != ownerPub {
 		t.Fatalf("unsigned event pubkey = %q, want owner pubkey %q", call.event.PubKey, ownerPub)
 	}
-	if call.event.ID != "" || call.event.Sig != "" {
+	if call.event.ID != (nostr.ID{}) || call.event.Sig != [64]byte{} {
 		t.Fatalf("enqueued event should be unsigned, got id=%q sig=%q", call.event.ID, call.event.Sig)
 	}
 	if got, ok := firstVal(&call.event, "d"); !ok || got != "signed-repo-id" {
@@ -211,12 +210,12 @@ func TestRepublishForGiteaRepoFallsBackToBridgeWhenOwnerGrantMissing(t *testing.
 	repositoriesDir := t.TempDir()
 	createBareRepoFixture(t, repositoriesDir, "carol", "fallback")
 
-	ownerPriv := nostr.GeneratePrivateKey()
-	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
 	if err != nil {
 		t.Fatalf("owner public key: %v", err)
 	}
-	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	ownerNpub, err := encodeNpubFromHex(ownerPub)
 	if err != nil {
 		t.Fatalf("owner npub: %v", err)
 	}
@@ -250,11 +249,11 @@ func TestRepublishForGiteaRepoFallsBackToBridgeWhenOwnerGrantMissing(t *testing.
 		t.Fatalf("relay saved %d kind:%d events, want 1", len(savedStateEvents), relaypkg.KindRepositoryState)
 	}
 	stateEvent := savedStateEvents[0]
-	if stateEvent.PubKey != svc.bridgePubKey {
+	if stateEvent.PubKey.Hex() != svc.bridgePubKey {
 		t.Fatalf("fallback pubkey = %q, want bridge pubkey %q", stateEvent.PubKey, svc.bridgePubKey)
 	}
-	if ok, err := stateEvent.CheckSignature(); !ok || err != nil {
-		t.Fatalf("fallback signature invalid: ok=%v err=%v", ok, err)
+	if !stateEvent.VerifySignature() {
+		t.Fatalf("fallback signature invalid")
 	}
 	if got, ok := firstVal(stateEvent, "p"); !ok || got != ownerPub {
 		t.Fatalf("fallback p tag = %q (present %v), want owner pubkey", got, ok)
@@ -270,12 +269,12 @@ func TestRepublishForGiteaRepoRebroadcastsCachedAnnouncement(t *testing.T) {
 	repositoriesDir := t.TempDir()
 	createBareRepoFixture(t, repositoriesDir, "bob", "announced")
 
-	ownerPriv := nostr.GeneratePrivateKey()
-	ownerPub, err := nostr.GetPublicKey(ownerPriv)
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
 	if err != nil {
 		t.Fatalf("owner public key: %v", err)
 	}
-	ownerNpub, err := nip19.EncodePublicKey(ownerPub)
+	ownerNpub, err := encodeNpubFromHex(ownerPub)
 	if err != nil {
 		t.Fatalf("owner npub: %v", err)
 	}
@@ -292,7 +291,7 @@ func TestRepublishForGiteaRepoRebroadcastsCachedAnnouncement(t *testing.T) {
 	})
 
 	announcement := nostr.Event{
-		PubKey:    ownerPub,
+		PubKey:    nostr.MustPubKeyFromHex(ownerPub),
 		CreatedAt: nostr.Timestamp(1700000000),
 		Kind:      relaypkg.KindRepositoryAnnouncement,
 		Tags: nostr.Tags{
@@ -302,14 +301,14 @@ func TestRepublishForGiteaRepoRebroadcastsCachedAnnouncement(t *testing.T) {
 		},
 		Content: "owner signed announcement",
 	}
-	if err := announcement.Sign(ownerPriv); err != nil {
+	if err := announcement.Sign(mustSK(ownerPriv)); err != nil {
 		t.Fatalf("sign announcement: %v", err)
 	}
 	announcementJSON, err := json.Marshal(announcement)
 	if err != nil {
 		t.Fatalf("marshal announcement: %v", err)
 	}
-	if err := st.SetAnnouncementEvent(ctx, ownerNpub, "announced-repo-id", string(announcementJSON), announcement.ID); err != nil {
+	if err := st.SetAnnouncementEvent(ctx, ownerNpub, "announced-repo-id", string(announcementJSON), announcement.ID.Hex()); err != nil {
 		t.Fatalf("cache announcement event: %v", err)
 	}
 
@@ -327,7 +326,7 @@ func TestRepublishForGiteaRepoRebroadcastsCachedAnnouncement(t *testing.T) {
 	}
 	assertSameEvent(t, &announcement, savedAnnouncements[0])
 
-	queried := relay.query(t, nostr.Filter{IDs: []string{announcement.ID}, Limit: 1})
+	queried := relay.query(t, nostr.Filter{IDs: []nostr.ID{announcement.ID}, Limit: 1})
 	if len(queried) != 1 {
 		t.Fatalf("relay query by announcement ID returned %d events, want 1", len(queried))
 	}
@@ -337,7 +336,7 @@ func TestRepublishForGiteaRepoRebroadcastsCachedAnnouncement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get mapping after republish: %v", err)
 	}
-	if gotMapping.LastRepublishedAnnouncementID != announcement.ID {
+	if gotMapping.LastRepublishedAnnouncementID != announcement.ID.Hex() {
 		t.Fatalf("LastRepublishedAnnouncementID = %q, want %q", gotMapping.LastRepublishedAnnouncementID, announcement.ID)
 	}
 	if gotMapping.LastRepublishedAnnouncementAt.IsZero() {
@@ -355,24 +354,24 @@ func TestFetchEventRoundTripsThroughRelay(t *testing.T) {
 		t.Fatalf("new publisher: %v", err)
 	}
 
-	priv := nostr.GeneratePrivateKey()
-	pub, err := nostr.GetPublicKey(priv)
+	priv := nostr.Generate().Hex()
+	pub, err := derivePubHex(priv)
 	if err != nil {
 		t.Fatalf("public key: %v", err)
 	}
 	ev := nostr.Event{
-		PubKey:    pub,
+		PubKey:    nostr.MustPubKeyFromHex(pub),
 		CreatedAt: nostr.Timestamp(1700000100),
 		Kind:      1,
 		Tags:      nostr.Tags{{"t", "fetch-roundtrip"}},
 		Content:   "fetch me from the relay",
 	}
-	if err := ev.Sign(priv); err != nil {
+	if err := ev.Sign(mustSK(priv)); err != nil {
 		t.Fatalf("sign event: %v", err)
 	}
 	publishDirectly(t, ctx, relay.url, ev)
 
-	got, err := svc.FetchEvent(ctx, ev.ID)
+	got, err := svc.FetchEvent(ctx, ev.ID.Hex())
 	if err != nil {
 		t.Fatalf("FetchEvent: %v", err)
 	}
@@ -435,15 +434,12 @@ func newTestRelay(t *testing.T) *testRelay {
 	}
 
 	tr := &testRelay{store: ss}
-	rl.StoreEvent = append(rl.StoreEvent, ss.SaveEvent)
-	rl.ReplaceEvent = append(rl.ReplaceEvent, ss.ReplaceEvent)
-	rl.DeleteEvent = append(rl.DeleteEvent, ss.DeleteEvent)
-	rl.QueryEvents = append(rl.QueryEvents, ss.QueryEvents)
-	rl.OnEventSaved = append(rl.OnEventSaved, func(ctx context.Context, ev *nostr.Event) {
+	rl.UseEventstore(ss, 1000)
+	rl.OnEventSaved = func(ctx context.Context, ev nostr.Event) {
 		tr.mu.Lock()
 		defer tr.mu.Unlock()
-		tr.saved = append(tr.saved, cloneEvent(ev))
-	})
+		tr.saved = append(tr.saved, cloneEvent(&ev))
+	}
 
 	tr.server = httptest.NewServer(rl)
 	tr.url = "ws" + strings.TrimPrefix(tr.server.URL, "http")
@@ -460,15 +456,16 @@ func (tr *testRelay) query(t *testing.T, filter nostr.Filter) []*nostr.Event {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	r, err := nostr.RelayConnect(ctx, tr.url)
+	r, err := nostr.RelayConnect(ctx, tr.url, nostr.RelayOptions{})
 	if err != nil {
 		t.Fatalf("connect relay for query: %v", err)
 	}
 	defer r.Close()
 
-	events, err := r.QuerySync(ctx, filter)
-	if err != nil {
-		t.Fatalf("query relay: %v", err)
+	var events []*nostr.Event
+	for ev := range r.QueryEvents(filter) {
+		e := ev
+		events = append(events, &e)
 	}
 	return events
 }
@@ -479,7 +476,7 @@ func (tr *testRelay) savedEventsByKind(kind int) []*nostr.Event {
 
 	out := make([]*nostr.Event, 0)
 	for _, ev := range tr.saved {
-		if ev.Kind == kind {
+		if int(ev.Kind) == kind {
 			out = append(out, cloneEvent(ev))
 		}
 	}
@@ -563,7 +560,7 @@ func writeFile(t *testing.T, path, content string) {
 func publishDirectly(t *testing.T, ctx context.Context, relayURL string, ev nostr.Event) {
 	t.Helper()
 
-	r, err := nostr.RelayConnect(ctx, relayURL)
+	r, err := nostr.RelayConnect(ctx, relayURL, nostr.RelayOptions{})
 	if err != nil {
 		t.Fatalf("connect relay for publish: %v", err)
 	}

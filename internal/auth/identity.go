@@ -12,7 +12,8 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/nbd-wtf/go-nostr/nip19"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
@@ -65,10 +66,11 @@ type ResolvedIdentity struct {
 // last_login_at.
 func (s *IdentityService) ResolveOrCreate(ctx context.Context, pubkey string, relayURLs []string) (ResolvedIdentity, error) {
 	// Encode npub for storage.
-	npub, err := nip19.EncodePublicKey(pubkey)
+	pk, err := nostr.PubKeyFromHex(pubkey)
 	if err != nil {
-		return ResolvedIdentity{}, fmt.Errorf("encode npub: %w", err)
+		return ResolvedIdentity{}, fmt.Errorf("invalid pubkey: %w", err)
 	}
+	npub := nip19.EncodeNpub(pk)
 
 	// Check for existing link.
 	existing, err := s.store.GetIdentityLinkByPubkey(ctx, pubkey)

@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
@@ -204,7 +204,7 @@ func makeSignedAnnouncementEventWithRelays(t *testing.T, repoID, cloneURL string
 		Tags:      tags,
 		Content:   "",
 	}
-	if err := ev.Sign(testSecretKey); err != nil {
+	if err := ev.Sign(mustSK(testSecretKey)); err != nil {
 		t.Fatalf("sign event: %v", err)
 	}
 	return ev
@@ -231,7 +231,7 @@ func TestAnnouncementProvisionsNewRepo(t *testing.T) {
 	}
 
 	// Verify event is marked as processed (deduplication).
-	processed, err := st.EventProcessed(ctx, ev.ID)
+	processed, err := st.EventProcessed(ctx, ev.ID.Hex())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,11 +459,8 @@ func TestNilAndWrongKindEventsRejected(t *testing.T) {
 
 	// Wrong kind (30618 instead of 30617).
 	wrongKind := &nostr.Event{
-		ID:     "event-wrong-kind",
-		PubKey: "pubkey",
-		Kind:   relay.KindRepositoryState,
-		Tags:   nostr.Tags{{"d", "repo"}},
-		Sig:    "fakesig",
+		Kind: relay.KindRepositoryState,
+		Tags: nostr.Tags{{"d", "repo"}},
 	}
 	if err := svc.HandleAnnouncementEvent(ctx, wrongKind, "ws://relay"); err != nil {
 		t.Errorf("non-30617 event should be silently ignored, got: %v", err)
