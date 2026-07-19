@@ -32,6 +32,9 @@ type Service struct {
 	logger          *slog.Logger
 	repositoriesDir string
 	relayURLs       []string
+	// Reuse connections across events. Closing a freshly connected go-nostr
+	// relay immediately after Publish races its background connection goroutine.
+	relayPool *nostr.SimplePool
 
 	bridgePrivKey string
 	bridgePubKey  string
@@ -52,7 +55,8 @@ func NewWithSigner(signer EventSigner, st *store.SQLiteStore, relayURLs []string
 		return nil, fmt.Errorf("external event signer is required")
 	}
 	return &Service{store: st, logger: logger, repositoriesDir: repositoriesDir, relayURLs: relayURLs,
-		repoLocks: make(map[int64]*sync.Mutex), signer: signer, bridgePubKey: signer.PublicKey()}, nil
+		relayPool: nostr.NewSimplePool(context.Background()), repoLocks: make(map[int64]*sync.Mutex),
+		signer: signer, bridgePubKey: signer.PublicKey()}, nil
 }
 
 // New creates a publisher service. If bridgeNsec is empty, the service
@@ -63,6 +67,7 @@ func New(bridgeNsec string, st *store.SQLiteStore, relayURLs []string, repositor
 		logger:          logger,
 		repositoriesDir: repositoriesDir,
 		relayURLs:       relayURLs,
+		relayPool:       nostr.NewSimplePool(context.Background()),
 		repoLocks:       make(map[int64]*sync.Mutex),
 	}
 
@@ -297,20 +302,12 @@ func (s *Service) publishToRelays(ctx context.Context, ev *nostr.Event) error {
 		return fmt.Errorf("no relay URLs configured")
 	}
 
+	pubCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	var succeeded int
-	for _, url := range s.relayURLs {
-		pubCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		r, err := nostr.RelayConnect(pubCtx, url)
-		if err != nil {
-			cancel()
-			s.logger.Warn("relay connect failed", "relay", url, "error", err)
-			continue
-		}
-		err = r.Publish(pubCtx, *ev)
-		r.Close()
-		cancel()
-		if err != nil {
-			s.logger.Warn("relay publish failed", "relay", url, "event", ev.ID, "error", err)
+	for result := range s.relayPool.PublishMany(pubCtx, s.relayURLs, *ev) {
+		if result.Error != nil {
+			s.logger.Warn("relay publish failed", "relay", result.RelayURL, "event", ev.ID, "error", result.Error)
 			continue
 		}
 		succeeded++
