@@ -450,6 +450,17 @@ func TestAuthDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestPublisherSignerInputsAreMutuallyExclusive(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",
+		"RELAY_URLS": "wss://relay", "BRIDGE_NSEC": "nsec1example",
+		"BRIDGE_SIGNER_BUNKER_URI": "bunker://example",
+	})
+	if _, err := Load(); err == nil {
+		t.Fatal("expected mutually exclusive signer error")
+	}
+}
+
 func TestChallengeTTLDefault(t *testing.T) {
 	setEnvs(t, map[string]string{
 		"GITEA_ADMIN_TOKEN": "tok",

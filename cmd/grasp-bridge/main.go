@@ -83,7 +83,16 @@ func main() {
 	// Create the publisher (signs & publishes NIP-34 events on mirror sync).
 	var publisherSvc *publisher.Service
 	if cfg.MirrorPublishEnabled() {
-		publisherSvc, err = publisher.New(cfg.BridgeNsec, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
+		if cfg.BridgeSignerBunkerURI != "" {
+			signer, signerErr := publisher.NewNIP46Signer(ctx, cfg.BridgeSignerBunkerURI)
+			if signerErr != nil {
+				logger.Error("failed to connect external publisher signer", "error", signerErr)
+				os.Exit(1)
+			}
+			publisherSvc, err = publisher.NewWithSigner(signer, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
+		} else {
+			publisherSvc, err = publisher.New(cfg.BridgeNsec, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
+		}
 		if err != nil {
 			logger.Error("failed to create publisher", "error", err)
 			os.Exit(1)

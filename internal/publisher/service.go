@@ -35,6 +35,7 @@ type Service struct {
 
 	bridgePrivKey string
 	bridgePubKey  string
+	signer        EventSigner
 
 	repoMu    sync.Mutex
 	repoLocks map[int64]*sync.Mutex
@@ -42,6 +43,16 @@ type Service struct {
 	ciEnabled      bool
 	ciTriggerRepos []string
 	ciDedup        *ciDedup
+}
+
+// NewWithSigner creates a publisher whose identity key remains in an external
+// signer. It is the preferred constructor for Signet-backed deployments.
+func NewWithSigner(signer EventSigner, st *store.SQLiteStore, relayURLs []string, repositoriesDir string, logger *slog.Logger) (*Service, error) {
+	if signer == nil || signer.PublicKey() == "" {
+		return nil, fmt.Errorf("external event signer is required")
+	}
+	return &Service{store: st, logger: logger, repositoriesDir: repositoriesDir, relayURLs: relayURLs,
+		repoLocks: make(map[int64]*sync.Mutex), signer: signer, bridgePubKey: signer.PublicKey()}, nil
 }
 
 // New creates a publisher service. If bridgeNsec is empty, the service
@@ -84,7 +95,15 @@ func New(bridgeNsec string, st *store.SQLiteStore, relayURLs []string, repositor
 
 // Enabled reports whether the publisher has a signing key configured.
 func (s *Service) Enabled() bool {
-	return s.bridgePrivKey != ""
+	return s.signer != nil || s.bridgePrivKey != ""
+}
+
+func (s *Service) signEvent(ctx context.Context, ev *nostr.Event) error {
+	if s.signer != nil {
+		return s.signer.SignEvent(ctx, ev)
+	}
+	ev.PubKey = s.bridgePubKey
+	return ev.Sign(s.bridgePrivKey)
 }
 
 // lockRepo acquires a per-repo mutex for serializing concurrent callbacks.
@@ -150,7 +169,7 @@ func (s *Service) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) 
 	}
 
 	// Build and sign a new state event.
-	stateEvent, err := s.buildStateEvent(mapping.Pubkey, mapping.RepoID, head, branches, tags)
+	stateEvent, err := s.buildStateEvent(ctx, mapping.Pubkey, mapping.RepoID, head, branches, tags)
 	if err != nil {
 		return fmt.Errorf("build state event: %w", err)
 	}
@@ -222,7 +241,7 @@ func validateAnnouncement(ev *nostr.Event, mapping *store.Mapping) error {
 
 // buildStateEvent creates a new NIP-34 repository state event and signs it
 // with the bridge key.
-func (s *Service) buildStateEvent(ownerPubkey string, repoID string, head string, branches map[string]string, tags map[string]string) (*nostr.Event, error) {
+func (s *Service) buildStateEvent(ctx context.Context, ownerPubkey string, repoID string, head string, branches map[string]string, tags map[string]string) (*nostr.Event, error) {
 	// Build tags in deterministic order.
 	eventTags := make(nostr.Tags, 0, 3+len(branches)+len(tags))
 	eventTags = append(eventTags, nostr.Tag{"d", repoID})
@@ -250,7 +269,7 @@ func (s *Service) buildStateEvent(ownerPubkey string, repoID string, head string
 		Kind:      relay.KindRepositoryState,
 		Tags:      eventTags,
 	}
-	if err := ev.Sign(s.bridgePrivKey); err != nil {
+	if err := s.signEvent(ctx, ev); err != nil {
 		return nil, fmt.Errorf("sign state event: %w", err)
 	}
 	return ev, nil
@@ -264,8 +283,7 @@ func (s *Service) PublishEvent(ctx context.Context, ev *nostr.Event) error {
 	}
 
 	// Set pubkey and sign with bridge key
-	ev.PubKey = s.bridgePubKey
-	if err := ev.Sign(s.bridgePrivKey); err != nil {
+	if err := s.signEvent(ctx, ev); err != nil {
 		return fmt.Errorf("sign event: %w", err)
 	}
 

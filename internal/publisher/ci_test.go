@@ -4,6 +4,7 @@
 package publisher
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -65,7 +66,7 @@ func TestBuildWorkflowRunEvent(t *testing.T) {
 	workflow := ".github/workflows/ci.yaml"
 	relayHint := "wss://relay.example.com"
 
-	ev, err := svc.buildWorkflowRunEvent(ownerPubkey, repoID, commitSHA, branch, workflow, relayHint)
+	ev, err := svc.buildWorkflowRunEvent(context.Background(), ownerPubkey, repoID, commitSHA, branch, workflow, relayHint)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -103,7 +104,7 @@ func TestBuildWorkflowRunEventDifferentBranch(t *testing.T) {
 	pubKey, _ := nostr.GetPublicKey(privKey)
 	svc := &Service{bridgePrivKey: privKey, bridgePubKey: pubKey}
 
-	ev, err := svc.buildWorkflowRunEvent("aabb", "repo1", "ccdd", "develop", ".github/workflows/test.yml", "wss://r.test")
+	ev, err := svc.buildWorkflowRunEvent(context.Background(), "aabb", "repo1", "ccdd", "develop", ".github/workflows/test.yml", "wss://r.test")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -120,6 +121,7 @@ func TestBuildWorkflowRunEventHiveWorkflow(t *testing.T) {
 	svc := &Service{bridgePrivKey: privKey, bridgePubKey: pubKey}
 
 	ev, err := svc.buildWorkflowRunEvent(
+		context.Background(),
 		"aabb", "repo1", "ccdd", "main",
 		".hive/workflows/build.yaml", "wss://r.test")
 	if err != nil {
@@ -272,5 +274,3 @@ func assertTag(t *testing.T, ev *nostr.Event, key, expectedValue string) {
 		t.Errorf("tag %q: expected %q, got %q", key, expectedValue, v)
 	}
 }
-
-
