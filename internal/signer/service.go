@@ -33,7 +33,7 @@ const (
 	permissionSignEvent = "sign_event"
 )
 
-// BunkerSigner is the small subset of go-nostr's *nip46.BunkerClient used by
+// BunkerSigner is the small subset of the NIP-46 bunker client used by
 // the persistent signer foundation. Tests provide fakes so they never need a
 // live remote signer.
 type BunkerSigner interface {
@@ -310,7 +310,7 @@ func parseBunkerURI(raw string) (expectedPubkey string, relays []string, err err
 		return "", nil, fmt.Errorf("invalid bunker URI: %w", err)
 	}
 	if u.Scheme == "" {
-		// go-nostr treats a scheme-less value as NIP-05. There is no pubkey or
+		// A scheme-less value is treated as NIP-05. There is no pubkey or
 		// relay list to sanity-check until ConnectBunker resolves it.
 		return "", nil, nil
 	}

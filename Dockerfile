@@ -1,10 +1,10 @@
 FROM golang:1.25-alpine AS build
 ARG BUILD_TAGS=""
-RUN apk add --no-cache build-base
+RUN apk add --no-cache build-base git ca-certificates
 WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=secret,id=gitauth,target=/root/.netrc go mod download
 COPY . .
-RUN go mod tidy
-RUN go mod download
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -tags "${BUILD_TAGS}" -o /out/grasp-bridge ./cmd/grasp-bridge
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/grasp-pre-receive ./cmd/grasp-pre-receive
 

@@ -1,0 +1,11 @@
+services:
+  grasp-bridge:
+    image: grasp-bridge:edb0ad55
+    environment:
+      BRIDGE_NSEC: ""
+      GRASP_SERVER_NSEC: ""
+      BRIDGE_SIGNER_BUNKER_URI: ""
+      SIGNET_BUNKER_URL: ${SIGNET_BUNKER_URL:?set SIGNET_BUNKER_URL}
+      SIGNER_MASTER_KEY: ${SIGNER_MASTER_KEY:?set SIGNER_MASTER_KEY}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:?set ADMIN_API_TOKEN}
+      GRASP_ENV: production

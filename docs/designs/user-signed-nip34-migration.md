@@ -76,7 +76,7 @@ architectural facts:
 
 1. **Durable signing authorization.** We must persist a reusable NIP-46 *client* keypair plus
    the bunker connect string (relay + secret) and the granted `sign_event` permission scope,
-   keyed by the authorizing pubkey. `go-nostr/nip46.ConnectBunker` + `BunkerClient.SignEvent`
+   keyed by the authorizing pubkey. The NIP-46 client connects to the bunker and requests event signatures
    can then be re-established and reused on demand.
 2. **An outbound signing queue.** Events are enqueued unsigned, and a worker requests
    signatures with retry/backoff; if the signer is offline the item waits (bounded) and
@@ -156,7 +156,7 @@ material security improvement (§8).
    be **status** events, not 1619); patches (1617) need `t root`/`root-revision`, `commit`,
    `parent-commit`, `commit-pgp-sig`, `committer`; status (1630-1633) needs `e` root/reply
    markers plus `q`/`merge-commit`/`applied-as-commits`; replies use NIP-22 (kind 1111). Use
-   the `go-nostr/nip34` helpers (`Repository`/`Patch`/`RepositoryState`).
+   the NIP-34 helpers (`Repository`/`Patch`/`RepositoryState`).
 2. **Earliest-unique-commit (euc)** `r` tag as the stable cross-fork repo identity; compute at
    provisioning and thread through announcements/patches.
 3. **Maintainers** — populate the `maintainers` tag on announcements and honor multi-maintainer
@@ -198,7 +198,7 @@ key (env-provided; e.g. NaCl secretbox / age). Plaintext keys are never persiste
 ## 9. Phased rollout (maps to Beads epic)
 
 - **Phase A — Persistent NIP-46 signer foundation.** Real `BunkerConnector` via
-  `go-nostr/nip46`; `signer_grants` storage + at-rest encryption; BunkerClient pool with
+  the NIP-46 client; `signer_grants` storage + at-rest encryption; bunker client pool with
   reconnect + `Ping`/`GetPublicKey`; `SignWithGrant` API + tests against a mock bunker.
 - **Phase B — Outbound signing queue.** `outbound_events` table + idempotent worker +
   backoff/dead-letter + metrics + admin endpoint.
