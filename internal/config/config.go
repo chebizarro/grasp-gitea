@@ -27,6 +27,9 @@ type Config struct {
 	AuthEnabled          bool
 	BridgePublicURL      string
 	ChallengeTTL         time.Duration
+	OAuth2ClientID       string
+	OAuth2ClientSecret   string
+	OAuth2RedirectURI    string
 
 	// Mirror republish: bridge signs NIP-34 state events with this key.
 	BridgeNsec          string
@@ -61,6 +64,9 @@ func Load() (Config, error) {
 		AuthEnabled:          boolEnv("AUTH_ENABLED", false),
 		BridgePublicURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
 		ChallengeTTL:         durationEnv("CHALLENGE_TTL", 5*time.Minute),
+		OAuth2ClientID:       strings.TrimSpace(os.Getenv("OAUTH2_CLIENT_ID")),
+		OAuth2ClientSecret:   strings.TrimSpace(os.Getenv("OAUTH2_CLIENT_SECRET")),
+		OAuth2RedirectURI:    strings.TrimSpace(os.Getenv("OAUTH2_REDIRECT_URI")),
 		BridgeNsec:           strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
 		MirrorCallbackToken:  strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
 		GiteaWebhookSecret:   strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
@@ -82,6 +88,9 @@ func Load() (Config, error) {
 
 	if cfg.AuthEnabled && cfg.BridgePublicURL == "" {
 		return Config{}, fmt.Errorf("BRIDGE_PUBLIC_URL is required when AUTH_ENABLED=true")
+	}
+	if cfg.AuthEnabled && (cfg.OAuth2ClientID == "" || cfg.OAuth2ClientSecret == "" || cfg.OAuth2RedirectURI == "") {
+		return Config{}, fmt.Errorf("OAUTH2_CLIENT_ID, OAUTH2_CLIENT_SECRET, and OAUTH2_REDIRECT_URI are required when AUTH_ENABLED=true")
 	}
 
 	return cfg, nil

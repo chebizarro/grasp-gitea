@@ -4,6 +4,9 @@
 package publisher
 
 import (
+	"github.com/nbd-wtf/go-nostr"
+	"github.com/sharegap/grasp-gitea/internal/relay"
+	"github.com/sharegap/grasp-gitea/internal/store"
 	"testing"
 )
 
@@ -24,6 +27,45 @@ func TestComputeDigestDeterministic(t *testing.T) {
 	}
 	if d1 == "" {
 		t.Fatal("digest should not be empty")
+	}
+}
+
+func signedAnnouncement(t *testing.T, repoID string) (*nostr.Event, string) {
+	t.Helper()
+	key := nostr.GeneratePrivateKey()
+	pubkey, err := nostr.GetPublicKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := &nostr.Event{Kind: relay.KindRepositoryAnnouncement, CreatedAt: nostr.Now(), Tags: nostr.Tags{{"d", repoID}}}
+	if err := ev.Sign(key); err != nil {
+		t.Fatal(err)
+	}
+	return ev, pubkey
+}
+
+func TestValidateAnnouncement(t *testing.T) {
+	ev, pubkey := signedAnnouncement(t, "repo-1")
+	mapping := &store.Mapping{Pubkey: pubkey, RepoID: "repo-1"}
+	if err := validateAnnouncement(ev, mapping); err != nil {
+		t.Fatalf("valid announcement rejected: %v", err)
+	}
+}
+
+func TestValidateAnnouncementRejectsWrongAuthority(t *testing.T) {
+	ev, _ := signedAnnouncement(t, "repo-1")
+	mapping := &store.Mapping{Pubkey: nostr.GeneratePrivateKey()[:64], RepoID: "repo-1"}
+	if err := validateAnnouncement(ev, mapping); err == nil {
+		t.Fatal("expected owner mismatch")
+	}
+}
+
+func TestValidateAnnouncementRejectsTampering(t *testing.T) {
+	ev, pubkey := signedAnnouncement(t, "repo-1")
+	ev.Tags = append(ev.Tags, nostr.Tag{"name", "tampered"})
+	mapping := &store.Mapping{Pubkey: pubkey, RepoID: "repo-1"}
+	if err := validateAnnouncement(ev, mapping); err == nil {
+		t.Fatal("expected invalid event id")
 	}
 }
 

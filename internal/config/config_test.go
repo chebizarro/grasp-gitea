@@ -397,11 +397,11 @@ func TestParseAllowlist(t *testing.T) {
 
 func TestAuthEnabledRequiresBridgePublicURL(t *testing.T) {
 	setEnvs(t, map[string]string{
-		"GITEA_ADMIN_TOKEN":  "tok",
-		"CLONE_PREFIX":       "https://git.example.com",
-		"RELAY_URLS":         "wss://relay",
-		"AUTH_ENABLED":       "true",
-		"BRIDGE_PUBLIC_URL":  "",
+		"GITEA_ADMIN_TOKEN": "tok",
+		"CLONE_PREFIX":      "https://git.example.com",
+		"RELAY_URLS":        "wss://relay",
+		"AUTH_ENABLED":      "true",
+		"BRIDGE_PUBLIC_URL": "",
 	})
 
 	_, err := Load()
@@ -412,11 +412,14 @@ func TestAuthEnabledRequiresBridgePublicURL(t *testing.T) {
 
 func TestAuthEnabledWithPublicURL(t *testing.T) {
 	setEnvs(t, map[string]string{
-		"GITEA_ADMIN_TOKEN":  "tok",
-		"CLONE_PREFIX":       "https://git.example.com",
-		"RELAY_URLS":         "wss://relay",
-		"AUTH_ENABLED":       "true",
-		"BRIDGE_PUBLIC_URL":  "https://bridge.example.com/",
+		"GITEA_ADMIN_TOKEN":    "tok",
+		"CLONE_PREFIX":         "https://git.example.com",
+		"RELAY_URLS":           "wss://relay",
+		"AUTH_ENABLED":         "true",
+		"BRIDGE_PUBLIC_URL":    "https://bridge.example.com/",
+		"OAUTH2_CLIENT_ID":     "gitea",
+		"OAUTH2_CLIENT_SECRET": "test-secret",
+		"OAUTH2_REDIRECT_URI":  "https://git.example.com/user/oauth2/nostr/callback",
 	})
 
 	cfg, err := Load()
