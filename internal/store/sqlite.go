@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -43,6 +45,16 @@ type NostrIdentityLink struct {
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 	LastLoginAt time.Time `json:"last_login_at,omitempty"`
+}
+
+type OAuth2AuthCode struct {
+	Code, Pubkey, RedirectURI string
+	ExpiresAt                 time.Time
+}
+
+type OAuth2AccessToken struct {
+	Token, Pubkey string
+	ExpiresAt     time.Time
 }
 
 type Mapping struct {
@@ -129,6 +141,13 @@ func Open(path string) (*SQLiteStore, error) {
 			error TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			expires_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS oauth2_auth_codes (
+			code TEXT PRIMARY KEY, pubkey TEXT NOT NULL, redirect_uri TEXT NOT NULL,
+			expires_at TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0
+		);`,
+		`CREATE TABLE IF NOT EXISTS oauth2_access_tokens (
+			token TEXT PRIMARY KEY, pubkey TEXT NOT NULL, expires_at TEXT NOT NULL
 		);`,
 	}
 
@@ -406,6 +425,65 @@ func (s *SQLiteStore) DeleteExpiredChallenges(ctx context.Context) (int64, error
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+func GenerateToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func (s *SQLiteStore) CreateAuthCode(ctx context.Context, code, pubkey, redirectURI string, expiresAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO oauth2_auth_codes(code,pubkey,redirect_uri,expires_at) VALUES(?,?,?,?)`, code, pubkey, redirectURI, expiresAt.UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s *SQLiteStore) ConsumeAuthCode(ctx context.Context, code string) (OAuth2AuthCode, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return OAuth2AuthCode{}, err
+	}
+	defer tx.Rollback()
+	var out OAuth2AuthCode
+	var expiry string
+	var used int
+	if err = tx.QueryRowContext(ctx, `SELECT code,pubkey,redirect_uri,expires_at,used FROM oauth2_auth_codes WHERE code=?`, code).Scan(&out.Code, &out.Pubkey, &out.RedirectURI, &expiry, &used); err != nil {
+		return out, err
+	}
+	out.ExpiresAt, err = time.Parse(time.RFC3339, expiry)
+	if err != nil || used != 0 || time.Now().After(out.ExpiresAt) {
+		return OAuth2AuthCode{}, fmt.Errorf("invalid or expired authorization code")
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE oauth2_auth_codes SET used=1 WHERE code=? AND used=0`, code)
+	if err != nil {
+		return OAuth2AuthCode{}, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil || rows != 1 {
+		return OAuth2AuthCode{}, fmt.Errorf("authorization code already consumed")
+	}
+	return out, tx.Commit()
+}
+
+func (s *SQLiteStore) CreateAccessToken(ctx context.Context, token, pubkey string, expiresAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO oauth2_access_tokens(token,pubkey,expires_at) VALUES(?,?,?)`, token, pubkey, expiresAt.UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s *SQLiteStore) GetAccessToken(ctx context.Context, token string) (OAuth2AccessToken, error) {
+	var out OAuth2AccessToken
+	var expiry string
+	if err := s.db.QueryRowContext(ctx, `SELECT token,pubkey,expires_at FROM oauth2_access_tokens WHERE token=?`, token).Scan(&out.Token, &out.Pubkey, &expiry); err != nil {
+		return out, err
+	}
+	var err error
+	out.ExpiresAt, err = time.Parse(time.RFC3339, expiry)
+	if err != nil || time.Now().After(out.ExpiresAt) {
+		return OAuth2AccessToken{}, fmt.Errorf("invalid or expired access token")
+	}
+	return out, nil
 }
 
 // --- Nostr identity link methods ---

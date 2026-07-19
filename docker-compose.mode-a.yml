@@ -20,6 +20,11 @@ services:
       HOOK_RELAY_URL: ws://localhost:3334
       LISTEN: :8090
       DB_PATH: /data/mappings.db
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      BRIDGE_PUBLIC_URL: ${BRIDGE_PUBLIC_URL:-}
+      OAUTH2_CLIENT_ID: ${OAUTH2_CLIENT_ID:-}
+      OAUTH2_CLIENT_SECRET: ${OAUTH2_CLIENT_SECRET:-}
+      OAUTH2_REDIRECT_URI: ${OAUTH2_REDIRECT_URI:-}
     volumes:
       - grasp-bridge-data:/data
       - gitea-data:/gitea-data

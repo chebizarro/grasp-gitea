@@ -20,6 +20,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
+	"github.com/sharegap/grasp-gitea/internal/oauth2"
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
@@ -99,12 +100,14 @@ func main() {
 		authSvc := auth.NewService(cfg, st, logger)
 		identitySvc := auth.NewIdentityService(st, giteaClient, nip05Resolver, logger)
 		nip07Handler := auth.NewNIP07Handler(authSvc, identitySvc, relayURLs, logger)
-		nip46Handler := auth.NewNIP46Handler(st, identitySvc, relayURLs, cfg.BridgePublicURL, nil, logger)
+		nip46Handler := auth.NewNIP46Handler(st, identitySvc, relayURLs, cfg.BridgePublicURL, auth.LiveBunkerConnector{}, logger)
 		nip55Handler := auth.NewNIP55Handler(authSvc, identitySvc, relayURLs, logger)
+		oauthProvider := oauth2.New(oauth2.Config{ClientID: cfg.OAuth2ClientID, ClientSecret: cfg.OAuth2ClientSecret, PublicURL: cfg.BridgePublicURL, RedirectURI: cfg.OAuth2RedirectURI}, authSvc, identitySvc, st, logger)
 		apiServer.AddRouteRegistrar(func(mux *http.ServeMux) {
 			nip07Handler.RegisterRoutes(mux)
 			nip46Handler.RegisterRoutes(mux)
 			nip55Handler.RegisterRoutes(mux)
+			oauthProvider.RegisterRoutes(mux)
 		})
 		logger.Info("Nostr auth routes enabled", "bridge_public_url", cfg.BridgePublicURL)
 	}
