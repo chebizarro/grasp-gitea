@@ -21,6 +21,51 @@ func TestOpenAndClose(t *testing.T) {
 	}
 }
 
+func TestOpenMigratesLegacyIdentityLinks(t *testing.T) {
+	path := t.TempDir() + "/legacy.db"
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	created := time.Now().UTC().Truncate(time.Second)
+	_, err = db.Exec(`
+		CREATE TABLE nostr_identity_links (
+			pubkey TEXT PRIMARY KEY,
+			npub TEXT NOT NULL,
+			nip05 TEXT NOT NULL DEFAULT '',
+			gitea_user_id INTEGER NOT NULL,
+			gitea_username TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			last_login_at DATETIME
+		);
+		INSERT INTO nostr_identity_links(pubkey, npub, nip05, gitea_user_id, gitea_username, created_at, last_login_at)
+		VALUES('legacy-pubkey', 'legacy-npub', '', 42, 'legacy-user', ?, ?)
+	`, created.Format(time.RFC3339), created.Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("seed legacy database: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate legacy database: %v", err)
+	}
+	defer st.Close()
+
+	link, err := st.GetIdentityLinkByPubkey(context.Background(), "legacy-pubkey")
+	if err != nil {
+		t.Fatalf("get migrated identity link: %v", err)
+	}
+	if link.GiteaUser != "legacy-user" {
+		t.Fatalf("migrated gitea user = %q, want legacy-user", link.GiteaUser)
+	}
+	if link.UpdatedAt.IsZero() {
+		t.Fatal("migrated updated_at is zero")
+	}
+}
+
 func TestUpsertAndGetMapping(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(t.TempDir() + "/test.db")

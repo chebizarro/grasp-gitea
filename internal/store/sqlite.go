@@ -325,6 +325,14 @@ func Open(path string) (*SQLiteStore, error) {
 	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_armed_at TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_fingerprint TEXT NOT NULL DEFAULT ''`)
 
+	// Migration: the original identity-link table used gitea_username and did
+	// not track updated_at. Preserve existing links while adopting the canonical
+	// column names used by the authentication service.
+	_, _ = db.Exec(`ALTER TABLE nostr_identity_links ADD COLUMN gitea_user TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE nostr_identity_links ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`UPDATE nostr_identity_links SET gitea_user = gitea_username WHERE gitea_user = ''`)
+	_, _ = db.Exec(`UPDATE nostr_identity_links SET updated_at = created_at WHERE updated_at = ''`)
+
 	// Index for looking up mappings by Gitea repo ID (used by mirror sync callback).
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_mappings_gitea_repo_id ON mappings(gitea_repo_id)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_nostr_refs_first_seen_at ON pending_nostr_refs(first_seen_at)`)
