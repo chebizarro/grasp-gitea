@@ -74,8 +74,18 @@ The local host lacked a C compiler, so SQLite/CGO tests fail closed with the kno
 and command wiring, compile and pass. The repository CI/build environment remains
 the full gate.
 
-GIT-AC1 is recorded after pushing this branch: retain the pushed commit SHA,
-webhook delivery response/log entry, and the relay-returned kind 30617 and 30618
-event IDs. Validate each event's computed ID and Schnorr signature before accepting
-the result. A 30617 may be a republished cached owner-signed announcement; 30618 is
-the bridge-signed pushed-ref state.
+GIT-AC1 push evidence:
+
+- Gitea accepted `netward/fp-32` at commit
+  `0a59abb8219d90b605a03ff97c3621c9e209239e` and reported `Processing 1
+  references` / `Processed 1 references in total`.
+- Relay event `d465280fa75a9d9a2c89581b82a17dee2068bdf51f9bb5be272a448067490aec`
+  is kind 30618, `d=grasp-gitea`, and contains
+  `refs/heads/netward/fp-32=0a59abb8219d90b605a03ff97c3621c9e209239e`.
+- Independent go-nostr verification returned `computed ID == event ID`,
+  `CheckID=true`, and `CheckSignature=true`.
+- A relay query for kinds 30617/30618 with `d=grasp-gitea` returned the new
+  30618 and older 30618 states, but no 30617. This is a real remaining gap: the
+  mapping has no relay-visible owner announcement to republish. Do not synthesize
+  one with a server key. GIT-AC1 is therefore not fully met until the owner signs
+  and publishes the canonical 30617 and a subsequent push proves both records.
