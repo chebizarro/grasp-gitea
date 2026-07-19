@@ -52,6 +52,14 @@ not rewritten.
 
 ## Verification record — 2026-07-18
 
+Fleet-planning baseline reconfirmed on 2026-07-19 at
+`3ad12218bd538db3d366a8b504db3433647b377d`: GIT-AC1 still requires a real
+Gitea Nostr session and push-produced, signature-valid 30617/30618. This branch
+now republishes the cached owner-signed 30617 on every state-producing push and
+rejects a cached announcement unless its kind, owner pubkey, `d` tag, computed
+ID, and Schnorr signature all match the repository mapping. It never re-signs
+30617 with the bridge key.
+
 Read-only live checks before change:
 
 - Gitea reported version `1.26.1` at `/api/v1/version`.

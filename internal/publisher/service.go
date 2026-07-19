@@ -126,8 +126,10 @@ func (s *Service) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) 
 		s.logger.Debug("continuing state publish without cached announcement", "owner", mapping.Owner, "repo", mapping.RepoID)
 	}
 
-	// Republish the cached owner-signed announcement if not already done.
-	if mapping.AnnouncementEventID != "" && mapping.AnnouncementEventID != mapping.LastRepublishedAnnouncementID {
+	// Republish the cached owner-signed announcement for every state-producing
+	// push. This makes the webhook proof self-contained: consumers receive the
+	// canonical owner authority (30617) alongside the new bridge state (30618).
+	if mapping.AnnouncementEventID != "" {
 		if err := s.republishAnnouncement(ctx, &mapping, now); err != nil {
 			s.logger.Warn("failed to republish announcement", "owner", mapping.Owner, "repo", mapping.RepoID, "error", err)
 			// Continue to state publishing regardless.
@@ -174,6 +176,9 @@ func (s *Service) republishAnnouncement(ctx context.Context, mapping *store.Mapp
 	if err := json.Unmarshal([]byte(mapping.AnnouncementEventJSON), &ev); err != nil {
 		return fmt.Errorf("unmarshal cached announcement: %w", err)
 	}
+	if err := validateAnnouncement(&ev, mapping); err != nil {
+		return err
+	}
 
 	if err := s.publishToRelays(ctx, &ev); err != nil {
 		return err
@@ -185,6 +190,33 @@ func (s *Service) republishAnnouncement(ctx context.Context, mapping *store.Mapp
 
 	s.logger.Info("republished owner-signed announcement",
 		"owner", mapping.Owner, "repo", mapping.RepoID, "event_id", ev.ID)
+	return nil
+}
+
+// validateAnnouncement ensures the cached event is the canonical owner-signed
+// authority for this mapping. The bridge republishes it verbatim and never
+// substitutes its server signer for kind 30617.
+func validateAnnouncement(ev *nostr.Event, mapping *store.Mapping) error {
+	if ev.Kind != relay.KindRepositoryAnnouncement {
+		return fmt.Errorf("cached announcement has kind %d, want %d", ev.Kind, relay.KindRepositoryAnnouncement)
+	}
+	if ev.PubKey != mapping.Pubkey {
+		return fmt.Errorf("cached announcement pubkey does not match mapping owner")
+	}
+	dTag := ev.Tags.GetFirst([]string{"d", ""})
+	if dTag == nil || len(*dTag) < 2 || (*dTag)[1] != mapping.RepoID {
+		return fmt.Errorf("cached announcement d tag does not match mapping repo")
+	}
+	if !ev.CheckID() {
+		return fmt.Errorf("cached announcement event id is invalid")
+	}
+	ok, err := ev.CheckSignature()
+	if err != nil {
+		return fmt.Errorf("verify cached announcement signature: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("cached announcement signature is invalid")
+	}
 	return nil
 }
 
