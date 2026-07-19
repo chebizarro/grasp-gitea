@@ -456,8 +456,38 @@ func TestPublisherSignerInputsAreMutuallyExclusive(t *testing.T) {
 		"RELAY_URLS": "wss://relay", "BRIDGE_NSEC": "nsec1example",
 		"BRIDGE_SIGNER_BUNKER_URI": "bunker://example",
 	})
-	if _, err := Load(); err == nil {
-		t.Fatal("expected mutually exclusive signer error")
+	if _, err := Load(); err == nil || err.Error() != "BRIDGE_NSEC and BRIDGE_SIGNER_BUNKER_URI are mutually exclusive" {
+		t.Fatalf("expected mutually exclusive signer error, got %v", err)
+	}
+}
+
+func TestPublisherRawKeyModeEnabled(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",
+		"RELAY_URLS": "wss://relay", "BRIDGE_NSEC": "nsec1example",
+		"BRIDGE_SIGNER_BUNKER_URI": "",
+	})
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.MirrorPublishEnabled() || cfg.BridgeSignerBunkerURI != "" {
+		t.Fatal("expected raw-key-only publisher mode")
+	}
+}
+
+func TestPublisherBunkerModeEnabled(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",
+		"RELAY_URLS": "wss://relay", "BRIDGE_NSEC": "",
+		"BRIDGE_SIGNER_BUNKER_URI": "bunker://example",
+	})
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.MirrorPublishEnabled() || cfg.BridgeNsec != "" {
+		t.Fatal("expected bunker-only publisher mode")
 	}
 }
 
