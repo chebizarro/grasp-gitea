@@ -4,11 +4,20 @@
 package publisher
 
 import (
+	"context"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 	"testing"
 )
+
+type testExternalSigner struct{ key, pubkey string }
+
+func (s testExternalSigner) PublicKey() string { return s.pubkey }
+func (s testExternalSigner) SignEvent(_ context.Context, ev *nostr.Event) error {
+	ev.PubKey = s.pubkey
+	return ev.Sign(s.key)
+}
 
 func TestComputeDigestDeterministic(t *testing.T) {
 	branches := map[string]string{
@@ -133,5 +142,25 @@ func TestNewServiceInvalidNsec(t *testing.T) {
 	_, err := New("not-an-nsec", nil, nil, "/tmp", nil)
 	if err == nil {
 		t.Fatal("expected error for invalid nsec")
+	}
+}
+
+func TestNewWithSignerBuildsSignatureValidState(t *testing.T) {
+	key := nostr.GeneratePrivateKey()
+	pubkey, _ := nostr.GetPublicKey(key)
+	svc, err := NewWithSigner(testExternalSigner{key: key, pubkey: pubkey}, nil, nil, "/tmp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, err := svc.buildStateEvent(context.Background(), "owner", "repo", "main", map[string]string{"main": "abc"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.PubKey != pubkey || !ev.CheckID() {
+		t.Fatal("external signer identity mismatch")
+	}
+	ok, err := ev.CheckSignature()
+	if err != nil || !ok {
+		t.Fatalf("external signature invalid: %v", err)
 	}
 }

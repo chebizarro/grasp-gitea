@@ -172,7 +172,7 @@ func (s *Service) HandleStateEventCI(ctx context.Context, ev *nostr.Event, sourc
 				return err
 			}
 
-			wfEv, buildErr := s.buildWorkflowRunEvent(
+			wfEv, buildErr := s.buildWorkflowRunEvent(ctx,
 				mapping.Pubkey, repoID, newSHA, branch, wf, sourceRelay)
 			if buildErr != nil {
 				s.logger.Warn("failed to build workflow run event",
@@ -261,7 +261,7 @@ func (s *Service) HandleWebhookPushCI(ctx context.Context, giteaRepoID int64, re
 	}
 
 	for _, wf := range workflows {
-		wfEv, buildErr := s.buildWorkflowRunEvent(mapping.Pubkey, mapping.RepoID, after, branch, wf, sourceRelay)
+		wfEv, buildErr := s.buildWorkflowRunEvent(ctx, mapping.Pubkey, mapping.RepoID, after, branch, wf, sourceRelay)
 		if buildErr != nil {
 			s.logger.Warn("failed to build workflow run event from webhook push",
 				"repo", mapping.RepoID, "branch", branch,
@@ -353,7 +353,7 @@ func listWorkflowFiles(ctx context.Context, repoPath, commitSHA, dir string) ([]
 
 // buildWorkflowRunEvent creates a kind:5401 WorkflowRun event and signs
 // it with the bridge key.
-func (s *Service) buildWorkflowRunEvent(ownerPubkey, repoID, commitSHA, branch, workflow, relayHint string) (*nostr.Event, error) {
+func (s *Service) buildWorkflowRunEvent(ctx context.Context, ownerPubkey, repoID, commitSHA, branch, workflow, relayHint string) (*nostr.Event, error) {
 	aTag := fmt.Sprintf("%d:%s:%s",
 		relay.KindRepositoryAnnouncement, ownerPubkey, repoID)
 
@@ -374,7 +374,7 @@ func (s *Service) buildWorkflowRunEvent(ownerPubkey, repoID, commitSHA, branch, 
 		Content: "",
 	}
 
-	if err := ev.Sign(s.bridgePrivKey); err != nil {
+	if err := s.signEvent(ctx, ev); err != nil {
 		return nil, fmt.Errorf("sign workflow run event: %w", err)
 	}
 	return ev, nil

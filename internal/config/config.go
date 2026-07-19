@@ -32,8 +32,9 @@ type Config struct {
 	OAuth2RedirectURI    string
 
 	// Mirror republish: bridge signs NIP-34 state events with this key.
-	BridgeNsec          string
-	MirrorCallbackToken string
+	BridgeNsec            string
+	BridgeSignerBunkerURI string
+	MirrorCallbackToken   string
 
 	// Gitea webhook handler for NIP-34 events (PRs, issues, patches, labels)
 	GiteaWebhookSecret string
@@ -46,32 +47,33 @@ type Config struct {
 
 func Load() (Config, error) {
 	cfg := Config{
-		GiteaURL:             envOrDefault("GITEA_URL", "http://gitea:3000"),
-		GiteaAdminToken:      strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
-		ClonePrefix:          strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
-		RelayURLs:            csvEnv("RELAY_URLS"),
-		Listen:               envOrDefault("LISTEN", ":8090"),
-		DBPath:               envOrDefault("DB_PATH", "./mappings.db"),
-		PubkeyAllowlist:      parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
-		ProvisionRateLimit:   intEnv("PROVISION_RATE_LIMIT", 0),
-		HookRelayURL:         envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),
-		HookBinaryPath:       envOrDefault("HOOK_BINARY_PATH", "/usr/local/bin/grasp-pre-receive"),
-		GiteaRepositoriesDir: envOrDefault("GITEA_REPOSITORIES_PATH", "/gitea-data/git/repositories"),
-		EmbeddedRelay:        boolEnv("EMBEDDED_RELAY", false),
-		EmbeddedRelayPort:    intEnv("EMBEDDED_RELAY_PORT", 3334),
-		EmbeddedRelayDB:      envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
-		AdminAPIToken:        strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
-		AuthEnabled:          boolEnv("AUTH_ENABLED", false),
-		BridgePublicURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
-		ChallengeTTL:         durationEnv("CHALLENGE_TTL", 5*time.Minute),
-		OAuth2ClientID:       strings.TrimSpace(os.Getenv("OAUTH2_CLIENT_ID")),
-		OAuth2ClientSecret:   strings.TrimSpace(os.Getenv("OAUTH2_CLIENT_SECRET")),
-		OAuth2RedirectURI:    strings.TrimSpace(os.Getenv("OAUTH2_REDIRECT_URI")),
-		BridgeNsec:           strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
-		MirrorCallbackToken:  strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
-		GiteaWebhookSecret:   strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
-		CIEnabled:            boolEnv("CI_ENABLED", false),
-		CITriggerRepos:       csvEnv("CI_TRIGGER_REPOS"),
+		GiteaURL:              envOrDefault("GITEA_URL", "http://gitea:3000"),
+		GiteaAdminToken:       strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
+		ClonePrefix:           strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
+		RelayURLs:             csvEnv("RELAY_URLS"),
+		Listen:                envOrDefault("LISTEN", ":8090"),
+		DBPath:                envOrDefault("DB_PATH", "./mappings.db"),
+		PubkeyAllowlist:       parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
+		ProvisionRateLimit:    intEnv("PROVISION_RATE_LIMIT", 0),
+		HookRelayURL:          envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),
+		HookBinaryPath:        envOrDefault("HOOK_BINARY_PATH", "/usr/local/bin/grasp-pre-receive"),
+		GiteaRepositoriesDir:  envOrDefault("GITEA_REPOSITORIES_PATH", "/gitea-data/git/repositories"),
+		EmbeddedRelay:         boolEnv("EMBEDDED_RELAY", false),
+		EmbeddedRelayPort:     intEnv("EMBEDDED_RELAY_PORT", 3334),
+		EmbeddedRelayDB:       envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
+		AdminAPIToken:         strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
+		AuthEnabled:           boolEnv("AUTH_ENABLED", false),
+		BridgePublicURL:       strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
+		ChallengeTTL:          durationEnv("CHALLENGE_TTL", 5*time.Minute),
+		OAuth2ClientID:        strings.TrimSpace(os.Getenv("OAUTH2_CLIENT_ID")),
+		OAuth2ClientSecret:    strings.TrimSpace(os.Getenv("OAUTH2_CLIENT_SECRET")),
+		OAuth2RedirectURI:     strings.TrimSpace(os.Getenv("OAUTH2_REDIRECT_URI")),
+		BridgeNsec:            strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
+		BridgeSignerBunkerURI: strings.TrimSpace(os.Getenv("BRIDGE_SIGNER_BUNKER_URI")),
+		MirrorCallbackToken:   strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
+		GiteaWebhookSecret:    strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
+		CIEnabled:             boolEnv("CI_ENABLED", false),
+		CITriggerRepos:        csvEnv("CI_TRIGGER_REPOS"),
 	}
 
 	if cfg.GiteaAdminToken == "" {
@@ -92,6 +94,9 @@ func Load() (Config, error) {
 	if cfg.AuthEnabled && (cfg.OAuth2ClientID == "" || cfg.OAuth2ClientSecret == "" || cfg.OAuth2RedirectURI == "") {
 		return Config{}, fmt.Errorf("OAUTH2_CLIENT_ID, OAUTH2_CLIENT_SECRET, and OAUTH2_REDIRECT_URI are required when AUTH_ENABLED=true")
 	}
+	if cfg.BridgeNsec != "" && cfg.BridgeSignerBunkerURI != "" {
+		return Config{}, fmt.Errorf("BRIDGE_NSEC and BRIDGE_SIGNER_BUNKER_URI are mutually exclusive")
+	}
 
 	return cfg, nil
 }
@@ -103,7 +108,7 @@ func (c Config) AllowlistEnabled() bool {
 // MirrorPublishEnabled reports whether the bridge is configured to republish
 // NIP-34 events on mirror sync callbacks.
 func (c Config) MirrorPublishEnabled() bool {
-	return c.BridgeNsec != ""
+	return c.BridgeNsec != "" || c.BridgeSignerBunkerURI != ""
 }
 
 func envOrDefault(key string, fallback string) string {

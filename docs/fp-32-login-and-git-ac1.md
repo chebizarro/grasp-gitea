@@ -15,6 +15,20 @@ OAUTH2_CLIENT_SECRET=<secret-store reference>
 OAUTH2_REDIRECT_URI=https://git.sharegap.net/user/oauth2/nostr/callback
 ```
 
+For nsec-free outbound 30618/5401 signing, configure the owner-approved,
+Signet-delivered URI:
+
+```text
+BRIDGE_SIGNER_BUNKER_URI=<secret-store reference to delivered bunker URI>
+BRIDGE_NSEC=
+```
+
+The signer inputs are mutually exclusive. Startup connects to the NIP-46
+bunker, resolves its public key, and fails closed if Signet is unavailable or
+returns an invalid event ID/signature. The generated NIP-46 client key is
+ephemeral and is not the bridge identity key. Never log or commit a delivered
+bunker URI because it may contain a connect secret.
+
 Register the matching authentication source from inside the Gitea 1.26.1
 container, with `OAUTH2_CLIENT_SECRET` injected by the secret store:
 
@@ -97,3 +111,37 @@ GIT-AC1 push evidence:
   mapping has no relay-visible owner announcement to republish. Do not synthesize
   one with a server key. GIT-AC1 is therefore not fully met until the owner signs
   and publishes the canonical 30617 and a subsequent push proves both records.
+
+## Infrastructure preflight — 2026-07-19
+
+No live configuration was changed.
+
+- `GET https://grasp.sharegap.net/health` returned 200.
+- OIDC discovery at `/.well-known/openid-configuration` returned 404.
+- Gitea 1.26.1 `/user/login` already renders “Sign in with Nostr” at
+  `/user/oauth2/Nostr`; following it returned HTTP 500. The auth source is
+  visible before its bridge provider is deployable. Keep it disabled or out of
+  user reach during the eventual change window until discovery, authorization,
+  token, and userinfo prechecks all pass.
+- Signet `192.168.40.104:8085/health` returned 200 with DB open, one relay,
+  keystore available, and ten active agents. Health does not prove that a bunker
+  URI for the grasp bridge identity has been delivered.
+
+The canonical `d=grasp-gitea` 30617 must be signed by repository owner pubkey
+`cdee943cbb19c51ab847a66d5d774373aa9f63d287246bb59b0827fa5e637400`,
+which is referenced as owner by the live 30618. The legitimate path is for Biz
+to sign kind 30617 directly with that identity (NIP-07) or through a
+Signet-delivered bunker for that same pubkey, with at least:
+
+```text
+["d", "grasp-gitea"]
+["name", "grasp-gitea"]
+["clone", "https://git.sharegap.net/cascadia/grasp-gitea.git"]
+["relays", "wss://relay.sharegap.net"]
+```
+
+Publish it to `wss://relay.sharegap.net`. The bridge subscriber validates it,
+matches the clone prefix/repository ID, and caches the raw event for verbatim
+republishing. The fleet-wide Signet daemon bunker pubkey is not proof of
+ownership and must not be used to impersonate Biz; provisioning or reissuing an
+owner-specific bunker is an authority-gated operation.
