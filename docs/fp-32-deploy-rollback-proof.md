@@ -7,7 +7,7 @@ Run the live sections only after explicit owner approval.
 ## Offline build and signer-mode proof
 
 ```sh
-git switch netward/fp-32-next
+git switch netward/fp-32
 git status --short --branch
 git rev-parse HEAD
 git diff --check
@@ -113,8 +113,8 @@ export GITEA_URL=https://git.sharegap.net
 export REPO_D=grasp-gitea
 export OWNER_PUBKEY=cdee943cbb19c51ab847a66d5d774373aa9f63d287246bb59b0827fa5e637400
 export PUBLISHER_PUBKEY='<public key returned by the approved bridge bunker>'
-export EXPECTED_REF=refs/heads/netward/fp-32-next
-export EXPECTED_SHA="$(git rev-parse netward/fp-32-next)"
+export EXPECTED_REF=refs/heads/netward/fp-32
+export EXPECTED_SHA="$(git rev-parse netward/fp-32)"
 ```
 
 1. Prove OIDC surfaces before exposing the login source:

@@ -102,6 +102,28 @@ exact OpenID Connect client library pinned by Gitea 1.26.1 (Goth v1.82.0) across
 discovery, authorization, NIP-07 proof, code exchange, ID-token validation, and
 userinfo identity matching.
 
+Executable end-to-end coverage on `netward/fp-32` adds two acceptance proofs:
+
+- `TestGitea126GothEndToEndSession` runs both NIP-07 and NIP-46 through the
+  bridge provider and Gitea 1.26.1's pinned Goth client, returns through
+  `/user/oauth2/nostr/callback`, exchanges the authorization code, resolves the
+  same Nostr identity through userinfo, and establishes a Gitea-compatible
+  `i_like_gitea` browser session. The verbose test output records only flow,
+  callback path, HTTP status, username, and cookie presence.
+- `TestOutboundNIP34AnnouncementAndStateEndToEnd` creates independent owner and
+  bridge identities, republishes the owner-signed 30617 and publishes the
+  bridge-signed 30618 through a real WebSocket relay, queries both back, and
+  independently verifies event IDs, Schnorr signatures, owner authority, `d`,
+  clone, `p`, ref, and commit SHA. The verbose output records only public event
+  evidence.
+
+A fresh read-only production relay query on 2026-07-19 independently verified
+the latest 30618 (`51df992fcdb377463fee1820c193401a7e0f4645a69f1a914c288c363ac7ae4a`)
+and found 13 signature-valid 30618 events but still zero 30617 events for
+`d=grasp-gitea`. The production owner-announcement gate therefore remains open;
+the hermetic proof does not substitute generated test authority for Biz's live
+owner identity.
+
 GIT-AC1 push evidence:
 
 - Gitea accepted `netward/fp-32` at commit
