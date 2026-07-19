@@ -39,6 +39,28 @@ func mergeRelayURLs(configured []string, embeddedURL string) []string {
 	return result
 }
 
+type publisherSignerFactory func(context.Context, string) (publisher.EventSigner, error)
+
+func createPublisher(ctx context.Context, cfg config.Config, st *store.SQLiteStore, relayURLs []string, logger *slog.Logger, connectSigner publisherSignerFactory) (*publisher.Service, error) {
+	if cfg.BridgeNsec != "" && cfg.BridgeSignerBunkerURI != "" {
+		return nil, errors.New("BRIDGE_NSEC and BRIDGE_SIGNER_BUNKER_URI are mutually exclusive")
+	}
+	if !cfg.MirrorPublishEnabled() {
+		return nil, nil
+	}
+	if cfg.BridgeSignerBunkerURI == "" {
+		return publisher.New(cfg.BridgeNsec, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
+	}
+	if connectSigner == nil {
+		return nil, errors.New("external publisher signer connector is required")
+	}
+	signer, err := connectSigner(ctx, cfg.BridgeSignerBunkerURI)
+	if err != nil {
+		return nil, err
+	}
+	return publisher.NewWithSigner(signer, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -81,22 +103,14 @@ func main() {
 	relayURLs := mergeRelayURLs(cfg.RelayURLs, embeddedRelayURL)
 
 	// Create the publisher (signs & publishes NIP-34 events on mirror sync).
-	var publisherSvc *publisher.Service
-	if cfg.MirrorPublishEnabled() {
-		if cfg.BridgeSignerBunkerURI != "" {
-			signer, signerErr := publisher.NewNIP46Signer(ctx, cfg.BridgeSignerBunkerURI)
-			if signerErr != nil {
-				logger.Error("failed to connect external publisher signer", "error", signerErr)
-				os.Exit(1)
-			}
-			publisherSvc, err = publisher.NewWithSigner(signer, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
-		} else {
-			publisherSvc, err = publisher.New(cfg.BridgeNsec, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
-		}
-		if err != nil {
-			logger.Error("failed to create publisher", "error", err)
-			os.Exit(1)
-		}
+	publisherSvc, err := createPublisher(ctx, cfg, st, relayURLs, logger, func(ctx context.Context, bunkerURI string) (publisher.EventSigner, error) {
+		return publisher.NewNIP46Signer(ctx, bunkerURI)
+	})
+	if err != nil {
+		logger.Error("failed to create publisher", "error", err)
+		os.Exit(1)
+	}
+	if publisherSvc != nil {
 		if cfg.CIEnabled {
 			publisherSvc.SetCIConfig(true, cfg.CITriggerRepos)
 			logger.Info("CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
