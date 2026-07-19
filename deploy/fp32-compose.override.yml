@@ -1,6 +1,6 @@
 services:
   grasp-bridge:
-    image: grasp-bridge:edb0ad55
+    image: grasp-bridge:fp32
     environment:
       BRIDGE_NSEC: ""
       GRASP_SERVER_NSEC: ""
