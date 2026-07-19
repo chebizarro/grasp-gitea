@@ -86,15 +86,21 @@ Read-only live checks before change:
 Source verification:
 
 ```sh
-go test ./...
+CGO_ENABLED=1 go test ./... -count=1
 go vet ./...
+CGO_ENABLED=1 go test -race \
+  ./cmd/grasp-bridge ./internal/config ./internal/oauth2 ./internal/publisher \
+  -count=1
 git diff --check
 ```
 
-The local host lacked a C compiler, so SQLite/CGO tests fail closed with the known
-`go-sqlite3 requires cgo` stub error. Non-SQLite packages, including bridge config
-and command wiring, compile and pass. The repository CI/build environment remains
-the full gate.
+The host lacked a system Go/C toolchain, so verification used checksum-verified
+temporary Go 1.24.13 and Zig 0.14.1 toolchains with `CGO_ENABLED=1`; nothing was
+installed system-wide. The complete SQLite-backed package suite, vet, and the
+focused race suite passed. `TestGitea126GothOIDCCompatibility` exercises the
+exact OpenID Connect client library pinned by Gitea 1.26.1 (Goth v1.82.0) across
+discovery, authorization, NIP-07 proof, code exchange, ID-token validation, and
+userinfo identity matching.
 
 GIT-AC1 push evidence:
 

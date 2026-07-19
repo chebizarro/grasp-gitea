@@ -6,9 +6,11 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 
 	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
@@ -96,8 +98,12 @@ func TestCreatePublisherDisabledWithoutSignerInput(t *testing.T) {
 
 func TestCreatePublisherUsesRawKeyWithoutConnectingBunker(t *testing.T) {
 	key := nostr.GeneratePrivateKey()
+	nsec, err := nip19.EncodePrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
 	connected := false
-	svc, err := createPublisher(context.Background(), config.Config{BridgeNsec: key}, nil, nil, nil,
+	svc, err := createPublisher(context.Background(), config.Config{BridgeNsec: nsec}, nil, nil, slog.Default(),
 		func(context.Context, string) (publisher.EventSigner, error) {
 			connected = true
 			return nil, errors.New("must not connect")
@@ -140,8 +146,12 @@ func TestCreatePublisherPropagatesBunkerConnectorFailure(t *testing.T) {
 }
 
 func TestCreatePublisherRejectsBothSignerModesBeforeConnecting(t *testing.T) {
+	nsec, err := nip19.EncodePrivateKey(nostr.GeneratePrivateKey())
+	if err != nil {
+		t.Fatal(err)
+	}
 	connected := false
-	svc, err := createPublisher(context.Background(), config.Config{BridgeNsec: nostr.GeneratePrivateKey(), BridgeSignerBunkerURI: "bunker://signer"}, nil, nil, nil,
+	svc, err := createPublisher(context.Background(), config.Config{BridgeNsec: nsec, BridgeSignerBunkerURI: "bunker://signer"}, nil, nil, nil,
 		func(context.Context, string) (publisher.EventSigner, error) {
 			connected = true
 			return nil, nil
