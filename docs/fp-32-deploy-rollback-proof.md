@@ -112,6 +112,7 @@ export BRIDGE_URL=https://grasp.sharegap.net
 export GITEA_URL=https://git.sharegap.net
 export REPO_D=grasp-gitea
 export OWNER_PUBKEY=cdee943cbb19c51ab847a66d5d774373aa9f63d287246bb59b0827fa5e637400
+export PUBLISHER_PUBKEY='<public key returned by the approved bridge bunker>'
 export EXPECTED_REF=refs/heads/netward/fp-32-next
 export EXPECTED_SHA="$(git rev-parse netward/fp-32-next)"
 ```
@@ -133,26 +134,32 @@ username, and logout success. Never record tokens, cookies, nsecs, or bunker URI
 `$OWNER_PUBKEY`. Do not synthesize or re-sign it with the bridge key. Then push
 the expected branch through the normal Gitea path so the bridge emits `30618`.
 
-4. Query the relay with an approved Nostr CLI and save JSON to a protected
-evidence directory. Verify both events independently:
+4. Query the relay with `nak` and save JSON to a protected evidence directory.
+Verify every returned event independently, then assert the expected authority,
+repository coordinate, owner tag, ref, and SHA:
 
 ```sh
-: "${NOSTR_QUERY_CMD:?set command that writes matching relay events as JSONL}"
+command -v nak >/dev/null
 EVIDENCE_DIR="$(mktemp -d)"
 chmod 0700 "$EVIDENCE_DIR"
-sh -c "$NOSTR_QUERY_CMD" >"$EVIDENCE_DIR/nip34.jsonl"
+nak req -k 30617 -k 30618 -t "d=$REPO_D" "$RELAY_URL" \
+  >"$EVIDENCE_DIR/nip34.jsonl"
+test -s "$EVIDENCE_DIR/nip34.jsonl"
+while IFS= read -r event; do
+  printf '%s\n' "$event" | nak verify
+done <"$EVIDENCE_DIR/nip34.jsonl"
 jq -e --arg owner "$OWNER_PUBKEY" --arg d "$REPO_D" \
   'select(.kind == 30617 and .pubkey == $owner and any(.tags[]; .[0] == "d" and .[1] == $d))' \
   "$EVIDENCE_DIR/nip34.jsonl" >/dev/null
-jq -e --arg ref "$EXPECTED_REF" --arg sha "$EXPECTED_SHA" --arg d "$REPO_D" \
-  'select(.kind == 30618 and any(.tags[]; .[0] == "d" and .[1] == $d) and any(.tags[]; .[0] == $ref and .[1] == $sha))' \
+jq -e --arg signer "$PUBLISHER_PUBKEY" --arg owner "$OWNER_PUBKEY" \
+  --arg ref "$EXPECTED_REF" --arg sha "$EXPECTED_SHA" --arg d "$REPO_D" \
+  'select(.kind == 30618 and .pubkey == $signer and any(.tags[]; .[0] == "d" and .[1] == $d) and any(.tags[]; .[0] == "p" and .[1] == $owner) and any(.tags[]; .[0] == $ref and .[1] == $sha))' \
   "$EVIDENCE_DIR/nip34.jsonl" >/dev/null
-: "${NOSTR_VERIFY_CMD:?set independent event ID/signature verifier command}"
-sh -c "$NOSTR_VERIFY_CMD '$EVIDENCE_DIR/nip34.jsonl'"
 sha256sum "$EVIDENCE_DIR/nip34.jsonl"
 ```
 
-The placeholders `NOSTR_QUERY_CMD` and `NOSTR_VERIFY_CMD` must be replaced by
-Gus's fp-ops.1 interface when delivered. fp-ops.2 is complete only when that
-interface proves relay receipt, computed IDs, Schnorr signatures, owner pubkey,
-`d` tag, expected ref, and expected SHA.
+When Gus delivers fp-ops.1, replace the `nak req`/`nak verify` block at this
+boundary with that interface while retaining the same JSONL and exit-status
+contract. fp-ops.2 is complete only when it proves relay receipt, computed IDs,
+Schnorr signatures, announcement owner pubkey, state publisher pubkey, owner
+`p` tag, `d` tag, expected ref, and expected SHA.
