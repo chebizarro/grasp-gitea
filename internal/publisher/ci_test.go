@@ -99,6 +99,31 @@ func TestBuildWorkflowRunEvent(t *testing.T) {
 	}
 }
 
+func TestBuildWorkflowRunEventWithExternalSigner(t *testing.T) {
+	privKey := nostr.GeneratePrivateKey()
+	pubKey, err := nostr.GetPublicKey(privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := NewWithSigner(testExternalSigner{key: privKey, pubkey: pubKey}, nil, nil, "/tmp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ev, err := svc.buildWorkflowRunEvent(context.Background(), "owner", "repo", "commit", "main", ".github/workflows/ci.yml", "wss://relay.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.PubKey != pubKey || !ev.CheckID() {
+		t.Fatal("external signer identity mismatch")
+	}
+	ok, err := ev.CheckSignature()
+	if err != nil || !ok {
+		t.Fatalf("external workflow-run signature invalid: %v", err)
+	}
+	assertTag(t, ev, "publisher", pubKey)
+}
+
 func TestBuildWorkflowRunEventDifferentBranch(t *testing.T) {
 	privKey := nostr.GeneratePrivateKey()
 	pubKey, _ := nostr.GetPublicKey(privKey)

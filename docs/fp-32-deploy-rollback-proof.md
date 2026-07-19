@@ -77,7 +77,8 @@ Render and validate the candidate without starting it:
 docker compose -f "$DEPLOY_DIR/docker-compose.yml" config --quiet
 docker compose -f "$DEPLOY_DIR/docker-compose.yml" build grasp-bridge
 docker compose -f "$DEPLOY_DIR/docker-compose.yml" run --rm --no-deps \
-  grasp-bridge /bin/sh -c 'test -n "${BRIDGE_NSEC:-}${BRIDGE_SIGNER_BUNKER_URI:-}"; test -z "${BRIDGE_NSEC:-}" || test -z "${BRIDGE_SIGNER_BUNKER_URI:-}"'
+  --entrypoint /bin/sh grasp-bridge \
+  -c 'test -n "${BRIDGE_NSEC:-}${BRIDGE_SIGNER_BUNKER_URI:-}"; test -z "${BRIDGE_NSEC:-}" || test -z "${BRIDGE_SIGNER_BUNKER_URI:-}"'
 ```
 
 ## Rollback
