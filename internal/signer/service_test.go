@@ -102,8 +102,8 @@ func TestCreateGrantPersistsEncryptedGrant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decrypt bunker URI: %v", err)
 	}
-	if bunkerURIPlain != bunkerURI {
-		t.Fatal("decrypted bunker URI did not round-trip")
+	if bunkerURIPlain != "bunker://"+signerPubkey+"?relay=wss%3A%2F%2Frelay.example" {
+		t.Fatalf("persisted bunker URI = %q; expected reusable URI without connect secret", bunkerURIPlain)
 	}
 	if stored.Relays != `["wss://relay.example"]` {
 		t.Fatalf("stored relays = %s", stored.Relays)

@@ -163,7 +163,11 @@ func (s *Service) CreateGrant(ctx context.Context, bunkerURI string) (GrantInfo,
 	if err != nil {
 		return GrantInfo{}, err
 	}
-	bunkerURIEnc, err := s.encryptSecret(bunkerURI)
+	durableBunkerURI, err := stripConnectSecret(bunkerURI)
+	if err != nil {
+		return GrantInfo{}, err
+	}
+	bunkerURIEnc, err := s.encryptSecret(durableBunkerURI)
 	if err != nil {
 		return GrantInfo{}, err
 	}
@@ -193,6 +197,21 @@ func (s *Service) CreateGrant(ctx context.Context, bunkerURI string) (GrantInfo,
 
 	s.cacheSigner(signerPubkey, bunker)
 	return GrantInfo{Pubkey: signerPubkey, ClientPubkey: clientPubkey, Relays: relays, GrantedAt: now}, nil
+}
+
+// stripConnectSecret removes the one-time NIP-46 connection secret before a
+// grant is persisted. Reconnects authenticate with the durable client key that
+// was authorized during CreateGrant; replaying the consumed secret can fail or
+// unnecessarily retain sensitive bootstrap material.
+func stripConnectSecret(bunkerURI string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(bunkerURI))
+	if err != nil {
+		return "", fmt.Errorf("parse bunker URI for persistence: %w", err)
+	}
+	q := u.Query()
+	q.Del("secret")
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 // SignWithGrant signs evt with the remote signer authorized by pubkey.
