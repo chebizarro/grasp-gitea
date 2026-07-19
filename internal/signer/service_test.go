@@ -147,6 +147,38 @@ func TestCreateGrantRejectsSignerPubkeyMismatch(t *testing.T) {
 	}
 }
 
+func TestCreateGrantAcceptsIdentityFromTrustedMultiplexedBunker(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	servicePubkey := mustPubkey(t, nostr.Generate().Hex())
+	identitySecret := nostr.Generate().Hex()
+	identityPubkey := mustPubkey(t, identitySecret)
+	bunkerURI := "bunker://" + servicePubkey + "?relay=wss://relay.example&secret=connect"
+
+	svc, err := NewService(
+		st,
+		[]byte("12345678901234567890123456789012"),
+		WithTrustedMultiplexedBunkerURI(bunkerURI),
+		WithConnector(func(context.Context, string, string) (BunkerSigner, error) {
+			return &fakeBunkerSigner{pubkey: identityPubkey, secret: identitySecret}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error: %v", err)
+	}
+
+	grant, err := svc.CreateGrant(ctx, bunkerURI)
+	if err != nil {
+		t.Fatalf("CreateGrant() error: %v", err)
+	}
+	if grant.Pubkey != identityPubkey {
+		t.Fatalf("grant pubkey = %s, want %s", grant.Pubkey, identityPubkey)
+	}
+	if _, err := st.GetSignerGrant(ctx, identityPubkey); err != nil {
+		t.Fatalf("trusted multiplexed signer grant was not stored: %v", err)
+	}
+}
+
 func TestSignWithGrantSignsViaPooledSigner(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStore(t)

@@ -55,10 +55,11 @@ type GrantInfo struct {
 }
 
 type Service struct {
-	store     *store.SQLiteStore
-	enabled   bool
-	masterKey [32]byte
-	connector BunkerConnector
+	store                *store.SQLiteStore
+	enabled              bool
+	masterKey            [32]byte
+	connector            BunkerConnector
+	trustedBunkerPubkeys map[string]struct{}
 
 	mu   sync.Mutex
 	pool map[string]BunkerSigner
@@ -75,14 +76,28 @@ func WithConnector(connector BunkerConnector) Option {
 	}
 }
 
+// WithTrustedMultiplexedBunkerURI permits a configured NIP-46 service to
+// return the selected identity pubkey instead of the service pubkey encoded in
+// its URI. This supports multi-tenant signers such as Signet without relaxing
+// pubkey matching for arbitrary user-supplied bunkers.
+func WithTrustedMultiplexedBunkerURI(bunkerURI string) Option {
+	return func(s *Service) {
+		pubkey, _, err := parseBunkerURI(strings.TrimSpace(bunkerURI))
+		if err == nil && pubkey != "" {
+			s.trustedBunkerPubkeys[pubkey] = struct{}{}
+		}
+	}
+}
+
 // NewService creates the persistent signer service. A nil/empty master key is a
 // safe disabled mode; callers can construct the service unconditionally and
 // check Enabled before exposing signer-dependent features.
 func NewService(st *store.SQLiteStore, masterKey []byte, opts ...Option) (*Service, error) {
 	svc := &Service{
-		store:     st,
-		connector: connectNIP46Bunker,
-		pool:      make(map[string]BunkerSigner),
+		store:                st,
+		connector:            connectNIP46Bunker,
+		pool:                 make(map[string]BunkerSigner),
+		trustedBunkerPubkeys: make(map[string]struct{}),
 	}
 	if len(masterKey) == 0 {
 		return svc, nil
@@ -136,7 +151,9 @@ func (s *Service) CreateGrant(ctx context.Context, bunkerURI string) (GrantInfo,
 	}
 	signerPubkey := signerPK.Hex()
 	if expectedPubkey != "" && signerPubkey != expectedPubkey {
-		return GrantInfo{}, fmt.Errorf("signer pubkey mismatch: bunker URI targets %s but signer reported %s", expectedPubkey, signerPubkey)
+		if _, trusted := s.trustedBunkerPubkeys[expectedPubkey]; !trusted {
+			return GrantInfo{}, fmt.Errorf("signer pubkey mismatch: bunker URI targets %s but signer reported %s", expectedPubkey, signerPubkey)
+		}
 	}
 	if err := bunker.Ping(ctx); err != nil {
 		return GrantInfo{}, fmt.Errorf("%w: ping signer: %v", ErrSignerOffline, err)

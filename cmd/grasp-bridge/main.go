@@ -105,7 +105,7 @@ func main() {
 
 	var signerSvc *signer.Service
 	if cfg.SignerEnabled() {
-		signerSvc, err = signer.NewService(st, cfg.SignerMasterKey)
+		signerSvc, err = signer.NewService(st, cfg.SignerMasterKey, signer.WithTrustedMultiplexedBunkerURI(cfg.SignetBunkerURL))
 		if err != nil {
 			logger.Error("failed to create signer service", "error", err)
 			os.Exit(1)
