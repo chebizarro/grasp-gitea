@@ -1565,6 +1565,19 @@ func (s *SQLiteStore) RecordStatePublished(ctx context.Context, npub, repoID, di
 
 // CreateNIP46Session persists a new NIP-46 login session.
 func (s *SQLiteStore) CreateNIP46Session(ctx context.Context, sess NIP46Session) error {
+	if hasLegacyNIP46Columns(s.db) {
+		_, err := s.db.ExecContext(ctx, `
+			INSERT INTO nip46_sessions(
+				session_token, bunker_pubkey, client_pubkey, oauth2_state, redirect_uri,
+				status, auth_code, error_msg, created_at, expires_at,
+				state, result_pubkey, error
+			) VALUES(?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, sess.SessionToken, sess.BunkerPubkey, sess.ClientPubkey, sess.RedirectURI,
+			sess.State, sess.ResultPubkey, sess.Error,
+			sess.CreatedAt.UTC().Format(time.RFC3339), sess.ExpiresAt.UTC().Format(time.RFC3339),
+			sess.State, sess.ResultPubkey, sess.Error)
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO nip46_sessions(session_token, bunker_pubkey, client_pubkey, state, redirect_uri, result_pubkey, error, created_at, expires_at)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1573,6 +1586,26 @@ func (s *SQLiteStore) CreateNIP46Session(ctx context.Context, sess NIP46Session)
 		sess.CreatedAt.UTC().Format(time.RFC3339),
 		sess.ExpiresAt.UTC().Format(time.RFC3339))
 	return err
+}
+
+func hasLegacyNIP46Columns(db *sql.DB) bool {
+	rows, err := db.Query(`PRAGMA table_info(nip46_sessions)`)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false
+		}
+		if name == "oauth2_state" {
+			return true
+		}
+	}
+	return false
 }
 
 // GetNIP46Session retrieves a session by token. Returns sql.ErrNoRows if not found.

@@ -109,6 +109,17 @@ func TestOpenMigratesLegacyNIP46Sessions(t *testing.T) {
 	if sess.State != "complete" || sess.ResultPubkey != "result-pubkey" {
 		t.Fatalf("migrated session = state %q result %q", sess.State, sess.ResultPubkey)
 	}
+
+	newSession := NIP46Session{
+		SessionToken: "new-session", BunkerPubkey: "new-bunker", ClientPubkey: "new-client",
+		State: "pending", RedirectURI: "/new", CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := st.CreateNIP46Session(context.Background(), newSession); err != nil {
+		t.Fatalf("create session in migrated legacy table: %v", err)
+	}
+	if _, err := st.GetNIP46Session(context.Background(), "new-session"); err != nil {
+		t.Fatalf("get new session from migrated legacy table: %v", err)
+	}
 }
 
 func TestUpsertAndGetMapping(t *testing.T) {
