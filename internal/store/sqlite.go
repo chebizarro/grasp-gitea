@@ -333,6 +333,15 @@ func Open(path string) (*SQLiteStore, error) {
 	_, _ = db.Exec(`UPDATE nostr_identity_links SET gitea_user = gitea_username WHERE gitea_user = ''`)
 	_, _ = db.Exec(`UPDATE nostr_identity_links SET updated_at = created_at WHERE updated_at = ''`)
 
+	// Migration: early NIP-46 sessions used status/auth_code/error_msg. Retain
+	// their state while moving to the canonical state/result_pubkey/error names.
+	_, _ = db.Exec(`ALTER TABLE nip46_sessions ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'`)
+	_, _ = db.Exec(`ALTER TABLE nip46_sessions ADD COLUMN result_pubkey TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE nip46_sessions ADD COLUMN error TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`UPDATE nip46_sessions SET state = status WHERE status != ''`)
+	_, _ = db.Exec(`UPDATE nip46_sessions SET result_pubkey = auth_code WHERE auth_code != ''`)
+	_, _ = db.Exec(`UPDATE nip46_sessions SET error = error_msg WHERE error_msg != ''`)
+
 	// Index for looking up mappings by Gitea repo ID (used by mirror sync callback).
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_mappings_gitea_repo_id ON mappings(gitea_repo_id)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_nostr_refs_first_seen_at ON pending_nostr_refs(first_seen_at)`)

@@ -66,6 +66,51 @@ func TestOpenMigratesLegacyIdentityLinks(t *testing.T) {
 	}
 }
 
+func TestOpenMigratesLegacyNIP46Sessions(t *testing.T) {
+	path := t.TempDir() + "/legacy-nip46.db"
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	_, err = db.Exec(`
+		CREATE TABLE nip46_sessions (
+			session_token TEXT PRIMARY KEY,
+			bunker_pubkey TEXT NOT NULL,
+			client_pubkey TEXT NOT NULL,
+			oauth2_state TEXT NOT NULL DEFAULT '',
+			redirect_uri TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'pending',
+			auth_code TEXT NOT NULL DEFAULT '',
+			error_msg TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			expires_at DATETIME NOT NULL
+		);
+		INSERT INTO nip46_sessions(session_token, bunker_pubkey, client_pubkey, redirect_uri, status, auth_code, error_msg, created_at, expires_at)
+		VALUES('legacy-session', 'bunker-pubkey', 'client-pubkey', '/', 'complete', 'result-pubkey', '', ?, ?)
+	`, now.Format(time.RFC3339), now.Add(time.Minute).Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("seed legacy database: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate legacy database: %v", err)
+	}
+	defer st.Close()
+
+	sess, err := st.GetNIP46Session(context.Background(), "legacy-session")
+	if err != nil {
+		t.Fatalf("get migrated NIP-46 session: %v", err)
+	}
+	if sess.State != "complete" || sess.ResultPubkey != "result-pubkey" {
+		t.Fatalf("migrated session = state %q result %q", sess.State, sess.ResultPubkey)
+	}
+}
+
 func TestUpsertAndGetMapping(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(t.TempDir() + "/test.db")
