@@ -7,12 +7,10 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
-	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 )
 
 // NIP07Handler provides HTTP endpoints for the NIP-07 browser extension
@@ -88,18 +86,10 @@ func (h *NIP07Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
 
 	ev := req.SignedEvent
 
-	// 1. Validate event ID and signature.
-	if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
+	// 1. Apply the fleet shared NIP-98 verification contract.
+	if _, err := h.authService.VerifyNIP98(ev, http.MethodPost, h.authService.publicURL+"/auth/nip07/verify"); err != nil {
 		metrics.IncAuthVerifyFailure()
-		h.logger.Warn("NIP-98 event failed signature check", "error", err)
-		h.writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid event signature"})
-		return
-	}
-
-	// 2. Validate NIP-98 semantics.
-	if err := h.validateNIP98(ev); err != nil {
-		metrics.IncAuthVerifyFailure()
-		h.logger.Warn("NIP-98 validation failed", "error", err, "pubkey", ev.PubKey)
+		h.logger.Warn("NIP-98 verification failed", "error", err, "pubkey", ev.PubKey)
 		h.writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 		return
 	}
@@ -151,40 +141,6 @@ func (h *NIP07Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusOK, resp)
 }
 
-// validateNIP98 checks NIP-98 event semantics:
-// - kind must be 27235 (NIP-98 HTTP Auth)
-// - "u" tag must match the verify URL
-// - "method" tag must be POST
-// - created_at must be within a reasonable time window
-func (h *NIP07Handler) validateNIP98(ev *nostr.Event) error {
-	// NIP-98 kind.
-	if ev.Kind != 27235 {
-		return &validationError{field: "kind", msg: "expected kind 27235 for NIP-98"}
-	}
-
-	// URL tag.
-	u := tagValue(ev.Tags, "u")
-	expectedURL := h.authService.publicURL + "/auth/nip07/verify"
-	if u != expectedURL {
-		return &validationError{field: "u", msg: "URL mismatch"}
-	}
-
-	// Method tag.
-	method := tagValue(ev.Tags, "method")
-	if method != "POST" {
-		return &validationError{field: "method", msg: "expected POST"}
-	}
-
-	// Time window: created_at should be within ±60 seconds of now.
-	eventTime := time.Unix(int64(ev.CreatedAt), 0)
-	now := time.Now()
-	if now.Sub(eventTime).Abs() > 60*time.Second {
-		return &validationError{field: "created_at", msg: "event timestamp too far from current time"}
-	}
-
-	return nil
-}
-
 // verifyRequest is the JSON body for POST /auth/nip07/verify.
 type verifyRequest struct {
 	SignedEvent *nostr.Event `json:"signed_event"`
@@ -195,16 +151,6 @@ type verifyResponse struct {
 	OK          bool             `json:"ok"`
 	Identity    ResolvedIdentity `json:"identity"`
 	RedirectURI string           `json:"redirect_uri,omitempty"`
-}
-
-// validationError describes a NIP-98 validation failure.
-type validationError struct {
-	field string
-	msg   string
-}
-
-func (e *validationError) Error() string {
-	return "NIP-98 validation: " + e.field + ": " + e.msg
 }
 
 // tagValue returns the first value for a tag key, or "" if not found.

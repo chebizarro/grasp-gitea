@@ -10,9 +10,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
+
+	fiatnostr "fiatjaf.com/nostr"
+	sharednip98 "git.sharegap.net/cascadia/cascadia-go/nip98"
+	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
@@ -41,6 +46,7 @@ type Service struct {
 	publicURL    string
 	challengeTTL time.Duration
 	logger       *slog.Logger
+	nip98        *sharednip98.Verifier
 }
 
 // NewService creates a new auth service. Returns nil if auth is disabled in config.
@@ -53,18 +59,23 @@ func NewService(cfg config.Config, st *store.SQLiteStore, logger *slog.Logger) *
 		publicURL:    cfg.BridgePublicURL,
 		challengeTTL: cfg.ChallengeTTL,
 		logger:       logger.With("component", "auth"),
+		nip98:        sharednip98.NewVerifier(60 * time.Second),
 	}
 }
 
 // IssueChallenge creates a new login challenge with a cryptographically random nonce.
 func (s *Service) IssueChallenge(ctx context.Context, req ChallengeRequest) (ChallengeResponse, error) {
+	return s.issueChallenge(ctx, req, "/auth/nip07/verify")
+}
+
+func (s *Service) issueChallenge(ctx context.Context, req ChallengeRequest, verifyPath string) (ChallengeResponse, error) {
 	nonce, err := generateNonce()
 	if err != nil {
 		return ChallengeResponse{}, fmt.Errorf("generate nonce: %w", err)
 	}
 
 	now := time.Now().UTC()
-	verifyURL := s.publicURL + "/auth/nip07/verify"
+	verifyURL := s.publicURL + verifyPath
 
 	challenge := store.AuthChallenge{
 		Nonce:       nonce,
@@ -88,6 +99,24 @@ func (s *Service) IssueChallenge(ctx context.Context, req ChallengeRequest) (Cha
 		Method:    "POST",
 		ExpiresAt: challenge.ExpiresAt,
 	}, nil
+}
+
+// VerifyNIP98 applies the fleet shared verifier to a challenge event. The JSON
+// bridge keeps grasp-gitea's existing go-nostr API surface while centralizing
+// NIP-98 semantics in cascadia-go.
+func (s *Service) VerifyNIP98(event *nostr.Event, method, target string) (*sharednip98.Principal, error) {
+	if event == nil {
+		return nil, fmt.Errorf("NIP-98 event is required")
+	}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		return nil, fmt.Errorf("marshal NIP-98 event: %w", err)
+	}
+	var sharedEvent fiatnostr.Event
+	if err := json.Unmarshal(raw, &sharedEvent); err != nil {
+		return nil, fmt.Errorf("decode NIP-98 event: %w", err)
+	}
+	return s.nip98.VerifyEvent(&sharedEvent, method, target, nil)
 }
 
 // ValidateChallenge loads a challenge by nonce and checks that it is valid:

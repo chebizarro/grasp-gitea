@@ -14,7 +14,6 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
-	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 )
 
 // NIP55Handler provides HTTP endpoints for the NIP-55 Android signer
@@ -73,9 +72,9 @@ type nip55CallbackResponse struct {
 func (h *NIP55Handler) handleChallenge(w http.ResponseWriter, r *http.Request) {
 	redirectURI := r.URL.Query().Get("redirect_uri")
 
-	challenge, err := h.authService.IssueChallenge(r.Context(), ChallengeRequest{
+	challenge, err := h.authService.issueChallenge(r.Context(), ChallengeRequest{
 		RedirectURI: redirectURI,
-	})
+	}, "/auth/nip55/callback")
 	if err != nil {
 		h.logger.Error("issue NIP-55 challenge failed", "error", err)
 		h.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to issue challenge"})
@@ -121,26 +120,11 @@ func (h *NIP55Handler) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	ev := req.SignedEvent
 
-	// 1. Validate event ID and signature.
-	if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
+	// 1. Apply the fleet shared NIP-98 verification contract.
+	if _, err := h.authService.VerifyNIP98(ev, http.MethodPost, h.authService.publicURL+"/auth/nip55/callback"); err != nil {
 		metrics.IncNIP55VerifyFailure()
-		h.logger.Warn("NIP-55 callback: event failed signature check", "error", err)
-		h.writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid event signature"})
-		return
-	}
-
-	// 2. Validate NIP-98 semantics.
-	if ev.Kind != 27235 {
-		metrics.IncNIP55VerifyFailure()
-		h.writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "expected kind 27235 for NIP-98"})
-		return
-	}
-
-	// Check time window.
-	eventTime := time.Unix(int64(ev.CreatedAt), 0)
-	if time.Since(eventTime).Abs() > 60*time.Second {
-		metrics.IncNIP55VerifyFailure()
-		h.writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "event timestamp too far from current time"})
+		h.logger.Warn("NIP-55 callback: NIP-98 verification failed", "error", err)
+		h.writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 		return
 	}
 
