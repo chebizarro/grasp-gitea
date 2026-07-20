@@ -4,7 +4,7 @@ go 1.25
 
 require (
 	fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026
-	git.sharegap.net/cascadia/cascadia-go v0.8.0
+	git.sharegap.net/cascadia/cascadia-go v1.0.3-0.20260720153145-c371769cdba8
 	github.com/mattn/go-sqlite3 v1.14.24
 	golang.org/x/crypto v0.39.0
 )

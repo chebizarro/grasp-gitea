@@ -120,7 +120,7 @@ func TestNIP55CallbackFullFlow(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Issue a challenge.
-	challenge, err := env.authService.IssueChallenge(ctx, ChallengeRequest{RedirectURI: "/repos"})
+	challenge, err := env.authService.issueChallenge(ctx, ChallengeRequest{RedirectURI: "/repos"}, "/auth/nip55/callback")
 	if err != nil {
 		t.Fatalf("IssueChallenge: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestNIP55CallbackReplayRejected(t *testing.T) {
 	env := newTestNIP55Env(t)
 	ctx := context.Background()
 
-	challenge, err := env.authService.IssueChallenge(ctx, ChallengeRequest{})
+	challenge, err := env.authService.issueChallenge(ctx, ChallengeRequest{}, "/auth/nip55/callback")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestNIP55CallbackWrongKind(t *testing.T) {
 	env := newTestNIP55Env(t)
 	ctx := context.Background()
 
-	challenge, _ := env.authService.IssueChallenge(ctx, ChallengeRequest{})
+	challenge, _ := env.authService.issueChallenge(ctx, ChallengeRequest{}, "/auth/nip55/callback")
 
 	ev := &nostr.Event{
 		Kind:      1,
@@ -231,7 +231,7 @@ func TestNIP55CallbackExpiredTimestamp(t *testing.T) {
 	env := newTestNIP55Env(t)
 	ctx := context.Background()
 
-	challenge, _ := env.authService.IssueChallenge(ctx, ChallengeRequest{})
+	challenge, _ := env.authService.issueChallenge(ctx, ChallengeRequest{}, "/auth/nip55/callback")
 
 	ev := &nostr.Event{
 		Kind:      27235,
