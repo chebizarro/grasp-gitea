@@ -4,10 +4,13 @@
 package publisher
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 
 	"fiatjaf.com/nostr"
+
+	cascadia "git.sharegap.net/cascadia/cascadia-go"
 
 	"github.com/sharegap/grasp-gitea/internal/relay"
 )
@@ -70,24 +73,38 @@ func TestBuildWorkflowRunEvent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if ev.Kind != relay.KindWorkflowRun {
-		t.Errorf("expected kind %d, got %d", relay.KindWorkflowRun, ev.Kind)
+	if int(ev.Kind) != cascadia.ContextVMMethods["ci/workflow-run"].Kind {
+		t.Errorf("expected canonical ContextVM kind, got %d", ev.Kind)
 	}
 	if ev.PubKey.Hex() != pubKey {
 		t.Errorf("expected pubkey %s, got %s", pubKey, ev.PubKey)
 	}
-	if ev.Content != "" {
-		t.Errorf("expected empty content, got %q", ev.Content)
+	var request struct {
+		JSONRPC string                           `json:"jsonrpc"`
+		ID      string                           `json:"id"`
+		Method  string                           `json:"method"`
+		Params  cascadia.HiveCiWorkflowV1Payload `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(ev.Content), &request); err != nil {
+		t.Fatalf("decode ContextVM request: %v", err)
+	}
+	if request.JSONRPC != "2.0" || request.Method != "ci/workflow-run" {
+		t.Fatalf("unexpected ContextVM request: %+v", request)
+	}
+	if request.ID == "" {
+		t.Error("expected a request id")
+	}
+	if request.Params.Workflow != workflow || request.Params.Commit != commitSHA || request.Params.Branch != branch || request.Params.TriggeredBy != "push" {
+		t.Errorf("unexpected workflow payload: %+v", request.Params)
+	}
+	if err := request.Params.Validate(); err != nil {
+		t.Errorf("generated payload validation failed: %v", err)
 	}
 
 	// Verify tags.
 	expectedA := "30617:" + ownerPubkey + ":" + repoID
 	assertTag(t, ev, "a", expectedA)
 	assertTag(t, ev, "p", ownerPubkey)
-	assertTag(t, ev, "commit", commitSHA)
-	assertTag(t, ev, "branch", branch)
-	assertTag(t, ev, "workflow", workflow)
-	assertTag(t, ev, "triggered-by", "push")
 	assertTag(t, ev, "publisher", pubKey)
 	assertTag(t, ev, "relay", relayHint)
 
@@ -107,10 +124,17 @@ func TestBuildWorkflowRunEventDifferentBranch(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	assertTag(t, ev, "branch", "develop")
-	assertTag(t, ev, "workflow", ".github/workflows/test.yml")
-	assertTag(t, ev, "triggered-by", "push")
 	assertTag(t, ev, "publisher", pubKey)
+	var request struct {
+		Method string                           `json:"method"`
+		Params cascadia.HiveCiWorkflowV1Payload `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(ev.Content), &request); err != nil {
+		t.Fatalf("decode ContextVM request: %v", err)
+	}
+	if request.Method != "ci/workflow-run" || request.Params.Branch != "develop" || request.Params.Workflow != ".github/workflows/test.yml" {
+		t.Errorf("unexpected request: %+v", request)
+	}
 }
 
 func TestBuildWorkflowRunEventHiveWorkflow(t *testing.T) {
@@ -125,10 +149,16 @@ func TestBuildWorkflowRunEventHiveWorkflow(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	assertTag(t, ev, "workflow", ".hive/workflows/build.yaml")
-	assertTag(t, ev, "branch", "main")
-	assertTag(t, ev, "triggered-by", "push")
 	assertTag(t, ev, "publisher", pubKey)
+	var request struct {
+		Params cascadia.HiveCiWorkflowV1Payload `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(ev.Content), &request); err != nil {
+		t.Fatalf("decode ContextVM request: %v", err)
+	}
+	if request.Params.Workflow != ".hive/workflows/build.yaml" || request.Params.Branch != "main" {
+		t.Errorf("unexpected payload: %+v", request.Params)
+	}
 }
 
 func TestCIEnabledRequiresBothFlags(t *testing.T) {
@@ -174,9 +204,16 @@ func TestEvTagValueEmptyTags(t *testing.T) {
 	}
 }
 
-func TestWorkflowRunEventKindConstant(t *testing.T) {
-	if relay.KindWorkflowRun != 5401 {
-		t.Errorf("KindWorkflowRun: expected 5401, got %d", relay.KindWorkflowRun)
+func TestWorkflowRunUsesGeneratedCanonicalBinding(t *testing.T) {
+	method, ok := cascadia.ContextVMMethods["ci/workflow-run"]
+	if !ok {
+		t.Fatal("generated binding missing ci/workflow-run")
+	}
+	if relay.KindContextVMIntent != method.Kind || relay.KindContextVMIntent != cascadia.CAS_INTENT {
+		t.Errorf("ContextVM kind drift: relay=%d method=%d generated=%d", relay.KindContextVMIntent, method.Kind, cascadia.CAS_INTENT)
+	}
+	if method.Schema != "hive.ci.workflow.v1" {
+		t.Errorf("unexpected schema %q", method.Schema)
 	}
 }
 
