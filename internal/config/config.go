@@ -39,7 +39,7 @@ type Config struct {
 	// Gitea webhook handler for NIP-34 events (PRs, issues, patches, labels)
 	GiteaWebhookSecret string
 
-	// CI workflow run publishing: emit kind:5401 when state events arrive
+	// CI workflow run publishing: emit ContextVM ci/workflow-run requests when state events arrive
 	// for repos that have CI workflows configured.
 	CIEnabled      bool
 	CITriggerRepos []string // ["*"] or ["owner/repo-id", ...]

@@ -15,7 +15,7 @@ OAUTH2_CLIENT_SECRET=<secret-store reference>
 OAUTH2_REDIRECT_URI=https://git.sharegap.net/user/oauth2/nostr/callback
 ```
 
-For nsec-free outbound 30618/5401 signing, configure the owner-approved,
+For nsec-free outbound 30618/ContextVM signing, configure the owner-approved,
 Signet-delivered URI:
 
 ```text

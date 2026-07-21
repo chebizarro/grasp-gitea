@@ -2,7 +2,7 @@
 
 Phase 1 + Phase 2 + Phase 3 implementation currently provides:
 
-> **Protocol note:** this bridge speaks NIP-34 for repo state and emits Hive CI `kind:5401` workflow-run events. It does **not** use legacy NIP-90 `kind:5900` as part of its CI trigger path. Actual compute dispatch belongs downstream in Loom `kind:5100` jobs.
+> **Protocol note:** this bridge speaks NIP-34 for repo state and emits canonical ContextVM `ci/workflow-run` requests. Compute dispatch belongs downstream of that canonical command boundary.
 
 - relay subscriber for NIP-34 repository announcements (kind `30617`)
 - automatic Gitea org/repo provisioning for clone URLs matching `CLONE_PREFIX`
@@ -17,7 +17,7 @@ Phase 1 + Phase 2 + Phase 3 implementation currently provides:
   - gitea config snippet (`deploy/gitea/app.ini.phase3.snippet`)
   - nginx vhost (`deploy/nginx/git.sharegap.net.conf`)
   - e2e checklist (`docs/phase3-e2e-checklist.md`)
-- Hive CI trigger publishing (`kind:5401`) when repo changes reveal CI workflows
+- Hive CI trigger publishing (ContextVM `ci/workflow-run`) when repo changes reveal CI workflows
 - admin API:
   - `GET /health`
   - `GET /metrics`

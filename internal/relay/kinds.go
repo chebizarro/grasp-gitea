@@ -1,9 +1,11 @@
 package relay
 
+import cascadia "git.sharegap.net/cascadia/cascadia-go"
+
 const (
 	KindRepositoryAnnouncement = 30617
 	KindRepositoryState        = 30618
-	KindWorkflowRun            = 5401
+	KindContextVMIntent        = cascadia.CAS_INTENT
 	KindPatch                  = 1617
 	KindPROpen                 = 1618
 	KindPRUpdate               = 1619

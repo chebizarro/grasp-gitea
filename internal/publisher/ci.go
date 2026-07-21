@@ -6,6 +6,7 @@ package publisher
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"path"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	cascadia "git.sharegap.net/cascadia/cascadia-go"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
 	"github.com/nbd-wtf/go-nostr/nip34"
@@ -33,7 +35,7 @@ const (
 )
 
 // ciDedup tracks recently processed event IDs to prevent duplicate
-// kind:5401 publications when the same state event arrives from
+// duplicate ContextVM publications when the same state event arrives from
 // multiple relays. Entries are evicted after dedupMaxAge.
 type ciDedup struct {
 	mu   sync.Mutex
@@ -97,7 +99,8 @@ func (s *Service) CIEnabled() bool {
 
 // HandleStateEventCI inspects an incoming kind:30618 repository state
 // event, detects changed branches, checks for CI workflow files, and
-// publishes a kind:5401 WorkflowRun event for each qualifying change.
+// publishes a canonical ContextVM ci/workflow-run request for each qualifying
+// change.
 //
 // Call this BEFORE proactive sync so that local refs still reflect the
 // previous state for change detection. The caller must serialise access
@@ -351,27 +354,49 @@ func listWorkflowFiles(ctx context.Context, repoPath, commitSHA, dir string) ([]
 // Event construction
 // ---------------------------------------------------------------------------
 
-// buildWorkflowRunEvent creates a kind:5401 WorkflowRun event and signs
-// it with the bridge key.
+// buildWorkflowRunEvent creates a canonical ContextVM ci/workflow-run request
+// and signs it with the bridge key. The repository coordinate remains on the
+// event so routers can select a worker without decoding the JSON-RPC payload.
 func (s *Service) buildWorkflowRunEvent(ctx context.Context, ownerPubkey, repoID, commitSHA, branch, workflow, relayHint string) (*nostr.Event, error) {
+	method, ok := cascadia.ContextVMMethods["ci/workflow-run"]
+	if !ok {
+		return nil, fmt.Errorf("generated binding missing ci/workflow-run")
+	}
+	payload := cascadia.HiveCiWorkflowV1Payload{
+		Workflow: workflow, Commit: commitSHA, Branch: branch, TriggeredBy: "push",
+	}
+	if err := payload.Validate(); err != nil {
+		return nil, fmt.Errorf("validate %s payload: %w", method.Schema, err)
+	}
+	request := struct {
+		JSONRPC string                           `json:"jsonrpc"`
+		ID      string                           `json:"id"`
+		Method  string                           `json:"method"`
+		Params  cascadia.HiveCiWorkflowV1Payload `json:"params"`
+	}{
+		JSONRPC: "2.0",
+		ID:      fmt.Sprintf("grasp:%s:%s:%s", repoID, commitSHA, workflow),
+		Method:  method.Name,
+		Params:  payload,
+	}
+	content, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("marshal %s request: %w", method.Name, err)
+	}
 	aTag := fmt.Sprintf("%d:%s:%s",
 		relay.KindRepositoryAnnouncement, ownerPubkey, repoID)
 
 	ev := &nostr.Event{
 		PubKey:    s.bridgePubKey,
 		CreatedAt: nostr.Now(),
-		Kind:      relay.KindWorkflowRun,
+		Kind:      method.Kind,
 		Tags: nostr.Tags{
 			{"a", aTag},
 			{"p", ownerPubkey},
-			{"commit", commitSHA},
-			{"branch", branch},
-			{"workflow", workflow},
-			{"triggered-by", "push"},
 			{"publisher", s.bridgePubKey},
 			{"relay", relayHint},
 		},
-		Content: "",
+		Content: string(content),
 	}
 
 	if err := s.signEvent(ctx, ev); err != nil {
