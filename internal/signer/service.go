@@ -45,6 +45,9 @@ type BunkerSigner interface {
 // BunkerConnector establishes a NIP-46 bunker signer for a persisted grant.
 type BunkerConnector func(ctx context.Context, clientSecretKey string, bunkerURI string) (BunkerSigner, error)
 
+// connectTimeout bounds the NIP-46 bunker handshake.
+const connectTimeout = 30 * time.Second
+
 // GrantInfo is returned after a grant is created without exposing plaintext
 // secrets or encrypted blobs to callers.
 type GrantInfo struct {
@@ -141,7 +144,7 @@ func (s *Service) CreateGrant(ctx context.Context, bunkerURI string) (GrantInfo,
 	clientSecretKey := clientSK.Hex()
 	clientPubkey := clientSK.Public().Hex()
 
-	bunker, err := s.connector(ctx, clientSecretKey, bunkerURI)
+	bunker, err := s.connectBunker(ctx, clientSecretKey, bunkerURI)
 	if err != nil {
 		return GrantInfo{}, fmt.Errorf("%w: connect bunker: %v", ErrSignerOffline, err)
 	}
@@ -234,6 +237,34 @@ func (s *Service) SignWithGrant(ctx context.Context, pubkey string, evt *nostr.E
 	return nil
 }
 
+// connectBunker establishes a bunker connection whose lifetime is detached
+// from the caller's context. nip46.ConnectBunker retains the context it is
+// given for the long-lived response subscription used by every later signing
+// call; connecting with a request- or timeout-scoped context would let the
+// connection be cached in the pool and then silently cancelled when the
+// caller's context ends. The handshake itself is still bounded by
+// connectTimeout and by caller cancellation.
+func (s *Service) connectBunker(ctx context.Context, clientSecretKey string, bunkerURI string) (BunkerSigner, error) {
+	type result struct {
+		bunker BunkerSigner
+		err    error
+	}
+	resultCh := make(chan result, 1)
+	connCtx := context.WithoutCancel(ctx)
+	go func() {
+		bunker, err := s.connector(connCtx, clientSecretKey, bunkerURI)
+		resultCh <- result{bunker: bunker, err: err}
+	}()
+	select {
+	case r := <-resultCh:
+		return r.bunker, r.err
+	case <-time.After(connectTimeout):
+		return nil, fmt.Errorf("connect bunker: %w", context.DeadlineExceeded)
+	case <-ctx.Done():
+		return nil, fmt.Errorf("connect bunker: %w", ctx.Err())
+	}
+}
+
 func connectNIP46Bunker(ctx context.Context, clientSecretKey string, bunkerURI string) (BunkerSigner, error) {
 	sk, err := nostr.SecretKeyFromHex(clientSecretKey)
 	if err != nil {
@@ -276,7 +307,7 @@ func (s *Service) signerForGrant(ctx context.Context, pubkey string) (BunkerSign
 		return nil, fmt.Errorf("decrypt signer bunker URI: %w", err)
 	}
 
-	bunker, err := s.connector(ctx, clientSecretKey, bunkerURI)
+	bunker, err := s.connectBunker(ctx, clientSecretKey, bunkerURI)
 	if err != nil {
 		return nil, fmt.Errorf("%w: reconnect signer %s: %v", ErrSignerOffline, pubkey, err)
 	}

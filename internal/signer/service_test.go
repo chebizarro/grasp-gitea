@@ -277,3 +277,28 @@ func mustPubkey(t *testing.T, secret string) string {
 	}
 	return sk.Public().Hex()
 }
+
+func TestConnectorReceivesCancellationDetachedContext(t *testing.T) {
+	st := openTestStore(t)
+	signerSecret := nostr.Generate().Hex()
+	signerPubkey := mustPubkey(t, signerSecret)
+	bunkerURI := "bunker://" + signerPubkey + "?relay=wss://relay.example"
+	fake := &fakeBunkerSigner{pubkey: signerPubkey, secret: signerSecret}
+
+	captured := make(chan context.Context, 1)
+	svc := newTestService(t, st, func(ctx context.Context, clientSecretKey string, gotURI string) (BunkerSigner, error) {
+		captured <- ctx
+		return fake, nil
+	})
+
+	callerCtx, cancel := context.WithCancel(context.Background())
+	if _, err := svc.CreateGrant(callerCtx, bunkerURI); err != nil {
+		t.Fatalf("CreateGrant: %v", err)
+	}
+	cancel()
+
+	connCtx := <-captured
+	if err := connCtx.Err(); err != nil {
+		t.Fatalf("connector context must survive caller cancellation, got %v", err)
+	}
+}
