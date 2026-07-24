@@ -61,14 +61,16 @@ func relaySubscriptionURLs(configured []string, embeddedURL string, publicEmbedd
 	return mergeRelayURLs(filtered, embeddedURL)
 }
 
-func newServerSigner(ctx context.Context, cfg config.Config, logger *slog.Logger) (publisher.ServerSigner, error) {
+func newServerSigner(ctx context.Context, cfg config.Config, st *store.SQLiteStore, logger *slog.Logger) (publisher.ServerSigner, error) {
 	if cfg.SignetBunkerURL != "" {
-		signer, err := publisher.NewSignetBunkerServerSigner(ctx, cfg.SignetBunkerURL, cfg.RelayURLs...)
+		// Restart-durable session: Signet authorization is one-time, so the
+		// authorized NIP-46 client key is persisted and reused across restarts.
+		serverSigner, err := signer.ConnectDurableSignetSigner(ctx, st, cfg.SignerMasterKey, cfg.SignetBunkerURL, cfg.RelayURLs, logger)
 		if err != nil {
 			return nil, err
 		}
-		logger.Info("Signet NIP-46 server signer ready", "server_pubkey", signer.PublicKey())
-		return signer, nil
+		logger.Info("Signet NIP-46 server signer ready", "server_pubkey", serverSigner.PublicKey())
+		return serverSigner, nil
 	}
 	if cfg.BridgeNsec == "" {
 		return nil, nil
@@ -164,7 +166,7 @@ func main() {
 	// so the bridge does not hold an nsec. BRIDGE_NSEC remains only as an
 	// explicit dev fallback and is rejected when GRASP_ENV/APP_ENV/ENVIRONMENT
 	// is production.
-	serverSigner, err := newServerSigner(ctx, cfg, logger)
+	serverSigner, err := newServerSigner(ctx, cfg, st, logger)
 	if err != nil {
 		logger.Error("failed to create server signer", "error", err)
 		os.Exit(1)

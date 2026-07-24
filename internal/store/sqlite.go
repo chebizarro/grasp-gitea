@@ -248,6 +248,14 @@ func Open(path string) (*SQLiteStore, error) {
 			created_at TEXT NOT NULL,
 			expires_at TEXT NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS bridge_signer_sessions (
+			bunker_uri TEXT PRIMARY KEY,
+			client_seckey_enc BLOB NOT NULL,
+			client_pubkey TEXT NOT NULL,
+			signer_pubkey TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL,
+			last_ok_at TIMESTAMP
+		);`,
 		`CREATE TABLE IF NOT EXISTS signer_grants (
 			pubkey TEXT PRIMARY KEY,
 			client_seckey_enc BLOB NOT NULL,
