@@ -8,14 +8,18 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/eventstore"
 	"fiatjaf.com/nostr/eventstore/lmdb"
 	"fiatjaf.com/nostr/khatru"
 	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
+	"github.com/sharegap/grasp-gitea/internal/purgatory"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -27,7 +31,6 @@ type hostedRepoChecker interface {
 type storedEventLookup func(ctx context.Context, eventID string) (*nostr.Event, error)
 
 func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Logger) (string, http.Handler, func(context.Context) error, error) {
-	_ = ctx
 	if !cfg.EmbeddedRelay {
 		return "", nil, func(context.Context) error { return nil }, nil
 	}
@@ -62,6 +65,49 @@ func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Log
 	r.OnEvent = func(ctx context.Context, event nostr.Event) (bool, string) {
 		return policy(ctx, &event)
 	}
+
+	// GRASP-01 durable purgatory: accepted repo events whose git objects have
+	// not arrived are acknowledged and durably retained, but kept out of the
+	// eventstore (and therefore out of normal queries) until released.
+	storeEvent, replaceEvent := r.StoreEvent, r.ReplaceEvent
+	releaseEvent := func(ctx context.Context, ev nostr.Event) error {
+		var err error
+		if ev.Kind.IsRegular() {
+			err = storeEvent(ctx, ev)
+		} else {
+			err = replaceEvent(ctx, ev)
+		}
+		if err == eventstore.ErrDupEvent {
+			return nil
+		}
+		return err
+	}
+	purgatorySvc := purgatory.New(repoStore, releaseEvent, logger)
+	repoPathForEvent := makeRepoPathResolver(cfg, repoStore)
+	holdIfAwaitingGitData := func(ctx context.Context, ev nostr.Event) (bool, error) {
+		repoPath := repoPathForEvent(ctx, &ev)
+		if repoPath == "" {
+			return false, nil
+		}
+		return purgatorySvc.Hold(ctx, &ev, repoPath)
+	}
+	r.StoreEvent = func(ctx context.Context, ev nostr.Event) error {
+		if held, err := holdIfAwaitingGitData(ctx, ev); err != nil {
+			return err
+		} else if held {
+			return eventstore.ErrDupEvent // OK-acked, not stored, not broadcast
+		}
+		return storeEvent(ctx, ev)
+	}
+	r.ReplaceEvent = func(ctx context.Context, ev nostr.Event) error {
+		if held, err := holdIfAwaitingGitData(ctx, ev); err != nil {
+			return err
+		} else if held {
+			return eventstore.ErrDupEvent
+		}
+		return replaceEvent(ctx, ev)
+	}
+	go purgatorySvc.Run(ctx, 30*time.Second)
 
 	relayRootHandler := graspNIP11Handler(r, cfg)
 	addr := fmt.Sprintf(":%d", cfg.EmbeddedRelayPort)
@@ -172,6 +218,43 @@ func referencesStoredCollaboration(ctx context.Context, event *nostr.Event, look
 		}
 	}
 	return false
+}
+
+// makeRepoPathResolver maps a repo-scoped event to its bare repository path.
+// State events (30618) are keyed by their own pubkey+d; PR events (1618/1619)
+// carry the repository coordinate in their a tag.
+func makeRepoPathResolver(cfg config.Config, mappings *store.SQLiteStore) func(ctx context.Context, ev *nostr.Event) string {
+	return func(ctx context.Context, ev *nostr.Event) string {
+		var ownerPubkey, repoID string
+		switch int(ev.Kind) {
+		case relay.KindRepositoryState:
+			ownerPubkey = ev.PubKey.Hex()
+			if d := ev.Tags.Find("d"); d != nil && len(d) >= 2 {
+				repoID = d[1]
+			}
+		case relay.KindPROpen, relay.KindPRUpdate:
+			if a := ev.Tags.Find("a"); a != nil && len(a) >= 2 {
+				parts := strings.SplitN(a[1], ":", 3)
+				if len(parts) == 3 && parts[0] == fmt.Sprint(relay.KindRepositoryAnnouncement) {
+					ownerPubkey, repoID = parts[1], parts[2]
+				}
+			}
+		default:
+			return ""
+		}
+		if ownerPubkey == "" || repoID == "" {
+			return ""
+		}
+		pk, err := nostr.PubKeyFromHex(ownerPubkey)
+		if err != nil {
+			return ""
+		}
+		mapping, err := mappings.GetMapping(ctx, nip19.EncodeNpub(pk), repoID)
+		if err != nil {
+			return ""
+		}
+		return filepath.Join(cfg.GiteaRepositoriesDir, mapping.Owner, mapping.RepoID+".git")
+	}
 }
 
 func graspNIP11Handler(relayHandler *khatru.Relay, cfg config.Config) http.Handler {

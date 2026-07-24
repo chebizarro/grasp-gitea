@@ -273,6 +273,16 @@ func Open(path string) (*SQLiteStore, error) {
 			created_at TEXT NOT NULL,
 			published_event_id TEXT NOT NULL DEFAULT ''
 		);`,
+		`CREATE TABLE IF NOT EXISTS purgatory_events (
+			event_id TEXT PRIMARY KEY,
+			pubkey TEXT NOT NULL,
+			kind INTEGER NOT NULL,
+			d_tag TEXT NOT NULL DEFAULT '',
+			event_json TEXT NOT NULL,
+			required_shas TEXT NOT NULL,
+			repo_path TEXT NOT NULL,
+			accepted_at TIMESTAMP NOT NULL
+		);`,
 		`CREATE TABLE IF NOT EXISTS pending_actor_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			gitea_user_id INTEGER NOT NULL,
