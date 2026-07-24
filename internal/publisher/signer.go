@@ -30,17 +30,36 @@ func NewNIP46Signer(ctx context.Context, bunkerURI string) (*NIP46Signer, error)
 	if bunkerURI == "" {
 		return nil, fmt.Errorf("bunker URI is required")
 	}
-	// Keep the relay pool on the application context while bounding only the
-	// startup handshake. Cancelling the handshake context must not tear down the
-	// long-lived NIP-46 subscription used for later signing calls.
+	// ConnectBunker retains the context passed to it for the long-lived response
+	// subscription. Passing a short-lived handshake context would make startup
+	// succeed and then silently cancel every later signing response. Keep the
+	// application context in ConnectBunker and bound startup externally.
 	pool := nostr.NewSimplePool(ctx)
-	connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	client, err := nip46.ConnectBunker(connectCtx, nostr.GeneratePrivateKey(), bunkerURI, pool, nil)
-	if err != nil {
-		return nil, fmt.Errorf("connect signer bunker: %w", err)
+	type connectResult struct {
+		client *nip46.BunkerClient
+		err    error
 	}
-	pubkey, err := client.GetPublicKey(connectCtx)
+	resultCh := make(chan connectResult, 1)
+	go func() {
+		client, err := nip46.ConnectBunker(ctx, nostr.GeneratePrivateKey(), bunkerURI, pool, nil)
+		resultCh <- connectResult{client: client, err: err}
+	}()
+
+	var client *nip46.BunkerClient
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			return nil, fmt.Errorf("connect signer bunker: %w", result.err)
+		}
+		client = result.client
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("connect signer bunker: %w", context.DeadlineExceeded)
+	case <-ctx.Done():
+		return nil, fmt.Errorf("connect signer bunker: %w", ctx.Err())
+	}
+	publicKeyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	pubkey, err := client.GetPublicKey(publicKeyCtx)
 	if err != nil {
 		return nil, fmt.Errorf("get signer public key: %w", err)
 	}
