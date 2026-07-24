@@ -46,3 +46,53 @@ func TestEvaluatePushRefNostrAndPRPolicy(t *testing.T) {
 		t.Fatalf("expected refs/heads/pr/* to fail")
 	}
 }
+
+func TestRefDeletionSemantics(t *testing.T) {
+	state := &nip34.RepositoryState{
+		Branches: map[string]string{"main": "abc123"},
+		Tags:     map[string]string{"v1.0.0": "def456"},
+	}
+
+	// Deletion accepted when state omits the ref.
+	if ok, _ := validateRefAgainstState("refs/heads/old-feature", zeroSHA, state); !ok {
+		t.Fatalf("expected deletion of omitted branch to pass")
+	}
+	if ok, _ := validateRefAgainstState("refs/tags/v0.9.0", zeroSHA, state); !ok {
+		t.Fatalf("expected deletion of omitted tag to pass")
+	}
+
+	// Deletion rejected while state still declares the ref.
+	if ok, reason := validateRefAgainstState("refs/heads/main", zeroSHA, state); ok {
+		t.Fatalf("expected deletion of declared branch to fail")
+	} else if reason == "" {
+		t.Fatalf("expected a rejection reason")
+	}
+	if ok, _ := validateRefAgainstState("refs/tags/v1.0.0", zeroSHA, state); ok {
+		t.Fatalf("expected deletion of declared tag to fail")
+	}
+}
+
+func TestAtomicMixedPushWithAdditionsUpdatesAndDeletions(t *testing.T) {
+	state := &nip34.RepositoryState{
+		Branches: map[string]string{"main": "abc123", "feature": "fff000"},
+		Tags:     map[string]string{"v1.1.0": "def456"},
+	}
+
+	// All updates authorized: update main, create feature, delete omitted refs.
+	good := []pushUpdate{
+		{refName: "refs/heads/main", newSHA: "abc123"},
+		{refName: "refs/heads/feature", newSHA: "fff000"},
+		{refName: "refs/heads/dead-branch", newSHA: zeroSHA},
+		{refName: "refs/tags/v1.1.0", newSHA: "def456"},
+		{refName: "refs/tags/v1.0.0", newSHA: zeroSHA},
+	}
+	if err := evaluatePushUpdates(good, state); err != nil {
+		t.Fatalf("expected mixed push to pass, got %v", err)
+	}
+
+	// One unauthorized deletion poisons the whole push.
+	bad := append(good, pushUpdate{refName: "refs/heads/feature", newSHA: zeroSHA})
+	if err := evaluatePushUpdates(bad, state); err == nil {
+		t.Fatalf("expected mixed push with declared-branch deletion to fail")
+	}
+}

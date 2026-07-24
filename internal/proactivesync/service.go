@@ -48,6 +48,8 @@ type gitRunner interface {
 	ObjectExists(ctx context.Context, repoPath string, sha string) (bool, error)
 	UpdateRef(ctx context.Context, repoPath string, ref string, sha string) error
 	SetSymbolicHEAD(ctx context.Context, repoPath string, ref string) error
+	ListRefs(ctx context.Context, repoPath string, prefix string) ([]string, error)
+	DeleteRef(ctx context.Context, repoPath string, ref string) error
 	Fetch(ctx context.Context, repoPath string, remoteURL string, refspecs []string) error
 }
 
@@ -410,9 +412,47 @@ func (s *Service) applyStateEvent(ctx context.Context, repoPath string, ev *nost
 	}
 
 	s.reconcileHEAD(ctx, repoPath, state)
+	s.reconcileDeletedRefs(ctx, repoPath, state)
 
 	s.logger.Info("proactive sync applied state event", "repo", repoPath, "event", ev.ID.Hex())
 	return nil
+}
+
+// reconcileDeletedRefs removes local refs/heads/* and refs/tags/* that the
+// authoritative signed state no longer declares. Repository state represents
+// deletion by omission, so a ref present locally but absent from the latest
+// state has been deleted upstream. Other namespaces (refs/nostr, refs/pull,
+// internal refs) are never touched.
+func (s *Service) reconcileDeletedRefs(ctx context.Context, repoPath string, state nip34.RepositoryState) {
+	prune := func(prefix string, declared func(name string) bool) {
+		refs, err := s.git.ListRefs(ctx, repoPath, prefix)
+		if err != nil {
+			s.logger.Warn("proactive sync ref listing failed", "repo", repoPath, "prefix", prefix, "error", err)
+			return
+		}
+		for _, ref := range refs {
+			name := strings.TrimPrefix(ref, prefix)
+			if name == "" || declared(name) {
+				continue
+			}
+			if err := s.git.DeleteRef(ctx, repoPath, ref); err != nil {
+				s.logger.Warn("proactive sync ref deletion failed", "repo", repoPath, "ref", ref, "error", err)
+				continue
+			}
+			s.logger.Info("proactive sync deleted ref omitted from state", "repo", repoPath, "ref", ref)
+		}
+	}
+	prune("refs/heads/", func(name string) bool {
+		_, ok := state.Branches[name]
+		return ok
+	})
+	prune("refs/tags/", func(name string) bool {
+		if _, ok := state.Tags[name]; ok {
+			return true
+		}
+		_, ok := state.Tags[name+"^{}"]
+		return ok
+	})
 }
 
 // reconcileHEAD updates the bare repository's symbolic HEAD to match the
@@ -617,6 +657,27 @@ func (execGitRunner) ObjectExists(ctx context.Context, repoPath string, sha stri
 func (execGitRunner) UpdateRef(ctx context.Context, repoPath string, ref string, sha string) error {
 	if out, err := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "update-ref", ref, sha).CombinedOutput(); err != nil {
 		return fmt.Errorf("update-ref failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (execGitRunner) ListRefs(ctx context.Context, repoPath string, prefix string) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "for-each-ref", "--format=%(refname)", prefix).Output()
+	if err != nil {
+		return nil, fmt.Errorf("for-each-ref failed: %w", err)
+	}
+	var refs []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			refs = append(refs, line)
+		}
+	}
+	return refs, nil
+}
+
+func (execGitRunner) DeleteRef(ctx context.Context, repoPath string, ref string) error {
+	if out, err := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "update-ref", "-d", ref).CombinedOutput(); err != nil {
+		return fmt.Errorf("update-ref -d failed: %s", strings.TrimSpace(string(out)))
 	}
 	return nil
 }

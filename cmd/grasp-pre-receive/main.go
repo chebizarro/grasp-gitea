@@ -20,6 +20,14 @@ type pushUpdate struct {
 	refName string
 }
 
+// zeroSHA is git's all-zero object id, which signals ref deletion in a
+// pre-receive update line.
+const zeroSHA = "0000000000000000000000000000000000000000"
+
+func isDeletion(newSHA string) bool {
+	return newSHA == zeroSHA
+}
+
 func main() {
 	relayURL := envOrDefault("GRASP_HOOK_RELAY_URL", envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"))
 	npub := strings.TrimSpace(os.Getenv("GRASP_REPO_NPUB"))
@@ -116,6 +124,15 @@ func validateRefAgainstState(refName string, newSHA string, state *nip34.Reposit
 	if strings.HasPrefix(refName, "refs/heads/") {
 		branch := strings.TrimPrefix(refName, "refs/heads/")
 		expected, ok := state.Branches[branch]
+		if isDeletion(newSHA) {
+			// Repository state represents deletion by omitting the ref: a
+			// deletion push is authorized exactly when the latest signed state
+			// no longer declares the branch.
+			if ok {
+				return false, fmt.Sprintf("push rejected: NIP-34 state still declares branch %s; publish updated state before deleting", branch)
+			}
+			return true, ""
+		}
 		if !ok {
 			return false, fmt.Sprintf("push rejected: branch %s is not present in NIP-34 state", branch)
 		}
@@ -128,6 +145,12 @@ func validateRefAgainstState(refName string, newSHA string, state *nip34.Reposit
 	if strings.HasPrefix(refName, "refs/tags/") {
 		tag := strings.TrimPrefix(refName, "refs/tags/")
 		expected, ok := state.Tags[tag]
+		if isDeletion(newSHA) {
+			if ok {
+				return false, fmt.Sprintf("push rejected: NIP-34 state still declares tag %s; publish updated state before deleting", tag)
+			}
+			return true, ""
+		}
 		if !ok {
 			return false, fmt.Sprintf("push rejected: tag %s is not present in NIP-34 state", tag)
 		}

@@ -207,6 +207,26 @@ func newFakeGitRunner() *fakeGitRunner {
 	return &fakeGitRunner{objects: map[string]bool{}, updates: map[string]string{}, heads: map[string]string{}}
 }
 
+func (g *fakeGitRunner) ListRefs(_ context.Context, repoPath string, prefix string) ([]string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var refs []string
+	for key := range g.updates {
+		parts := strings.SplitN(key, "|", 2)
+		if len(parts) == 2 && parts[0] == repoPath && strings.HasPrefix(parts[1], prefix) {
+			refs = append(refs, parts[1])
+		}
+	}
+	return refs, nil
+}
+
+func (g *fakeGitRunner) DeleteRef(_ context.Context, repoPath string, ref string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.updates, repoPath+"|"+ref)
+	return nil
+}
+
 func (g *fakeGitRunner) SetSymbolicHEAD(_ context.Context, repoPath string, ref string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -605,5 +625,51 @@ func TestApplyStateEventHEADIgnoredWhenUndeclaredOrMissing(t *testing.T) {
 	}
 	if got, ok := git.heads[repoPath]; ok {
 		t.Fatalf("expected HEAD untouched for missing object, got %q", got)
+	}
+}
+
+func TestApplyStateEventDeletesRefsOmittedFromState(t *testing.T) {
+	ctx := context.Background()
+	priv := nostr.Generate().Hex()
+	git := newFakeGitRunner()
+	keepSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	oldSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	git.objects[keepSHA] = true
+	git.objects[oldSHA] = true
+
+	repoPath := "/repos/alice/project.git"
+	// Local refs before the state event arrives.
+	git.updates[repoPath+"|refs/heads/main"] = keepSHA
+	git.updates[repoPath+"|refs/heads/stale-branch"] = oldSHA
+	git.updates[repoPath+"|refs/tags/v1.0.0"] = keepSHA
+	git.updates[repoPath+"|refs/tags/v0.1.0"] = oldSHA
+	git.updates[repoPath+"|refs/nostr/"+strings.Repeat("ab", 32)] = oldSHA
+
+	svc := New(t.TempDir(), &stubStore{}, testLogger())
+	svc.git = git
+
+	state := signedTestEvent(t, priv, relay.KindRepositoryState, nostr.Tags{
+		{"d", "project"},
+		{"refs/heads/main", keepSHA},
+		{"refs/tags/v1.0.0", keepSHA},
+	})
+	if err := svc.applyStateEvent(ctx, repoPath, state); err != nil {
+		t.Fatalf("apply state: %v", err)
+	}
+
+	if _, ok := git.updates[repoPath+"|refs/heads/stale-branch"]; ok {
+		t.Fatalf("expected omitted branch to be deleted")
+	}
+	if _, ok := git.updates[repoPath+"|refs/tags/v0.1.0"]; ok {
+		t.Fatalf("expected omitted tag to be deleted")
+	}
+	if _, ok := git.updates[repoPath+"|refs/heads/main"]; !ok {
+		t.Fatalf("expected declared branch to survive")
+	}
+	if _, ok := git.updates[repoPath+"|refs/tags/v1.0.0"]; !ok {
+		t.Fatalf("expected declared tag to survive")
+	}
+	if _, ok := git.updates[repoPath+"|refs/nostr/"+strings.Repeat("ab", 32)]; !ok {
+		t.Fatalf("expected refs/nostr namespace to be untouched")
 	}
 }
