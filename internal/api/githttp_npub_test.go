@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
@@ -289,4 +290,38 @@ func TestGitHTTPNpubProxyNeverSurfacesGiteaBasicChallenge(t *testing.T) {
 		t.Fatalf("expected no Set-Cookie on public response, got %q", got)
 	}
 	assertGitHTTPCORS(t, w.Result().Header)
+}
+
+func TestGitHTTPNpubLandingPageForKnownAndUnknownRepos(t *testing.T) {
+	ctx := context.Background()
+	st := openGitHTTPProxyTestStore(t)
+	seedGitHTTPProxyMapping(t, ctx, st, store.Mapping{
+		Npub: "npub1owner", RepoID: "repo one", Pubkey: "pubkey",
+		Owner: "org", RepoName: "repo", GiteaRepoID: 1,
+		CloneURL: "http://gitea/org/repo.git", SourceEvent: "event1",
+	})
+	srv := New(config.Config{GiteaURL: "http://gitea:3000"}, nil, nil, st, testLogger())
+
+	// Known repository: human-facing landing page at the bare .git path.
+	req := httptest.NewRequest(http.MethodGet, "/npub1owner/repo%20one.git", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 landing page, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "git clone") || !strings.Contains(body, "/npub1owner/repo%20one.git") {
+		t.Fatalf("expected clone instructions in landing page, got %q", body)
+	}
+
+	// Unknown repository: useful 404.
+	req = httptest.NewRequest(http.MethodGet, "/npub1owner/unknown.git", nil)
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown repo, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "kind 30617") {
+		t.Fatalf("expected explanatory 404 body, got %q", w.Body.String())
+	}
 }

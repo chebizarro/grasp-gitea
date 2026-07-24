@@ -3,6 +3,8 @@ package api
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"html/template"
 	"io"
 	"net/http"
 	"net/http/httputil"
@@ -51,6 +53,10 @@ func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request) {
 
 	mapping, err := s.store.GetMapping(r.Context(), npub, repoID)
 	if errors.Is(err, sql.ErrNoRows) {
+		if gitSubpath == "" {
+			s.serveRepoLandingPage(w, r, npub, repoID, false)
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}
@@ -68,6 +74,11 @@ func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request) {
 			s.logger.Error("invalid Gitea URL for git smart-http proxy", "gitea_url", s.giteaURL, "error", err)
 		}
 		http.Error(w, "git backend unavailable", http.StatusBadGateway)
+		return
+	}
+
+	if gitSubpath == "" {
+		s.serveRepoLandingPage(w, r, npub, repoID, true)
 		return
 	}
 
@@ -126,14 +137,22 @@ func parseNpubGitHTTPPath(r *http.Request) (npub string, repoID string, gitSubpa
 	repoAndGitPath := rest[slash+1:]
 	gitMarker := ".git/"
 	marker := strings.Index(repoAndGitPath, gitMarker)
+	var encodedRepoID string
 	if marker <= 0 {
-		return "", "", "", false, nil
-	}
-
-	encodedRepoID := repoAndGitPath[:marker]
-	gitSubpath = repoAndGitPath[marker+len(gitMarker):]
-	if !isGitSmartHTTPSubpath(gitSubpath) {
-		return "", "", "", false, nil
+		// GRASP-01 recommends a human-facing page at the bare
+		// /<npub>/<identifier>.git path itself.
+		trimmed := strings.TrimSuffix(repoAndGitPath, "/")
+		if !strings.HasSuffix(trimmed, ".git") || len(trimmed) <= len(".git") {
+			return "", "", "", false, nil
+		}
+		encodedRepoID = strings.TrimSuffix(trimmed, ".git")
+		gitSubpath = ""
+	} else {
+		encodedRepoID = repoAndGitPath[:marker]
+		gitSubpath = repoAndGitPath[marker+len(gitMarker):]
+		if !isGitSmartHTTPSubpath(gitSubpath) {
+			return "", "", "", false, nil
+		}
 	}
 
 	npub, err = url.PathUnescape(encodedNpub)
@@ -153,6 +172,35 @@ func parseNpubGitHTTPPath(r *http.Request) (npub string, repoID string, gitSubpa
 	}
 
 	return npub, repoID, gitSubpath, true, nil
+}
+
+// serveRepoLandingPage renders the human-facing page GRASP-01 recommends at
+// /<npub>/<identifier>.git: a pointer to the clone URL and a Nostr git
+// browser for known repositories, and a useful 404 for unknown ones.
+func (s *Server) serveRepoLandingPage(w http.ResponseWriter, r *http.Request, npub string, repoID string, known bool) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	cloneURL := "https://" + r.Host + "/" + url.PathEscape(npub) + "/" + url.PathEscape(repoID) + ".git"
+	naddr := url.PathEscape(npub) + "/" + url.PathEscape(repoID)
+	if !known {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, `<!doctype html><html><head><title>repository not found</title></head><body>
+<h1>Repository not found</h1>
+<p>No GRASP repository is mapped for <code>%s</code>.</p>
+<p>Repositories appear here after an owner-signed NIP-34 announcement
+(kind 30617) naming this service in both <code>clone</code> and
+<code>relays</code> tags is accepted.</p>
+</body></html>`, template.HTMLEscapeString(naddr))
+		return
+	}
+	fmt.Fprintf(w, `<!doctype html><html><head><title>%[1]s</title></head><body>
+<h1><code>%[1]s</code></h1>
+<p>This is a GRASP-01 git repository. Clone it without credentials:</p>
+<pre>git clone %[2]s</pre>
+<p>Browse it on <a href="https://gitworkshop.dev/%[3]s">gitworkshop.dev</a>.</p>
+</body></html>`,
+		template.HTMLEscapeString(repoID),
+		template.HTMLEscapeString(cloneURL),
+		template.HTMLEscapeString(naddr))
 }
 
 func isGitSmartHTTPSubpath(subpath string) bool {
