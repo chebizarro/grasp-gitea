@@ -3,16 +3,20 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip19"
 	"fiatjaf.com/nostr/nip34"
 
 	"github.com/sharegap/grasp-gitea/internal/nostrstate"
+	"github.com/sharegap/grasp-gitea/internal/refsnostr"
+	"github.com/sharegap/grasp-gitea/internal/relay"
 )
 
 type pushUpdate struct {
@@ -60,9 +64,61 @@ func main() {
 		}
 	}
 
-	if err := evaluatePushUpdates(updates, state); err != nil {
+	checker := newRelayNostrRefChecker(relayURL)
+	if err := evaluatePushUpdates(updates, state, checker); err != nil {
 		reject(err.Error())
 	}
+}
+
+// nostrRefChecker validates a refs/nostr/<event-id> push against relay state.
+// It returns an error when the push must be rejected.
+type nostrRefChecker func(eventID string, tipSHA string) error
+
+// newRelayNostrRefChecker enforces GRASP-01 differing-tip rejection before the
+// git update commits: if the relay already holds the PR/PR-update event named
+// by the ref and that event lists a different tip commit, the push is
+// rejected during pre-receive rather than being noticed later by a webhook.
+// Valid IDs with no relay event are accepted. Relay unreachability fails
+// closed, matching the state-check path.
+func newRelayNostrRefChecker(relayURL string) nostrRefChecker {
+	return func(eventID string, tipSHA string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		fetcher := relayEventFetcher{relayURL: relayURL}
+		_, err := refsnostr.FetchEventForTip(ctx, fetcher, eventID, tipSHA)
+		if errors.Is(err, refsnostr.ErrDifferingTip) {
+			return fmt.Errorf("push rejected: refs/nostr/%s conflicts with the relay event's declared tip", eventID)
+		}
+		if err != nil {
+			return fmt.Errorf("push rejected: cannot verify refs/nostr/%s against relay: %v", eventID, err)
+		}
+		return nil
+	}
+}
+
+type relayEventFetcher struct {
+	relayURL string
+}
+
+func (f relayEventFetcher) FetchEvent(ctx context.Context, id string) (*nostr.Event, error) {
+	eid, err := nostr.IDFromHex(id)
+	if err != nil {
+		return nil, fmt.Errorf("invalid event id: %w", err)
+	}
+	r, err := nostr.RelayConnect(ctx, f.relayURL, nostr.RelayOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("connect relay: %w", err)
+	}
+	defer r.Close()
+	for ev := range r.QueryEvents(nostr.Filter{
+		IDs:   []nostr.ID{eid},
+		Kinds: []nostr.Kind{relay.KindPROpen, relay.KindPRUpdate},
+		Limit: 1,
+	}) {
+		e := ev
+		return &e, nil
+	}
+	return nil, nil
 }
 
 func collectPushUpdates(r io.Reader) ([]pushUpdate, error) {
@@ -92,20 +148,30 @@ func requiresStateCheck(updates []pushUpdate) bool {
 	return false
 }
 
-func evaluatePushUpdates(updates []pushUpdate, state *nip34.RepositoryState) error {
+func evaluatePushUpdates(updates []pushUpdate, state *nip34.RepositoryState, checkNostrRef nostrRefChecker) error {
 	for _, update := range updates {
-		if ok, reason := evaluatePushRef(update.refName, update.newSHA, state); !ok {
+		if ok, reason := evaluatePushRef(update.refName, update.newSHA, state, checkNostrRef); !ok {
 			return fmt.Errorf("%s", reason)
 		}
 	}
 	return nil
 }
 
-func evaluatePushRef(refName string, newSHA string, state *nip34.RepositoryState) (bool, string) {
+func evaluatePushRef(refName string, newSHA string, state *nip34.RepositoryState, checkNostrRef nostrRefChecker) (bool, string) {
 	if strings.HasPrefix(refName, "refs/nostr/") {
 		eventID := strings.TrimPrefix(refName, "refs/nostr/")
 		if !nostr.IsValid32ByteHex(eventID) {
 			return false, "refs/nostr/<event-id> must use a valid event id"
+		}
+		if isDeletion(newSHA) {
+			// Deletion of refs/nostr is handled by the retention reaper and
+			// carries no tip to conflict with.
+			return true, ""
+		}
+		if checkNostrRef != nil {
+			if err := checkNostrRef(eventID, newSHA); err != nil {
+				return false, err.Error()
+			}
 		}
 		return true, ""
 	}

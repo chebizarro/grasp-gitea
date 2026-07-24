@@ -68,7 +68,7 @@ func TestEvaluatePushUpdatesIntegration(t *testing.T) {
 				t.Fatalf("unexpected parse error: %v", err)
 			}
 
-			err = evaluatePushUpdates(updates, tt.state)
+			err = evaluatePushUpdates(updates, tt.state, nil)
 			if tt.wantError == "" && err != nil {
 				t.Fatalf("expected no error, got %v", err)
 			}
