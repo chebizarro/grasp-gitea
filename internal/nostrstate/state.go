@@ -97,6 +97,19 @@ func selectLatestState(events []nostr.Event, maintainerSet map[string]struct{}) 
 	return latest
 }
 
+// Maintainers computes the recursive maintainer set for a repository from a
+// pool of announcement events: the owner's announcement is required, and each
+// maintainer's own announcement (matching d tag) can extend the set.
+func Maintainers(events []nostr.Event, ownerPubkey string, repoID string) ([]string, error) {
+	return extractMaintainers(events, ownerPubkey, repoID)
+}
+
+// SelectLatest picks the authoritative state event among candidates signed by
+// the maintainer set, using canonical NIP-01 replaceable ordering.
+func SelectLatest(events []nostr.Event, maintainerSet map[string]struct{}) *nostr.Event {
+	return selectLatestState(events, maintainerSet)
+}
+
 func extractMaintainers(events []nostr.Event, ownerPubkey string, repoID string) ([]string, error) {
 	announcementsByPubkey := map[string]nostr.Event{}
 	for _, ev := range events {

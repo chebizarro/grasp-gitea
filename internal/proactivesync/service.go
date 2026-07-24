@@ -16,6 +16,7 @@ import (
 	"fiatjaf.com/nostr/nip19"
 	"fiatjaf.com/nostr/nip34"
 
+	"github.com/sharegap/grasp-gitea/internal/nostrstate"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -241,18 +242,15 @@ func (s *Service) syncMapping(ctx context.Context, mapping store.Mapping) error 
 }
 
 func (s *Service) fetchLatestStateEvent(ctx context.Context, mapping store.Mapping, relayURLs []string) *nostr.Event {
-	authorPK, err := nostr.PubKeyFromHex(mapping.Pubkey)
-	if err != nil {
-		s.logger.Warn("proactive sync invalid mapping pubkey", "repo_id", mapping.RepoID, "error", err)
-		return nil
-	}
+	// GRASP-02: state events signed by any member of the recursive maintainer
+	// set are authoritative, not only owner-authored state. Query both
+	// announcements (to derive the maintainer set) and state events.
 	filter := nostr.Filter{
-		Kinds:   []nostr.Kind{relay.KindRepositoryState},
-		Authors: []nostr.PubKey{authorPK},
-		Tags:    nostr.TagMap{"d": []string{mapping.RepoID}},
-		Limit:   stateQueryLimit,
+		Kinds: []nostr.Kind{relay.KindRepositoryAnnouncement, relay.KindRepositoryState},
+		Tags:  nostr.TagMap{"d": []string{mapping.RepoID}},
+		Limit: stateQueryLimit,
 	}
-	var latest *nostr.Event
+	var pool []nostr.Event
 	for _, relayURL := range relayURLs {
 		events, err := s.queryRelayHistory(ctx, relayURL, filter, stateQueryLimit)
 		if err != nil {
@@ -266,12 +264,25 @@ func (s *Service) fetchLatestStateEvent(ctx context.Context, mapping store.Mappi
 			if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
 				continue
 			}
-			if latest == nil || ev.CreatedAt > latest.CreatedAt {
-				latest = cloneEvent(ev)
-			}
+			pool = append(pool, *ev)
 		}
 	}
-	return latest
+	// Ensure the cached owner announcement participates even when a relay has
+	// dropped it, so the maintainer set can always be derived.
+	if cached, err := cachedAnnouncement(mapping); err == nil && cached != nil {
+		pool = append(pool, *cached)
+	}
+
+	maintainers, err := nostrstate.Maintainers(pool, mapping.Pubkey, mapping.RepoID)
+	if err != nil {
+		// No owner announcement anywhere: only owner-authored state is safe.
+		maintainers = []string{mapping.Pubkey}
+	}
+	maintainerSet := make(map[string]struct{}, len(maintainers))
+	for _, m := range maintainers {
+		maintainerSet[m] = struct{}{}
+	}
+	return nostrstate.SelectLatest(pool, maintainerSet)
 }
 
 func (s *Service) fetchPREvents(ctx context.Context, mapping store.Mapping, relayURLs []string) []*nostr.Event {
@@ -573,13 +584,15 @@ func uniqueStateSHAs(ctx context.Context, git gitRunner, repoPath string, state 
 }
 
 func stateEventMatchesMapping(ev *nostr.Event, mapping store.Mapping) bool {
-	if ev == nil || ev.Kind != relay.KindRepositoryState {
+	if ev == nil {
 		return false
 	}
-	if tagValue(ev.Tags, "d") != mapping.RepoID {
+	if ev.Kind != relay.KindRepositoryState && ev.Kind != relay.KindRepositoryAnnouncement {
 		return false
 	}
-	return ev.PubKey.Hex() == mapping.Pubkey
+	// Signer authorization happens against the recursive maintainer set in
+	// fetchLatestStateEvent; here we only bind the repository identifier.
+	return tagValue(ev.Tags, "d") == mapping.RepoID
 }
 
 func prEventMatchesRepo(ev *nostr.Event, coord string) bool {

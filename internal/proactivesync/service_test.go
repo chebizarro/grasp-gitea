@@ -673,3 +673,80 @@ func TestApplyStateEventDeletesRefsOmittedFromState(t *testing.T) {
 		t.Fatalf("expected refs/nostr namespace to be untouched")
 	}
 }
+
+func TestSyncOnceAcceptsMaintainerSignedState(t *testing.T) {
+	ctx := context.Background()
+	reposDir := t.TempDir()
+	owner := "alice"
+	repoID := "project"
+	repoPath := reposDir + "/" + owner + "/" + repoID + ".git"
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("create bare repo dir: %v", err)
+	}
+
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
+	if err != nil {
+		t.Fatalf("owner public key: %v", err)
+	}
+	ownerPK, err := nostr.PubKeyFromHex(ownerPub)
+	if err != nil {
+		t.Fatalf("owner pubkey: %v", err)
+	}
+	ownerNpub := nip19.EncodeNpub(ownerPK)
+
+	maintainerPriv := nostr.Generate().Hex()
+	maintainerPub, err := derivePubHex(maintainerPriv)
+	if err != nil {
+		t.Fatalf("maintainer public key: %v", err)
+	}
+
+	cloneURL := "https://git.example.com/alice/project.git"
+	announcement := signedTestEvent(t, ownerPriv, relay.KindRepositoryAnnouncement, nostr.Tags{
+		{"d", repoID},
+		{"clone", cloneURL},
+		{"relays", "wss://relay.example.com"},
+		{"maintainers", maintainerPub},
+	})
+	announcementJSON, err := json.Marshal(announcement)
+	if err != nil {
+		t.Fatalf("marshal announcement: %v", err)
+	}
+
+	stateSHA := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	maintainerState := signedTestEvent(t, maintainerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", repoID},
+		{"refs/heads/main", stateSHA},
+	})
+
+	mapping := store.Mapping{
+		Npub:                  ownerNpub,
+		RepoID:                repoID,
+		Pubkey:                ownerPub,
+		Owner:                 owner,
+		RepoName:              repoID,
+		AnnouncedCloneURL:     cloneURL,
+		AnnouncementEventJSON: string(announcementJSON),
+	}
+	st := &stubStore{
+		stubResolver: stubResolver{mappings: map[string]store.Mapping{ownerNpub + "/" + repoID: mapping}},
+		mappingsList: []store.Mapping{mapping},
+	}
+	git := newFakeGitRunner()
+	git.objects[stateSHA] = true
+	relays := &fakeRelayQueries{state: []*nostr.Event{maintainerState, announcement}}
+
+	svc := New(reposDir, st, testLogger())
+	svc.git = git
+	svc.queryRelay = relays.query
+
+	if err := svc.SyncOnce(ctx); err != nil {
+		t.Fatalf("SyncOnce() error: %v", err)
+	}
+
+	git.mu.Lock()
+	defer git.mu.Unlock()
+	if got := git.updates[repoPath+"|refs/heads/main"]; got != stateSHA {
+		t.Fatalf("expected maintainer-signed state to update main to %s, got %q", stateSHA, got)
+	}
+}
