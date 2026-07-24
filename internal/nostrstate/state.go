@@ -56,6 +56,30 @@ func FetchLatestRepositoryStateForRepo(ctx context.Context, relayURL string, own
 		maintainerSet[m] = struct{}{}
 	}
 
+	latest := selectLatestState(events, maintainerSet)
+
+	if latest == nil {
+		return nil, nil, nil, fmt.Errorf("no repository state event found")
+	}
+
+	state := nip34.ParseRepositoryState(*latest)
+	return latest, &state, maintainers, nil
+}
+
+// supersedes reports whether replaceable event a wins over b under canonical
+// NIP-01 ordering: newer created_at wins; on equal timestamps the
+// lexically-lowest event id wins.
+func supersedes(a, b *nostr.Event) bool {
+	if a.CreatedAt != b.CreatedAt {
+		return a.CreatedAt > b.CreatedAt
+	}
+	return a.ID.Hex() < b.ID.Hex()
+}
+
+// selectLatestState picks the authoritative repository-state event among the
+// candidates: it must be kind 30618, signed by a member of the recursive
+// maintainer set, and win canonical NIP-01 replaceable-event ordering.
+func selectLatestState(events []nostr.Event, maintainerSet map[string]struct{}) *nostr.Event {
 	var latest *nostr.Event
 	for i := range events {
 		ev := events[i]
@@ -65,18 +89,12 @@ func FetchLatestRepositoryStateForRepo(ctx context.Context, relayURL string, own
 		if _, ok := maintainerSet[ev.PubKey.Hex()]; !ok {
 			continue
 		}
-		if latest == nil || ev.CreatedAt > latest.CreatedAt {
+		if latest == nil || supersedes(&ev, latest) {
 			copy := ev
 			latest = &copy
 		}
 	}
-
-	if latest == nil {
-		return nil, nil, nil, fmt.Errorf("no repository state event found")
-	}
-
-	state := nip34.ParseRepositoryState(*latest)
-	return latest, &state, maintainers, nil
+	return latest
 }
 
 func extractMaintainers(events []nostr.Event, ownerPubkey string, repoID string) ([]string, error) {
@@ -87,6 +105,11 @@ func extractMaintainers(events []nostr.Event, ownerPubkey string, repoID string)
 		}
 		repo := nip34.ParseRepository(ev)
 		if repo.ID != repoID {
+			continue
+		}
+		// Replaceable events: keep only the winning announcement per pubkey
+		// under canonical NIP-01 ordering.
+		if existing, ok := announcementsByPubkey[ev.PubKey.Hex()]; ok && !supersedes(&ev, &existing) {
 			continue
 		}
 		announcementsByPubkey[ev.PubKey.Hex()] = ev
