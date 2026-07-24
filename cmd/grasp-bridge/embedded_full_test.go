@@ -118,8 +118,12 @@ func TestEmbeddedRelayNIP11AdvertisesGRASPFields(t *testing.T) {
 			seen[s] = true
 		}
 	}
-	if !seen["GRASP-01"] || !seen["GRASP-02"] {
-		t.Fatalf("expected GRASP-01 and GRASP-02 in supported_grasps, got %#v", supported)
+	if !seen["GRASP-01"] {
+		t.Fatalf("expected GRASP-01 in supported_grasps, got %#v", supported)
+	}
+	// GRASP-02 must not be advertised until validated (beads phase1-t7j).
+	if seen["GRASP-02"] {
+		t.Fatalf("GRASP-02 must not be advertised before validation, got %#v", supported)
 	}
 }
 

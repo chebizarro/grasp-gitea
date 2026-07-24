@@ -25,6 +25,14 @@ const (
 // handler resolves (npub, repo-id) through the mapping store and reverse-proxies
 // the smart-HTTP request to /<owner>/<repo>.git/<git-smart-http-subpath>.
 func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request) {
+	// GRASP-01: the service root is the relay endpoint — WebSocket upgrades
+	// and NIP-11 (Accept: application/nostr+json) negotiate there, while
+	// /<npub>/<identifier>.git paths remain the git surface.
+	if s.rootRelayHandler != nil && r.URL.Path == "/" {
+		s.rootRelayHandler.ServeHTTP(w, r)
+		return
+	}
+
 	npub, repoID, gitSubpath, ok, err := parseNpubGitHTTPPath(r)
 	if err != nil {
 		setGitHTTPCORS(w.Header())

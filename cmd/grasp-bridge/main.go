@@ -101,7 +101,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	embeddedRelayURL, shutdownEmbedded, err := startEmbeddedRelay(ctx, cfg, logger)
+	embeddedRelayURL, relayRootHandler, shutdownEmbedded, err := startEmbeddedRelay(ctx, cfg, logger)
 	if err != nil {
 		logger.Error("failed to start embedded relay", "error", err)
 		os.Exit(1)
@@ -179,6 +179,11 @@ func main() {
 	}
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
+	if relayRootHandler != nil {
+		// GRASP-01: serve the Nostr relay (WebSocket) and NIP-11 negotiation
+		// at the canonical service root on the public listener.
+		apiServer.SetRootRelayHandler(relayRootHandler)
+	}
 	if signerSvc != nil {
 		apiServer.SetSignerAuthorizer(signerSvc)
 	}

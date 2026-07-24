@@ -30,6 +30,7 @@ type Server struct {
 	giteaURL            string
 	gitBackendUser      string
 	gitBackendPassword  string
+	rootRelayHandler    http.Handler
 	signerAuthorizer    SignerAuthorizer
 }
 
@@ -50,6 +51,13 @@ func New(cfg config.Config, provisionerSvc *provisioner.Service, publisherSvc *p
 		gitBackendUser:      cfg.GitBackendUser,
 		gitBackendPassword:  cfg.GitBackendPassword,
 	}
+}
+
+// SetRootRelayHandler serves a Nostr relay (WebSocket upgrade + NIP-11
+// content negotiation) at the service root, per GRASP-01 single-endpoint
+// requirements.
+func (s *Server) SetRootRelayHandler(h http.Handler) {
+	s.rootRelayHandler = h
 }
 
 // SetWebhookHandler wires the Gitea webhook handler for NIP-34 event publishing.

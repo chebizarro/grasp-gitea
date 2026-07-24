@@ -26,22 +26,22 @@ type hostedRepoChecker interface {
 
 type storedEventLookup func(ctx context.Context, eventID string) (*nostr.Event, error)
 
-func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Logger) (string, func(context.Context) error, error) {
+func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Logger) (string, http.Handler, func(context.Context) error, error) {
 	_ = ctx
 	if !cfg.EmbeddedRelay {
-		return "", func(context.Context) error { return nil }, nil
+		return "", nil, func(context.Context) error { return nil }, nil
 	}
 
 	r := khatru.NewRelay()
 	db := &lmdb.LMDBBackend{Path: cfg.EmbeddedRelayDB}
 	if err := db.Init(); err != nil {
-		return "", nil, fmt.Errorf("init embedded relay db: %w", err)
+		return "", nil, nil, fmt.Errorf("init embedded relay db: %w", err)
 	}
 
 	repoStore, err := store.Open(cfg.DBPath)
 	if err != nil {
 		db.Close()
-		return "", nil, fmt.Errorf("open embedded relay mapping store: %w", err)
+		return "", nil, nil, fmt.Errorf("open embedded relay mapping store: %w", err)
 	}
 
 	r.UseEventstore(db, 500)
@@ -63,8 +63,9 @@ func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Log
 		return policy(ctx, &event)
 	}
 
+	relayRootHandler := graspNIP11Handler(r, cfg)
 	addr := fmt.Sprintf(":%d", cfg.EmbeddedRelayPort)
-	httpServer := &http.Server{Addr: addr, Handler: graspNIP11Handler(r, cfg)}
+	httpServer := &http.Server{Addr: addr, Handler: relayRootHandler}
 	go func() {
 		logger.Info("embedded relay listening", "addr", addr, "db", cfg.EmbeddedRelayDB)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -82,7 +83,7 @@ func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Log
 	}
 
 	localURL := fmt.Sprintf("ws://localhost:%d", cfg.EmbeddedRelayPort)
-	return localURL, shutdown, nil
+	return localURL, relayRootHandler, shutdown, nil
 }
 
 func makeEmbeddedRelayRejectPolicy(repoChecker hostedRepoChecker, lookup storedEventLookup) func(context.Context, *nostr.Event) (bool, string) {
@@ -208,7 +209,9 @@ func writeGRASPNIP11(w http.ResponseWriter, relayHandler *khatru.Relay, cfg conf
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	doc["supported_grasps"] = []string{"GRASP-01", "GRASP-02"}
+	// GRASP-02 is intentionally not advertised until its complete behavior
+	// passes validation (beads phase1-t7j).
+	doc["supported_grasps"] = []string{"GRASP-01"}
 	doc["repo_acceptance_criteria"] = "Repository announcements must list this service in clone and relays tags; collaboration events must reference a hosted repository or accepted issue, patch, or pull request."
 	if cfg.AllowlistEnabled() {
 		doc["curation"] = "Repository announcements are limited to the configured pubkey allowlist."

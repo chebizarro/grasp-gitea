@@ -325,3 +325,41 @@ func TestGitHTTPNpubLandingPageForKnownAndUnknownRepos(t *testing.T) {
 		t.Fatalf("expected explanatory 404 body, got %q", w.Body.String())
 	}
 }
+
+func TestRootPathServesRelayHandlerWhenConfigured(t *testing.T) {
+	srv := New(config.Config{GiteaURL: "http://gitea:3000"}, nil, nil, nil, testLogger())
+	srv.SetRootRelayHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept"), "application/nostr+json") {
+			w.Header().Set("Content-Type", "application/nostr+json")
+			_, _ = w.Write([]byte(`{"supported_grasps":["GRASP-01"]}`))
+			return
+		}
+		_, _ = w.Write([]byte("relay root"))
+	}))
+
+	// NIP-11 negotiation at the root.
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept", "application/nostr+json")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "GRASP-01") {
+		t.Fatalf("expected NIP-11 at root, got %d %q", w.Code, w.Body.String())
+	}
+
+	// Plain root request also reaches the relay handler (WebSocket upgrades
+	// arrive as GET / and are handled inside the relay handler).
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Body.String() != "relay root" {
+		t.Fatalf("expected relay handler at root, got %q", w.Body.String())
+	}
+
+	// Git npub paths are unaffected.
+	req = httptest.NewRequest(http.MethodGet, "/npub1x/repo.git/info/refs?service=git-upload-pack", nil)
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Body.String() == "relay root" {
+		t.Fatalf("git path must not hit relay handler")
+	}
+}
