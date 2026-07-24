@@ -200,10 +200,18 @@ type fakeGitRunner struct {
 	objects map[string]bool
 	fetches []fetchCall
 	updates map[string]string
+	heads   map[string]string
 }
 
 func newFakeGitRunner() *fakeGitRunner {
-	return &fakeGitRunner{objects: map[string]bool{}, updates: map[string]string{}}
+	return &fakeGitRunner{objects: map[string]bool{}, updates: map[string]string{}, heads: map[string]string{}}
+}
+
+func (g *fakeGitRunner) SetSymbolicHEAD(_ context.Context, repoPath string, ref string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.heads[repoPath] = ref
+	return nil
 }
 
 func (g *fakeGitRunner) ObjectExists(_ context.Context, _ string, sha string) (bool, error) {
@@ -518,4 +526,84 @@ func signedTestEvent(t *testing.T, priv string, kind int, tags nostr.Tags) *nost
 		t.Fatalf("sign event: %v", err)
 	}
 	return ev
+}
+
+func TestApplyStateEventReconcilesSymbolicHEAD(t *testing.T) {
+	ctx := context.Background()
+	priv := nostr.Generate().Hex()
+	git := newFakeGitRunner()
+	mainSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	devSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	git.objects[mainSHA] = true
+	git.objects[devSHA] = true
+
+	svc := New(t.TempDir(), &stubStore{}, testLogger())
+	svc.git = git
+	repoPath := "/repos/alice/project.git"
+
+	state1 := signedTestEvent(t, priv, relay.KindRepositoryState, nostr.Tags{
+		{"d", "project"},
+		{"HEAD", "ref: refs/heads/main"},
+		{"refs/heads/main", mainSHA},
+		{"refs/heads/develop", devSHA},
+	})
+	if err := svc.applyStateEvent(ctx, repoPath, state1); err != nil {
+		t.Fatalf("apply state1: %v", err)
+	}
+	if got := git.heads[repoPath]; got != "refs/heads/main" {
+		t.Fatalf("expected HEAD refs/heads/main, got %q", got)
+	}
+
+	// HEAD transition main -> develop.
+	state2 := signedTestEvent(t, priv, relay.KindRepositoryState, nostr.Tags{
+		{"d", "project"},
+		{"HEAD", "ref: refs/heads/develop"},
+		{"refs/heads/main", mainSHA},
+		{"refs/heads/develop", devSHA},
+	})
+	if err := svc.applyStateEvent(ctx, repoPath, state2); err != nil {
+		t.Fatalf("apply state2: %v", err)
+	}
+	if got := git.heads[repoPath]; got != "refs/heads/develop" {
+		t.Fatalf("expected HEAD refs/heads/develop after transition, got %q", got)
+	}
+}
+
+func TestApplyStateEventHEADIgnoredWhenUndeclaredOrMissing(t *testing.T) {
+	ctx := context.Background()
+	priv := nostr.Generate().Hex()
+	git := newFakeGitRunner()
+	mainSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	git.objects[mainSHA] = true
+
+	svc := New(t.TempDir(), &stubStore{}, testLogger())
+	svc.git = git
+	repoPath := "/repos/alice/project.git"
+
+	// HEAD names a branch the state does not declare.
+	undeclared := signedTestEvent(t, priv, relay.KindRepositoryState, nostr.Tags{
+		{"d", "project"},
+		{"HEAD", "ref: refs/heads/ghost"},
+		{"refs/heads/main", mainSHA},
+	})
+	if err := svc.applyStateEvent(ctx, repoPath, undeclared); err != nil {
+		t.Fatalf("apply undeclared: %v", err)
+	}
+	if got, ok := git.heads[repoPath]; ok {
+		t.Fatalf("expected HEAD untouched for undeclared branch, got %q", got)
+	}
+
+	// HEAD branch object missing locally.
+	missingSHA := "cccccccccccccccccccccccccccccccccccccccc"
+	missingObj := signedTestEvent(t, priv, relay.KindRepositoryState, nostr.Tags{
+		{"d", "project"},
+		{"HEAD", "ref: refs/heads/develop"},
+		{"refs/heads/develop", missingSHA},
+	})
+	if err := svc.applyStateEvent(ctx, repoPath, missingObj); err != nil {
+		t.Fatalf("apply missing object: %v", err)
+	}
+	if got, ok := git.heads[repoPath]; ok {
+		t.Fatalf("expected HEAD untouched for missing object, got %q", got)
+	}
 }

@@ -47,6 +47,7 @@ type MappingLister interface {
 type gitRunner interface {
 	ObjectExists(ctx context.Context, repoPath string, sha string) (bool, error)
 	UpdateRef(ctx context.Context, repoPath string, ref string, sha string) error
+	SetSymbolicHEAD(ctx context.Context, repoPath string, ref string) error
 	Fetch(ctx context.Context, repoPath string, remoteURL string, refspecs []string) error
 }
 
@@ -408,8 +409,43 @@ func (s *Service) applyStateEvent(ctx context.Context, repoPath string, ev *nost
 		}
 	}
 
+	s.reconcileHEAD(ctx, repoPath, state)
+
 	s.logger.Info("proactive sync applied state event", "repo", repoPath, "event", ev.ID.Hex())
 	return nil
+}
+
+// reconcileHEAD updates the bare repository's symbolic HEAD to match the
+// state event's HEAD tag. The target must name a branch the state declares
+// (refs/heads/*), pass ref validation, and point at an object that exists
+// locally — otherwise HEAD is left untouched.
+func (s *Service) reconcileHEAD(ctx context.Context, repoPath string, state nip34.RepositoryState) {
+	branch := strings.TrimSpace(state.HEAD)
+	if branch == "" {
+		return
+	}
+	ref := "refs/heads/" + branch
+	if !validRef.MatchString(ref) {
+		s.logger.Warn("proactive sync skipped invalid HEAD target", "repo", repoPath, "head", branch)
+		return
+	}
+	sha, declared := state.Branches[branch]
+	if !declared {
+		s.logger.Warn("proactive sync HEAD names undeclared branch", "repo", repoPath, "head", branch)
+		return
+	}
+	if !validHex.MatchString(sha) {
+		s.logger.Warn("proactive sync HEAD branch has invalid sha", "repo", repoPath, "head", branch, "sha", sha)
+		return
+	}
+	exists, err := s.git.ObjectExists(ctx, repoPath, sha)
+	if err != nil || !exists {
+		s.logger.Warn("proactive sync HEAD target object missing", "repo", repoPath, "head", branch, "sha", sha, "error", err)
+		return
+	}
+	if err := s.git.SetSymbolicHEAD(ctx, repoPath, ref); err != nil {
+		s.logger.Warn("proactive sync HEAD update failed", "repo", repoPath, "head", branch, "error", err)
+	}
 }
 
 func (s *Service) updateRefIfObjectExists(ctx context.Context, repoPath string, ref string, sha string) error {
@@ -581,6 +617,13 @@ func (execGitRunner) ObjectExists(ctx context.Context, repoPath string, sha stri
 func (execGitRunner) UpdateRef(ctx context.Context, repoPath string, ref string, sha string) error {
 	if out, err := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "update-ref", ref, sha).CombinedOutput(); err != nil {
 		return fmt.Errorf("update-ref failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (execGitRunner) SetSymbolicHEAD(ctx context.Context, repoPath string, ref string) error {
+	if out, err := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "symbolic-ref", "HEAD", ref).CombinedOutput(); err != nil {
+		return fmt.Errorf("symbolic-ref HEAD failed: %s", strings.TrimSpace(string(out)))
 	}
 	return nil
 }
