@@ -20,6 +20,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/hooks"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
+	"github.com/sharegap/grasp-gitea/internal/nostrprofile"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -229,6 +230,17 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 
 	if err := s.gitea.EnsureOrg(ctx, orgName); err != nil {
 		return fmt.Errorf("ensure org %s: %w", orgName, err)
+	}
+
+	// Sync kind:0 profile into the Gitea org (non-fatal — don't block provisioning).
+	if profile, err := nostrprofile.Fetch(ctx, pubkey, relayURLs); err != nil {
+		s.logger.Debug("nostr profile fetch failed (non-fatal)", "pubkey", pubkey, "error", err)
+	} else if profile != nil && !profile.IsEmpty() {
+		if syncErr := s.gitea.SyncNostrProfile(ctx, "", orgName, *profile); syncErr != nil {
+			s.logger.Warn("nostr profile sync partial failure (non-fatal)", "org", orgName, "error", syncErr)
+		} else {
+			s.logger.Info("synced nostr profile to gitea org", "org", orgName, "display_name", profile.DisplayName)
+		}
 	}
 
 	repo, err := s.gitea.EnsureRepo(ctx, orgName, repoID)
