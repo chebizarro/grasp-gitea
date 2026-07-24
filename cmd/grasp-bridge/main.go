@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -41,6 +42,23 @@ func mergeRelayURLs(configured []string, embeddedURL string) []string {
 		result = append(result, embeddedURL)
 	}
 	return result
+}
+
+// relaySubscriptionURLs avoids subscribing to an embedded relay through both
+// its local and public addresses. Treating those as separate upstream relays
+// creates a reflection loop because externally received repository events are
+// forwarded into the embedded relay.
+func relaySubscriptionURLs(configured []string, embeddedURL string, publicEmbeddedURL string) []string {
+	filtered := make([]string, 0, len(configured))
+	publicEmbeddedURL = strings.TrimRight(strings.TrimSpace(publicEmbeddedURL), "/")
+	for _, relayURL := range configured {
+		if embeddedURL != "" && publicEmbeddedURL != "" &&
+			strings.TrimRight(strings.TrimSpace(relayURL), "/") == publicEmbeddedURL {
+			continue
+		}
+		filtered = append(filtered, relayURL)
+	}
+	return mergeRelayURLs(filtered, embeddedURL)
 }
 
 func newServerSigner(ctx context.Context, cfg config.Config, logger *slog.Logger) (publisher.ServerSigner, error) {
@@ -108,7 +126,7 @@ func main() {
 	}
 	defer shutdownEmbedded(context.Background())
 
-	relayURLs := mergeRelayURLs(cfg.RelayURLs, embeddedRelayURL)
+	relayURLs := relaySubscriptionURLs(cfg.RelayURLs, embeddedRelayURL, cfg.GraspRelayURL)
 
 	var signerSvc *signer.Service
 	if cfg.SignerEnabled() {

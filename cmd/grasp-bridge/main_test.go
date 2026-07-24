@@ -68,3 +68,28 @@ func TestMergeRelayURLsDoesNotMutateInput(t *testing.T) {
 		t.Error("mergeRelayURLs mutated the input slice content")
 	}
 }
+
+func TestRelaySubscriptionURLsSkipsPublicEmbeddedRelay(t *testing.T) {
+	configured := []string{
+		"wss://external.example",
+		"wss://grasp.example/",
+	}
+	result := relaySubscriptionURLs(configured, "ws://localhost:3334", "wss://grasp.example")
+	if len(result) != 2 {
+		t.Fatalf("expected external and local embedded relay, got %v", result)
+	}
+	if result[0] != "wss://external.example" || result[1] != "ws://localhost:3334" {
+		t.Fatalf("unexpected relay subscriptions: %v", result)
+	}
+}
+
+func TestRelaySubscriptionURLsKeepsPublicRelayWithoutEmbedded(t *testing.T) {
+	result := relaySubscriptionURLs(
+		[]string{"wss://grasp.example"},
+		"",
+		"wss://grasp.example",
+	)
+	if len(result) != 1 || result[0] != "wss://grasp.example" {
+		t.Fatalf("expected public relay without embedded relay, got %v", result)
+	}
+}
