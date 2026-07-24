@@ -3,9 +3,11 @@ package api
 import (
 	"database/sql"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -77,9 +79,19 @@ func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request) {
 			pr.Out.URL.Path = singleJoiningSlash(target.Path, backendPath)
 			pr.Out.URL.RawPath = ""
 			pr.Out.URL.RawQuery = joinRawQuery(target.RawQuery, pr.In.URL.RawQuery)
+			// GRASP-01: the public interface is unauthenticated and caller
+			// credentials must never reach Gitea. Push authorization comes from
+			// signed repository-state events enforced by the pre-receive hook,
+			// so the bridge authenticates to Gitea with its own scoped service
+			// identity, injected only after the npub/identifier mapping resolved.
+			stripCallerCredentials(pr.Out.Header)
+			if s.gitBackendUser != "" || s.gitBackendPassword != "" {
+				pr.Out.SetBasicAuth(s.gitBackendUser, s.gitBackendPassword)
+			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			setGitHTTPCORS(resp.Header)
+			sanitizeGitBackendResponse(resp)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -149,6 +161,39 @@ func isGitSmartHTTPSubpath(subpath string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// stripCallerCredentials removes any caller-supplied authentication material
+// before the request is forwarded to Gitea. GRASP-01 git smart-HTTP is public;
+// forwarding these headers would let Gitea authenticate (or challenge) the
+// caller, which must never happen on this path.
+func stripCallerCredentials(h http.Header) {
+	h.Del("Authorization")
+	h.Del("Proxy-Authorization")
+	h.Del("Cookie")
+}
+
+// sanitizeGitBackendResponse guarantees the public GRASP surface never emits a
+// Gitea authentication challenge or session state. A backend 401/407 means the
+// bridge's own service identity is missing or misconfigured, which is an
+// operator error — report it as a backend failure, not an auth challenge.
+func sanitizeGitBackendResponse(resp *http.Response) {
+	resp.Header.Del("WWW-Authenticate")
+	resp.Header.Del("Proxy-Authenticate")
+	resp.Header.Del("Set-Cookie")
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusProxyAuthRequired {
+		body := "git backend unavailable\n"
+		if resp.Body != nil {
+			resp.Body.Close()
+		}
+		resp.StatusCode = http.StatusBadGateway
+		resp.Status = http.StatusText(http.StatusBadGateway)
+		resp.Body = io.NopCloser(strings.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		resp.Header.Set("Content-Type", "text/plain; charset=utf-8")
 	}
 }
 

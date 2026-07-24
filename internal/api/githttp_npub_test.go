@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -173,4 +174,119 @@ func assertGitHTTPCORS(t *testing.T, h http.Header) {
 	if got := h.Get("Access-Control-Allow-Headers"); got != "Content-Type" {
 		t.Fatalf("expected Access-Control-Allow-Headers Content-Type, got %q", got)
 	}
+}
+
+func TestGitHTTPNpubProxyStripsCallerCredentialsAndInjectsServiceIdentity(t *testing.T) {
+	ctx := context.Background()
+	type observedAuth struct {
+		authorization string
+		cookie        string
+		proxyAuth     string
+	}
+	backendAuth := make(chan observedAuth, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendAuth <- observedAuth{
+			authorization: r.Header.Get("Authorization"),
+			cookie:        r.Header.Get("Cookie"),
+			proxyAuth:     r.Header.Get("Proxy-Authorization"),
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	st := openGitHTTPProxyTestStore(t)
+	seedGitHTTPProxyMapping(t, ctx, st, store.Mapping{
+		Npub: "npub1owner", RepoID: "repo", Pubkey: "pubkey",
+		Owner: "org", RepoName: "repo", GiteaRepoID: 1,
+		CloneURL: backend.URL + "/org/repo.git", SourceEvent: "event1",
+	})
+
+	srv := New(config.Config{
+		GiteaURL:           backend.URL,
+		GitBackendUser:     "grasp-bridge",
+		GitBackendPassword: "service-secret",
+	}, nil, nil, st, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/npub1owner/repo.git/info/refs?service=git-upload-pack", nil)
+	req.Header.Set("Authorization", "Basic Y2FsbGVyOnNlY3JldA==")
+	req.Header.Set("Proxy-Authorization", "Basic cHJveHk6c2VjcmV0")
+	req.Header.Set("Cookie", "i_like_gitea=session-token")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	seen := <-backendAuth
+	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("grasp-bridge:service-secret"))
+	if seen.authorization != wantAuth {
+		t.Fatalf("expected service identity auth %q, got %q", wantAuth, seen.authorization)
+	}
+	if seen.cookie != "" {
+		t.Fatalf("expected caller cookie to be stripped, got %q", seen.cookie)
+	}
+	if seen.proxyAuth != "" {
+		t.Fatalf("expected caller proxy auth to be stripped, got %q", seen.proxyAuth)
+	}
+}
+
+func TestGitHTTPNpubProxyForwardsNoCredentialsWhenUnconfigured(t *testing.T) {
+	ctx := context.Background()
+	backendAuth := make(chan string, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendAuth <- r.Header.Get("Authorization")
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	st := openGitHTTPProxyTestStore(t)
+	seedGitHTTPProxyMapping(t, ctx, st, store.Mapping{
+		Npub: "npub1owner", RepoID: "repo", Pubkey: "pubkey",
+		Owner: "org", RepoName: "repo", GiteaRepoID: 1,
+		CloneURL: backend.URL + "/org/repo.git", SourceEvent: "event1",
+	})
+
+	srv := New(config.Config{GiteaURL: backend.URL}, nil, nil, st, testLogger())
+	req := httptest.NewRequest(http.MethodGet, "/npub1owner/repo.git/info/refs?service=git-upload-pack", nil)
+	req.Header.Set("Authorization", "Basic Y2FsbGVyOnNlY3JldA==")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if got := <-backendAuth; got != "" {
+		t.Fatalf("expected no credentials forwarded to backend, got %q", got)
+	}
+}
+
+func TestGitHTTPNpubProxyNeverSurfacesGiteaBasicChallenge(t *testing.T) {
+	ctx := context.Background()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Gitea"`)
+		w.Header().Set("Set-Cookie", "i_like_gitea=abc; Path=/")
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	}))
+	defer backend.Close()
+
+	st := openGitHTTPProxyTestStore(t)
+	seedGitHTTPProxyMapping(t, ctx, st, store.Mapping{
+		Npub: "npub1owner", RepoID: "repo", Pubkey: "pubkey",
+		Owner: "org", RepoName: "repo", GiteaRepoID: 1,
+		CloneURL: backend.URL + "/org/repo.git", SourceEvent: "event1",
+	})
+
+	srv := New(config.Config{GiteaURL: backend.URL}, nil, nil, st, testLogger())
+	req := httptest.NewRequest(http.MethodGet, "/npub1owner/repo.git/info/refs?service=git-receive-pack", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected backend 401 to surface as 502, got %d", w.Code)
+	}
+	if got := w.Result().Header.Get("WWW-Authenticate"); got != "" {
+		t.Fatalf("expected no WWW-Authenticate on public response, got %q", got)
+	}
+	if got := w.Result().Header.Get("Set-Cookie"); got != "" {
+		t.Fatalf("expected no Set-Cookie on public response, got %q", got)
+	}
+	assertGitHTTPCORS(t, w.Result().Header)
 }

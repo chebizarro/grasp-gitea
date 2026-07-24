@@ -28,6 +28,8 @@ type Server struct {
 	webhookHandler      http.Handler // Gitea webhook handler for NIP-34 events
 	routeRegistrars     []func(*http.ServeMux)
 	giteaURL            string
+	gitBackendUser      string
+	gitBackendPassword  string
 	signerAuthorizer    SignerAuthorizer
 }
 
@@ -45,6 +47,8 @@ func New(cfg config.Config, provisionerSvc *provisioner.Service, publisherSvc *p
 		apiToken:            cfg.AdminAPIToken,
 		mirrorCallbackToken: cfg.MirrorCallbackToken,
 		giteaURL:            cfg.GiteaURL,
+		gitBackendUser:      cfg.GitBackendUser,
+		gitBackendPassword:  cfg.GitBackendPassword,
 	}
 }
 

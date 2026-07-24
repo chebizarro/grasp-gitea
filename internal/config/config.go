@@ -46,6 +46,12 @@ type Config struct {
 	// Gitea webhook handler for NIP-34 events (PRs, issues, patches, labels)
 	GiteaWebhookSecret string
 
+	// GRASP-01 public git smart-HTTP backend identity. The public npub proxy is
+	// unauthenticated; the bridge authenticates to Gitea itself using this
+	// narrowly scoped service account so callers never need Gitea credentials.
+	GitBackendUser     string
+	GitBackendPassword string
+
 	// CI workflow run publishing: emit ContextVM ci/workflow-run requests when state events arrive
 	// for repos that have CI workflows configured.
 	CIEnabled      bool
@@ -87,6 +93,8 @@ func Load() (Config, error) {
 		Environment:            firstEnv("GRASP_ENV", "APP_ENV", "ENVIRONMENT"),
 		MirrorCallbackToken:    strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
 		GiteaWebhookSecret:     strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
+		GitBackendUser:         strings.TrimSpace(os.Getenv("GIT_BACKEND_USER")),
+		GitBackendPassword:     strings.TrimSpace(os.Getenv("GIT_BACKEND_PASSWORD")),
 		CIEnabled:              boolEnv("CI_ENABLED", false),
 		CITriggerRepos:         csvEnv("CI_TRIGGER_REPOS"),
 		HiveCIEnabled:          boolEnv("HIVE_CI_ENABLED", false),
