@@ -89,6 +89,13 @@ func main() {
 		logger.Warn("hook reconciliation had errors", "error", err)
 	}
 
+	// Migrate every served repository to the required GRASP-01 upload-pack
+	// capability configuration (allowFilter, allowTipSHA1InWant,
+	// allowReachableSHA1InWant).
+	if err := provisionerSvc.EnsureUploadPackCapabilities(context.Background()); err != nil {
+		logger.Warn("upload-pack capability migration had errors", "error", err)
+	}
+
 	proactiveSyncSvc := proactivesync.New(cfg.GiteaRepositoriesDir, st, logger)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

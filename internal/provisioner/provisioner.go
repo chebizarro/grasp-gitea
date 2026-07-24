@@ -323,6 +323,26 @@ func (s *Service) ReconcileHooks(ctx context.Context) error {
 	return errors.Join(reconcileErrors...)
 }
 
+// EnsureUploadPackCapabilities migrates every mapped repository to the
+// required GRASP-01 upload-pack capability configuration. Call on startup.
+func (s *Service) EnsureUploadPackCapabilities(ctx context.Context) error {
+	mappings, err := s.store.ListMappings(ctx)
+	if err != nil {
+		return fmt.Errorf("list mappings: %w", err)
+	}
+	var errs []error
+	for _, m := range mappings {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.installer.ConfigureUploadPack(m.Owner, m.RepoID); err != nil {
+			errs = append(errs, fmt.Errorf("upload-pack config %s/%s: %w", m.Owner, m.RepoID, err))
+			continue
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (s *Service) validatePolicy(ctx context.Context, npub string, pubkey string) error {
 	if s.cfg.AllowlistEnabled() {
 		if _, ok := s.cfg.PubkeyAllowlist[pubkey]; !ok {

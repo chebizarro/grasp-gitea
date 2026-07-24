@@ -5,6 +5,7 @@ package hooks
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -81,5 +82,49 @@ func TestInstallRejectsNonexistentRepoPath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "repository path not found") {
 		t.Fatalf("expected 'repository path not found' error, got: %v", err)
+	}
+}
+
+func TestInstallConfiguresUploadPackCapabilities(t *testing.T) {
+	reposDir := t.TempDir()
+	repoDir := filepath.Join(reposDir, "org1", "repo1.git")
+	if err := os.MkdirAll(filepath.Join(repoDir, "hooks"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	installer := NewInstaller(reposDir, "/usr/local/bin/grasp-pre-receive", "ws://relay:3334")
+	if err := installer.Install("org1", "npub1abc", "repo1"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	for _, key := range []string{"uploadpack.allowFilter", "uploadpack.allowTipSHA1InWant", "uploadpack.allowReachableSHA1InWant"} {
+		out, err := exec.Command("git", "config", "--file", filepath.Join(repoDir, "config"), "--get", key).Output()
+		if err != nil {
+			t.Fatalf("read %s: %v", key, err)
+		}
+		if got := strings.TrimSpace(string(out)); got != "true" {
+			t.Fatalf("expected %s=true, got %q", key, got)
+		}
+	}
+}
+
+func TestConfigureUploadPackMigratesExistingRepo(t *testing.T) {
+	reposDir := t.TempDir()
+	repoDir := filepath.Join(reposDir, "org1", "existing.git")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	installer := NewInstaller(reposDir, "/usr/local/bin/grasp-pre-receive", "ws://relay:3334")
+	if err := installer.ConfigureUploadPack("org1", "existing"); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	out, err := exec.Command("git", "config", "--file", filepath.Join(repoDir, "config"), "--get", "uploadpack.allowReachableSHA1InWant").Output()
+	if err != nil || strings.TrimSpace(string(out)) != "true" {
+		t.Fatalf("expected capability set, got %q err %v", out, err)
+	}
+
+	if err := installer.ConfigureUploadPack("org1", "missing"); err == nil {
+		t.Fatalf("expected error for missing repository")
 	}
 }
