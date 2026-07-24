@@ -409,9 +409,11 @@ func findCloneForService(tags nostr.Tags, graspPublicURL string, clonePrefix str
 			if len(tag) < 2 || tag[0] != "clone" {
 				continue
 			}
-			clone := strings.TrimRight(tag[1], "/")
-			if clone == canonical || decodedEqual(clone, canonical) {
-				return canonical, true
+			for _, value := range tag[1:] {
+				clone := strings.TrimRight(value, "/")
+				if clone == canonical || decodedEqual(clone, canonical) {
+					return canonical, true
+				}
 			}
 		}
 	}
@@ -430,9 +432,11 @@ func findCloneForPrefix(tags nostr.Tags, clonePrefix string) (string, bool) {
 		if len(tag) < 2 || tag[0] != "clone" {
 			continue
 		}
-		clone := strings.TrimRight(tag[1], "/")
-		if strings.HasPrefix(clone, clonePrefix+"/") {
-			return clone, true
+		for _, value := range tag[1:] {
+			clone := strings.TrimRight(value, "/")
+			if strings.HasPrefix(clone, clonePrefix+"/") {
+				return clone, true
+			}
 		}
 	}
 	return "", false
