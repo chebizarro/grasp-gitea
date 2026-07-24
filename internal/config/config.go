@@ -46,6 +46,13 @@ type Config struct {
 	// Gitea webhook handler for NIP-34 events (PRs, issues, patches, labels)
 	GiteaWebhookSecret string
 
+	// GraspPublicURL is the canonical GRASP-01 service origin
+	// (e.g. https://grasp.sharegap.net). When set, announcement acceptance
+	// requires the canonical npub clone URL and bridge-emitted events
+	// advertise it. GraspRelayURL is the matching wss:// relay origin.
+	GraspPublicURL string
+	GraspRelayURL  string
+
 	// GRASP-01 public git smart-HTTP backend identity. The public npub proxy is
 	// unauthenticated; the bridge authenticates to Gitea itself using this
 	// narrowly scoped service account so callers never need Gitea credentials.
@@ -93,6 +100,8 @@ func Load() (Config, error) {
 		Environment:            firstEnv("GRASP_ENV", "APP_ENV", "ENVIRONMENT"),
 		MirrorCallbackToken:    strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
 		GiteaWebhookSecret:     strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
+		GraspPublicURL:         strings.TrimRight(strings.TrimSpace(os.Getenv("GRASP_PUBLIC_URL")), "/"),
+		GraspRelayURL:          strings.TrimRight(strings.TrimSpace(os.Getenv("GRASP_RELAY_URL")), "/"),
 		GitBackendUser:         strings.TrimSpace(os.Getenv("GIT_BACKEND_USER")),
 		GitBackendPassword:     strings.TrimSpace(os.Getenv("GIT_BACKEND_PASSWORD")),
 		CIEnabled:              boolEnv("CI_ENABLED", false),

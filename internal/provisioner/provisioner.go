@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"log/slog"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
+	"github.com/sharegap/grasp-gitea/internal/grasp"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
@@ -104,7 +106,7 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		return fmt.Errorf("missing d tag for announcement %s", ev.ID)
 	}
 
-	cloneURL, ok := findCloneForPrefix(ev.Tags, s.cfg.ClonePrefix)
+	cloneURL, ok := findCloneForService(ev.Tags, s.cfg.GraspPublicURL, s.cfg.ClonePrefix, npub, repoID)
 	if !ok {
 		if !s.cfg.ArchiveMode {
 			metrics.IncAnnouncementRejected()
@@ -137,7 +139,7 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		metrics.IncAnnouncementRejected()
 		return fmt.Errorf("announcement %s clone URL does not match repo id %s", ev.ID, repoID)
 	}
-	if !s.cfg.ArchiveMode && !hasRelayForService(ev.Tags, s.cfg.HookRelayURL) {
+	if !s.cfg.ArchiveMode && !hasRelayForService(ev.Tags, s.serviceRelayURL()) {
 		metrics.IncAnnouncementRejected()
 		return fmt.Errorf("announcement %s does not list this service in relays tags", ev.ID)
 	}
@@ -181,7 +183,10 @@ func (s *Service) ManualProvision(ctx context.Context, npub string, pubkey strin
 		pubkey = decoded.Hex()
 	}
 
-	cloneURL := fmt.Sprintf("%s/%s/%s.git", s.cfg.ClonePrefix, npub, repoID)
+	cloneURL := grasp.CanonicalCloneURL(s.cfg.GraspPublicURL, npub, repoID)
+	if cloneURL == "" {
+		cloneURL = fmt.Sprintf("%s/%s/%s.git", s.cfg.ClonePrefix, npub, repoID)
+	}
 	err := s.provisionFromAnnouncement(ctx, npub, pubkey, repoID, cloneURL, "manual", "manual")
 	if err != nil {
 		metrics.IncManualProvisionFailures()
@@ -371,6 +376,41 @@ func getTagValue(tags nostr.Tags, key string) string {
 		return ""
 	}
 	return v[1]
+}
+
+// serviceRelayURL returns the relay URL announcements must advertise: the
+// canonical GRASP relay origin when configured, otherwise the hook relay.
+func (s *Service) serviceRelayURL() string {
+	if s.cfg.GraspRelayURL != "" {
+		return s.cfg.GraspRelayURL
+	}
+	return s.cfg.HookRelayURL
+}
+
+// findCloneForService accepts the canonical GRASP-01 npub-form clone URL
+// (<graspPublicURL>/<npub>/<percent-encoded-id>.git) when a canonical origin
+// is configured, and falls back to legacy clone-prefix matching. Conventional
+// Gitea /org/repo.git URLs are never treated as canonical GRASP URLs.
+func findCloneForService(tags nostr.Tags, graspPublicURL string, clonePrefix string, npub string, repoID string) (string, bool) {
+	if canonical := grasp.CanonicalCloneURL(graspPublicURL, npub, repoID); canonical != "" {
+		for _, tag := range tags {
+			if len(tag) < 2 || tag[0] != "clone" {
+				continue
+			}
+			clone := strings.TrimRight(tag[1], "/")
+			if clone == canonical || decodedEqual(clone, canonical) {
+				return canonical, true
+			}
+		}
+	}
+	return findCloneForPrefix(tags, clonePrefix)
+}
+
+// decodedEqual compares two URLs ignoring percent-encoding differences.
+func decodedEqual(a string, b string) bool {
+	da, errA := url.PathUnescape(a)
+	db, errB := url.PathUnescape(b)
+	return errA == nil && errB == nil && da == db
 }
 
 func findCloneForPrefix(tags nostr.Tags, clonePrefix string) (string, bool) {

@@ -27,6 +27,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/relay"
+	"github.com/sharegap/grasp-gitea/internal/grasp"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -81,6 +82,7 @@ type Handler struct {
 	actorOutbox     ActorOutbox
 	actorLookup     ActorIdentityLookup
 	repositoriesDir string
+	graspPublicURL  string
 	now             func() time.Time
 	echoGuardWindow time.Duration
 
@@ -445,7 +447,7 @@ func (h *Handler) buildPROpenEvent(mapping store.Mapping, p PullRequestPayload, 
 	if p.PullRequest.Head.SHA != "" {
 		tags = append(tags, nostr.Tag{"c", p.PullRequest.Head.SHA})
 	}
-	if clone := prCloneURL(mapping, p); clone != "" {
+	if clone := h.prCloneURL(mapping, p); clone != "" {
 		tags = append(tags, nostr.Tag{"clone", clone})
 	}
 	if p.PullRequest.Head.Ref != "" {
@@ -473,7 +475,7 @@ func (h *Handler) buildPRUpdateEvent(mapping store.Mapping, p PullRequestPayload
 	if p.PullRequest.Head.SHA != "" {
 		tags = append(tags, nostr.Tag{"c", p.PullRequest.Head.SHA})
 	}
-	if clone := prCloneURL(mapping, p); clone != "" {
+	if clone := h.prCloneURL(mapping, p); clone != "" {
 		tags = append(tags, nostr.Tag{"clone", clone})
 	}
 	if p.PullRequest.MergeBase != "" {
@@ -566,7 +568,12 @@ func prStatusKind(pr PullRequest) int {
 	return KindStatusClosed
 }
 
-func prCloneURL(mapping store.Mapping, p PullRequestPayload) string {
+func (h *Handler) prCloneURL(mapping store.Mapping, p PullRequestPayload) string {
+	// The canonical GRASP-01 npub clone URL takes precedence: conventional
+	// Gitea /org/repo.git URLs are not canonical GRASP URLs.
+	if canonical := grasp.CanonicalCloneURL(h.graspPublicURL, mapping.Npub, mapping.RepoID); canonical != "" {
+		return canonical
+	}
 	if p.PullRequest.Head.Repo.CloneURL != "" {
 		return p.PullRequest.Head.Repo.CloneURL
 	}
@@ -577,6 +584,12 @@ func prCloneURL(mapping store.Mapping, p PullRequestPayload) string {
 		return mapping.AnnouncedCloneURL
 	}
 	return mapping.CloneURL
+}
+
+// SetGraspPublicURL configures the canonical GRASP service origin used when
+// advertising clone URLs on emitted NIP-34 events.
+func (h *Handler) SetGraspPublicURL(publicURL string) {
+	h.graspPublicURL = strings.TrimRight(strings.TrimSpace(publicURL), "/")
 }
 
 func eventTimestamp(t time.Time) nostr.Timestamp {
