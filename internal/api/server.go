@@ -85,6 +85,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/outbound-events", method(http.MethodGet, s.requireAuth(s.outboundEvents)))
 	mux.HandleFunc("/signer/authorize", method(http.MethodPost, s.requireAuth(s.signerAuthorize)))
 	mux.HandleFunc("/repository-state/propose", method(http.MethodPost, s.requireConfiguredAuth(s.proposeRepositoryState)))
+	mux.HandleFunc("/repository-state/proposed", method(http.MethodGet, s.requireConfiguredAuth(s.proposedRepositoryState)))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.requireAuth(s.manualProvision)))
 	mux.HandleFunc("/internal/mirror-sync", method(http.MethodPost, s.requireMirrorAuth(s.mirrorSync)))
 

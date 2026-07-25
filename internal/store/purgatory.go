@@ -86,6 +86,30 @@ func (s *SQLiteStore) ListPurgatoryEvents(ctx context.Context) ([]PurgatoryEvent
 	return out, rows.Err()
 }
 
+// LatestPurgatoryEvent returns the newest held event for an exact
+// author/kind/d-tag tuple. It is used by the authenticated pre-receive path to
+// break the intentional state-before-object purgatory cycle without exposing
+// held events through the public relay.
+func (s *SQLiteStore) LatestPurgatoryEvent(ctx context.Context, pubkey string, kind int, dTag string) (PurgatoryEvent, error) {
+	var ev PurgatoryEvent
+	var shas string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT event_id, pubkey, kind, d_tag, event_json, required_shas, repo_path, accepted_at
+		FROM purgatory_events
+		WHERE pubkey = ? AND kind = ? AND d_tag = ?
+		ORDER BY accepted_at DESC, event_id ASC
+		LIMIT 1`, pubkey, kind, dTag).
+		Scan(&ev.EventID, &ev.Pubkey, &ev.Kind, &ev.DTag, &ev.EventJSON, &shas, &ev.RepoPath, &ev.AcceptedAt)
+	if err != nil {
+		return PurgatoryEvent{}, err
+	}
+	ev.RequiredSHAs, err = unmarshalStringSlice(shas)
+	if err != nil {
+		return PurgatoryEvent{}, fmt.Errorf("decode required shas: %w", err)
+	}
+	return ev, nil
+}
+
 // DeletePurgatoryEvent removes an event from purgatory (after release or expiry).
 func (s *SQLiteStore) DeletePurgatoryEvent(ctx context.Context, eventID string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM purgatory_events WHERE event_id = ?`, eventID)

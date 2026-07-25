@@ -4,14 +4,52 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"fiatjaf.com/nostr"
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
+
+func TestProposedRepositoryStateReturnsAuthenticatedHeldEvent(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	key := nostr.Generate()
+	event := nostr.Event{
+		Kind:      nostr.KindRepositoryState,
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Tags:      nostr.Tags{{"d", "demo"}},
+	}
+	if err := event.Sign(key); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertPurgatoryEvent(t.Context(), store.PurgatoryEvent{
+		EventID: event.ID.Hex(), Pubkey: key.Public().Hex(), Kind: int(event.Kind),
+		DTag: "demo", EventJSON: string(raw), AcceptedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler := New(config.Config{AdminAPIToken: "secret"}, nil, nil, st, nil).Handler()
+	req := httptest.NewRequest(http.MethodGet, "/repository-state/proposed?pubkey="+key.Public().Hex()+"&repo_id=demo", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), event.ID.Hex()) {
+		t.Fatalf("response = %d %s", w.Code, w.Body.String())
+	}
+}
 
 func TestHealthEndpointNoAuth(t *testing.T) {
 	cfg := config.Config{AdminAPIToken: "secret"}

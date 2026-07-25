@@ -3,9 +3,12 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -59,8 +62,13 @@ func main() {
 	if requiresStateCheck(updates) {
 		ctx := context.Background()
 		_, state, _, err = nostrstate.FetchLatestRepositoryStateForRepo(ctx, relayURL, pubkey, repoID)
-		if err != nil {
-			reject("no valid NIP-34 state event found; publish kind 30618 before pushing")
+		if err != nil || evaluatePushUpdates(updates, state, nil) != nil {
+			proposed, proposedErr := fetchProposedRepositoryState(ctx, pubkey, repoID)
+			if proposedErr == nil {
+				state = proposed
+			} else if err != nil {
+				reject("no valid NIP-34 state event found; publish kind 30618 before pushing")
+			}
 		}
 	}
 
@@ -68,6 +76,55 @@ func main() {
 	if err := evaluatePushUpdates(updates, state, checker); err != nil {
 		reject(err.Error())
 	}
+}
+
+func fetchProposedRepositoryState(ctx context.Context, pubkey string, repoID string) (*nip34.RepositoryState, error) {
+	tokenFile := envOrDefault("GRASP_HOOK_ADMIN_TOKEN_FILE", "/run/secrets/grasp-admin-api-token")
+	token, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return nil, fmt.Errorf("read hook credential: %w", err)
+	}
+	adminURL := strings.TrimRight(envOrDefault("GRASP_HOOK_ADMIN_URL", "http://grasp-bridge:8090"), "/")
+	endpoint, err := url.Parse(adminURL + "/repository-state/proposed")
+	if err != nil {
+		return nil, fmt.Errorf("parse admin url: %w", err)
+	}
+	query := endpoint.Query()
+	query.Set("pubkey", pubkey)
+	query.Set("repo_id", repoID)
+	endpoint.RawQuery = query.Encode()
+
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build proposed-state request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch proposed state: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch proposed state: status %d", response.StatusCode)
+	}
+	var payload struct {
+		Event nostr.Event `json:"event"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode proposed state: %w", err)
+	}
+	if payload.Event.Kind != nostr.KindRepositoryState ||
+		payload.Event.PubKey.Hex() != pubkey ||
+		!payload.Event.VerifySignature() {
+		return nil, fmt.Errorf("invalid proposed state event")
+	}
+	parsed := nip34.ParseRepositoryState(payload.Event)
+	if parsed.ID != repoID {
+		return nil, fmt.Errorf("proposed state repository mismatch")
+	}
+	return &parsed, nil
 }
 
 func decodedPubkeyHex(value any) (string, bool) {

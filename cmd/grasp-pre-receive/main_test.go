@@ -1,13 +1,57 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip34"
 )
+
+func TestFetchProposedRepositoryState(t *testing.T) {
+	key := nostr.Generate()
+	event := nostr.Event{
+		Kind:      nostr.KindRepositoryState,
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Tags: nostr.Tags{
+			{"d", "demo"},
+			{"refs/heads/main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+			{"HEAD", "ref: refs/heads/main"},
+		},
+	}
+	if err := event.Sign(key); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer hook-token" {
+			t.Fatalf("authorization = %q", got)
+		}
+		if r.URL.Query().Get("pubkey") != key.Public().Hex() || r.URL.Query().Get("repo_id") != "demo" {
+			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"event": event})
+	}))
+	defer server.Close()
+	tokenFile := t.TempDir() + "/token"
+	if err := os.WriteFile(tokenFile, []byte("hook-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GRASP_HOOK_ADMIN_URL", server.URL)
+	t.Setenv("GRASP_HOOK_ADMIN_TOKEN_FILE", tokenFile)
+	state, err := fetchProposedRepositoryState(t.Context(), key.Public().Hex(), "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Branches["main"] != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("unexpected state: %#v", state)
+	}
+}
 
 func TestDecodedPubkeyHexAcceptsTypedNIP19Result(t *testing.T) {
 	key := nostr.Generate().Public()
