@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"fiatjaf.com/nostr"
@@ -85,6 +86,29 @@ func TestComputeDigestEmptyRepo(t *testing.T) {
 	d := computeDigest("", nil, nil)
 	if d == "" {
 		t.Fatal("digest should not be empty even for empty repo")
+	}
+}
+
+func TestValidateProposedState(t *testing.T) {
+	valid := ProposedRepositoryState{
+		ExpectedCurrentDigest: strings.Repeat("a", 64),
+		Head:                  "master",
+		Branches:              map[string]string{"master": strings.Repeat("b", 40)},
+		Tags:                  map[string]string{"v1.0.0": strings.Repeat("c", 40)},
+	}
+	if err := validateProposedState(valid); err != nil {
+		t.Fatalf("valid proposed state rejected: %v", err)
+	}
+	tests := []ProposedRepositoryState{
+		{ExpectedCurrentDigest: "bad", Head: "master", Branches: valid.Branches},
+		{ExpectedCurrentDigest: valid.ExpectedCurrentDigest, Head: "../master", Branches: valid.Branches},
+		{ExpectedCurrentDigest: valid.ExpectedCurrentDigest, Head: "master", Branches: map[string]string{"other": strings.Repeat("b", 40)}},
+		{ExpectedCurrentDigest: valid.ExpectedCurrentDigest, Head: "master", Branches: map[string]string{"master": "bad"}},
+	}
+	for i, proposed := range tests {
+		if err := validateProposedState(proposed); err == nil {
+			t.Fatalf("invalid proposed state %d accepted", i)
+		}
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -58,6 +59,22 @@ type StateSigner interface {
 type StateOutbox interface {
 	Enqueue(ctx context.Context, kind int, authorPubkey string, scope string, unsignedEvent *nostr.Event, dedupeKey string) error
 }
+
+// ProposedRepositoryState is an administrator-authorized ref transition. The
+// current digest is an optimistic concurrency guard; branches and tags describe
+// the exact state the GRASP hook may accept next.
+type ProposedRepositoryState struct {
+	ExpectedCurrentDigest string
+	Head                  string
+	Branches              map[string]string
+	Tags                  map[string]string
+}
+
+var (
+	gitObjectIDPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	stateDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	gitRefPartPattern  = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+)
 
 // ServerSigner signs bridge/operator-authored outbound events without exposing
 // the private key to the publisher. Production should provide a Signet/NIP-46
@@ -120,6 +137,84 @@ func (s *Service) SetOwnerStateSigning(signer StateSigner, outbox StateOutbox) {
 
 func (s *Service) ownerStateSigningConfigured() bool {
 	return s.ownerStateSigner != nil && s.ownerStateSigner.Enabled() && s.ownerStateOutbox != nil && s.store != nil
+}
+
+// EnqueueProposedState validates and queues an exact future repository state
+// for signing by the repository owner's existing NIP-46 grant. It never falls
+// back to bridge signing and does not update Git refs; the pre-receive hook
+// remains the authority that admits the subsequent matching push.
+func (s *Service) EnqueueProposedState(ctx context.Context, giteaRepoID int64, proposed ProposedRepositoryState) (string, error) {
+	if !s.ownerStateSigningConfigured() {
+		return "", fmt.Errorf("owner state signing is not configured")
+	}
+	if giteaRepoID <= 0 {
+		return "", fmt.Errorf("gitea repository id must be positive")
+	}
+	if err := validateProposedState(proposed); err != nil {
+		return "", err
+	}
+
+	mu := s.lockRepo(giteaRepoID)
+	defer mu.Unlock()
+
+	mapping, err := s.store.GetMappingByGiteaRepoID(ctx, giteaRepoID)
+	if err != nil {
+		return "", fmt.Errorf("lookup mapping by gitea repo id %d: %w", giteaRepoID, err)
+	}
+	repoPath := filepath.Join(s.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
+	currentHead, currentBranches, currentTags, err := snapshotRefs(ctx, repoPath)
+	if err != nil {
+		return "", fmt.Errorf("snapshot current refs: %w", err)
+	}
+	currentDigest := computeDigest(currentHead, currentBranches, currentTags)
+	if proposed.ExpectedCurrentDigest != currentDigest {
+		return "", fmt.Errorf("current repository state changed: digest=%s", currentDigest)
+	}
+
+	digest := computeDigest(proposed.Head, proposed.Branches, proposed.Tags)
+	stateEvent, err := s.buildStateEvent(mapping.Pubkey, mapping.RepoID, proposed.Head, proposed.Branches, proposed.Tags)
+	if err != nil {
+		return "", fmt.Errorf("build proposed state event: %w", err)
+	}
+	enqueued, err := s.enqueueOwnerSignedState(ctx, &mapping, stateEvent, digest)
+	if err != nil {
+		return "", fmt.Errorf("enqueue proposed owner-signed state: %w", err)
+	}
+	if !enqueued {
+		return "", fmt.Errorf("repository owner has no active signing grant")
+	}
+	s.logger.Info("enqueued administrator-authorized proposed repository state",
+		"owner", mapping.Owner, "repo", mapping.RepoID, "digest", digest,
+		"branches", len(proposed.Branches), "tags", len(proposed.Tags))
+	return digest, nil
+}
+
+func validateProposedState(proposed ProposedRepositoryState) error {
+	if !stateDigestPattern.MatchString(proposed.ExpectedCurrentDigest) {
+		return fmt.Errorf("expected_current_digest must be 64 lowercase hex characters")
+	}
+	if proposed.Head == "" || !gitRefPartPattern.MatchString(proposed.Head) || strings.Contains(proposed.Head, "..") ||
+		strings.HasPrefix(proposed.Head, "/") || strings.HasSuffix(proposed.Head, "/") {
+		return fmt.Errorf("head must name a valid branch")
+	}
+	if len(proposed.Branches) == 0 {
+		return fmt.Errorf("at least one branch is required")
+	}
+	if _, ok := proposed.Branches[proposed.Head]; !ok {
+		return fmt.Errorf("head branch %q is not present in branches", proposed.Head)
+	}
+	for kind, refs := range map[string]map[string]string{"branch": proposed.Branches, "tag": proposed.Tags} {
+		for name, objectID := range refs {
+			if name == "" || !gitRefPartPattern.MatchString(name) || strings.Contains(name, "..") ||
+				strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") {
+				return fmt.Errorf("%s %q is invalid", kind, name)
+			}
+			if !gitObjectIDPattern.MatchString(objectID) {
+				return fmt.Errorf("%s %q object id must be 40 lowercase hex characters", kind, name)
+			}
+		}
+	}
+	return nil
 }
 
 // lockRepo acquires a per-repo mutex for serializing concurrent callbacks.

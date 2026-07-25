@@ -72,6 +72,13 @@ func TestAuthRequiredWhenTokenConfigured(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 with correct token, got %d", w.Code)
 	}
+
+	req = httptest.NewRequest(http.MethodPost, "/repository-state/propose", strings.NewReader(`{}`))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected proposed-state endpoint to require auth, got %d", w.Code)
+	}
 }
 
 func TestNoAuthRequiredWhenTokenEmpty(t *testing.T) {
@@ -91,6 +98,13 @@ func TestNoAuthRequiredWhenTokenEmpty(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 with no token configured, got %d", w.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/repository-state/propose", strings.NewReader(`{}`))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected proposed-state endpoint to fail closed without configured auth, got %d", w.Code)
 	}
 }
 

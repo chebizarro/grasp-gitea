@@ -84,6 +84,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/mappings", method(http.MethodGet, s.requireAuth(s.mappings)))
 	mux.HandleFunc("/outbound-events", method(http.MethodGet, s.requireAuth(s.outboundEvents)))
 	mux.HandleFunc("/signer/authorize", method(http.MethodPost, s.requireAuth(s.signerAuthorize)))
+	mux.HandleFunc("/repository-state/propose", method(http.MethodPost, s.requireConfiguredAuth(s.proposeRepositoryState)))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.requireAuth(s.manualProvision)))
 	mux.HandleFunc("/internal/mirror-sync", method(http.MethodPost, s.requireMirrorAuth(s.mirrorSync)))
 
@@ -99,6 +100,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.gitHTTPNpubProxy)
 
 	return mux
+}
+
+// requireConfiguredAuth is used for security-sensitive mutation endpoints that
+// must never inherit the legacy open-mode behavior.
+func (s *Server) requireConfiguredAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.apiToken == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "admin authentication is not configured"})
+			return
+		}
+		s.requireAuth(next)(w, r)
+	}
 }
 
 // requireAuth wraps a handler with bearer token authentication.
