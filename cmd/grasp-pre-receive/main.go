@@ -45,8 +45,8 @@ func main() {
 	if err != nil || decodedType != "npub" {
 		reject("invalid npub in GRASP_REPO_NPUB")
 	}
-	pubkey, ok := v.(string)
-	if !ok || strings.TrimSpace(pubkey) == "" {
+	pubkey, ok := decodedPubkeyHex(v)
+	if !ok {
 		reject("invalid decoded pubkey")
 	}
 
@@ -67,6 +67,18 @@ func main() {
 	checker := newRelayNostrRefChecker(relayURL)
 	if err := evaluatePushUpdates(updates, state, checker); err != nil {
 		reject(err.Error())
+	}
+}
+
+func decodedPubkeyHex(value any) (string, bool) {
+	switch decoded := value.(type) {
+	case string:
+		decoded = strings.TrimSpace(decoded)
+		return decoded, decoded != ""
+	case nostr.PubKey:
+		return decoded.Hex(), decoded != (nostr.PubKey{})
+	default:
+		return "", false
 	}
 }
 

@@ -5,8 +5,20 @@ import (
 	"strings"
 	"testing"
 
+	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip34"
 )
+
+func TestDecodedPubkeyHexAcceptsTypedNIP19Result(t *testing.T) {
+	key := nostr.Generate().Public()
+	got, ok := decodedPubkeyHex(key)
+	if !ok || got != key.Hex() {
+		t.Fatalf("typed pubkey decode failed: got=%q ok=%v", got, ok)
+	}
+	if _, ok := decodedPubkeyHex(nostr.PubKey{}); ok {
+		t.Fatal("zero typed pubkey accepted")
+	}
+}
 
 func TestValidateRefAgainstState(t *testing.T) {
 	state := &nip34.RepositoryState{
