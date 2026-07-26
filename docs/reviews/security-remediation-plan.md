@@ -116,9 +116,39 @@ Done when:
 - [x] README/Dockerfile claims reconciled (install `act` or label Hive-CI experimental).
 
 ### Item F — Loom integration (design first)  [Wave 3]
-Bead: phase1-yk8 (P1). Greenfield; produce a design doc under `docs/designs/`
-mapping loom-protocol events → Gitea CI/status, subscription kinds, publication
-path, config, then implement. Do design pass before code.
+Bead: phase1-yk8 (P1, kept open as tracking/epic). Greenfield; produce a design
+doc under `docs/designs/` mapping loom-protocol events → Gitea CI/status,
+subscription kinds, publication path, config, then implement. Do design pass
+before code.
+Done when:
+- [x] Design doc written + Oracle-reviewed: `docs/designs/loom-integration.md`.
+      grasp-gitea = Hive-CI orchestrator / Loom **client** targeting the
+      **canonical** Loom+Hive kinds (5100/5101/30100/5102/5401/5402), not the
+      cascadia 25910 `ci/workflow-run` dialect `internal/publisher/ci.go` emits
+      today (the two do NOT interoperate on the core job request/result).
+- [x] Mapping defined: inbound 30100/5101/5402 → **new** Gitea commit-status
+      writer (`internal/gitea/status.go`, POST /statuses/{sha}); correlation via a
+      new bounded `loom_jobs` store; inbound authority anchored in our own
+      immutable dispatch record (verify 5402 signer=ephemeral publisher, 5101/
+      30100 signer=selected worker) + full-field match; outbound author authz
+      reuses `internal/nostrauthz`.
+- [x] Config surface (minimal, default-off): `LOOM_ENABLED`,
+      `LOOM_DISPATCH_MODE`, `LOOM_WORKER_PUBKEYS`, `LOOM_RELAY_URLS`,
+      `LOOM_JOB_MAX_DURATION`, `CI_PROTOCOL=canonical|cascadia`, Cashu keys
+      reserved for Phase 3. Reuses existing `CI_TRIGGER_REPOS`.
+- [x] Follow-up implementation beads filed: phase1-asj (P1 status writer +
+      reflect Tier-A local runs), phase1-5de (P2 outbound dispatch), phase1-zrk
+      (P3 Cashu + Blossom + cancel), phase1-pwy (P4 dialect reconcile, gated on
+      maintainer Q1). Dependency chain P1→P2→P3.
+- [ ] Implementation (tracked by the above child beads).
+**Open questions for maintainer** (doc §12): (Q1) canonical vs cascadia dialect —
+blocking; (Q3) worker `cmd`/image contract; (Q4) trusted-fleet free-payment mode
+for first release; (Q5) local vs remote default; (Q6) merge-gating; plus
+webhook-trigger authz (no Nostr author) and Blossom log re-hosting.
+**Cross-item note:** Phase 1 will touch Item D-owned `internal/hiveci/runner.go`
+(route local results through a neutral StatusSink) + `cmd/grasp-bridge/main.go`,
+and add an Item C-adjacent sibling `internal/gitea/status.go`. Coordinate via
+hooks / owner sign-off when those phases execute.
 
 ---
 
@@ -137,6 +167,13 @@ path, config, then implement. Do design pass before code.
   methods to Item C's merged `internal/gitea/client.go`.
 
 ## Progress log
+- 2026-07-26: Item F design pass complete. Wrote + Oracle-reviewed
+  `docs/designs/loom-integration.md` (canonical Loom/Hive-CI over the cascadia
+  25910 dialect; inbound→Gitea commit-status mapping with dispatch-record-
+  anchored trust; nostrauthz-gated outbound; phased Cashu). Filed implementation
+  beads phase1-asj/5de/zrk/pwy (chain P1→P2→P3; P4 gated on maintainer Q1);
+  phase1-yk8 kept open as the tracking epic with the design linked. No code
+  changed this pass (design-only).
 - 2026-07-25: Item E completed cookie/audience-bound single-use Gitea session handoff for NIP-07 and browser-bound NIP-46 exchange, normalized redirects and NIP-55 deep linking, canonical single-host nginx plus hardened hook/secret compose wiring, refs/nostr rate/object quotas with bounded verification and cleanup, canonical replaceable ordering, and README/runtime claim reconciliation. Focused, default full, and `-tags full` test suites pass; Compose and JavaScript static validation pass.
 - 2026-07-25: Item B completed NIP-34 issue-status authorization, durable
   thread roots and standard NIP-22 root resolution, inbound NIP-32 label
