@@ -299,6 +299,12 @@ func main() {
 			}
 			unlock := lockRepoState(ev.PubKey.Hex() + "/" + dTag)
 
+			if authErr := proactiveSyncSvc.AuthorizeStateEvent(ctx, ev); authErr != nil {
+				unlock()
+				logger.Warn("repository state event authorization failed", "event", ev.ID, "error", authErr)
+				return nil
+			}
+
 			// CI trigger runs before proactive sync so local refs
 			// still reflect the previous state for change detection.
 			if publisherSvc != nil {

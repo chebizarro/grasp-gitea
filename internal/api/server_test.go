@@ -119,7 +119,7 @@ func TestAuthRequiredWhenTokenConfigured(t *testing.T) {
 	}
 }
 
-func TestNoAuthRequiredWhenTokenEmpty(t *testing.T) {
+func TestAdminAPIFailsClosedWhenTokenEmpty(t *testing.T) {
 	cfg := config.Config{AdminAPIToken: ""}
 	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
@@ -134,8 +134,8 @@ func TestNoAuthRequiredWhenTokenEmpty(t *testing.T) {
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 with no token configured, got %d", w.Code)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 with no token configured, got %d", w.Code)
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/repository-state/propose", strings.NewReader(`{}`))
@@ -147,7 +147,7 @@ func TestNoAuthRequiredWhenTokenEmpty(t *testing.T) {
 }
 
 func TestProvisionBodySizeLimit(t *testing.T) {
-	cfg := config.Config{AdminAPIToken: ""}
+	cfg := config.Config{AdminAPIToken: "secret"}
 	st, err := store.Open(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatal(err)
@@ -160,6 +160,7 @@ func TestProvisionBodySizeLimit(t *testing.T) {
 	// Send a body larger than maxRequestBodySize (1MB).
 	bigBody := strings.Repeat("x", maxRequestBodySize+1)
 	req := httptest.NewRequest(http.MethodPost, "/provision", strings.NewReader(bigBody))
+	req.Header.Set("Authorization", "Bearer secret")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
