@@ -9,6 +9,7 @@ import (
 
 	"fiatjaf.com/nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/cashu"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 )
@@ -30,6 +31,7 @@ type WorkerAd struct {
 	MinDuration     time.Duration
 	MaxDuration     time.Duration
 	RequiresPayment bool
+	Prices          map[string]uint64
 }
 
 // WorkerPool keeps at most one canonical kind-10100 event per allowlisted key.
@@ -104,6 +106,20 @@ func (p *WorkerPool) HandleEvent(ev *nostr.Event, now time.Time) error {
 // is resolved before capability validation, so a newer malformed ad cannot leave
 // an older, now-superseded offer selectable.
 func (p *WorkerPool) Select(now time.Time, jobBound time.Duration, paymentConfigured bool) (WorkerAd, bool) {
+	return p.selectWorker(now, jobBound, paymentConfigured, "")
+}
+
+// SelectForMint returns the lowest-priced eligible worker advertising the
+// configured Cashu mint. Canonical event ordering breaks equal-price ties.
+func (p *WorkerPool) SelectForMint(now time.Time, jobBound time.Duration, mintURL string) (WorkerAd, bool) {
+	normalized, err := cashu.NormalizeMintURL(mintURL)
+	if err != nil {
+		return WorkerAd{}, false
+	}
+	return p.selectWorker(now, jobBound, true, normalized)
+}
+
+func (p *WorkerPool) selectWorker(now time.Time, jobBound time.Duration, paymentConfigured bool, mintURL string) (WorkerAd, bool) {
 	if p == nil {
 		return WorkerAd{}, false
 	}
@@ -124,10 +140,22 @@ func (p *WorkerPool) Select(now time.Time, jobBound time.Duration, paymentConfig
 		if err != nil || !p.eligible(ad, jobBound, paymentConfigured) {
 			continue
 		}
-		if !found || canonicalNewer(ad.Event, selected.Event) ||
-			(ad.Event.CreatedAt == selected.Event.CreatedAt && ad.Event.ID == selected.Event.ID &&
-				ad.Event.PubKey.Hex() < selected.Event.PubKey.Hex()) {
+		if mintURL != "" {
+			price, supported := ad.Prices[mintURL]
+			if !supported || price == 0 {
+				continue
+			}
+		}
+		selectedPrice, candidatePrice := uint64(0), uint64(0)
+		if mintURL != "" {
+			selectedPrice, candidatePrice = selected.Prices[mintURL], ad.Prices[mintURL]
+		}
+		if !found || (mintURL != "" && candidatePrice < selectedPrice) ||
+			(candidatePrice == selectedPrice && canonicalNewer(ad.Event, selected.Event)) ||
+			(candidatePrice == selectedPrice && ad.Event.CreatedAt == selected.Event.CreatedAt &&
+				ad.Event.ID == selected.Event.ID && ad.Event.PubKey.Hex() < selected.Event.PubKey.Hex()) {
 			selected, found = ad, true
+			continue
 		}
 	}
 	return selected, found
@@ -152,7 +180,7 @@ func (p *WorkerPool) eligible(ad WorkerAd, jobBound time.Duration, paymentConfig
 }
 
 func parseWorkerAd(ev nostr.Event) (WorkerAd, error) {
-	ad := WorkerAd{Event: ev, Software: map[string]string{}}
+	ad := WorkerAd{Event: ev, Software: map[string]string{}, Prices: map[string]uint64{}}
 	var minSet, maxSet bool
 	for _, tag := range ev.Tags {
 		if len(tag) < 2 {
@@ -184,9 +212,16 @@ func parseWorkerAd(ev nostr.Event) (WorkerAd, error) {
 			if len(tag) < 4 {
 				return WorkerAd{}, fmt.Errorf("malformed worker price")
 			}
-			price, err := strconv.ParseFloat(strings.TrimSpace(tag[2]), 64)
-			if err != nil || price < 0 {
+			mintURL, err := cashu.NormalizeMintURL(tag[1])
+			if err != nil || !strings.EqualFold(strings.TrimSpace(tag[3]), "sat") {
+				return WorkerAd{}, fmt.Errorf("invalid worker price mint/unit")
+			}
+			price, err := strconv.ParseUint(strings.TrimSpace(tag[2]), 10, 64)
+			if err != nil {
 				return WorkerAd{}, fmt.Errorf("invalid worker price")
+			}
+			if old, ok := ad.Prices[mintURL]; !ok || price < old {
+				ad.Prices[mintURL] = price
 			}
 			if price > 0 {
 				ad.RequiresPayment = true

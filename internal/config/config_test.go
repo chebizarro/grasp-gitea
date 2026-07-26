@@ -306,6 +306,33 @@ func TestLoadLoomRemoteRequiresTrustedFleetGuards(t *testing.T) {
 	}
 }
 
+func TestLoadLoomCashuModeRequiresSafeMint(t *testing.T) {
+	base := map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",
+		"RELAY_URLS": "wss://repo-relay", "LOOM_ENABLED": "true",
+		"LOOM_PAYMENT_MODE": "cashu",
+	}
+	setEnvs(t, base)
+	if _, err := Load(); err == nil {
+		t.Fatal("Cashu mode without mint accepted")
+	}
+	base["LOOM_MINT_URL"] = "http://127.0.0.1:3338"
+	setEnvs(t, base)
+	if _, err := Load(); err == nil {
+		t.Fatal("unsafe Cashu mint URL accepted")
+	}
+	base["LOOM_MINT_URL"] = "https://mint.example"
+	base["LOOM_CASHU_MAX_PAYMENT"] = "5000"
+	setEnvs(t, base)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LoomPaymentMode != "cashu" || cfg.LoomCashuWalletPath == "" || cfg.LoomCashuMaxPayment != 5000 || cfg.LoomLogMaxBytes != 1<<20 {
+		t.Fatalf("unexpected Cashu config: %#v", cfg)
+	}
+}
+
 func TestLoadRejectsEmbeddedOnlyLoom(t *testing.T) {
 	setEnvs(t, map[string]string{
 		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",

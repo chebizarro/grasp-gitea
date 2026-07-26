@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -84,6 +86,10 @@ type Config struct {
 	LoomStatusContextPrefix string
 	LoomMintURL             string
 	LoomStaticPaymentToken  string
+	LoomPaymentMode         string
+	LoomCashuWalletPath     string
+	LoomCashuMaxPayment     uint64
+	LoomLogMaxBytes         int64
 	LoomJobTTL              time.Duration
 	LoomMaxJobs             int
 	LoomFutureSkew          time.Duration
@@ -142,6 +148,10 @@ func Load() (Config, error) {
 		LoomStatusContextPrefix: envOrDefault("LOOM_STATUS_CONTEXT_PREFIX", "hive-ci"),
 		LoomMintURL:             strings.TrimSpace(os.Getenv("LOOM_MINT_URL")),
 		LoomStaticPaymentToken:  strings.TrimSpace(os.Getenv("LOOM_STATIC_PAYMENT_TOKEN")),
+		LoomPaymentMode:         strings.ToLower(envOrDefault("LOOM_PAYMENT_MODE", "trusted")),
+		LoomCashuWalletPath:     strings.TrimSpace(os.Getenv("LOOM_CASHU_WALLET_PATH")),
+		LoomCashuMaxPayment:     uint64Env("LOOM_CASHU_MAX_PAYMENT", 0),
+		LoomLogMaxBytes:         int64(boundedIntEnv("LOOM_LOG_MAX_BYTES", 1<<20, 1024, 10<<20)),
 		LoomJobTTL:              boundedDurationEnv("LOOM_JOB_TTL", 7*24*time.Hour, time.Hour, 30*24*time.Hour),
 		LoomMaxJobs:             boundedIntEnv("LOOM_MAX_JOBS", 4096, 1, 100000),
 		LoomFutureSkew:          boundedDurationEnv("LOOM_FUTURE_SKEW", 5*time.Minute, time.Second, time.Hour),
@@ -155,6 +165,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.SignerMasterKey = signerMasterKey
+	if cfg.LoomCashuWalletPath == "" {
+		cfg.LoomCashuWalletPath = cfg.DBPath + ".cashu-wallet"
+	}
+	if filepath.Clean(cfg.LoomCashuWalletPath) == filepath.Clean(cfg.DBPath) {
+		return Config{}, fmt.Errorf("LOOM_CASHU_WALLET_PATH must not equal DB_PATH")
+	}
 
 	if cfg.GiteaAdminToken == "" {
 		return Config{}, fmt.Errorf("GITEA_ADMIN_TOKEN is required")
@@ -173,6 +189,27 @@ func Load() (Config, error) {
 	}
 	if cfg.LoomDispatchMode != "local" && cfg.LoomDispatchMode != "remote" && cfg.LoomDispatchMode != "both" {
 		return Config{}, fmt.Errorf("LOOM_DISPATCH_MODE must be local, remote, or both")
+	}
+	if cfg.LoomPaymentMode != "trusted" && cfg.LoomPaymentMode != "cashu" {
+		return Config{}, fmt.Errorf("LOOM_PAYMENT_MODE must be trusted or cashu")
+	}
+	if cfg.LoomMintURL != "" {
+		u, err := url.Parse(cfg.LoomMintURL)
+		if err != nil || !u.IsAbs() || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" ||
+			u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return Config{}, fmt.Errorf("LOOM_MINT_URL must be an absolute HTTPS URL without credentials, query, or fragment")
+		}
+	}
+	if cfg.LoomPaymentMode == "cashu" {
+		if cfg.LoomMintURL == "" {
+			return Config{}, fmt.Errorf("LOOM_MINT_URL is required when LOOM_PAYMENT_MODE=cashu")
+		}
+		if cfg.LoomStaticPaymentToken != "" {
+			return Config{}, fmt.Errorf("LOOM_STATIC_PAYMENT_TOKEN cannot be combined with LOOM_PAYMENT_MODE=cashu")
+		}
+		if cfg.LoomCashuMaxPayment == 0 {
+			return Config{}, fmt.Errorf("LOOM_CASHU_MAX_PAYMENT is required when LOOM_PAYMENT_MODE=cashu")
+		}
 	}
 	if !cfg.LoomEnabled && cfg.LoomDispatchMode != "local" {
 		return Config{}, fmt.Errorf("LOOM_ENABLED=true is required for non-local LOOM_DISPATCH_MODE")
@@ -267,6 +304,18 @@ func intEnv(key string, fallback int) int {
 		return fallback
 	}
 	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+func uint64Env(key string, fallback uint64) uint64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
 	if err != nil {
 		return fallback
 	}

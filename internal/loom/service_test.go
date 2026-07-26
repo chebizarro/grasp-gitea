@@ -3,6 +3,8 @@ package loom
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,5 +164,82 @@ func TestProcessEventRejectsFutureStatus(t *testing.T) {
 	}
 	if len(sink.statuses) != 0 {
 		t.Fatal("future event changed status")
+	}
+}
+
+type changeJobStore struct {
+	fixedJobStore
+	claimed bool
+	marked  int
+}
+
+func (s *changeJobStore) ClaimLoomCashuChange(context.Context, string, string, string, time.Time) (bool, error) {
+	if s.claimed {
+		return false, nil
+	}
+	s.claimed = true
+	return true, nil
+}
+func (s *changeJobStore) MarkLoomCashuChangeRedeemed(context.Context, string, string, uint64, time.Time) error {
+	s.marked++
+	return nil
+}
+
+func TestProcessEventRedeemsCashuChangeOnce(t *testing.T) {
+	worker := nostr.Generate()
+	job := store.LoomJob{DispatchKey: "dispatch", WorkflowRunID: "run", JobRequestID: "request",
+		WorkerPub: worker.Public().Hex(), Owner: "alice", RepoName: "repo", RepoID: "r",
+		CommitSHA: "abc", WorkflowPath: "ci.yml"}
+	st := &changeJobStore{fixedJobStore: fixedJobStore{job: job}}
+	wallet := &countingCashuWallet{}
+	sink := &captureSink{}
+	svc := New(Config{Enabled: true, ResultGrace: time.Nanosecond, Wallet: wallet}, st, sink, nil)
+	ev := &nostr.Event{PubKey: worker.Public(), ID: nostr.ID{9}, Kind: relay.KindLoomJobResult,
+		CreatedAt: nostr.Now(), Tags: nostr.Tags{{"e", "request"}, {"change", "cashu-change"}},
+		Content: `{"success":true}`}
+	if err := svc.processEvent(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.processEvent(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	if wallet.redeemCalls != 1 || st.marked != 1 {
+		t.Fatalf("change redemption calls=%d marked=%d", wallet.redeemCalls, st.marked)
+	}
+}
+
+type fixedLogFetcher struct {
+	artifact LogArtifact
+	err      error
+}
+
+func (f fixedLogFetcher) Fetch(context.Context, string) (LogArtifact, error) {
+	return f.artifact, f.err
+}
+
+func TestProcessEventSurfacesOnlyVerifiedLog(t *testing.T) {
+	publisher := nostr.Generate()
+	job := store.LoomJob{WorkflowRunID: "run", PublisherPub: publisher.Public().Hex(),
+		Owner: "alice", RepoName: "repo", RepoID: "r", CommitSHA: "abc", WorkflowPath: "ci.yml"}
+	sink := &captureSink{}
+	svc := New(Config{Enabled: true, LogFetcher: fixedLogFetcher{artifact: LogArtifact{
+		URL: "https://blossom.example/digest", Tail: "tests passed"}}}, fixedJobStore{job}, sink, nil)
+	ev := &nostr.Event{PubKey: publisher.Public(), ID: nostr.ID{10}, Kind: relay.KindHiveWorkflowResult,
+		CreatedAt: nostr.Now(), Tags: nostr.Tags{{"e", "run"}, {"status", "success"}, {"log_url", "https://worker.invalid/log"}}}
+	if err := svc.processEvent(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.statuses) != 1 || sink.statuses[0].TargetURL != "" ||
+		!strings.Contains(sink.statuses[0].Description, "tests passed") {
+		t.Fatalf("verified log status = %#v", sink.statuses)
+	}
+
+	sink.statuses = nil
+	svc.logs = fixedLogFetcher{err: errors.New("digest mismatch")}
+	if err := svc.processEvent(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	if sink.statuses[0].State != store.LoomStatusError || sink.statuses[0].TargetURL != "" {
+		t.Fatalf("rejected log leaked into status: %#v", sink.statuses[0])
 	}
 }

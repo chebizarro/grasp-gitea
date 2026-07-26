@@ -3,9 +3,11 @@ package loom
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"fiatjaf.com/nostr/nip19"
 	"fiatjaf.com/nostr/nip44"
 
+	"github.com/sharegap/grasp-gitea/internal/cashu"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -225,6 +228,177 @@ func TestDispatcherRetryReusesExactEventIDs(t *testing.T) {
 	}
 	if len(retryIDs) != 2 || retryIDs[0] != firstIDs[0] || retryIDs[1] != firstIDs[1] {
 		t.Fatalf("retry IDs = %v, want %v", retryIDs, firstIDs)
+	}
+}
+
+type countingCashuWallet struct {
+	createCalls int
+	redeemCalls int
+	last        cashu.PaymentRequest
+}
+
+func (w *countingCashuWallet) CreatePayment(_ context.Context, req cashu.PaymentRequest) (cashu.Payment, error) {
+	w.createCalls++
+	w.last = req
+	return cashu.Payment{Token: fmt.Sprintf("cashu-token-%d", w.createCalls), QuoteID: "quote-1", Amount: req.Amount}, nil
+}
+func (w *countingCashuWallet) RedeemChange(context.Context, string) (uint64, error) {
+	w.redeemCalls++
+	return 1, nil
+}
+func (w *countingCashuWallet) ReceivePubkey() string { return "02" + stringsOf('c', 64) }
+func (w *countingCashuWallet) Close() error          { return nil }
+
+func TestDispatcherCashuSpendIsExactAndNeverRepeated(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "cashu.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	worker, operator := nostr.Generate(), nostr.Generate()
+	pool := NewWorkerPool(WorkerPoolConfig{Allowlist: []string{worker.Public().Hex()}, AdTTL: time.Hour})
+	if err := pool.HandleEvent(signedWorkerAd(t, worker, now, "act", "2"), now); err != nil {
+		t.Fatal(err)
+	}
+	wallet := &countingCashuWallet{}
+	d := NewDispatcher(DispatcherConfig{Enabled: true, PaymentMode: "cashu", MintURL: "https://mint.invalid",
+		MaxDuration: 15 * time.Minute, MaxPayment: 2000, RelayURLs: []string{"wss://relay.invalid"}},
+		pool, st, testDispatchSigner{operator}, nil, wallet)
+	var firstIDs []nostr.ID
+	d.publish = func(_ context.Context, ev *nostr.Event) error {
+		firstIDs = append(firstIDs, ev.ID)
+		return errors.New("relay unavailable")
+	}
+	req := testDispatchRequest(operator.Public().Hex())
+	if handled, err := d.Dispatch(ctx, req); !handled || err == nil {
+		t.Fatalf("first paid dispatch = %v, %v", handled, err)
+	}
+	if wallet.createCalls != 1 || wallet.last.Amount != 1800 || wallet.last.WorkerPubkey != worker.Public().Hex() {
+		t.Fatalf("wallet calls=%d request=%+v", wallet.createCalls, wallet.last)
+	}
+	key, _ := dispatchKey(req)
+	spend, err := st.GetLoomCashuSpend(ctx, key)
+	if err != nil || spend.State != "ready" || spend.Token != "cashu-token-1" || spend.Amount != 1800 {
+		t.Fatalf("durable spend = %+v, %v", spend, err)
+	}
+	var retryIDs []nostr.ID
+	d.publish = func(_ context.Context, ev *nostr.Event) error {
+		retryIDs = append(retryIDs, ev.ID)
+		if ev.Kind == relay.KindLoomJobRequest && tagValue(ev.Tags, "payment") != "cashu-token-1" {
+			t.Fatalf("retry changed token: %#v", ev.Tags)
+		}
+		return nil
+	}
+	if handled, err := d.Dispatch(ctx, req); err != nil || !handled {
+		t.Fatalf("paid retry = %v, %v", handled, err)
+	}
+	if wallet.createCalls != 1 || len(retryIDs) != 2 || retryIDs[0] != firstIDs[0] || retryIDs[1] != firstIDs[1] {
+		t.Fatalf("retry double-paid or changed events: calls=%d first=%v retry=%v", wallet.createCalls, firstIDs, retryIDs)
+	}
+	d.maxPayment = 1000
+	over := req
+	over.SourceEventID = stringsOf('f', 64)
+	over.CommitSHA = stringsOf('f', 40)
+	if handled, err := d.Dispatch(ctx, over); handled || err == nil {
+		t.Fatalf("over-budget dispatch = %v, %v", handled, err)
+	}
+	if wallet.createCalls != 1 {
+		t.Fatal("over-budget worker reached the wallet")
+	}
+}
+
+func TestDispatcherCancelsSupersededSameRef(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "cancel.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	worker, operator := nostr.Generate(), nostr.Generate()
+	pool := NewWorkerPool(WorkerPoolConfig{Allowlist: []string{worker.Public().Hex()}, AdTTL: time.Hour})
+	if err := pool.HandleEvent(signedWorkerAd(t, worker, now, "act", "0"), now); err != nil {
+		t.Fatal(err)
+	}
+	d := NewDispatcher(DispatcherConfig{Enabled: true, MaxDuration: 15 * time.Minute,
+		RelayURLs: []string{"wss://relay.invalid"}}, pool, st, testDispatchSigner{operator}, nil)
+	var published []nostr.Event
+	d.publish = func(_ context.Context, ev *nostr.Event) error { published = append(published, *ev); return nil }
+	first := testDispatchRequest(operator.Public().Hex())
+	if handled, err := d.Dispatch(ctx, first); err != nil || !handled {
+		t.Fatal(handled, err)
+	}
+	firstKey, _ := dispatchKey(first)
+	old, err := st.GetLoomJobByDispatchKey(ctx, firstKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.SourceEventID = stringsOf('d', 64)
+	second.CommitSHA = stringsOf('e', 40)
+	if handled, err := d.Dispatch(ctx, second); err != nil || !handled {
+		t.Fatal(handled, err)
+	}
+	var cancel *nostr.Event
+	for i := range published {
+		if published[i].Kind == relay.KindLoomJobCancel {
+			cancel = &published[i]
+		}
+	}
+	if cancel == nil || tagValue(cancel.Tags, "e") != old.JobRequestID || tagValue(cancel.Tags, "p") != old.WorkerPub {
+		t.Fatalf("missing/malformed supersession cancellation: %#v", cancel)
+	}
+	old, err = st.GetLoomJobByWorkflowRunID(ctx, old.WorkflowRunID)
+	if err != nil || old.CancelState != "published" {
+		t.Fatalf("cancellation outbox = %+v, %v", old, err)
+	}
+}
+
+func TestDispatcherAmbiguousCashuReservationFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "ambiguous.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	worker, operator := nostr.Generate(), nostr.Generate()
+	req := testDispatchRequest(operator.Public().Hex())
+	key, _ := dispatchKey(req)
+	if _, claimed, err := st.ReserveLoomCashuSpend(ctx, store.LoomCashuSpend{
+		DispatchKey: key, WorkerPub: worker.Public().Hex(), WorkerAdID: stringsOf('a', 64), MintURL: "https://mint.invalid",
+		Amount: 1800, PricePerSecond: 2, DurationSeconds: 900,
+	}, time.Now().UTC()); err != nil || !claimed {
+		t.Fatalf("reserve crash window = %v, %v", claimed, err)
+	}
+	pool := NewWorkerPool(WorkerPoolConfig{Allowlist: []string{worker.Public().Hex()}})
+	wallet := &countingCashuWallet{}
+	d := NewDispatcher(DispatcherConfig{Enabled: true, PaymentMode: "cashu", MintURL: "https://mint.invalid",
+		MaxDuration: 15 * time.Minute, MaxPayment: 2000, RelayURLs: []string{"wss://relay.invalid"}},
+		pool, st, testDispatchSigner{operator}, nil, wallet)
+	if handled, err := d.Dispatch(ctx, req); handled || err == nil || !strings.Contains(err.Error(), "refusing a second payment") {
+		t.Fatalf("ambiguous dispatch = %v, %v", handled, err)
+	}
+	if wallet.createCalls != 0 {
+		t.Fatal("ambiguous reserved spend invoked wallet again")
+	}
+}
+
+func TestEphemeralPublisherIsolatedAcrossWorkers(t *testing.T) {
+	operator, firstWorker, secondWorker := nostr.Generate(), nostr.Generate(), nostr.Generate()
+	d := &Dispatcher{signer: testDispatchSigner{operator}}
+	req := testDispatchRequest(operator.Public().Hex())
+	first, err := d.buildAttempt(context.Background(), req, "first", firstWorker.Public().Hex(), "", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := d.buildAttempt(context.Background(), req, "second", secondWorker.Public().Hex(), "", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.PublisherPub == second.PublisherPub {
+		t.Fatal("ephemeral HIVE_CI_NSEC publisher reused across workers")
 	}
 }
 

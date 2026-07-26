@@ -18,6 +18,7 @@ import (
 
 	"github.com/sharegap/grasp-gitea/internal/api"
 	"github.com/sharegap/grasp-gitea/internal/auth"
+	cashuwallet "github.com/sharegap/grasp-gitea/internal/cashu"
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/hiveci"
@@ -31,6 +32,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/reflector"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/relay"
+	"github.com/sharegap/grasp-gitea/internal/safefetch"
 	"github.com/sharegap/grasp-gitea/internal/signer"
 	"github.com/sharegap/grasp-gitea/internal/store"
 	"github.com/sharegap/grasp-gitea/internal/webhook"
@@ -206,12 +208,30 @@ func main() {
 	}
 	remoteRequested := cfg.LoomEnabled && cfg.CIProtocol == "canonical" &&
 		(cfg.LoomDispatchMode == "remote" || cfg.LoomDispatchMode == "both")
+	var loomWallet cashuwallet.Wallet
+	if remoteRequested && cfg.LoomPaymentMode == "cashu" {
+		walletErr := safefetch.ValidateHTTPSURL(ctx, cfg.LoomMintURL)
+		var wallet *cashuwallet.GonutsWallet
+		if walletErr == nil {
+			wallet, walletErr = cashuwallet.New(cashuwallet.Config{
+				MintURL: cfg.LoomMintURL, Path: cfg.LoomCashuWalletPath,
+			})
+		}
+		if walletErr != nil {
+			logger.Error("Cashu wallet unavailable; refusing to strand paid-job settlement", "error", walletErr)
+			os.Exit(1)
+		} else {
+			loomWallet = wallet
+			defer loomWallet.Close()
+		}
+	}
 	loomDispatcher := loom.NewDispatcher(loom.DispatcherConfig{
 		Enabled: remoteRequested, MaxDuration: cfg.LoomJobMaxDuration,
 		CommandTemplate: cfg.LoomJobCmdTemplate, StaticPaymentToken: cfg.LoomStaticPaymentToken,
+		PaymentMode: cfg.LoomPaymentMode, MintURL: cfg.LoomMintURL, MaxPayment: cfg.LoomCashuMaxPayment,
 		ContextPrefix: cfg.LoomStatusContextPrefix, RelayURLs: loomRelayURLs,
 		JobTTL: cfg.LoomJobTTL, MaxJobs: cfg.LoomMaxJobs,
-	}, workerPool, st, dispatchSigner, logger)
+	}, workerPool, st, dispatchSigner, logger, loomWallet)
 	if remoteRequested && !loomDispatcher.Enabled() {
 		if cfg.LoomDispatchMode == "remote" {
 			logger.Error("remote-only Loom dispatch unavailable; check signer NIP-44 support, worker allowlist, and relay URLs")
@@ -234,6 +254,7 @@ func main() {
 	loomSvc := loom.New(loom.Config{
 		Enabled: cfg.LoomEnabled, ContextPrefix: cfg.LoomStatusContextPrefix,
 		FutureSkew: cfg.LoomFutureSkew, ResultGrace: cfg.LoomResultGrace,
+		LogFetcher: loom.NewBlossomFetcher(cfg.LoomLogMaxBytes), Wallet: loomWallet,
 	}, st, statusSink, logger)
 	loomSvc.Run(ctx)
 

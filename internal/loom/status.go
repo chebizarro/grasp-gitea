@@ -21,10 +21,10 @@ const (
 )
 
 type Ref struct {
-	DispatchKey                                          string
-	WorkflowRunID, JobRequestID, PublisherPub, WorkerPub string
-	Owner, RepoName, RepoID, CommitSHA, WorkflowPath     string
-	WorkflowRunEvent, JobRequestEvent                    string
+	DispatchKey                                              string
+	WorkflowRunID, JobRequestID, PublisherPub, WorkerPub     string
+	Owner, RepoName, RepoID, CommitSHA, WorkflowPath, Branch string
+	WorkflowRunEvent, JobRequestEvent                        string
 }
 
 type Status struct {
@@ -125,7 +125,7 @@ func persistedStatus(status Status) (store.LoomJob, store.LoomStatusUpdate) {
 			DispatchKey: status.Ref.DispatchKey, WorkflowRunID: status.Ref.WorkflowRunID, JobRequestID: status.Ref.JobRequestID,
 			PublisherPub: status.Ref.PublisherPub, WorkerPub: status.Ref.WorkerPub,
 			Owner: status.Ref.Owner, RepoName: status.Ref.RepoName, RepoID: status.Ref.RepoID,
-			CommitSHA: status.Ref.CommitSHA, WorkflowPath: status.Ref.WorkflowPath,
+			CommitSHA: status.Ref.CommitSHA, WorkflowPath: status.Ref.WorkflowPath, Branch: status.Ref.Branch,
 			WorkflowRunEvent: status.Ref.WorkflowRunEvent, JobRequestEvent: status.Ref.JobRequestEvent,
 		}, store.LoomStatusUpdate{
 			State: status.State, Description: bounded(status.Description, 255),

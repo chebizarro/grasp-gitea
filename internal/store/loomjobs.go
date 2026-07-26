@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -35,6 +36,7 @@ type LoomJob struct {
 	RepoID               string
 	CommitSHA            string
 	WorkflowPath         string
+	Branch               string
 	WorkflowRunEvent     string
 	JobRequestEvent      string
 	Status               string
@@ -48,8 +50,26 @@ type LoomJob struct {
 	DispatchNextAttempt  time.Time
 	DispatchLastError    string
 	PublishedAt          time.Time
+	CancelEvent          string
+	CancelEventID        string
+	CancelState          string
+	CancelAttempts       int
+	CancelNextAttempt    time.Time
+	CancelLastError      string
+	CancelledBy          string
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
+}
+
+// LoomCashuSpend is the durable single-use payment/change state for one logical dispatch.
+type LoomCashuSpend struct {
+	DispatchKey, WorkflowRunID, WorkerPub, WorkerAdID, MintURL string
+	QuoteID, Token, State                                      string
+	Amount, PricePerSecond                                     uint64
+	DurationSeconds                                            int64
+	ChangeEventID, ChangeToken, ChangeState                    string
+	ChangeAmount                                               uint64
+	CreatedAt, UpdatedAt                                       time.Time
 }
 
 // LoomStatusUpdate is a validated desired Gitea status.
@@ -97,6 +117,7 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 			repo_id TEXT NOT NULL,
 			commit_sha TEXT NOT NULL,
 			workflow_path TEXT NOT NULL,
+			branch TEXT NOT NULL DEFAULT '',
 			workflow_run_event TEXT NOT NULL DEFAULT '',
 			job_request_event TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'pending',
@@ -110,6 +131,13 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 			dispatch_next_attempt_at INTEGER NOT NULL DEFAULT 0,
 			dispatch_last_error TEXT NOT NULL DEFAULT '',
 			published_at INTEGER NOT NULL DEFAULT 0,
+			cancel_event TEXT NOT NULL DEFAULT '',
+			cancel_event_id TEXT NOT NULL DEFAULT '',
+			cancel_state TEXT NOT NULL DEFAULT '',
+			cancel_attempts INTEGER NOT NULL DEFAULT 0,
+			cancel_next_attempt_at INTEGER NOT NULL DEFAULT 0,
+			cancel_last_error TEXT NOT NULL DEFAULT '',
+			cancelled_by TEXT NOT NULL DEFAULT '',
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		)`,
@@ -138,6 +166,26 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_loom_status_due
 			ON loom_status_deliveries(next_attempt_at, workflow_run_id)`,
+		`CREATE TABLE IF NOT EXISTS loom_cashu_spends (
+			dispatch_key TEXT PRIMARY KEY,
+			workflow_run_id TEXT NOT NULL DEFAULT '',
+			worker_pub TEXT NOT NULL,
+			worker_ad_id TEXT NOT NULL DEFAULT '',
+			mint_url TEXT NOT NULL,
+			quote_id TEXT NOT NULL DEFAULT '',
+			token TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL,
+			amount INTEGER NOT NULL,
+			price_per_second INTEGER NOT NULL,
+			duration_seconds INTEGER NOT NULL,
+			change_event_id TEXT NOT NULL DEFAULT '',
+			change_token TEXT NOT NULL DEFAULT '',
+			change_state TEXT NOT NULL DEFAULT '',
+			change_amount INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_loom_cashu_workflow ON loom_cashu_spends(workflow_run_id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -152,8 +200,21 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 		"dispatch_next_attempt_at": "INTEGER NOT NULL DEFAULT 0",
 		"dispatch_last_error":      "TEXT NOT NULL DEFAULT ''",
 		"published_at":             "INTEGER NOT NULL DEFAULT 0",
+		"branch":                   "TEXT NOT NULL DEFAULT ''",
+		"cancel_event":             "TEXT NOT NULL DEFAULT ''",
+		"cancel_event_id":          "TEXT NOT NULL DEFAULT ''",
+		"cancel_state":             "TEXT NOT NULL DEFAULT ''",
+		"cancel_attempts":          "INTEGER NOT NULL DEFAULT 0",
+		"cancel_next_attempt_at":   "INTEGER NOT NULL DEFAULT 0",
+		"cancel_last_error":        "TEXT NOT NULL DEFAULT ''",
+		"cancelled_by":             "TEXT NOT NULL DEFAULT ''",
+		"worker_ad_id":             "TEXT NOT NULL DEFAULT ''",
 	} {
-		if err := ensureSQLiteColumn(s.db, "loom_jobs", column, definition); err != nil &&
+		table := "loom_jobs"
+		if column == "worker_ad_id" {
+			table = "loom_cashu_spends"
+		}
+		if err := ensureSQLiteColumn(s.db, table, column, definition); err != nil &&
 			!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 			return fmt.Errorf("migrate Loom %s: %w", column, err)
 		}
@@ -165,6 +226,14 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_loom_dispatch_due
 		ON loom_jobs(dispatch_state, dispatch_next_attempt_at, workflow_run_id)`); err != nil {
 		return fmt.Errorf("initialize Loom dispatch due index: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_loom_cancel_due
+		ON loom_jobs(cancel_state, cancel_next_attempt_at, workflow_run_id)`); err != nil {
+		return fmt.Errorf("initialize Loom cancellation due index: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_loom_ref_active
+		ON loom_jobs(owner, repo_name, repo_id, workflow_path, branch, status)`); err != nil {
+		return fmt.Errorf("initialize Loom supersession index: %w", err)
 	}
 	return nil
 }
@@ -192,11 +261,11 @@ func (s *SQLiteStore) SaveLoomJob(ctx context.Context, job LoomJob, now time.Tim
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO loom_jobs(
 			workflow_run_id, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
-			commit_sha, workflow_path, workflow_run_event, job_request_event, status, delivery_state,
+			commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, delivery_state,
 			created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
 	`, job.WorkflowRunID, job.JobRequestID, job.PublisherPub, job.WorkerPub, job.Owner, job.RepoName,
-		job.RepoID, job.CommitSHA, job.WorkflowPath, job.WorkflowRunEvent, job.JobRequestEvent,
+		job.RepoID, job.CommitSHA, job.WorkflowPath, job.Branch, job.WorkflowRunEvent, job.JobRequestEvent,
 		LoomStatusPending, job.CreatedAt.UTC().Unix(), now.Unix())
 	if err != nil {
 		return fmt.Errorf("save Loom job: %w", err)
@@ -268,11 +337,11 @@ func (s *SQLiteStore) ClaimLoomJobStatus(ctx context.Context, job LoomJob, updat
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO loom_jobs(
 			workflow_run_id, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
-			commit_sha, workflow_path, workflow_run_event, job_request_event, status, terminal_source,
+			commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, terminal_source,
 			last_protocol_event_id, delivery_state, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
 	`, job.WorkflowRunID, job.JobRequestID, job.PublisherPub, job.WorkerPub, job.Owner, job.RepoName,
-		job.RepoID, job.CommitSHA, job.WorkflowPath, job.WorkflowRunEvent, job.JobRequestEvent,
+		job.RepoID, job.CommitSHA, job.WorkflowPath, job.Branch, job.WorkflowRunEvent, job.JobRequestEvent,
 		update.State, "", update.ProtocolEventID, job.CreatedAt.UTC().Unix(), now.Unix())
 	if err != nil {
 		return false, fmt.Errorf("claim Loom job: %w", err)
@@ -353,11 +422,11 @@ func (s *SQLiteStore) ClaimLoomOutbound(ctx context.Context, job LoomJob, update
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO loom_jobs(
 			workflow_run_id, dispatch_key, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
-			commit_sha, workflow_path, workflow_run_event, job_request_event, status, terminal_source,
+			commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, terminal_source,
 			last_protocol_event_id, delivery_state, dispatch_state, dispatch_next_attempt_at, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', 'pending', ?, ?, ?)
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', 'pending', ?, ?, ?)
 	`, job.WorkflowRunID, job.DispatchKey, job.JobRequestID, job.PublisherPub, job.WorkerPub,
-		job.Owner, job.RepoName, job.RepoID, job.CommitSHA, job.WorkflowPath,
+		job.Owner, job.RepoName, job.RepoID, job.CommitSHA, job.WorkflowPath, job.Branch,
 		job.WorkflowRunEvent, job.JobRequestEvent, update.State, update.ProtocolEventID,
 		now.Unix(), job.CreatedAt.UTC().Unix(), now.Unix())
 	if err != nil {
@@ -401,6 +470,177 @@ func (s *SQLiteStore) ClaimLoomOutbound(ctx context.Context, job LoomJob, update
 	job.DispatchNextAttempt = now
 	job.UpdatedAt = now
 	return job, true, nil
+}
+
+// ReserveLoomCashuSpend durably fixes worker, mint, price, duration, and amount
+// before the wallet is asked to spend. A reserved row without a token is an
+// ambiguous crash state and must never be paid again automatically.
+func (s *SQLiteStore) ReserveLoomCashuSpend(ctx context.Context, spend LoomCashuSpend, now time.Time) (LoomCashuSpend, bool, error) {
+	normalizeLoomCashuSpend(&spend)
+	if spend.DispatchKey == "" || spend.WorkerPub == "" || spend.WorkerAdID == "" || spend.MintURL == "" || spend.Amount == 0 ||
+		spend.Amount > math.MaxInt64 || spend.PricePerSecond == 0 || spend.PricePerSecond > math.MaxInt64 || spend.DurationSeconds <= 0 {
+		return LoomCashuSpend{}, false, fmt.Errorf("complete bounded Loom Cashu spend is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return LoomCashuSpend{}, false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return LoomCashuSpend{}, false, err
+	}
+	defer tx.Rollback()
+	_, _ = tx.ExecContext(ctx, `DELETE FROM loom_cashu_spends WHERE updated_at < ?`, now.Add(-DefaultLoomJobTTL).Unix())
+	res, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO loom_cashu_spends(
+			dispatch_key, worker_pub, worker_ad_id, mint_url, state, amount, price_per_second,
+			duration_seconds, created_at, updated_at
+		) VALUES(?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?)
+	`, spend.DispatchKey, spend.WorkerPub, spend.WorkerAdID, spend.MintURL, spend.Amount, spend.PricePerSecond,
+		spend.DurationSeconds, now.Unix(), now.Unix())
+	if err != nil {
+		return LoomCashuSpend{}, false, fmt.Errorf("reserve Loom Cashu spend: %w", err)
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return LoomCashuSpend{}, false, err
+	}
+	stored, err := getLoomCashuSpendTx(ctx, tx, spend.DispatchKey)
+	if err != nil {
+		return LoomCashuSpend{}, false, err
+	}
+	if !sameLoomCashuSpend(stored, spend) {
+		return LoomCashuSpend{}, false, fmt.Errorf("Loom Cashu spend identity mismatch")
+	}
+	if err := tx.Commit(); err != nil {
+		return LoomCashuSpend{}, false, err
+	}
+	return stored, inserted > 0, nil
+}
+
+// CompleteLoomCashuSpend persists the exact token before any dispatch publish.
+func (s *SQLiteStore) CompleteLoomCashuSpend(ctx context.Context, dispatchKey, quoteID, token string, now time.Time) (LoomCashuSpend, error) {
+	dispatchKey, quoteID, token = strings.TrimSpace(dispatchKey), strings.TrimSpace(quoteID), strings.TrimSpace(token)
+	if dispatchKey == "" || quoteID == "" || token == "" {
+		return LoomCashuSpend{}, fmt.Errorf("complete Loom Cashu token state is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return LoomCashuSpend{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return LoomCashuSpend{}, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE loom_cashu_spends SET quote_id = ?, token = ?, state = 'ready', updated_at = ?
+		WHERE dispatch_key = ? AND state = 'reserved' AND token = ''`, quoteID, token, now.Unix(), dispatchKey)
+	if err != nil {
+		return LoomCashuSpend{}, err
+	}
+	stored, err := getLoomCashuSpendTx(ctx, tx, dispatchKey)
+	if err != nil {
+		return LoomCashuSpend{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 && (stored.State != "ready" || stored.QuoteID != quoteID || stored.Token != token) {
+		return LoomCashuSpend{}, fmt.Errorf("Loom Cashu spend was not in a completable state")
+	}
+	if err := tx.Commit(); err != nil {
+		return LoomCashuSpend{}, err
+	}
+	return stored, nil
+}
+
+func (s *SQLiteStore) GetLoomCashuSpend(ctx context.Context, dispatchKey string) (LoomCashuSpend, error) {
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return LoomCashuSpend{}, err
+	}
+	return scanLoomCashuSpend(s.db.QueryRowContext(ctx, loomCashuSelectSQL()+" WHERE dispatch_key = ?", strings.TrimSpace(dispatchKey)))
+}
+
+func (s *SQLiteStore) AttachLoomCashuSpend(ctx context.Context, dispatchKey, workflowRunID string, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE loom_cashu_spends SET workflow_run_id = ?, updated_at = ?
+		WHERE dispatch_key = ? AND state = 'ready' AND (workflow_run_id = '' OR workflow_run_id = ?)`,
+		strings.TrimSpace(workflowRunID), now.Unix(), strings.TrimSpace(dispatchKey), strings.TrimSpace(workflowRunID))
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("ready Loom Cashu spend not found")
+	}
+	return nil
+}
+
+// ClaimLoomCashuChange makes redemption event-idempotent. A duplicate or an
+// ambiguous redeeming state is never submitted to the mint a second time.
+func (s *SQLiteStore) ClaimLoomCashuChange(ctx context.Context, dispatchKey, eventID, token string, now time.Time) (bool, error) {
+	dispatchKey, eventID, token = strings.TrimSpace(dispatchKey), strings.TrimSpace(eventID), strings.TrimSpace(token)
+	if dispatchKey == "" || eventID == "" || token == "" {
+		return false, fmt.Errorf("complete Loom Cashu change is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	spend, err := getLoomCashuSpendTx(ctx, tx, dispatchKey)
+	if err != nil {
+		return false, err
+	}
+	if spend.State != "ready" {
+		return false, fmt.Errorf("Loom Cashu spend is not ready")
+	}
+	if spend.ChangeEventID != "" {
+		if spend.ChangeEventID != eventID || spend.ChangeToken != token {
+			return false, fmt.Errorf("Loom Cashu change identity mismatch")
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE loom_cashu_spends SET change_event_id = ?, change_token = ?,
+		change_state = 'redeeming', updated_at = ? WHERE dispatch_key = ? AND change_event_id = ''`,
+		eventID, token, now.Unix(), dispatchKey)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *SQLiteStore) MarkLoomCashuChangeRedeemed(ctx context.Context, dispatchKey, eventID string, amount uint64, now time.Time) error {
+	if amount > math.MaxInt64 {
+		return fmt.Errorf("Cashu change amount exceeds persistence bound")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE loom_cashu_spends SET change_state = 'redeemed', change_amount = ?, updated_at = ?
+		WHERE dispatch_key = ? AND change_event_id = ? AND change_state = 'redeeming'`,
+		amount, now.Unix(), strings.TrimSpace(dispatchKey), strings.TrimSpace(eventID))
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("redeeming Loom Cashu change not found")
+	}
+	return nil
 }
 
 // GetLoomJobByWorkflowRunID resolves a 5402 or local run.
@@ -490,6 +730,142 @@ func (s *SQLiteStore) MarkLoomDispatchRetry(ctx context.Context, workflowRunID s
 			dispatch_next_attempt_at = ?, dispatch_last_error = ?, updated_at = ?
 		WHERE workflow_run_id = ? AND dispatch_state != 'published'
 	`, next.Unix(), lastErr, time.Now().UTC().Unix(), strings.TrimSpace(workflowRunID))
+	return err
+}
+
+// ListSupersededLoomJobs returns older, non-terminal outbound runs for the same ref.
+func (s *SQLiteStore) ListSupersededLoomJobs(ctx context.Context, newer LoomJob, limit int) ([]LoomJob, error) {
+	normalizeLoomJob(&newer)
+	if newer.WorkflowRunID == "" || newer.Owner == "" || newer.RepoName == "" || newer.RepoID == "" ||
+		newer.WorkflowPath == "" || newer.Branch == "" {
+		return nil, fmt.Errorf("complete Loom supersession identity is required")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, loomJobSelectSQL()+`
+		WHERE workflow_run_id != ? AND dispatch_key != '' AND owner = ? AND repo_name = ? AND repo_id = ?
+			AND workflow_path = ? AND branch = ? AND status = ?
+			AND rowid < (SELECT rowid FROM loom_jobs WHERE workflow_run_id = ?)
+		ORDER BY created_at, workflow_run_id LIMIT ?`, newer.WorkflowRunID, newer.Owner, newer.RepoName,
+		newer.RepoID, newer.WorkflowPath, newer.Branch, LoomStatusPending, newer.WorkflowRunID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []LoomJob
+	for rows.Next() {
+		job, err := getLoomJobRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// ClaimLoomCancellation persists the exact signed kind-5102 before publishing it.
+func (s *SQLiteStore) ClaimLoomCancellation(ctx context.Context, workflowRunID, cancelledBy, eventID, eventJSON string, now time.Time) (LoomJob, bool, error) {
+	workflowRunID, cancelledBy = strings.TrimSpace(workflowRunID), strings.TrimSpace(cancelledBy)
+	eventID, eventJSON = strings.TrimSpace(eventID), strings.TrimSpace(eventJSON)
+	if workflowRunID == "" || cancelledBy == "" || eventID == "" || eventJSON == "" {
+		return LoomJob{}, false, fmt.Errorf("complete Loom cancellation is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return LoomJob{}, false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return LoomJob{}, false, err
+	}
+	defer tx.Rollback()
+	job, err := getLoomJobTx(ctx, tx, "workflow_run_id", workflowRunID)
+	if err != nil {
+		return LoomJob{}, false, err
+	}
+	if isLoomTerminal(job.Status) {
+		if err := tx.Commit(); err != nil {
+			return LoomJob{}, false, err
+		}
+		return job, false, nil
+	}
+	if job.CancelState != "" {
+		if job.CancelledBy != cancelledBy || job.CancelEventID != eventID || job.CancelEvent != eventJSON {
+			return LoomJob{}, false, fmt.Errorf("Loom cancellation identity mismatch")
+		}
+		if err := tx.Commit(); err != nil {
+			return LoomJob{}, false, err
+		}
+		return job, false, nil
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE loom_jobs SET cancel_event = ?, cancel_event_id = ?, cancel_state = 'pending',
+		cancel_next_attempt_at = ?, cancelled_by = ?, updated_at = ? WHERE workflow_run_id = ? AND cancel_state = ''`,
+		eventJSON, eventID, now.Unix(), cancelledBy, now.Unix(), workflowRunID)
+	if err != nil {
+		return LoomJob{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return LoomJob{}, false, err
+	}
+	job.CancelEvent, job.CancelEventID, job.CancelState = eventJSON, eventID, "pending"
+	job.CancelNextAttempt, job.CancelledBy = now, cancelledBy
+	return job, true, nil
+}
+
+func (s *SQLiteStore) ListDueLoomCancellations(ctx context.Context, now time.Time, limit int) ([]LoomJob, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, loomJobSelectSQL()+`
+		WHERE cancel_state != '' AND cancel_state != 'published' AND cancel_next_attempt_at <= ?
+		ORDER BY cancel_next_attempt_at, workflow_run_id LIMIT ?`, now.Unix(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []LoomJob
+	for rows.Next() {
+		job, err := getLoomJobRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+func (s *SQLiteStore) MarkLoomCancellationPublished(ctx context.Context, workflowRunID string, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE loom_jobs SET cancel_state = 'published', cancel_last_error = '',
+		updated_at = ? WHERE workflow_run_id = ?`, now.Unix(), strings.TrimSpace(workflowRunID))
+	return err
+}
+
+func (s *SQLiteStore) MarkLoomCancellationRetry(ctx context.Context, workflowRunID string, next time.Time, lastErr string) error {
+	if next.IsZero() {
+		next = time.Now().UTC()
+	}
+	if len(lastErr) > 1000 {
+		lastErr = lastErr[:1000]
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE loom_jobs SET cancel_state = 'retrying',
+		cancel_attempts = cancel_attempts + 1, cancel_next_attempt_at = ?, cancel_last_error = ?, updated_at = ?
+		WHERE workflow_run_id = ? AND cancel_state != 'published'`, next.Unix(), lastErr,
+		time.Now().UTC().Unix(), strings.TrimSpace(workflowRunID))
 	return err
 }
 
@@ -731,6 +1107,9 @@ func sweepLoomJobsTx(ctx context.Context, tx *sql.Tx, now time.Time, ttl time.Du
 	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_job_events WHERE workflow_run_id IN (SELECT workflow_run_id FROM loom_jobs WHERE updated_at < ?)`, cutoff); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_cashu_spends WHERE updated_at < ?`, cutoff); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_jobs WHERE updated_at < ?`, cutoff); err != nil {
 		return err
 	}
@@ -752,6 +1131,11 @@ func sweepLoomJobsTx(ctx context.Context, tx *sql.Tx, now time.Time, ttl time.Du
 	)`, excess); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_cashu_spends WHERE workflow_run_id IN (
+		SELECT workflow_run_id FROM loom_jobs ORDER BY updated_at, workflow_run_id LIMIT ?
+	)`, excess); err != nil {
+		return err
+	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM loom_jobs WHERE workflow_run_id IN (
 		SELECT workflow_run_id FROM loom_jobs ORDER BY updated_at, workflow_run_id LIMIT ?
 	)`, excess)
@@ -760,23 +1144,25 @@ func sweepLoomJobsTx(ctx context.Context, tx *sql.Tx, now time.Time, ttl time.Du
 
 func loomJobSelectSQL() string {
 	return `SELECT dispatch_key, workflow_run_id, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
-		commit_sha, workflow_path, workflow_run_event, job_request_event, status, terminal_source,
+		commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, terminal_source,
 		last_protocol_event_id, status_event_created_at, status_event_id, delivery_state,
 		dispatch_state, dispatch_attempts, dispatch_next_attempt_at, dispatch_last_error, published_at,
-		created_at, updated_at FROM loom_jobs`
+		cancel_event, cancel_event_id, cancel_state, cancel_attempts, cancel_next_attempt_at,
+		cancel_last_error, cancelled_by, created_at, updated_at FROM loom_jobs`
 }
 
 type loomScanner interface{ Scan(...any) error }
 
 func getLoomJobRow(row loomScanner) (LoomJob, error) {
 	var job LoomJob
-	var dispatchNext, published, created, updated int64
+	var dispatchNext, published, cancelNext, created, updated int64
 	err := row.Scan(&job.DispatchKey, &job.WorkflowRunID, &job.JobRequestID, &job.PublisherPub, &job.WorkerPub,
-		&job.Owner, &job.RepoName, &job.RepoID, &job.CommitSHA, &job.WorkflowPath,
+		&job.Owner, &job.RepoName, &job.RepoID, &job.CommitSHA, &job.WorkflowPath, &job.Branch,
 		&job.WorkflowRunEvent, &job.JobRequestEvent, &job.Status, &job.TerminalSource,
 		&job.LastProtocolEventID, &job.StatusEventCreatedAt, &job.StatusEventID,
 		&job.DeliveryState, &job.DispatchState, &job.DispatchAttempts, &dispatchNext,
-		&job.DispatchLastError, &published, &created, &updated)
+		&job.DispatchLastError, &published, &job.CancelEvent, &job.CancelEventID, &job.CancelState,
+		&job.CancelAttempts, &cancelNext, &job.CancelLastError, &job.CancelledBy, &created, &updated)
 	if err != nil {
 		return LoomJob{}, err
 	}
@@ -785,6 +1171,9 @@ func getLoomJobRow(row loomScanner) (LoomJob, error) {
 	}
 	if published > 0 {
 		job.PublishedAt = time.Unix(published, 0).UTC()
+	}
+	if cancelNext > 0 {
+		job.CancelNextAttempt = time.Unix(cancelNext, 0).UTC()
 	}
 	job.CreatedAt = time.Unix(created, 0).UTC()
 	job.UpdatedAt = time.Unix(updated, 0).UTC()
@@ -804,6 +1193,49 @@ func loomJobCountTx(ctx context.Context, tx *sql.Tx) (int64, error) {
 	return count, err
 }
 
+func loomCashuSelectSQL() string {
+	return `SELECT dispatch_key, workflow_run_id, worker_pub, worker_ad_id, mint_url, quote_id, token, state,
+		amount, price_per_second, duration_seconds, change_event_id, change_token, change_state,
+		change_amount, created_at, updated_at FROM loom_cashu_spends`
+}
+
+func scanLoomCashuSpend(row loomScanner) (LoomCashuSpend, error) {
+	var spend LoomCashuSpend
+	var amount, price, changeAmount, created, updated int64
+	err := row.Scan(&spend.DispatchKey, &spend.WorkflowRunID, &spend.WorkerPub, &spend.WorkerAdID, &spend.MintURL,
+		&spend.QuoteID, &spend.Token, &spend.State, &amount, &price, &spend.DurationSeconds,
+		&spend.ChangeEventID, &spend.ChangeToken, &spend.ChangeState, &changeAmount, &created, &updated)
+	if err != nil {
+		return LoomCashuSpend{}, err
+	}
+	if amount < 0 || price < 0 || changeAmount < 0 {
+		return LoomCashuSpend{}, fmt.Errorf("invalid negative Loom Cashu amount")
+	}
+	spend.Amount, spend.PricePerSecond, spend.ChangeAmount = uint64(amount), uint64(price), uint64(changeAmount)
+	spend.CreatedAt, spend.UpdatedAt = time.Unix(created, 0).UTC(), time.Unix(updated, 0).UTC()
+	return spend, nil
+}
+
+func getLoomCashuSpendTx(ctx context.Context, tx *sql.Tx, dispatchKey string) (LoomCashuSpend, error) {
+	return scanLoomCashuSpend(tx.QueryRowContext(ctx, loomCashuSelectSQL()+" WHERE dispatch_key = ?", dispatchKey))
+}
+
+func normalizeLoomCashuSpend(spend *LoomCashuSpend) {
+	spend.DispatchKey = strings.TrimSpace(spend.DispatchKey)
+	spend.WorkflowRunID = strings.TrimSpace(spend.WorkflowRunID)
+	spend.WorkerPub = strings.TrimSpace(spend.WorkerPub)
+	spend.WorkerAdID = strings.TrimSpace(spend.WorkerAdID)
+	spend.MintURL = strings.TrimSpace(spend.MintURL)
+	spend.QuoteID = strings.TrimSpace(spend.QuoteID)
+	spend.Token = strings.TrimSpace(spend.Token)
+	spend.State = strings.TrimSpace(spend.State)
+}
+
+func sameLoomCashuSpend(a, b LoomCashuSpend) bool {
+	return a.DispatchKey == b.DispatchKey && a.WorkerPub == b.WorkerPub && a.WorkerAdID == b.WorkerAdID && a.MintURL == b.MintURL &&
+		a.Amount == b.Amount && a.PricePerSecond == b.PricePerSecond && a.DurationSeconds == b.DurationSeconds
+}
+
 func normalizeLoomJob(job *LoomJob) {
 	job.DispatchKey = strings.TrimSpace(job.DispatchKey)
 	job.WorkflowRunID = strings.TrimSpace(job.WorkflowRunID)
@@ -815,6 +1247,7 @@ func normalizeLoomJob(job *LoomJob) {
 	job.RepoID = strings.TrimSpace(job.RepoID)
 	job.CommitSHA = strings.TrimSpace(job.CommitSHA)
 	job.WorkflowPath = strings.TrimSpace(job.WorkflowPath)
+	job.Branch = strings.TrimSpace(job.Branch)
 }
 
 func validateLoomJob(job LoomJob) error {
@@ -829,7 +1262,7 @@ func sameLoomIdentity(a, b LoomJob) bool {
 	return a.DispatchKey == b.DispatchKey && a.WorkflowRunID == b.WorkflowRunID && a.JobRequestID == b.JobRequestID &&
 		a.PublisherPub == b.PublisherPub && a.WorkerPub == b.WorkerPub &&
 		a.Owner == b.Owner && a.RepoName == b.RepoName && a.RepoID == b.RepoID &&
-		a.CommitSHA == b.CommitSHA && a.WorkflowPath == b.WorkflowPath &&
+		a.CommitSHA == b.CommitSHA && a.WorkflowPath == b.WorkflowPath && a.Branch == b.Branch &&
 		a.WorkflowRunEvent == b.WorkflowRunEvent && a.JobRequestEvent == b.JobRequestEvent
 }
 

@@ -15,12 +15,15 @@ import (
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip19"
 
+	"github.com/sharegap/grasp-gitea/internal/cashu"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
 const defaultDispatchRetry = 5 * time.Second
+
+var errNoLoomWorker = errors.New("no eligible Loom worker")
 
 // DispatchRequest is an already-authorized workflow trigger from the shared
 // Hive-CI detector. TriggeredBy is the Nostr signer authorized by Resolver.
@@ -52,6 +55,15 @@ type DispatchStore interface {
 	ListDueLoomDispatches(context.Context, time.Time, int) ([]store.LoomJob, error)
 	MarkLoomDispatchPublished(context.Context, string, time.Time) error
 	MarkLoomDispatchRetry(context.Context, string, time.Time, string) error
+	ReserveLoomCashuSpend(context.Context, store.LoomCashuSpend, time.Time) (store.LoomCashuSpend, bool, error)
+	CompleteLoomCashuSpend(context.Context, string, string, string, time.Time) (store.LoomCashuSpend, error)
+	GetLoomCashuSpend(context.Context, string) (store.LoomCashuSpend, error)
+	AttachLoomCashuSpend(context.Context, string, string, time.Time) error
+	ListSupersededLoomJobs(context.Context, store.LoomJob, int) ([]store.LoomJob, error)
+	ClaimLoomCancellation(context.Context, string, string, string, string, time.Time) (store.LoomJob, bool, error)
+	ListDueLoomCancellations(context.Context, time.Time, int) ([]store.LoomJob, error)
+	MarkLoomCancellationPublished(context.Context, string, time.Time) error
+	MarkLoomCancellationRetry(context.Context, string, time.Time, string) error
 }
 
 type DispatcherConfig struct {
@@ -59,6 +71,9 @@ type DispatcherConfig struct {
 	MaxDuration        time.Duration
 	CommandTemplate    string
 	StaticPaymentToken string
+	PaymentMode        string
+	MintURL            string
+	MaxPayment         uint64
 	ContextPrefix      string
 	RelayURLs          []string
 	JobTTL             time.Duration
@@ -70,6 +85,10 @@ type Dispatcher struct {
 	maxDuration     time.Duration
 	commandTemplate string
 	paymentToken    string
+	paymentMode     string
+	mintURL         string
+	maxPayment      uint64
+	wallet          cashu.Wallet
 	contextPrefix   string
 	relayURLs       []string
 	ttl             time.Duration
@@ -82,7 +101,7 @@ type Dispatcher struct {
 	wake            chan struct{}
 }
 
-func NewDispatcher(cfg DispatcherConfig, pool *WorkerPool, st DispatchStore, signer DispatchSigner, logger *slog.Logger) *Dispatcher {
+func NewDispatcher(cfg DispatcherConfig, pool *WorkerPool, st DispatchStore, signer DispatchSigner, logger *slog.Logger, wallets ...cashu.Wallet) *Dispatcher {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -98,14 +117,26 @@ func NewDispatcher(cfg DispatcherConfig, pool *WorkerPool, st DispatchStore, sig
 	if strings.TrimSpace(cfg.ContextPrefix) == "" {
 		cfg.ContextPrefix = DefaultContextPrefix
 	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.PaymentMode))
+	if mode == "" {
+		mode = "trusted"
+	}
+	var wallet cashu.Wallet
+	if len(wallets) > 0 {
+		wallet = wallets[0]
+	}
 	d := &Dispatcher{
 		enabled:     cfg.Enabled && pool != nil && st != nil && signer != nil && len(cfg.RelayURLs) > 0,
 		maxDuration: cfg.MaxDuration, commandTemplate: strings.TrimSpace(cfg.CommandTemplate),
 		paymentToken: strings.TrimSpace(cfg.StaticPaymentToken), contextPrefix: cfg.ContextPrefix,
+		paymentMode: mode, mintURL: strings.TrimSpace(cfg.MintURL), maxPayment: cfg.MaxPayment, wallet: wallet,
 		relayURLs: append([]string(nil), cfg.RelayURLs...), ttl: cfg.JobTTL, maxJobs: cfg.MaxJobs,
 		pool: pool, store: st, signer: signer, logger: logger, wake: make(chan struct{}, 1),
 	}
 	d.publish = d.publishToRelays
+	if d.paymentMode == "cashu" && (d.wallet == nil || d.mintURL == "" || d.maxPayment == 0) {
+		d.enabled = false
+	}
 	return d
 }
 
@@ -123,6 +154,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (bool, e
 		return false, err
 	}
 	if existing, err := d.store.GetLoomJobByDispatchKey(ctx, key); err == nil {
+		d.ensureSupersededCancellations(ctx, existing)
 		if existing.DispatchState == "published" {
 			return true, nil
 		}
@@ -132,11 +164,14 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (bool, e
 	}
 
 	now := time.Now().UTC()
-	worker, ok := d.pool.Select(now, d.maxDuration, d.paymentToken != "")
-	if !ok {
+	workerPub, paymentToken, err := d.preparePayment(ctx, key, now)
+	if errors.Is(err, errNoLoomWorker) {
 		return false, nil
 	}
-	job, err := d.buildAttempt(ctx, req, key, worker.Event.PubKey.Hex(), now)
+	if err != nil {
+		return false, err
+	}
+	job, err := d.buildAttempt(ctx, req, key, workerPub, paymentToken, now)
 	if err != nil {
 		return false, err
 	}
@@ -149,6 +184,12 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (bool, e
 	if err != nil {
 		return false, err
 	}
+	if d.paymentMode == "cashu" {
+		if err := d.store.AttachLoomCashuSpend(ctx, key, stored.WorkflowRunID, now); err != nil {
+			return true, err
+		}
+	}
+	d.ensureSupersededCancellations(ctx, stored)
 	select {
 	case d.wake <- struct{}{}:
 	default:
@@ -156,7 +197,71 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (bool, e
 	return true, d.publishAttempt(ctx, stored)
 }
 
-func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key, workerPub string, now time.Time) (store.LoomJob, error) {
+func (d *Dispatcher) preparePayment(ctx context.Context, key string, now time.Time) (string, string, error) {
+	if d.paymentMode != "cashu" {
+		worker, ok := d.pool.Select(now, d.maxDuration, d.paymentToken != "")
+		if !ok {
+			return "", "", errNoLoomWorker
+		}
+		return worker.Event.PubKey.Hex(), d.paymentToken, nil
+	}
+
+	if spend, err := d.store.GetLoomCashuSpend(ctx, key); err == nil {
+		if spend.State != "ready" || spend.Token == "" {
+			return "", "", fmt.Errorf("Cashu spend %s is reserved without a durable token; refusing a second payment", key)
+		}
+		return spend.WorkerPub, spend.Token, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return "", "", err
+	}
+
+	worker, ok := d.pool.SelectForMint(now, d.maxDuration, d.mintURL)
+	if !ok {
+		return "", "", errNoLoomWorker
+	}
+	price := worker.Prices[mustNormalizeMint(d.mintURL)]
+	amount, err := cashu.PaymentAmount(price, d.maxDuration)
+	if err != nil {
+		return "", "", err
+	}
+	if amount > d.maxPayment {
+		return "", "", fmt.Errorf("Cashu payment %d exceeds configured per-job maximum %d", amount, d.maxPayment)
+	}
+	spend, claimed, err := d.store.ReserveLoomCashuSpend(ctx, store.LoomCashuSpend{
+		DispatchKey: key, WorkerPub: worker.Event.PubKey.Hex(), WorkerAdID: worker.Event.ID.Hex(), MintURL: mustNormalizeMint(d.mintURL),
+		Amount: amount, PricePerSecond: price, DurationSeconds: int64(d.maxDuration / time.Second),
+	}, now)
+	if err != nil {
+		return "", "", err
+	}
+	if !claimed {
+		if spend.State == "ready" && spend.Token != "" {
+			return spend.WorkerPub, spend.Token, nil
+		}
+		return "", "", fmt.Errorf("Cashu spend %s is already reserved without a durable token; refusing a second payment", key)
+	}
+	payment, err := d.wallet.CreatePayment(ctx, cashu.PaymentRequest{
+		Amount: amount, MintURL: spend.MintURL, WorkerPubkey: spend.WorkerPub,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	if payment.Amount != amount {
+		return "", "", fmt.Errorf("Cashu wallet returned amount %d, want %d", payment.Amount, amount)
+	}
+	ready, err := d.store.CompleteLoomCashuSpend(ctx, key, payment.QuoteID, payment.Token, time.Now().UTC())
+	if err != nil {
+		return "", "", err
+	}
+	return ready.WorkerPub, ready.Token, nil
+}
+
+func mustNormalizeMint(raw string) string {
+	value, _ := cashu.NormalizeMintURL(raw)
+	return value
+}
+
+func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key, workerPub, paymentToken string, now time.Time) (store.LoomJob, error) {
 	bridgePub, err := nostr.PubKeyFromHex(strings.TrimSpace(d.signer.PublicKey()))
 	if err != nil {
 		return store.LoomJob{}, fmt.Errorf("invalid Loom operator pubkey: %w", err)
@@ -195,8 +300,11 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key,
 		{"p", workerPub}, {"cmd", cmd}, append(nostr.Tag{"args"}, args...),
 		{"e", run.ID.Hex()}, {"secret", "HIVE_CI_NSEC", encrypted},
 	}
-	if d.paymentToken != "" {
-		tags = append(tags, nostr.Tag{"payment", d.paymentToken})
+	if paymentToken != "" {
+		tags = append(tags, nostr.Tag{"payment", paymentToken})
+	}
+	if d.paymentMode == "cashu" && d.wallet.ReceivePubkey() != "" {
+		tags = append(tags, nostr.Tag{"cashu_pubkey", d.wallet.ReceivePubkey()})
 	}
 	request := &nostr.Event{
 		PubKey: bridgePub, CreatedAt: nostr.Timestamp(now.Unix()), Kind: relay.KindLoomJobRequest,
@@ -221,6 +329,7 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key,
 		PublisherPub: ephemeral.Public().Hex(), WorkerPub: workerPub,
 		Owner: req.Owner, RepoName: req.RepoName, RepoID: req.RepoID,
 		CommitSHA: req.CommitSHA, WorkflowPath: req.WorkflowPath,
+		Branch:           req.Branch,
 		WorkflowRunEvent: string(runBytes), JobRequestEvent: string(requestBytes),
 		CreatedAt: now,
 	}, nil
@@ -259,6 +368,84 @@ func (d *Dispatcher) publishAttempt(ctx context.Context, job store.LoomJob) erro
 	return publishErr
 }
 
+func (d *Dispatcher) ensureSupersededCancellations(ctx context.Context, newer store.LoomJob) {
+	jobs, err := d.store.ListSupersededLoomJobs(ctx, newer, 100)
+	if err != nil {
+		d.logger.Warn("Loom supersession query failed", "workflow_run", newer.WorkflowRunID, "error", err)
+		return
+	}
+	for _, old := range jobs {
+		if old.CancelState != "" {
+			continue
+		}
+		now := time.Now().UTC()
+		pub, err := nostr.PubKeyFromHex(strings.TrimSpace(d.signer.PublicKey()))
+		if err != nil {
+			d.logger.Warn("Loom cancellation signer is invalid", "error", err)
+			return
+		}
+		var original nostr.Event
+		if err := json.Unmarshal([]byte(old.JobRequestEvent), &original); err != nil || original.PubKey != pub {
+			d.logger.Warn("Loom cancellation signer no longer matches original requester", "job", old.JobRequestID)
+			continue
+		}
+		ev := &nostr.Event{PubKey: pub, CreatedAt: nostr.Timestamp(now.Unix()), Kind: relay.KindLoomJobCancel,
+			Tags: nostr.Tags{{"e", old.JobRequestID}, {"p", old.WorkerPub}}, Content: ""}
+		if err := d.signer.SignEvent(ctx, ev); err != nil {
+			d.logger.Warn("sign Loom cancellation failed", "job", old.JobRequestID, "error", err)
+			continue
+		}
+		if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
+			d.logger.Warn("invalid signed Loom cancellation", "job", old.JobRequestID, "error", err)
+			continue
+		}
+		encoded, err := json.Marshal(ev)
+		if err != nil {
+			continue
+		}
+		persisted, claimed, claimErr := d.store.ClaimLoomCancellation(ctx, old.WorkflowRunID,
+			newer.WorkflowRunID, ev.ID.Hex(), string(encoded), now)
+		if claimErr != nil {
+			d.logger.Warn("persist Loom cancellation failed", "job", old.JobRequestID, "error", claimErr)
+			continue
+		}
+		if claimed {
+			if err := d.publishCancellation(ctx, persisted); err != nil {
+				d.logger.Warn("publish Loom cancellation failed", "job", old.JobRequestID, "error", err)
+			}
+		}
+	}
+}
+
+func (d *Dispatcher) publishCancellation(ctx context.Context, job store.LoomJob) error {
+	var ev nostr.Event
+	if err := json.Unmarshal([]byte(job.CancelEvent), &ev); err != nil {
+		return fmt.Errorf("decode persisted cancellation: %w", err)
+	}
+	var original nostr.Event
+	if err := json.Unmarshal([]byte(job.JobRequestEvent), &original); err != nil {
+		return fmt.Errorf("decode original persisted job request: %w", err)
+	}
+	if err := nostrverify.ValidateEventIDAndSignature(&original); err != nil || original.ID.Hex() != job.JobRequestID {
+		return fmt.Errorf("original persisted job request is invalid")
+	}
+	if ev.Kind != relay.KindLoomJobCancel || ev.ID.Hex() != job.CancelEventID || ev.PubKey != original.PubKey ||
+		tagValue(ev.Tags, "e") != job.JobRequestID || tagValue(ev.Tags, "p") != job.WorkerPub {
+		return fmt.Errorf("persisted Loom cancellation does not match dispatch")
+	}
+	if err := nostrverify.ValidateEventIDAndSignature(&ev); err != nil {
+		return fmt.Errorf("persisted Loom cancellation is invalid: %w", err)
+	}
+	if err := d.publish(ctx, &ev); err != nil {
+		next := time.Now().UTC().Add(dispatchRetryBackoff(job.CancelAttempts))
+		if markErr := d.store.MarkLoomCancellationRetry(ctx, job.WorkflowRunID, next, err.Error()); markErr != nil {
+			return errors.Join(err, markErr)
+		}
+		return err
+	}
+	return d.store.MarkLoomCancellationPublished(ctx, job.WorkflowRunID, time.Now().UTC())
+}
+
 // Run republishes exact persisted events after process or relay failures.
 func (d *Dispatcher) Run(ctx context.Context) {
 	if !d.Enabled() {
@@ -289,6 +476,19 @@ func (d *Dispatcher) publishDue(ctx context.Context) {
 		}
 		if err := d.publishAttempt(ctx, job); err != nil {
 			d.logger.Warn("Loom dispatch publish failed", "workflow_run", job.WorkflowRunID, "error", err)
+		}
+	}
+	cancellations, err := d.store.ListDueLoomCancellations(ctx, time.Now().UTC(), 25)
+	if err != nil {
+		d.logger.Warn("Loom cancellation outbox query failed", "error", err)
+		return
+	}
+	for _, job := range cancellations {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := d.publishCancellation(ctx, job); err != nil {
+			d.logger.Warn("Loom cancellation publish failed", "workflow_run", job.WorkflowRunID, "error", err)
 		}
 	}
 }

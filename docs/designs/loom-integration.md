@@ -443,6 +443,10 @@ All new keys default OFF so existing deployments are unaffected. Reuse existing
 | `LOOM_STATUS_CONTEXT_PREFIX` | string | `hive-ci` | Prefix for the Gitea commit-status `context`. |
 | `LOOM_MINT_URL` | url | – | (Phase 3) Cashu mint. |
 | `LOOM_STATIC_PAYMENT_TOKEN` | string | – | (Phase 2) pre-funded trusted-fleet token. |
+| `LOOM_PAYMENT_MODE` | enum | `trusted` | `trusted` keeps the Phase-2 absent/static-token path; `cashu` enables the Phase-3 wallet. |
+| `LOOM_CASHU_WALLET_PATH` | path | `<DB_PATH>.cashu-wallet` | Persistent owner-only gonuts wallet directory. |
+| `LOOM_CASHU_MAX_PAYMENT` | uint64 sats | – | Required in `cashu` mode; hard per-job spend ceiling after checked price × duration math. |
+| `LOOM_LOG_MAX_BYTES` | bytes | `1048576` | Maximum guarded Blossom log response size. |
 | `CI_PROTOCOL` | enum | `canonical` | `canonical` (Loom/Hive 5x00 kinds) or `cascadia` (legacy 25910 `ci/workflow-run`). Mutually exclusive — never both for one trigger (§2a). |
 
 `internal/config/config.go` gains a `Loom*` block loaded with the same helpers

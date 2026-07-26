@@ -13,6 +13,7 @@ import (
 
 	"fiatjaf.com/nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/cashu"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -30,11 +31,18 @@ type Config struct {
 	FutureSkew    time.Duration
 	ResultGrace   time.Duration
 	QueueSize     int
+	LogFetcher    LogFetcher
+	Wallet        cashu.Wallet
 }
 
 type JobStore interface {
 	GetLoomJobByWorkflowRunID(context.Context, string) (store.LoomJob, error)
 	GetLoomJobByRequestID(context.Context, string) (store.LoomJob, error)
+}
+
+type CashuChangeStore interface {
+	ClaimLoomCashuChange(context.Context, string, string, string, time.Time) (bool, error)
+	MarkLoomCashuChangeRedeemed(context.Context, string, string, uint64, time.Time) error
 }
 
 type Service struct {
@@ -45,6 +53,9 @@ type Service struct {
 	futureSkew, resultGrace time.Duration
 	logger                  *slog.Logger
 	queue                   chan nostr.Event
+	logs                    LogFetcher
+	wallet                  cashu.Wallet
+	changeStore             CashuChangeStore
 }
 
 func New(cfg Config, st JobStore, sink StatusSink, logger *slog.Logger) *Service {
@@ -65,10 +76,12 @@ func New(cfg Config, st JobStore, sink StatusSink, logger *slog.Logger) *Service
 	if strings.TrimSpace(cfg.ContextPrefix) == "" {
 		cfg.ContextPrefix = DefaultContextPrefix
 	}
+	changeStore, _ := st.(CashuChangeStore)
 	return &Service{
 		enabled: cfg.Enabled && st != nil && sink != nil, store: st, sink: sink,
 		contextPrefix: cfg.ContextPrefix, futureSkew: cfg.FutureSkew,
 		resultGrace: cfg.ResultGrace, logger: logger, queue: make(chan nostr.Event, cfg.QueueSize),
+		logs: cfg.LogFetcher, wallet: cfg.Wallet, changeStore: changeStore,
 	}
 }
 
@@ -180,6 +193,23 @@ func (s *Service) processEvent(ctx context.Context, ev *nostr.Event) error {
 	if err != nil {
 		return err
 	}
+	if ev.Kind == relay.KindLoomJobResult && s.wallet != nil && s.changeStore != nil {
+		if change := tagValue(ev.Tags, "change"); change != "" {
+			if err := s.redeemChange(ctx, job, ev.ID.Hex(), change); err != nil {
+				s.logger.Warn("Loom Cashu change redemption failed", "event", ev.ID.Hex(), "job", job.JobRequestID, "error", err)
+			}
+		}
+	}
+	if rawLogURL := resultLogURL(ev.Kind, ev.Tags); rawLogURL != "" && s.logs != nil {
+		artifact, fetchErr := s.logs.Fetch(ctx, rawLogURL)
+		if fetchErr != nil {
+			state, description = store.LoomStatusError, "hive-ci: log artifact rejected"
+		} else {
+			if artifact.Tail != "" {
+				description = description + " — log: " + artifact.Tail
+			}
+		}
+	}
 	availableAt := time.Now().UTC()
 	if ev.Kind == relay.KindLoomJobResult {
 		availableAt = availableAt.Add(s.resultGrace)
@@ -189,13 +219,38 @@ func (s *Service) processEvent(ctx context.Context, ev *nostr.Event) error {
 			DispatchKey: job.DispatchKey, WorkflowRunID: job.WorkflowRunID, JobRequestID: job.JobRequestID,
 			PublisherPub: job.PublisherPub, WorkerPub: job.WorkerPub,
 			Owner: job.Owner, RepoName: job.RepoName, RepoID: job.RepoID,
-			CommitSHA: job.CommitSHA, WorkflowPath: job.WorkflowPath,
+			CommitSHA: job.CommitSHA, WorkflowPath: job.WorkflowPath, Branch: job.Branch,
 			WorkflowRunEvent: job.WorkflowRunEvent, JobRequestEvent: job.JobRequestEvent,
 		},
 		State: state, Description: description, Context: Context(s.contextPrefix, job.WorkflowPath),
 		Source: sourceForKind(ev.Kind), ProtocolEventID: ev.ID.Hex(),
 		EventCreatedAt: int64(ev.CreatedAt), AvailableAt: availableAt,
 	})
+}
+
+func (s *Service) redeemChange(ctx context.Context, job store.LoomJob, eventID, token string) error {
+	claimed, err := s.changeStore.ClaimLoomCashuChange(ctx, job.DispatchKey, eventID, token, time.Now().UTC())
+	if err != nil || !claimed {
+		return err
+	}
+	amount, err := s.wallet.RedeemChange(ctx, token)
+	if err != nil {
+		return err
+	}
+	return s.changeStore.MarkLoomCashuChangeRedeemed(ctx, job.DispatchKey, eventID, amount, time.Now().UTC())
+}
+
+func resultLogURL(kind nostr.Kind, tags nostr.Tags) string {
+	if kind == relay.KindHiveWorkflowResult {
+		return tagValue(tags, "log_url")
+	}
+	if kind == relay.KindLoomJobResult {
+		if stdout := tagValue(tags, "stdout"); stdout != "" {
+			return stdout
+		}
+		return tagValue(tags, "stderr")
+	}
+	return ""
 }
 
 // MapResult maps canonical 30100/5101/5402 payloads to Gitea states.

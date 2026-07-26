@@ -49,10 +49,54 @@ func TestEnsureLoomTablesMigratesPhaseOneSchema(t *testing.T) {
 		columns[name] = true
 	}
 	for _, name := range []string{"dispatch_key", "dispatch_state", "dispatch_attempts",
-		"dispatch_next_attempt_at", "dispatch_last_error", "published_at"} {
+		"dispatch_next_attempt_at", "dispatch_last_error", "published_at", "branch",
+		"cancel_event", "cancel_state", "cancel_next_attempt_at"} {
 		if !columns[name] {
 			t.Fatalf("migration did not add %s", name)
 		}
+	}
+}
+
+func TestLoomCashuSpendAndChangeAreIdempotent(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "cashu.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	intent := LoomCashuSpend{DispatchKey: "dispatch", WorkerPub: "worker", WorkerAdID: "ad", MintURL: "https://mint.example",
+		Amount: 600, PricePerSecond: 2, DurationSeconds: 300}
+	reserved, claimed, err := st.ReserveLoomCashuSpend(ctx, intent, now)
+	if err != nil || !claimed || reserved.State != "reserved" {
+		t.Fatalf("reserve = %+v, %v, %v", reserved, claimed, err)
+	}
+	if _, claimed, err := st.ReserveLoomCashuSpend(ctx, intent, now); err != nil || claimed {
+		t.Fatalf("duplicate reserve = %v, %v", claimed, err)
+	}
+	ready, err := st.CompleteLoomCashuSpend(ctx, "dispatch", "quote", "token", now)
+	if err != nil || ready.State != "ready" || ready.Token != "token" {
+		t.Fatalf("complete = %+v, %v", ready, err)
+	}
+	if err := st.AttachLoomCashuSpend(ctx, "dispatch", "run", now); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = st.ClaimLoomCashuChange(ctx, "dispatch", "result", "change", now)
+	if err != nil || !claimed {
+		t.Fatalf("claim change = %v, %v", claimed, err)
+	}
+	if claimed, err = st.ClaimLoomCashuChange(ctx, "dispatch", "result", "change", now); err != nil || claimed {
+		t.Fatalf("duplicate change = %v, %v", claimed, err)
+	}
+	if _, err := st.ClaimLoomCashuChange(ctx, "dispatch", "other", "change", now); err == nil {
+		t.Fatal("different result replaced claimed change")
+	}
+	if err := st.MarkLoomCashuChangeRedeemed(ctx, "dispatch", "result", 500, now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetLoomCashuSpend(ctx, "dispatch")
+	if err != nil || got.ChangeState != "redeemed" || got.ChangeAmount != 500 {
+		t.Fatalf("redeemed spend = %+v, %v", got, err)
 	}
 }
 
