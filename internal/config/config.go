@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -11,26 +12,27 @@ import (
 )
 
 type Config struct {
-	GiteaURL              string
-	GiteaAdminToken       string
-	ClonePrefix           string
-	RelayURLs             []string
-	Listen                string
-	DBPath                string
-	PubkeyAllowlist       map[string]struct{}
-	ProvisionRateLimit    int
-	HookRelayURL          string
-	HookBinaryPath        string
-	GiteaRepositoriesDir  string
-	EmbeddedRelay         bool
-	EmbeddedRelayPort     int
-	EmbeddedRelayDB       string
-	ArchiveMode           bool
-	AdminAPIToken         string
-	AuthEnabled           bool
-	BridgePublicURL       string
-	ChallengeTTL          time.Duration
-	ProactiveSyncInterval time.Duration
+	GiteaURL               string
+	GiteaAdminToken        string
+	ClonePrefix            string
+	RelayURLs              []string
+	Listen                 string
+	DBPath                 string
+	PubkeyAllowlist        map[string]struct{}
+	ProvisionRateLimit     int
+	HookRelayURL           string
+	HookBinaryPath         string
+	GiteaRepositoriesDir   string
+	EmbeddedRelay          bool
+	EmbeddedRelayPort      int
+	EmbeddedRelayDB        string
+	ArchiveMode            bool
+	AdminAPIToken          string
+	AuthEnabled            bool
+	BridgePublicURL        string
+	ChallengeTTL           time.Duration
+	NIP46TrustedProxyCIDRs []string
+	ProactiveSyncInterval  time.Duration
 
 	// SignerMasterKey enables the persistent NIP-46 signer subsystem when set.
 	// It is decoded from SIGNER_MASTER_KEY (base64 or hex) and must be 32 bytes.
@@ -65,8 +67,10 @@ type Config struct {
 	CITriggerRepos []string // ["*"] or ["owner/repo-id", ...]
 
 	// Hive-CI Tier A runs act locally and publishes signed check/audit results.
-	HiveCIEnabled bool
-	HiveCIActPath string
+	HiveCIEnabled       bool
+	HiveCIActPath       string
+	HiveCIRunTimeout    time.Duration
+	HiveCIMaxConcurrent int
 
 	// NIP34StatusSyncEnabled updates Gitea issue state from inbound NIP-34 status events.
 	NIP34StatusSyncEnabled bool
@@ -93,6 +97,7 @@ func Load() (Config, error) {
 		AuthEnabled:            boolEnv("AUTH_ENABLED", false),
 		BridgePublicURL:        strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
 		ChallengeTTL:           durationEnv("CHALLENGE_TTL", 5*time.Minute),
+		NIP46TrustedProxyCIDRs: csvEnv("NIP46_TRUSTED_PROXY_CIDRS"),
 		ProactiveSyncInterval:  normalizeProactiveSyncInterval(durationEnv("PROACTIVE_SYNC_INTERVAL", time.Hour)),
 		SignerMasterKey:        nil,
 		SignetBunkerURL:        strings.TrimSpace(os.Getenv("SIGNET_BUNKER_URL")),
@@ -108,6 +113,8 @@ func Load() (Config, error) {
 		CITriggerRepos:         csvEnv("CI_TRIGGER_REPOS"),
 		HiveCIEnabled:          boolEnv("HIVE_CI_ENABLED", false),
 		HiveCIActPath:          envOrDefault("HIVE_CI_ACT_PATH", "/usr/bin/act"),
+		HiveCIRunTimeout:       boundedDurationEnv("HIVE_CI_RUN_TIMEOUT", 15*time.Minute, time.Second, time.Hour),
+		HiveCIMaxConcurrent:    boundedIntEnv("HIVE_CI_MAX_CONCURRENT", 2, 1, 16),
 		NIP34StatusSyncEnabled: boolEnv("NIP34_STATUS_SYNC_ENABLED", false),
 	}
 
@@ -131,6 +138,18 @@ func Load() (Config, error) {
 
 	if cfg.AuthEnabled && cfg.BridgePublicURL == "" {
 		return Config{}, fmt.Errorf("BRIDGE_PUBLIC_URL is required when AUTH_ENABLED=true")
+	}
+	for _, cidr := range cfg.NIP46TrustedProxyCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return Config{}, fmt.Errorf("invalid NIP46_TRUSTED_PROXY_CIDRS entry %q: %w", cidr, err)
+		}
+	}
+
+	if cfg.Production() && cfg.AdminAPIToken == "" {
+		return Config{}, fmt.Errorf("ADMIN_API_TOKEN is required in production")
+	}
+	if cfg.Production() && (cfg.SignetBunkerURL != "" || cfg.AuthEnabled) && !cfg.SignerEnabled() {
+		return Config{}, fmt.Errorf("SIGNER_MASTER_KEY is required for production durable signing")
 	}
 
 	return cfg, nil
@@ -183,6 +202,14 @@ func intEnv(key string, fallback int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+func boundedIntEnv(key string, fallback, min, max int) int {
+	n := intEnv(key, fallback)
+	if n < min || n > max {
 		return fallback
 	}
 	return n
@@ -245,6 +272,14 @@ func durationEnv(key string, fallback time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
+		return fallback
+	}
+	return d
+}
+
+func boundedDurationEnv(key string, fallback, min, max time.Duration) time.Duration {
+	d := durationEnv(key, fallback)
+	if d < min || d > max {
 		return fallback
 	}
 	return d

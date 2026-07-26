@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -84,8 +85,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/mappings", method(http.MethodGet, s.requireAuth(s.mappings)))
 	mux.HandleFunc("/outbound-events", method(http.MethodGet, s.requireAuth(s.outboundEvents)))
 	mux.HandleFunc("/signer/authorize", method(http.MethodPost, s.requireAuth(s.signerAuthorize)))
-	mux.HandleFunc("/repository-state/propose", method(http.MethodPost, s.requireConfiguredAuth(s.proposeRepositoryState)))
-	mux.HandleFunc("/repository-state/proposed", method(http.MethodGet, s.requireConfiguredAuth(s.proposedRepositoryState)))
+	mux.HandleFunc("/repository-state/propose", method(http.MethodPost, s.requireAuth(s.proposeRepositoryState)))
+	mux.HandleFunc("/repository-state/proposed", method(http.MethodGet, s.requireAuth(s.proposedRepositoryState)))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.requireAuth(s.manualProvision)))
 	mux.HandleFunc("/internal/mirror-sync", method(http.MethodPost, s.requireMirrorAuth(s.mirrorSync)))
 
@@ -103,41 +104,27 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// requireConfiguredAuth is used for security-sensitive mutation endpoints that
-// must never inherit the legacy open-mode behavior.
-func (s *Server) requireConfiguredAuth(next http.HandlerFunc) http.HandlerFunc {
+// requireAuth wraps an administrative handler with fail-closed bearer-token
+// authentication. A missing token is a configuration failure, never an open
+// mode, even when a Server is constructed outside the production entrypoint.
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.apiToken == "" {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "admin authentication is not configured"})
 			return
 		}
-		s.requireAuth(next)(w, r)
-	}
-}
 
-// requireAuth wraps a handler with bearer token authentication.
-// If no AdminAPIToken is configured, all requests are allowed (open mode).
-func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.apiToken == "" {
-			// No token configured; allow all requests (backwards-compatible).
-			next(w, r)
-			return
-		}
-
-		auth := r.Header.Get("Authorization")
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
 		if auth == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authorization required"})
 			return
 		}
-
-		// Accept "Bearer <token>" format.
-		token := strings.TrimPrefix(auth, "Bearer ")
-		if token == auth {
-			// No "Bearer " prefix; try plain token.
-			token = auth
+		if !strings.HasPrefix(auth, "Bearer ") {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "bearer authorization required"})
+			return
 		}
-		if token != s.apiToken {
+		token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.apiToken)) != 1 {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid token"})
 			return
 		}

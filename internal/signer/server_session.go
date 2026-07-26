@@ -33,6 +33,14 @@ type DurableSignetSigner struct {
 // PublicKey returns the remote signer's pubkey (hex).
 func (d *DurableSignetSigner) PublicKey() string { return d.pubKey }
 
+// Close releases the long-lived NIP-46 relay subscription.
+func (d *DurableSignetSigner) Close() error {
+	if d != nil {
+		closeBunkerSigner(d.bunker)
+	}
+	return nil
+}
+
 // SignEvent signs with the persistent bunker session.
 func (d *DurableSignetSigner) SignEvent(ctx context.Context, ev *nostr.Event) error {
 	if ev == nil {
@@ -106,6 +114,12 @@ func connectSignetSession(ctx context.Context, st *store.SQLiteStore, clientKey 
 	if err != nil {
 		return nil, err
 	}
+	retained := false
+	defer func() {
+		if !retained {
+			closeBunkerSigner(client)
+		}
+	}()
 	pkCtx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 	pubKey, err := client.GetPublicKey(pkCtx)
@@ -129,36 +143,56 @@ func connectSignetSession(ctx context.Context, st *store.SQLiteStore, clientKey 
 		return nil, err
 	}
 
-	return &DurableSignetSigner{
+	signer := &DurableSignetSigner{
 		bunker:    client,
 		pubKey:    pubKey.Hex(),
 		bunkerURI: durableURI,
 		st:        st,
 		logger:    logger,
-	}, nil
+	}
+	retained = true
+	return signer, nil
 }
 
-// connectBunkerDetached mirrors Service.connectBunker for the bridge session:
-// ConnectBunker retains its context for the long-lived response subscription,
-// so the connection uses a cancellation-detached context while the handshake
-// stays bounded.
+// connectBunkerDetached gives the long-lived bridge client its own context,
+// but cancels that context if the caller or handshake timeout wins. Successful
+// connections keep the context alive for their response subscription.
 func connectBunkerDetached(ctx context.Context, clientKey nostr.SecretKey, bunkerURL string) (BunkerSigner, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("connect bunker: %w", err)
+	}
 	type result struct {
 		client *nip46.BunkerClient
 		err    error
 	}
 	resultCh := make(chan result, 1)
-	connCtx := context.WithoutCancel(ctx)
+	connCtx, connCancel := context.WithCancel(context.Background())
 	go func() {
 		client, err := nip46.ConnectBunker(connCtx, clientKey, bunkerURL, nil, func(string) {})
 		resultCh <- result{client: client, err: err}
 	}()
+	timer := time.NewTimer(connectTimeout)
+	defer timer.Stop()
 	select {
 	case r := <-resultCh:
-		return r.client, r.err
-	case <-time.After(connectTimeout):
+		if err := ctx.Err(); err != nil {
+			connCancel()
+			return nil, fmt.Errorf("connect bunker: %w", err)
+		}
+		if r.err != nil {
+			connCancel()
+			return nil, r.err
+		}
+		if r.client == nil {
+			connCancel()
+			return nil, fmt.Errorf("connector returned no bunker client")
+		}
+		return &managedBunkerSigner{BunkerSigner: r.client, cancel: connCancel}, nil
+	case <-timer.C:
+		connCancel()
 		return nil, fmt.Errorf("connect bunker: %w", context.DeadlineExceeded)
 	case <-ctx.Done():
+		connCancel()
 		return nil, fmt.Errorf("connect bunker: %w", ctx.Err())
 	}
 }

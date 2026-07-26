@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -61,11 +62,14 @@ func relaySubscriptionURLs(configured []string, embeddedURL string, publicEmbedd
 	return mergeRelayURLs(filtered, embeddedURL)
 }
 
-func newServerSigner(ctx context.Context, cfg config.Config, st *store.SQLiteStore, logger *slog.Logger) (publisher.ServerSigner, error) {
+func newServerSigner(ctx context.Context, cfg config.Config, st *store.SQLiteStore, relayURLs []string, logger *slog.Logger) (publisher.ServerSigner, error) {
 	if cfg.SignetBunkerURL != "" {
+		if cfg.Production() && len(cfg.SignerMasterKey) != 32 {
+			return nil, errors.New("SIGNER_MASTER_KEY is required for production durable signing")
+		}
 		// Restart-durable session: Signet authorization is one-time, so the
 		// authorized NIP-46 client key is persisted and reused across restarts.
-		serverSigner, err := signer.ConnectDurableSignetSigner(ctx, st, cfg.SignerMasterKey, cfg.SignetBunkerURL, cfg.RelayURLs, logger)
+		serverSigner, err := signer.ConnectDurableSignetSigner(ctx, st, cfg.SignerMasterKey, cfg.SignetBunkerURL, relayURLs, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -137,6 +141,7 @@ func main() {
 			logger.Error("failed to create signer service", "error", err)
 			os.Exit(1)
 		}
+		defer signerSvc.Close()
 		logger.Info("persistent NIP-46 signer service enabled")
 	} else {
 		logger.Info("persistent NIP-46 signer service disabled", "reason", "SIGNER_MASTER_KEY not configured")
@@ -166,17 +171,25 @@ func main() {
 	// so the bridge does not hold an nsec. BRIDGE_NSEC remains only as an
 	// explicit dev fallback and is rejected when GRASP_ENV/APP_ENV/ENVIRONMENT
 	// is production.
-	serverSigner, err := newServerSigner(ctx, cfg, st, logger)
+	serverSigner, err := newServerSigner(ctx, cfg, st, relayURLs, logger)
 	if err != nil {
 		logger.Error("failed to create server signer", "error", err)
 		os.Exit(1)
+	}
+	if closer, ok := serverSigner.(interface{ Close() error }); ok {
+		defer closer.Close()
 	}
 	publisherSvc := publisher.NewWithServerSigner(serverSigner, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
 	if cfg.CIEnabled && publisherSvc.Enabled() {
 		publisherSvc.SetCIConfig(true, cfg.CITriggerRepos)
 		logger.Info("CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
 	}
-	hiveRunner := hiveci.New(hiveci.Config{Enabled: cfg.HiveCIEnabled, ActPath: cfg.HiveCIActPath}, st, serverSigner, relayURLs, cfg.GiteaRepositoriesDir, logger)
+	hiveRunner := hiveci.New(hiveci.Config{
+		Enabled:       cfg.HiveCIEnabled,
+		ActPath:       cfg.HiveCIActPath,
+		RunTimeout:    cfg.HiveCIRunTimeout,
+		MaxConcurrent: cfg.HiveCIMaxConcurrent,
+	}, st, serverSigner, relayURLs, cfg.GiteaRepositoriesDir, logger)
 	if cfg.HiveCIEnabled && !hiveRunner.Enabled() {
 		logger.Warn("Hive-CI requested but disabled; check server signer, repositories path, and act path")
 	} else if hiveRunner.Enabled() {
@@ -213,6 +226,8 @@ func main() {
 		identitySvc := auth.NewIdentityService(st, giteaClient, nip05Resolver, logger)
 		nip07Handler := auth.NewNIP07Handler(authSvc, identitySvc, relayURLs, logger)
 		nip46Handler := auth.NewNIP46Handler(st, identitySvc, relayURLs, cfg.BridgePublicURL, signerSvc, logger)
+		nip46Handler.SetTrustedProxyCIDRs(cfg.NIP46TrustedProxyCIDRs)
+		go nip46Handler.RunCleanup(ctx)
 		if actorBackfiller != nil {
 			nip46Handler.SetActorEventBackfiller(actorBackfiller)
 		}
@@ -243,19 +258,13 @@ func main() {
 		reflectorSvc.SetPatchRejectionPublisher(publisherSvc)
 	}
 
-	// Per-repo lock serialises state-event processing (CI + proactive
-	// sync) across relay goroutines so ref reads in the CI handler
-	// cannot race with ref writes from proactive sync.
-	var repoStateMu sync.Mutex
-	repoStateLocks := make(map[string]*sync.Mutex)
+	// A fixed set of striped locks serialises state-event processing (CI +
+	// proactive sync) without retaining attacker-controlled repository keys.
+	// Hash collisions only add harmless cross-repository serialization.
+	var repoStateLocks [256]sync.Mutex
 	lockRepoState := func(key string) func() {
-		repoStateMu.Lock()
-		mu, ok := repoStateLocks[key]
-		if !ok {
-			mu = &sync.Mutex{}
-			repoStateLocks[key] = mu
-		}
-		repoStateMu.Unlock()
+		sum := sha256.Sum256([]byte(key))
+		mu := &repoStateLocks[int(sum[0])]
 		mu.Lock()
 		return mu.Unlock
 	}

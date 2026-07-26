@@ -11,9 +11,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
@@ -21,8 +23,18 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
-// NIP46SessionTTL is the default lifetime of a NIP-46 login session.
-const NIP46SessionTTL = 2 * time.Minute
+const (
+	// NIP46SessionTTL is the default lifetime of a NIP-46 login session.
+	NIP46SessionTTL = 2 * time.Minute
+
+	nip46InitWindow       = time.Minute
+	nip46InitPerIPLimit   = 10
+	nip46InitGlobalLimit  = 100
+	nip46MaxActiveFlows   = 16
+	nip46MaxTrackedIPs    = 1024
+	nip46CleanupInterval  = time.Minute
+	nip46MaxInitBodyBytes = 64 << 10
+)
 
 // NIP46Handler provides HTTP endpoints for the NIP-46 remote signer
 // (bunker) login flow: session init and status polling.
@@ -38,6 +50,17 @@ type NIP46Handler struct {
 	// bunker connector.
 	GrantCreator GrantCreator
 	Backfiller   ActorEventBackfiller
+
+	limitMu        sync.Mutex
+	ipWindows      map[string]initRateWindow
+	globalWindow   initRateWindow
+	flowSlots      chan struct{}
+	trustedProxies []*net.IPNet
+}
+
+type initRateWindow struct {
+	started time.Time
+	count   int
 }
 
 // GrantCreator abstracts durable NIP-46 signer authorization.
@@ -67,7 +90,22 @@ func NewNIP46Handler(
 		publicURL:       publicURL,
 		GrantCreator:    grantCreator,
 		logger:          logger.With("component", "auth.nip46"),
+		ipWindows:       make(map[string]initRateWindow),
+		flowSlots:       make(chan struct{}, nip46MaxActiveFlows),
 	}
+}
+
+// SetTrustedProxyCIDRs configures proxies whose forwarded client-address
+// headers may be used for per-IP admission control. Untrusted peers can never
+// influence the selected client IP.
+func (h *NIP46Handler) SetTrustedProxyCIDRs(cidrs []string) {
+	trusted := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		if _, network, err := net.ParseCIDR(strings.TrimSpace(cidr)); err == nil {
+			trusted = append(trusted, network)
+		}
+	}
+	h.trustedProxies = trusted
 }
 
 // SetActorEventBackfiller wires the optional pre-link actor event backfill hook.
@@ -107,6 +145,7 @@ type nip46StatusResponse struct {
 // Request: { "bunker_uri": "bunker://...", "redirect_uri": "/dashboard" }
 // Response: { "session_token": "...", "poll_url": "...", "expires_at": "..." }
 func (h *NIP46Handler) handleInit(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, nip46MaxInitBodyBytes)
 	var req nip46InitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -124,6 +163,17 @@ func (h *NIP46Handler) handleInit(w http.ResponseWriter, r *http.Request) {
 		h.writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("invalid bunker_uri: %v", err)})
 		return
 	}
+
+	if !h.admitInit(h.clientIP(r), time.Now().UTC()) {
+		h.writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many NIP-46 initialization requests"})
+		return
+	}
+	releaseFlow := true
+	defer func() {
+		if releaseFlow {
+			h.releaseFlow()
+		}
+	}()
 
 	// Generate session token.
 	token, err := generateSessionToken()
@@ -152,8 +202,13 @@ func (h *NIP46Handler) handleInit(w http.ResponseWriter, r *http.Request) {
 
 	metrics.IncNIP46SessionsInitiated()
 
-	// Start async bunker connection.
-	go h.runBunkerFlow(token, req.BunkerURI)
+	// Start async bunker connection. The admission slot remains held until the
+	// complete grant/identity flow exits, bounding expensive remote work.
+	releaseFlow = false
+	go func() {
+		defer h.releaseFlow()
+		h.runBunkerFlow(token, req.BunkerURI)
+	}()
 
 	pollURL := h.publicURL + "/auth/nip46/status?session=" + url.QueryEscape(token)
 	h.writeJSON(w, http.StatusOK, nip46InitResponse{
@@ -161,6 +216,123 @@ func (h *NIP46Handler) handleInit(w http.ResponseWriter, r *http.Request) {
 		PollURL:      pollURL,
 		ExpiresAt:    sess.ExpiresAt.Format(time.RFC3339),
 	})
+}
+
+// RunCleanup deletes expired public auth records until ctx is cancelled.
+// It bounds durable session/challenge growth even when clients never poll.
+func (h *NIP46Handler) RunCleanup(ctx context.Context) {
+	ticker := time.NewTicker(nip46CleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if n, err := h.store.DeleteExpiredNIP46Sessions(ctx); err != nil {
+				h.logger.Warn("delete expired NIP-46 sessions failed", "error", err)
+			} else if n > 0 {
+				h.logger.Debug("deleted expired NIP-46 sessions", "count", n)
+			}
+			if n, err := h.store.DeleteExpiredChallenges(ctx); err != nil {
+				h.logger.Warn("delete expired auth challenges failed", "error", err)
+			} else if n > 0 {
+				h.logger.Debug("deleted expired auth challenges", "count", n)
+			}
+		}
+	}
+}
+
+func (h *NIP46Handler) admitInit(ip string, now time.Time) bool {
+	h.limitMu.Lock()
+	defer h.limitMu.Unlock()
+
+	if now.Sub(h.globalWindow.started) >= nip46InitWindow || h.globalWindow.started.IsZero() {
+		h.globalWindow = initRateWindow{started: now}
+	}
+	if h.globalWindow.count >= nip46InitGlobalLimit {
+		return false
+	}
+
+	window, ok := h.ipWindows[ip]
+	if !ok || now.Sub(window.started) >= nip46InitWindow {
+		if !ok && len(h.ipWindows) >= nip46MaxTrackedIPs {
+			h.evictOldestIPWindow()
+		}
+		window = initRateWindow{started: now}
+	}
+	if window.count >= nip46InitPerIPLimit {
+		return false
+	}
+
+	select {
+	case h.flowSlots <- struct{}{}:
+		window.count++
+		h.ipWindows[ip] = window
+		h.globalWindow.count++
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *NIP46Handler) evictOldestIPWindow() {
+	var oldestIP string
+	var oldest time.Time
+	for ip, window := range h.ipWindows {
+		if oldestIP == "" || window.started.Before(oldest) {
+			oldestIP = ip
+			oldest = window.started
+		}
+	}
+	if oldestIP != "" {
+		delete(h.ipWindows, oldestIP)
+	}
+}
+
+func (h *NIP46Handler) releaseFlow() {
+	select {
+	case <-h.flowSlots:
+	default:
+	}
+}
+
+func (h *NIP46Handler) clientIP(r *http.Request) string {
+	peer := parseRemoteIP(r.RemoteAddr)
+	if peer == nil || !h.trustedProxy(peer) {
+		if peer == nil {
+			return "unknown"
+		}
+		return peer.String()
+	}
+
+	// Walk the proxy chain from nearest to farthest and select the first
+	// untrusted address. This prevents a client-supplied leftmost value from
+	// overriding the address appended by a trusted reverse proxy.
+	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(forwarded) - 1; i >= 0; i-- {
+		candidate := net.ParseIP(strings.TrimSpace(forwarded[i]))
+		if candidate != nil && !h.trustedProxy(candidate) {
+			return candidate.String()
+		}
+	}
+	return peer.String()
+}
+
+func (h *NIP46Handler) trustedProxy(ip net.IP) bool {
+	for _, network := range h.trustedProxies {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseRemoteIP(remoteAddr string) net.IP {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err == nil {
+		return net.ParseIP(host)
+	}
+	return net.ParseIP(strings.TrimSpace(remoteAddr))
 }
 
 // handleStatus returns the current state of a NIP-46 login session.
@@ -287,6 +459,10 @@ func parseBunkerURI(uri string) (string, error) {
 
 	if len(pubkey) != 64 {
 		return "", fmt.Errorf("pubkey must be 64 hex characters, got %d", len(pubkey))
+	}
+	decoded, err := hex.DecodeString(pubkey)
+	if err != nil || len(decoded) != 32 {
+		return "", fmt.Errorf("pubkey must be valid 32-byte hex")
 	}
 
 	return pubkey, nil

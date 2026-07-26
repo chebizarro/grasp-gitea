@@ -21,10 +21,12 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"fiatjaf.com/nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -35,14 +37,21 @@ const (
 	auditSchema          = "hiveci.audit.gate_decision.v1"
 	auditType            = "CAS_AUDIT"
 	maxPublishedLogBytes = 8192
+	defaultRunTimeout    = 15 * time.Minute
+	defaultMaxConcurrent = 2
+	maxStartedEntries    = 4096
+	startedEntryTTL      = 24 * time.Hour
+	worktreeCleanupLimit = 30 * time.Second
 )
 
 var validCommitSHA = regexp.MustCompile(`^[0-9a-fA-F]{40,64}$`)
 
 // Config controls the Hive-CI Tier A runner.
 type Config struct {
-	Enabled bool
-	ActPath string
+	Enabled       bool
+	ActPath       string
+	RunTimeout    time.Duration
+	MaxConcurrent int
 }
 
 // Store resolves NIP-34 repository coordinates to local Gitea repositories.
@@ -66,9 +75,11 @@ type Runner struct {
 	relayURLs       []string
 	repositoriesDir string
 	logger          *slog.Logger
+	runTimeout      time.Duration
+	runSlots        chan struct{}
 
 	mu      sync.Mutex
-	started map[string]struct{}
+	started map[string]time.Time
 
 	publish func(context.Context, *nostr.Event) error
 }
@@ -107,6 +118,16 @@ func New(cfg Config, st Store, signer Signer, relayURLs []string, repositoriesDi
 	if actPath == "" {
 		actPath = defaultActPath
 	}
+	runTimeout := cfg.RunTimeout
+	if runTimeout <= 0 || runTimeout > time.Hour {
+		runTimeout = defaultRunTimeout
+	}
+	maxConcurrent := cfg.MaxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrent
+	} else if maxConcurrent > 16 {
+		maxConcurrent = 16
+	}
 	r := &Runner{
 		enabled:         cfg.Enabled && st != nil && signer != nil && repositoriesDir != "" && actPath != "",
 		actPath:         actPath,
@@ -115,7 +136,9 @@ func New(cfg Config, st Store, signer Signer, relayURLs []string, repositoriesDi
 		relayURLs:       append([]string(nil), relayURLs...),
 		repositoriesDir: repositoriesDir,
 		logger:          logger,
-		started:         make(map[string]struct{}),
+		runTimeout:      runTimeout,
+		runSlots:        make(chan struct{}, maxConcurrent),
+		started:         make(map[string]time.Time),
 	}
 	r.publish = r.publishToRelays
 	return r
@@ -129,6 +152,10 @@ func (r *Runner) Enabled() bool {
 // HandleEvent consumes NIP-34 repository state (push) and PR/patch events.
 func (r *Runner) HandleEvent(ctx context.Context, ev *nostr.Event, sourceRelay string) error {
 	if !r.Enabled() || ev == nil {
+		return nil
+	}
+	if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
+		r.logger.Warn("HiveCI ignored event with invalid ID or signature", "event", ev.ID.Hex(), "kind", ev.Kind, "error", err)
 		return nil
 	}
 	switch ev.Kind {
@@ -173,6 +200,10 @@ func (r *Runner) handlePullRequestEvent(ctx context.Context, ev *nostr.Event, so
 }
 
 func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *nostr.Event, sourceRelay, trigger, branch, commit string) error {
+	if !workflowAuthorAuthorized(mapping, ev.PubKey.Hex()) {
+		r.logger.Warn("HiveCI ignored workflow from unauthorized author", "repo", mapping.RepoID, "event", ev.ID.Hex(), "author", ev.PubKey.Hex())
+		return nil
+	}
 	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
 	workflows, err := detectWorkflows(ctx, repoPath, commit)
 	if err != nil {
@@ -189,6 +220,7 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 		}
 		record := r.runWorkflow(ctx, mapping, ev, sourceRelay, trigger, branch, commit, workflow)
 		if err := r.publishRun(ctx, mapping, record); err != nil {
+			r.unmarkStarted(key)
 			return err
 		}
 		r.logger.Info("HiveCI check run published", "repo", mapping.RepoID, "branch", branch, "workflow", workflow, "commit", commit, "result", record.Result)
@@ -216,6 +248,17 @@ func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, ev *nos
 		ExitCode:      -1,
 	}
 
+	select {
+	case r.runSlots <- struct{}{}:
+		defer func() { <-r.runSlots }()
+	case <-ctx.Done():
+		rec.Reason = "run cancelled while waiting for concurrency slot: " + ctx.Err().Error()
+		rec.DurationMS = time.Since(start).Milliseconds()
+		return rec
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, r.runTimeout)
+	defer cancel()
 	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
 	parent, err := os.MkdirTemp("", "hiveci-*")
 	if err != nil {
@@ -228,26 +271,36 @@ func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, ev *nos
 	added := false
 	defer func() {
 		if added {
-			_, _ = exec.CommandContext(context.Background(), "git", "--git-dir", repoPath, "worktree", "remove", "--force", worktree).CombinedOutput()
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), worktreeCleanupLimit)
+			defer cleanupCancel()
+			_, _ = exec.CommandContext(cleanupCtx, "git", "--git-dir", repoPath, "worktree", "remove", "--force", worktree).CombinedOutput()
 		}
 	}()
 
-	if out, err := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "worktree", "add", "--detach", worktree, commit).CombinedOutput(); err != nil {
-		rec.Reason = commandError("git worktree add", err, out)
+	if out, err := exec.CommandContext(runCtx, "git", "--git-dir", repoPath, "worktree", "add", "--detach", worktree, commit).CombinedOutput(); err != nil {
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			rec.Reason = "HiveCI run timed out after " + r.runTimeout.String()
+		} else {
+			rec.Reason = commandError("git worktree add", err, out)
+		}
 		rec.OutputTail = tailString(string(out), maxPublishedLogBytes)
 		rec.DurationMS = time.Since(start).Milliseconds()
 		return rec
 	}
 	added = true
 
-	cmd := exec.CommandContext(ctx, r.actPath, trigger, "-W", workflow)
+	cmd := exec.Command(r.actPath, trigger, "-W", workflow, "--rm")
 	cmd.Dir = worktree
 	cmd.Env = append(os.Environ(), "CI=true")
-	out, err := cmd.CombinedOutput()
+	out, err := runBoundedCommand(runCtx, cmd, maxPublishedLogBytes)
 	rec.OutputTail = tailString(string(out), maxPublishedLogBytes)
 	rec.DurationMS = time.Since(start).Milliseconds()
 	if err != nil {
-		rec.Reason = commandError("act", err, out)
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			rec.Reason = "HiveCI run timed out after " + r.runTimeout.String()
+		} else {
+			rec.Reason = commandError("act", err, out)
+		}
 		rec.ExitCode = exitCode(err)
 		return rec
 	}
@@ -419,6 +472,43 @@ func (r *Runner) mappingForAddress(ctx context.Context, ev *nostr.Event) (store.
 	return mapping, true, nil
 }
 
+func workflowAuthorAuthorized(mapping store.Mapping, author string) bool {
+	author = strings.TrimSpace(author)
+	if author == "" {
+		return false
+	}
+	if author == strings.TrimSpace(mapping.Pubkey) {
+		return true
+	}
+	if strings.TrimSpace(mapping.AnnouncementEventJSON) == "" {
+		return false
+	}
+
+	var announcement nostr.Event
+	if err := json.Unmarshal([]byte(mapping.AnnouncementEventJSON), &announcement); err != nil {
+		return false
+	}
+	if int(announcement.Kind) != relay.KindRepositoryAnnouncement ||
+		announcement.PubKey.Hex() != mapping.Pubkey ||
+		tagValue(announcement.Tags, "d") != mapping.RepoID {
+		return false
+	}
+	if err := nostrverify.ValidateEventIDAndSignature(&announcement); err != nil {
+		return false
+	}
+	for _, tag := range announcement.Tags {
+		if len(tag) < 2 || tag[0] != "maintainers" {
+			continue
+		}
+		for _, maintainer := range tag[1:] {
+			if strings.TrimSpace(maintainer) == author {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func branchTips(tags nostr.Tags) []branchTip {
 	tips := make([]branchTip, 0)
 	for _, tag := range tags {
@@ -481,13 +571,36 @@ func listWorkflowFiles(ctx context.Context, repoPath, commitSHA, dir string) ([]
 }
 
 func (r *Runner) markStarted(key string) bool {
+	now := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	for existing, startedAt := range r.started {
+		if now.Sub(startedAt) >= startedEntryTTL {
+			delete(r.started, existing)
+		}
+	}
 	if _, ok := r.started[key]; ok {
 		return true
 	}
-	r.started[key] = struct{}{}
+	if len(r.started) >= maxStartedEntries {
+		var oldestKey string
+		var oldest time.Time
+		for existing, startedAt := range r.started {
+			if oldestKey == "" || startedAt.Before(oldest) {
+				oldestKey = existing
+				oldest = startedAt
+			}
+		}
+		delete(r.started, oldestKey)
+	}
+	r.started[key] = now
 	return false
+}
+
+func (r *Runner) unmarkStarted(key string) {
+	r.mu.Lock()
+	delete(r.started, key)
+	r.mu.Unlock()
 }
 
 func runKey(eventID, commit, workflow string) string {
@@ -522,6 +635,56 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+type tailOutput struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func (w *tailOutput) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	written := len(p)
+	if len(p) >= w.max {
+		w.buf = append(w.buf[:0], p[len(p)-w.max:]...)
+		return written, nil
+	}
+	w.buf = append(w.buf, p...)
+	if excess := len(w.buf) - w.max; excess > 0 {
+		copy(w.buf, w.buf[excess:])
+		w.buf = w.buf[:w.max]
+	}
+	return written, nil
+}
+
+func (w *tailOutput) Bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.buf...)
+}
+
+func runBoundedCommand(ctx context.Context, cmd *exec.Cmd, maxOutput int) ([]byte, error) {
+	output := &tailOutput{max: maxOutput}
+	cmd.Stdout = output
+	cmd.Stderr = output
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return output.Bytes(), err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return output.Bytes(), err
+	case <-ctx.Done():
+		// Kill the whole process group so workflow child processes do not keep
+		// consuming host resources after the run deadline.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		<-done
+		return output.Bytes(), ctx.Err()
+	}
 }
 
 func commandError(prefix string, err error, output []byte) string {

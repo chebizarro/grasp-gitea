@@ -42,6 +42,24 @@ type BunkerSigner interface {
 	SignEvent(ctx context.Context, evt *nostr.Event) error
 }
 
+type managedBunkerSigner struct {
+	BunkerSigner
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (m *managedBunkerSigner) close() {
+	if m != nil {
+		m.once.Do(m.cancel)
+	}
+}
+
+func closeBunkerSigner(signer BunkerSigner) {
+	if managed, ok := signer.(*managedBunkerSigner); ok {
+		managed.close()
+	}
+}
+
 // BunkerConnector establishes a NIP-46 bunker signer for a persisted grant.
 type BunkerConnector func(ctx context.Context, clientSecretKey string, bunkerURI string) (BunkerSigner, error)
 
@@ -123,6 +141,24 @@ func (s *Service) Enabled() bool {
 	return s != nil && s.enabled
 }
 
+// Close releases all cached long-lived bunker connections.
+func (s *Service) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	pooled := make([]BunkerSigner, 0, len(s.pool))
+	for pubkey, bunker := range s.pool {
+		pooled = append(pooled, bunker)
+		delete(s.pool, pubkey)
+	}
+	s.mu.Unlock()
+	for _, bunker := range pooled {
+		closeBunkerSigner(bunker)
+	}
+	return nil
+}
+
 // CreateGrant connects to a user bunker, verifies the signer pubkey, encrypts
 // the reusable client secret and bunker URI, and stores the durable grant keyed
 // by the signer's pubkey.
@@ -148,6 +184,12 @@ func (s *Service) CreateGrant(ctx context.Context, bunkerURI string) (GrantInfo,
 	if err != nil {
 		return GrantInfo{}, fmt.Errorf("%w: connect bunker: %v", ErrSignerOffline, err)
 	}
+	retained := false
+	defer func() {
+		if !retained {
+			closeBunkerSigner(bunker)
+		}
+	}()
 	signerPK, err := bunker.GetPublicKey(ctx)
 	if err != nil {
 		return GrantInfo{}, fmt.Errorf("%w: get signer pubkey: %v", ErrSignerOffline, err)
@@ -199,6 +241,7 @@ func (s *Service) CreateGrant(ctx context.Context, bunkerURI string) (GrantInfo,
 	}
 
 	s.cacheSigner(signerPubkey, bunker)
+	retained = true
 	return GrantInfo{Pubkey: signerPubkey, ClientPubkey: clientPubkey, Relays: relays, GrantedAt: now}, nil
 }
 
@@ -237,30 +280,46 @@ func (s *Service) SignWithGrant(ctx context.Context, pubkey string, evt *nostr.E
 	return nil
 }
 
-// connectBunker establishes a bunker connection whose lifetime is detached
-// from the caller's context. nip46.ConnectBunker retains the context it is
-// given for the long-lived response subscription used by every later signing
-// call; connecting with a request- or timeout-scoped context would let the
-// connection be cached in the pool and then silently cancelled when the
-// caller's context ends. The handshake itself is still bounded by
-// connectTimeout and by caller cancellation.
+// connectBunker gives ConnectBunker a dedicated long-lived context because
+// the client retains it for later signing calls. Unlike context.WithoutCancel,
+// this context is explicitly cancelled when the caller or handshake timeout
+// wins, so failed connection attempts cannot outlive the request.
 func (s *Service) connectBunker(ctx context.Context, clientSecretKey string, bunkerURI string) (BunkerSigner, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("connect bunker: %w", err)
+	}
 	type result struct {
 		bunker BunkerSigner
 		err    error
 	}
 	resultCh := make(chan result, 1)
-	connCtx := context.WithoutCancel(ctx)
+	connCtx, connCancel := context.WithCancel(context.Background())
 	go func() {
 		bunker, err := s.connector(connCtx, clientSecretKey, bunkerURI)
 		resultCh <- result{bunker: bunker, err: err}
 	}()
+	timer := time.NewTimer(connectTimeout)
+	defer timer.Stop()
 	select {
 	case r := <-resultCh:
-		return r.bunker, r.err
-	case <-time.After(connectTimeout):
+		if err := ctx.Err(); err != nil {
+			connCancel()
+			return nil, fmt.Errorf("connect bunker: %w", err)
+		}
+		if r.err != nil {
+			connCancel()
+			return nil, r.err
+		}
+		if r.bunker == nil {
+			connCancel()
+			return nil, fmt.Errorf("connector returned no bunker client")
+		}
+		return &managedBunkerSigner{BunkerSigner: r.bunker, cancel: connCancel}, nil
+	case <-timer.C:
+		connCancel()
 		return nil, fmt.Errorf("connect bunker: %w", context.DeadlineExceeded)
 	case <-ctx.Done():
+		connCancel()
 		return nil, fmt.Errorf("connect bunker: %w", ctx.Err())
 	}
 }
@@ -311,6 +370,12 @@ func (s *Service) signerForGrant(ctx context.Context, pubkey string) (BunkerSign
 	if err != nil {
 		return nil, fmt.Errorf("%w: reconnect signer %s: %v", ErrSignerOffline, pubkey, err)
 	}
+	retained := false
+	defer func() {
+		if !retained {
+			closeBunkerSigner(bunker)
+		}
+	}()
 	signerPK, err := bunker.GetPublicKey(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%w: verify signer %s: %v", ErrSignerOffline, pubkey, err)
@@ -324,6 +389,7 @@ func (s *Service) signerForGrant(ctx context.Context, pubkey string) (BunkerSign
 	}
 
 	s.cacheSigner(pubkey, bunker)
+	retained = true
 	_ = s.store.RecordSignerGrantOK(ctx, pubkey, time.Now().UTC())
 	return bunker, nil
 }
@@ -336,14 +402,20 @@ func (s *Service) cachedSigner(pubkey string) BunkerSigner {
 
 func (s *Service) cacheSigner(pubkey string, signer BunkerSigner) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	previous := s.pool[pubkey]
 	s.pool[pubkey] = signer
+	s.mu.Unlock()
+	if previous != signer {
+		closeBunkerSigner(previous)
+	}
 }
 
 func (s *Service) evictSigner(pubkey string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	previous := s.pool[pubkey]
 	delete(s.pool, pubkey)
+	s.mu.Unlock()
+	closeBunkerSigner(previous)
 }
 
 func (s *Service) encryptSecret(plaintext string) ([]byte, error) {
