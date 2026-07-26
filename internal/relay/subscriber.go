@@ -35,6 +35,7 @@ func subscriptionFilter() nostr.Filter {
 		KindStatusApplied,
 		KindStatusClosed,
 		KindStatusDraft,
+		KindNIP32Label,
 	}}
 }
 

@@ -34,6 +34,7 @@ type reflectorFakeGitea struct {
 	issues   map[int64]gitea.Issue
 	pulls    map[int64]reflectorPR
 	comments map[int64][]string
+	labels   map[int64][]gitea.Label
 }
 
 type reflectorPR struct {
@@ -66,7 +67,10 @@ func (p *reflectorFakePublisher) published() []*nostr.Event {
 }
 
 func newReflectorFakeGitea() *reflectorFakeGitea {
-	return &reflectorFakeGitea{next: 1, issues: map[int64]gitea.Issue{}, pulls: map[int64]reflectorPR{}, comments: map[int64][]string{}}
+	return &reflectorFakeGitea{
+		next: 1, issues: map[int64]gitea.Issue{}, pulls: map[int64]reflectorPR{},
+		comments: map[int64][]string{}, labels: map[int64][]gitea.Label{},
+	}
 }
 
 func (f *reflectorFakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +136,35 @@ func (f *reflectorFakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		if len(parts) == 5 && parts[4] == "labels" {
+			switch r.Method {
+			case http.MethodPost:
+				var body struct {
+					Labels []string `json:"labels"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				for _, name := range body.Labels {
+					f.labels[idx] = append(f.labels[idx], gitea.Label{ID: int64(len(f.labels[idx]) + 1), Name: name})
+				}
+				_ = json.NewEncoder(w).Encode(f.labels[idx])
+				return
+			case http.MethodGet:
+				_ = json.NewEncoder(w).Encode(f.labels[idx])
+				return
+			}
+		}
+		if r.Method == http.MethodDelete && len(parts) == 6 && parts[4] == "labels" {
+			labelID, _ := strconv.ParseInt(parts[5], 10, 64)
+			labels := f.labels[idx]
+			for i, label := range labels {
+				if label.ID == labelID {
+					f.labels[idx] = append(labels[:i], labels[i+1:]...)
+					break
+				}
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if r.Method == http.MethodPost && len(parts) == 5 && parts[4] == "comments" {
 			var body struct {
 				Body string `json:"body"`
@@ -193,12 +226,14 @@ func TestReflectorReflectsIssueCommentStatusAndDedupes(t *testing.T) {
 		t.Fatalf("unexpected reflected issue row: %+v", ref)
 	}
 
+	// Recreate the reflector to prove the root-only NIP-22 comment resolves from
+	// durable state rather than the old process-local thread map.
+	restarted := New(st, gitea.NewClient(ts.URL, "tok"), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	commentEv := signedEvent(t, actorPriv, relay.KindNIP22Comment, nostr.Tags{
-		{"a", coord},
-		{"E", issueEv.ID.Hex(), "", "root"},
+		{"E", issueEv.ID.Hex(), "", issueEv.PubKey.Hex()},
 		{"K", strconv.Itoa(relay.KindIssue)},
 	}, "comment body")
-	if err := r.HandleEvent(ctx, commentEv, "wss://relay.test"); err != nil {
+	if err := restarted.HandleEvent(ctx, commentEv, "wss://relay.test"); err != nil {
 		t.Fatalf("reflect comment: %v", err)
 	}
 	fake.mu.Lock()
@@ -274,6 +309,99 @@ func TestReflectorReflectsIssueCommentStatusAndDedupes(t *testing.T) {
 	fake.mu.Unlock()
 }
 
+func TestReflectorRejectsUnauthorizedIssueClose(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+
+	r := New(st, gitea.NewClient(ts.URL, "tok"), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.SetStatusSyncEnabled(true)
+	authorPriv := nostr.Generate().Hex()
+	issueEv := signedEvent(t, authorPriv, relay.KindIssue, nostr.Tags{
+		{"a", coord},
+		{"subject", "authorization regression"},
+	}, "must remain open")
+	if err := r.HandleEvent(ctx, issueEv, ""); err != nil {
+		t.Fatalf("reflect issue: %v", err)
+	}
+
+	attackerPriv := nostr.Generate().Hex()
+	closeEv := signedEvent(t, attackerPriv, relay.KindStatusClosed, nostr.Tags{
+		{"a", coord},
+		{"e", issueEv.ID.Hex(), "", "root"},
+	}, "")
+	if err := r.HandleEvent(ctx, closeEv, ""); err != nil {
+		t.Fatalf("unauthorized status should be rejected without poisoning subscriber: %v", err)
+	}
+
+	fake.mu.Lock()
+	state := fake.issues[1].State
+	fake.mu.Unlock()
+	if state != "open" {
+		t.Fatalf("unauthorized close changed issue state to %q", state)
+	}
+	processed, err := st.EventProcessed(ctx, closeEv.ID.Hex())
+	if err != nil {
+		t.Fatalf("check rejected event dedupe: %v", err)
+	}
+	if !processed {
+		t.Fatal("rejected unauthorized status was not durably deduplicated")
+	}
+}
+
+func TestReflectorAppliesAndRemovesInboundNIP32Label(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+
+	r := New(st, gitea.NewClient(ts.URL, "tok"), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	actorPriv := nostr.Generate().Hex()
+	issueEv := signedEvent(t, actorPriv, relay.KindIssue, nostr.Tags{
+		{"a", coord},
+		{"subject", "label target"},
+	}, "")
+	if err := r.HandleEvent(ctx, issueEv, ""); err != nil {
+		t.Fatalf("reflect issue: %v", err)
+	}
+
+	addEv := signedEvent(t, actorPriv, relay.KindNIP32Label, nostr.Tags{
+		{"a", coord},
+		{"e", issueEv.ID.Hex(), "", "root"},
+		{"L", "gitea/label"},
+		{"l", "bug", "gitea/label"},
+		{"action", "apply"},
+	}, "")
+	if err := r.HandleEvent(ctx, addEv, ""); err != nil {
+		t.Fatalf("reflect label apply: %v", err)
+	}
+	fake.mu.Lock()
+	if got := fake.labels[1]; len(got) != 1 || got[0].Name != "bug" {
+		fake.mu.Unlock()
+		t.Fatalf("labels after apply = %#v", got)
+	}
+	fake.mu.Unlock()
+
+	removeEv := signedEvent(t, actorPriv, relay.KindNIP32Label, nostr.Tags{
+		{"a", coord},
+		{"e", issueEv.ID.Hex(), "", "root"},
+		{"L", "gitea/label"},
+		{"l", "bug", "gitea/label"},
+		{"action", "remove"},
+	}, "")
+	if err := r.HandleEvent(ctx, removeEv, ""); err != nil {
+		t.Fatalf("reflect label removal: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if got := fake.labels[1]; len(got) != 0 {
+		t.Fatalf("labels after removal = %#v", got)
+	}
+}
+
 func TestReflectorTipPatchCreatesPullRequest(t *testing.T) {
 	for _, kind := range []int{relay.KindPatch, relay.KindPROpen} {
 		t.Run(strconv.Itoa(kind), func(t *testing.T) {
@@ -285,6 +413,7 @@ func TestReflectorTipPatchCreatesPullRequest(t *testing.T) {
 			defer ts.Close()
 
 			r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			r.validateGitCloneURL = func(context.Context, string) error { return nil }
 			actorPriv := nostr.Generate().Hex()
 			ev := signedEvent(t, actorPriv, kind, nostr.Tags{
 				{"a", coord},
@@ -335,6 +464,7 @@ func TestReflectorPRUpdateMovesExistingHeadBranchAndRecordsEchoGuard(t *testing.
 	defer ts.Close()
 
 	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
 	rootID := "reflected-pr-root"
 	headBranch := "feature/tip"
 	if err := gitFetch(ctx, repo.repoPath, repo.workDir, "+"+repo.tip+":refs/heads/"+headBranch); err != nil {
@@ -398,6 +528,7 @@ func TestReflectorPRUpdateUnknownRootIsIgnored(t *testing.T) {
 	defer ts.Close()
 
 	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
 	headBranch := "feature/tip"
 	if err := gitFetch(ctx, repo.repoPath, repo.workDir, "+"+repo.tip+":refs/heads/"+headBranch); err != nil {
 		t.Fatalf("seed PR head branch: %v", err)
@@ -438,6 +569,7 @@ func TestReflectorExistingBranchNameFallsBackToEventBranch(t *testing.T) {
 	defer ts.Close()
 
 	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
 	actorPriv := nostr.Generate().Hex()
 	ev := signedEvent(t, actorPriv, relay.KindPROpen, nostr.Tags{
 		{"a", coord},
@@ -477,6 +609,7 @@ func TestReflectorContentPatchAppliesAndCreatesPullRequest(t *testing.T) {
 
 	patch := reflectorGitOutput(t, repo.workDir, "format-patch", "-1", "--stdout", "HEAD")
 	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
 	actorPriv := nostr.Generate().Hex()
 	ev := signedEvent(t, actorPriv, relay.KindPatch, nostr.Tags{
 		{"a", coord},
@@ -519,6 +652,7 @@ func TestReflectorGarbagePatchFallsBackAndCleansWorktree(t *testing.T) {
 	defer ts.Close()
 
 	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
 	rejectionPub := &reflectorFakePublisher{}
 	r.SetPatchRejectionPublisher(rejectionPub)
 	actorPriv := nostr.Generate().Hex()
@@ -610,6 +744,18 @@ func newReflectorTestStore(t *testing.T) (*store.SQLiteStore, store.Mapping, str
 	if err := st.UpsertMapping(ctx, mapping); err != nil {
 		t.Fatalf("seed mapping: %v", err)
 	}
+	announcement := signedEvent(t, ownerPriv, relay.KindRepositoryAnnouncement, nostr.Tags{
+		{"d", mapping.RepoID},
+	}, "")
+	rawAnnouncement, err := json.Marshal(announcement)
+	if err != nil {
+		t.Fatalf("marshal owner announcement: %v", err)
+	}
+	if err := st.SetAnnouncementEvent(ctx, mapping.Npub, mapping.RepoID, string(rawAnnouncement), announcement.ID.Hex()); err != nil {
+		t.Fatalf("cache owner announcement: %v", err)
+	}
+	mapping.AnnouncementEventJSON = string(rawAnnouncement)
+	mapping.AnnouncementEventID = announcement.ID.Hex()
 	coord := "30617:" + ownerPub + ":" + mapping.RepoID
 	return st, mapping, coord
 }

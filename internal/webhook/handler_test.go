@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +36,8 @@ import (
 // A valid 32-byte (64 hex char) Nostr public key used across tests. The npub
 // below is an arbitrary human-readable label; the handler must NEVER place it
 // in "p" or "a" tag positions (those require hex per NIP-01/NIP-34).
+var testDeliverySequence atomic.Uint64
+
 const (
 	testPubkeyHex = "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2"
 	testNpub      = "npub1sdrqlzptdw40d96079a7g2kevrncr54u2mnmgjsf7wj4rahmumzqz2r2f7"
@@ -266,6 +269,7 @@ func post(t *testing.T, h *Handler, eventType string, payload any, secret string
 	}
 	req := httptest.NewRequest(http.MethodPost, "/webhook/gitea", bytes.NewReader(body))
 	req.Header.Set("X-Gitea-Event", eventType)
+	req.Header.Set("X-Gitea-Delivery", fmt.Sprintf("test-delivery-%d", testDeliverySequence.Add(1)))
 	if secret != "" {
 		mac := hmac.New(sha256.New, []byte(secret))
 		mac.Write(body)
@@ -348,6 +352,52 @@ func TestServeHTTP_HMACRejectAndAccept(t *testing.T) {
 	}
 	if len(fake.ciPushes) != 1 || fake.ciPushes[0].ref != "refs/heads/main" {
 		t.Fatalf("expected one CI push for refs/heads/main, got %v", fake.ciPushes)
+	}
+}
+
+func TestWebhookDeliveryPersistsBefore200AndRetries(t *testing.T) {
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	h.retriesEnabled = false
+	fake.failPublish = true
+
+	payload := IssuePayload{Action: "opened", Number: 9, Repository: Repository{ID: testGiteaID}}
+	payload.Issue.Title = "durable issue"
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/webhook/gitea", bytes.NewReader(body))
+	req.Header.Set("X-Gitea-Event", "issues")
+	req.Header.Set("X-Gitea-Delivery", "durable-delivery-1")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after durable receipt", rr.Code)
+	}
+
+	delivery, err := st.GetWebhookDelivery(context.Background(), "durable-delivery-1")
+	if err != nil {
+		t.Fatalf("get persisted delivery: %v", err)
+	}
+	if delivery.State != store.WebhookDeliveryPending || delivery.Attempts != 1 || delivery.LastError == "" {
+		t.Fatalf("failed delivery not pending for retry: %#v", delivery)
+	}
+
+	fake.failPublish = false
+	if _, err := st.MarkWebhookDeliveryRetry(context.Background(), delivery.DeliveryID, time.Now().Add(-time.Second), delivery.LastError); err != nil {
+		t.Fatalf("make delivery due: %v", err)
+	}
+	h.retryPendingWebhookDeliveries()
+	delivery, err = st.GetWebhookDelivery(context.Background(), delivery.DeliveryID)
+	if err != nil {
+		t.Fatalf("reload delivery: %v", err)
+	}
+	if delivery.State != store.WebhookDeliveryDone {
+		t.Fatalf("retried delivery state = %q, want done (last error %q)", delivery.State, delivery.LastError)
+	}
+	if fake.firstOfKind(KindIssue) == nil {
+		t.Fatal("retry did not publish bridge-signed fallback event")
 	}
 }
 
@@ -536,6 +586,26 @@ func TestPR_UnlinkedContributorPersistsPendingWhenSignerEnabled(t *testing.T) {
 	after := metrics.Snapshot()["unlinked_actor_skipped"]
 	if after != before+1 {
 		t.Fatalf("unlinked_actor_skipped delta = %d, want 1 (before=%d after=%d)", after-before, before, after)
+	}
+
+	seedActorGrant(t, st, 303, "carol", testActorPubkeyHex)
+	backfiller := NewActorBackfiller(st, outbox, testLogger())
+	if count, err := backfiller.EnqueuePending(context.Background(), 303, testActorPubkeyHex); err != nil || count != 1 {
+		t.Fatalf("backfill pending PR root: count=%d err=%v", count, err)
+	}
+	queued := outbox.all()
+	if len(queued) != 1 {
+		t.Fatalf("backfilled queue = %#v, want one PR root", queued)
+	}
+	root, err := st.GetThreadRoot(context.Background(), "pr", testGiteaID, 9)
+	if err != nil {
+		t.Fatalf("get finalized PR thread root: %v", err)
+	}
+	if root.NostrEventID != queued[0].event.ID.Hex() || root.Pubkey != testActorPubkeyHex || root.Kind != KindPROpen {
+		t.Fatalf("unexpected finalized PR thread root: %#v", root)
+	}
+	if _, err := st.GetReflectedEvent(context.Background(), root.NostrEventID); err != nil {
+		t.Fatalf("backfilled PR root lacks Nostr/Gitea mapping: %v", err)
 	}
 }
 
@@ -756,6 +826,11 @@ func TestIssueCommentEmitsNIP22ThreadedComment(t *testing.T) {
 	}
 	root := queued[0].event
 
+	// Simulate a process restart: only SQLite state is carried into the new
+	// handler, not the old in-memory Handler value.
+	h = &Handler{pub: fake, store: st, logger: testLogger(), actorLookup: st}
+	h.SetActorSigning(fakeActorSigner{enabled: true}, outbox, st)
+
 	comment := IssueCommentPayload{
 		Action:     "created",
 		Issue:      Issue{Number: 3},
@@ -776,6 +851,7 @@ func TestIssueCommentEmitsNIP22ThreadedComment(t *testing.T) {
 	if cm.Content != "plain comment" {
 		t.Fatalf("comment content = %q", cm.Content)
 	}
+	requireTag(t, &cm, "a", fmt.Sprintf("30617:%s:%s", testPubkeyHex, testRepoID))
 	requireTag(t, &cm, "E", root.ID.Hex(), "", testActorPubkeyHex)
 	requireTag(t, &cm, "K", fmt.Sprint(KindIssue))
 	requireTag(t, &cm, "P", testActorPubkeyHex)
@@ -910,7 +986,7 @@ func TestPRSynchronizedSkipsBridgeReflectedUpdateOnce(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	h.now = func() time.Time { return now }
 	h.echoGuardWindow = 5 * time.Minute
-	h.rememberThread("pr", testGiteaID, 7, threadRef{EventID: "root-pr-event", Pubkey: testActorPubkeyHex, Kind: KindPROpen})
+	h.rememberThread(context.Background(), "pr", testGiteaID, 7, threadRef{EventID: "root-pr-event", Pubkey: testActorPubkeyHex, Kind: KindPROpen})
 	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
 		NostrEventID:    "nostr-pr-update-event",
 		GiteaRepoID:     testGiteaID,
@@ -942,7 +1018,7 @@ func TestIssueClosedSkipsBridgeReflectedStatusDuplicates(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	h.now = func() time.Time { return now }
 	h.echoGuardWindow = 5 * time.Minute
-	h.rememberThread("issue", testGiteaID, 3, threadRef{EventID: "root-issue-event", Pubkey: testActorPubkeyHex, Kind: KindIssue})
+	h.rememberThread(context.Background(), "issue", testGiteaID, 3, threadRef{EventID: "root-issue-event", Pubkey: testActorPubkeyHex, Kind: KindIssue})
 	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
 		NostrEventID:    "nostr-status-event",
 		GiteaRepoID:     testGiteaID,
@@ -971,7 +1047,7 @@ func TestIssueCommentSkipsBridgeReflectedDuplicates(t *testing.T) {
 	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	h.now = func() time.Time { return now }
 	h.echoGuardWindow = 5 * time.Minute
-	h.rememberThread("issue", testGiteaID, 3, threadRef{EventID: "root-issue-event", Pubkey: testActorPubkeyHex, Kind: KindIssue})
+	h.rememberThread(context.Background(), "issue", testGiteaID, 3, threadRef{EventID: "root-issue-event", Pubkey: testActorPubkeyHex, Kind: KindIssue})
 	if _, err := st.RecordReflectedEvent(context.Background(), store.ReflectedEvent{
 		NostrEventID:    "nostr-comment-event",
 		GiteaRepoID:     testGiteaID,
@@ -1011,6 +1087,23 @@ func TestIssue_LabeledEmitsNIP32Label(t *testing.T) {
 	assertTagsWellFormed(t, labelEv)
 	if l := labelEv.Tags.Find("l"); l == nil || len(l) < 2 || l[1] != "enhancement" {
 		t.Errorf("label 'l' tag = %v, want enhancement", l)
+	}
+	requireTag(t, labelEv, "action", "apply")
+
+	unlabeled := payload
+	unlabeled.Action = "unlabeled"
+	post(t, h, "issues", unlabeled, "")
+	var removal *nostr.Event
+	for _, ev := range fake.events {
+		if int(ev.Kind) == KindNIP32Label {
+			if action := ev.Tags.Find("action"); action != nil && len(action) >= 2 && action[1] == "remove" {
+				removal = ev
+				break
+			}
+		}
+	}
+	if removal == nil {
+		t.Fatal("unlabeled issue did not emit distinct action=remove representation")
 	}
 }
 

@@ -21,6 +21,9 @@ const defaultPendingActorBackfillLimit = 500
 type PendingActorEventStore interface {
 	ListPendingActorEvents(ctx context.Context, giteaUserID int64, limit int) ([]store.PendingActorEvent, error)
 	DeletePendingActorEvent(ctx context.Context, id int64) error
+	FinalizePendingThreadRoot(ctx context.Context, dedupeKey, eventID, pubkey string) (store.ThreadRoot, bool, error)
+	DeletePendingThreadRoot(ctx context.Context, dedupeKey string) error
+	RecordNostrObjectMapping(ctx context.Context, ref store.ReflectedEvent) (bool, error)
 }
 
 // ActorBackfiller enqueues previously skipped unsigned actor events once a
@@ -77,8 +80,27 @@ func (b *ActorBackfiller) EnqueuePending(ctx context.Context, giteaUserID int64,
 		if err := b.outbox.Enqueue(ctx, row.Kind, linkedPubkey, row.Scope, &ev, row.DedupeKey); err != nil {
 			return count, fmt.Errorf("enqueue pending actor event %d: %w", row.ID, err)
 		}
+		root, hasRoot, err := b.store.FinalizePendingThreadRoot(ctx, row.DedupeKey, ev.ID.Hex(), linkedPubkey)
+		if err != nil {
+			return count, fmt.Errorf("finalize pending actor thread %d: %w", row.ID, err)
+		}
+		if hasRoot {
+			if _, err := b.store.RecordNostrObjectMapping(ctx, store.ReflectedEvent{
+				NostrEventID: ev.ID.Hex(),
+				GiteaRepoID:  root.GiteaRepoID,
+				GiteaIndex:   root.GiteaIndex,
+				Kind:         root.Kind,
+			}); err != nil {
+				return count, fmt.Errorf("record backfilled actor root mapping %d: %w", row.ID, err)
+			}
+		}
 		if err := b.store.DeletePendingActorEvent(ctx, row.ID); err != nil {
 			return count, fmt.Errorf("delete pending actor event %d: %w", row.ID, err)
+		}
+		if hasRoot {
+			if err := b.store.DeletePendingThreadRoot(ctx, row.DedupeKey); err != nil {
+				return count, fmt.Errorf("delete pending actor thread %d: %w", row.ID, err)
+			}
 		}
 		metrics.IncActorEventsBackfilled()
 		count++

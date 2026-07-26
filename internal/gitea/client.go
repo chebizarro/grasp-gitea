@@ -64,6 +64,12 @@ type IssueComment struct {
 	Body string `json:"body"`
 }
 
+// Label is a repository label returned by the Gitea issue-label API.
+type Label struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+}
+
 func NewClient(baseURL string, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -238,6 +244,34 @@ func (c *Client) SetIssueState(ctx context.Context, owner string, repo string, i
 		return Issue{}, err
 	}
 	return parseIssue(resp)
+}
+
+// AddIssueLabel applies an existing repository or organization label by name.
+func (c *Client) AddIssueLabel(ctx context.Context, owner string, repo string, index int64, label string) error {
+	payload := map[string]any{"labels": []string{label}}
+	_, err := c.doJSON(ctx, http.MethodPost, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/issues/"+fmt.Sprint(index)+"/labels", payload)
+	return err
+}
+
+// RemoveIssueLabel removes a matching label from an issue or pull request.
+func (c *Client) RemoveIssueLabel(ctx context.Context, owner string, repo string, index int64, label string) error {
+	path := "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repo) + "/issues/" + fmt.Sprint(index) + "/labels"
+	resp, err := c.doJSON(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	var labels []Label
+	if err := json.Unmarshal(resp, &labels); err != nil {
+		return fmt.Errorf("decode Gitea issue labels: %w", err)
+	}
+	for _, current := range labels {
+		if current.Name != label {
+			continue
+		}
+		_, err := c.doJSON(ctx, http.MethodDelete, path+"/"+fmt.Sprint(current.ID), nil)
+		return err
+	}
+	return nil
 }
 
 // DeleteBareRef deletes ref from a bare repository using git update-ref -d.

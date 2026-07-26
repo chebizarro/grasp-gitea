@@ -83,13 +83,13 @@ phase1-u5m (threads-map portion, subsumed by persistence).
 Owns: `internal/reflector/reflector.go`, `internal/webhook/handler.go`,
 `internal/webhook/*.go`, `internal/relay/subscriber.go`.
 Done when:
-- [ ] Issue status events enforce NIP-34 authority (use `internal/nostrauthz`).
-- [ ] Thread roots persisted (SQLite) + survive restart; standard NIP-22 comment
+- [x] Issue status events enforce NIP-34 authority (use `internal/nostrauthz`).
+- [x] Thread roots persisted (SQLite) + survive restart; standard NIP-22 comment
       referencing only its root reflects correctly.
-- [ ] Inbound NIP-32 (kind 1985) labels map to Gitea; unlabeled has distinct
+- [x] Inbound NIP-32 (kind 1985) labels map to Gitea; unlabeled has distinct
       removal representation.
-- [ ] Webhook deliveries durably recorded before HTTP 200; bridge-signed paths retried.
-- [ ] Wire `internal/safefetch` into reflector clone fetch.
+- [x] Webhook deliveries durably recorded before HTTP 200; bridge-signed paths retried.
+- [x] Wire `internal/safefetch` into reflector clone fetch.
 
 ### Item E — Login/session + deploy + pre-receive + ordering  [Wave 2]
 Beads: phase1-p1j (P1 Gitea session + NIP-55), phase1-9mq (P1 open redirect),
@@ -131,8 +131,16 @@ path, config, then implement. Do design pass before code.
   available as a mutation-free gate. Wire it in `cmd/grasp-bridge/main.go`
   before `HandleStateEventCI`; Item A could not edit Item D's owned file.
 - 2026-07-25 Item C: `internal/safefetch` now compiles. Items A/B can use `safefetch.ValidateGitCloneURL(ctx, rawURL)` immediately before Git clone/fetch; guarded HTTP callers should use `safefetch.NewClient()`.
+- 2026-07-25 Item B: added isolated `internal/store/threads.go` for lazy
+  thread-root and webhook-delivery tables, avoiding concurrent `sqlite.go`
+  edits. With maintainer approval, added only Gitea issue-label add/remove API
+  methods to Item C's merged `internal/gitea/client.go`.
 
 ## Progress log
+- 2026-07-25: Item B completed NIP-34 issue-status authorization, durable
+  thread roots and standard NIP-22 root resolution, inbound NIP-32 label
+  add/removal, durable receipt-before-200 webhook retry handling, and guarded
+  reflector Git fetches. Full tests, vet, and build pass.
 - 2026-07-25: Item C completed guarded HTTP/clone URL validation, avatar and NIP-05 egress protection, domain-qualified identity naming with explicit mapping-backed adoption, unique Gitea identity enforcement, and kind-0 cryptographic/author validation. Focused tests, scoped vet, and full build pass; full tests are blocked only by concurrent Item D API expectation updates.
 - 2026-07-25: Item A completed inbound state authorization, owner-coordinate
   purgatory routing, owner-signed outbox tracking, and safefetch clone guarding;

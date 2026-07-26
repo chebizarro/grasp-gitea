@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,9 +24,11 @@ import (
 
 	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
+	"github.com/sharegap/grasp-gitea/internal/nostrauthz"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/relay"
+	"github.com/sharegap/grasp-gitea/internal/safefetch"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -38,15 +41,21 @@ type Store interface {
 	EventProcessed(ctx context.Context, eventID string) (bool, error)
 	MarkEventProcessed(ctx context.Context, eventID string, pubkey string, kind int) error
 	GetProvisionedMappingByRepoAddr(ctx context.Context, pubkey string, repoID string) (store.Mapping, error)
+	GetMappingByGiteaRepoID(ctx context.Context, giteaRepoID int64) (store.Mapping, error)
 	RecordReflectedEvent(ctx context.Context, ref store.ReflectedEvent) (bool, error)
 	GetReflectedEvent(ctx context.Context, nostrEventID string) (store.ReflectedEvent, error)
 	RecordPendingNostrRef(ctx context.Context, ref store.PendingNostrRef) error
+	UpsertThreadRoot(ctx context.Context, root store.ThreadRoot) error
+	GetThreadRoot(ctx context.Context, objectType string, giteaRepoID, giteaIndex int64) (store.ThreadRoot, error)
+	GetThreadRootByEventID(ctx context.Context, eventID string) (store.ThreadRoot, error)
 }
 
 type GiteaClient interface {
 	CreateIssue(ctx context.Context, owner string, repo string, title string, body string) (gitea.Issue, error)
 	CreateIssueComment(ctx context.Context, owner string, repo string, index int64, body string) (gitea.IssueComment, error)
 	SetIssueState(ctx context.Context, owner string, repo string, index int64, state string) (gitea.Issue, error)
+	AddIssueLabel(ctx context.Context, owner string, repo string, index int64, label string) error
+	RemoveIssueLabel(ctx context.Context, owner string, repo string, index int64, label string) error
 	CreatePullRequest(ctx context.Context, owner string, repo string, head string, base string, title string, body string) (gitea.PullRequest, error)
 }
 
@@ -62,13 +71,20 @@ type Reflector struct {
 	logger                  *slog.Logger
 	statusSyncEnabled       bool
 	patchRejectionPublisher PatchRejectionPublisher
+	validateGitCloneURL     func(context.Context, string) error
 }
 
 func New(st Store, g GiteaClient, repositoriesDir string, logger *slog.Logger) *Reflector {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Reflector{store: st, gitea: g, repositoriesDir: repositoriesDir, logger: logger}
+	return &Reflector{
+		store:               st,
+		gitea:               g,
+		repositoriesDir:     repositoriesDir,
+		logger:              logger,
+		validateGitCloneURL: safefetch.ValidateGitCloneURL,
+	}
 }
 
 func (r *Reflector) SetStatusSyncEnabled(enabled bool) {
@@ -106,7 +122,23 @@ func (r *Reflector) HandleEvent(ctx context.Context, ev *nostr.Event, relayURL s
 		return fmt.Errorf("collaboration event cryptographic validation failed: %w", err)
 	}
 
-	if _, err := r.store.GetReflectedEvent(ctx, ev.ID.Hex()); err == nil {
+	if reflected, err := r.store.GetReflectedEvent(ctx, ev.ID.Hex()); err == nil {
+		if reflected.GiteaIndex > 0 && (reflected.Kind == relay.KindIssue || reflected.Kind == relay.KindPROpen) {
+			objectType := "issue"
+			if reflected.Kind == relay.KindPROpen {
+				objectType = "pr"
+			}
+			if _, rootErr := r.store.GetThreadRootByEventID(ctx, ev.ID.Hex()); errors.Is(rootErr, sql.ErrNoRows) {
+				if rootErr := r.store.UpsertThreadRoot(ctx, store.ThreadRoot{
+					ObjectType: objectType, GiteaRepoID: reflected.GiteaRepoID, GiteaIndex: reflected.GiteaIndex,
+					NostrEventID: ev.ID.Hex(), Pubkey: ev.PubKey.Hex(), Kind: reflected.Kind,
+				}); rootErr != nil {
+					return fmt.Errorf("repair reflected thread root: %w", rootErr)
+				}
+			} else if rootErr != nil {
+				return fmt.Errorf("check reflected thread root: %w", rootErr)
+			}
+		}
 		return r.store.MarkEventProcessed(ctx, ev.ID.Hex(), ev.PubKey.Hex(), int(ev.Kind))
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("check reflected event: %w", err)
@@ -128,11 +160,17 @@ func (r *Reflector) HandleEvent(ctx context.Context, ev *nostr.Event, relayURL s
 	case relay.KindNIP22Comment:
 		success, err = r.reflectComment(ctx, mapping, ev)
 	case relay.KindStatusOpen, relay.KindStatusApplied, relay.KindStatusClosed, relay.KindStatusDraft:
-		success, err = r.reflectIssueStatus(ctx, mapping, ev)
+		success, err = r.reflectIssueStatus(ctx, mapping, ev, relayURL)
+	case relay.KindNIP32Label:
+		success, err = r.reflectLabel(ctx, mapping, ev)
 	case relay.KindPatch, relay.KindPROpen:
 		success, err = r.reflectPatch(ctx, mapping, ev)
 	case relay.KindPRUpdate:
 		success, err = r.reflectPRUpdate(ctx, mapping, ev)
+	}
+	if errors.Is(err, nostrauthz.ErrUnauthorized) {
+		r.logger.Warn("reflector: rejected unauthorized issue status", "event", ev.ID.Hex(), "pubkey", ev.PubKey.Hex())
+		return r.store.MarkEventProcessed(ctx, ev.ID.Hex(), ev.PubKey.Hex(), int(ev.Kind))
 	}
 	if err != nil {
 		return err
@@ -149,7 +187,28 @@ func (r *Reflector) mappingForEvent(ctx context.Context, ev *nostr.Event) (store
 	addr := tagValue(ev.Tags, "a")
 	pubkey, repoID, ok := parseRepoAddr(addr)
 	if !ok {
-		return store.Mapping{}, false, nil
+		if ev.Kind != relay.KindNIP22Comment && ev.Kind != relay.KindNIP32Label {
+			return store.Mapping{}, false, nil
+		}
+		rootID := rootEventID(ev.Tags)
+		if rootID == "" {
+			return store.Mapping{}, false, nil
+		}
+		root, err := r.store.GetThreadRootByEventID(ctx, rootID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return store.Mapping{}, false, nil
+		}
+		if err != nil {
+			return store.Mapping{}, false, fmt.Errorf("lookup persisted thread root %s: %w", rootID, err)
+		}
+		mapping, err := r.store.GetMappingByGiteaRepoID(ctx, root.GiteaRepoID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return store.Mapping{}, false, nil
+		}
+		if err != nil {
+			return store.Mapping{}, false, fmt.Errorf("lookup mapping for persisted thread root %s: %w", rootID, err)
+		}
+		return mapping, true, nil
 	}
 	mapping, err := r.store.GetProvisionedMappingByRepoAddr(ctx, pubkey, repoID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -186,6 +245,16 @@ func (r *Reflector) reflectIssue(ctx context.Context, mapping store.Mapping, ev 
 	}); err != nil {
 		return false, fmt.Errorf("record reflected issue: %w", err)
 	}
+	if err := r.store.UpsertThreadRoot(ctx, store.ThreadRoot{
+		ObjectType:   "issue",
+		GiteaRepoID:  mapping.GiteaRepoID,
+		GiteaIndex:   index,
+		NostrEventID: ev.ID.Hex(),
+		Pubkey:       ev.PubKey.Hex(),
+		Kind:         relay.KindIssue,
+	}); err != nil {
+		return false, fmt.Errorf("persist reflected issue thread root: %w", err)
+	}
 	r.logger.Info("reflector: created Gitea issue from Nostr", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "index", index)
 	return true, nil
 }
@@ -221,7 +290,7 @@ func (r *Reflector) reflectComment(ctx context.Context, mapping store.Mapping, e
 	return true, nil
 }
 
-func (r *Reflector) reflectIssueStatus(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {
+func (r *Reflector) reflectIssueStatus(ctx context.Context, mapping store.Mapping, ev *nostr.Event, relayURL string) (bool, error) {
 	if !r.statusSyncEnabled {
 		r.logger.Debug("reflector: NIP-34 status sync disabled", "event", ev.ID.Hex(), "kind", ev.Kind)
 		return false, nil
@@ -240,6 +309,15 @@ func (r *Reflector) reflectIssueStatus(ctx context.Context, mapping store.Mappin
 	if root.GiteaRepoID != mapping.GiteaRepoID || root.GiteaIndex == 0 || root.Kind != relay.KindIssue {
 		return false, nil
 	}
+
+	authorized, err := r.issueStatusAuthorized(ctx, mapping, ev, rootID, relayURL)
+	if err != nil {
+		return false, err
+	}
+	if !authorized {
+		return false, fmt.Errorf("%w: signer %s cannot update issue root %s", nostrauthz.ErrUnauthorized, ev.PubKey.Hex(), rootID)
+	}
+
 	state := "open"
 	if ev.Kind == relay.KindStatusClosed || ev.Kind == relay.KindStatusApplied {
 		state = "closed"
@@ -258,6 +336,157 @@ func (r *Reflector) reflectIssueStatus(ctx context.Context, mapping store.Mappin
 	}
 	r.logger.Info("reflector: updated Gitea issue state from Nostr", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "index", root.GiteaIndex, "state", state)
 	return true, nil
+}
+
+func (r *Reflector) issueStatusAuthorized(ctx context.Context, mapping store.Mapping, ev *nostr.Event, rootID, relayURL string) (bool, error) {
+	thread, err := r.store.GetThreadRootByEventID(ctx, rootID)
+	if err == nil && thread.GiteaRepoID == mapping.GiteaRepoID && thread.Kind == relay.KindIssue && thread.Pubkey == ev.PubKey.Hex() {
+		return true, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("lookup issue root author: %w", err)
+	}
+
+	var ownerAnnouncement nostr.Event
+	if strings.TrimSpace(mapping.AnnouncementEventJSON) == "" {
+		return false, fmt.Errorf("%w: cached owner announcement missing", nostrauthz.ErrAuthorityUnavailable)
+	}
+	if err := json.Unmarshal([]byte(mapping.AnnouncementEventJSON), &ownerAnnouncement); err != nil {
+		return false, fmt.Errorf("%w: decode cached owner announcement: %v", nostrauthz.ErrAuthorityUnavailable, err)
+	}
+	coord := fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement, mapping.Pubkey, mapping.RepoID)
+	pool := []nostr.Event{ownerAnnouncement}
+	authorized, err := nostrauthz.NewResolver(pool).IsAuthorized(ev.PubKey.Hex(), coord)
+	if err != nil {
+		return false, fmt.Errorf("resolve issue status authority: %w", err)
+	}
+	if authorized || strings.TrimSpace(relayURL) == "" {
+		return authorized, nil
+	}
+
+	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	source, err := nostr.RelayConnect(fetchCtx, relayURL, nostr.RelayOptions{})
+	if err != nil {
+		return false, fmt.Errorf("%w: query maintainer announcements: %v", nostrauthz.ErrAuthorityUnavailable, err)
+	}
+	defer source.Close()
+	sub, err := source.Subscribe(fetchCtx, nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindRepositoryAnnouncement},
+		Tags:  nostr.TagMap{"d": []string{mapping.RepoID}},
+		Limit: 200,
+	}, nostr.SubscriptionOptions{})
+	if err != nil {
+		return false, fmt.Errorf("%w: subscribe maintainer announcements: %v", nostrauthz.ErrAuthorityUnavailable, err)
+	}
+	for {
+		select {
+		case announcement, ok := <-sub.Events:
+			if ok {
+				pool = append(pool, announcement)
+			}
+		case <-sub.EndOfStoredEvents:
+			authorized, err := nostrauthz.NewResolver(pool).IsAuthorized(ev.PubKey.Hex(), coord)
+			if err != nil {
+				return false, fmt.Errorf("resolve recursive issue status authority: %w", err)
+			}
+			return authorized, nil
+		case <-fetchCtx.Done():
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			return false, fmt.Errorf("%w: maintainer announcement query timed out", nostrauthz.ErrAuthorityUnavailable)
+		}
+	}
+}
+
+func (r *Reflector) reflectLabel(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {
+	label := nip32GiteaLabel(ev.Tags)
+	if label == "" {
+		return false, nil
+	}
+	index, ok, err := r.labelTargetIndex(ctx, mapping, ev)
+	if err != nil || !ok {
+		return false, err
+	}
+	remove := isLabelRemoval(ev.Tags)
+	if remove {
+		if err := r.gitea.RemoveIssueLabel(ctx, mapping.Owner, mapping.RepoName, index, label); err != nil {
+			return false, fmt.Errorf("remove Gitea issue label: %w", err)
+		}
+	} else {
+		if err := r.gitea.AddIssueLabel(ctx, mapping.Owner, mapping.RepoName, index, label); err != nil {
+			return false, fmt.Errorf("add Gitea issue label: %w", err)
+		}
+	}
+	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{
+		NostrEventID:    ev.ID.Hex(),
+		GiteaRepoID:     mapping.GiteaRepoID,
+		GiteaIndex:      index,
+		Kind:            relay.KindNIP32Label,
+		EchoFingerprint: labelEchoFingerprint(label, remove),
+	}); err != nil {
+		return false, fmt.Errorf("record reflected label: %w", err)
+	}
+	r.logger.Info("reflector: updated Gitea issue label from Nostr", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "index", index, "label", label, "remove", remove)
+	return true, nil
+}
+
+func (r *Reflector) labelTargetIndex(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (int64, bool, error) {
+	if rootID := rootEventID(ev.Tags); rootID != "" {
+		root, err := r.store.GetThreadRootByEventID(ctx, rootID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, fmt.Errorf("lookup label target root: %w", err)
+		}
+		if root.GiteaRepoID != mapping.GiteaRepoID || root.GiteaIndex <= 0 {
+			return 0, false, nil
+		}
+		return root.GiteaIndex, true, nil
+	}
+	for _, target := range tagValues(ev.Tags, "r") {
+		parts := strings.Split(strings.Trim(target, "/"), "/")
+		if len(parts) < 2 || (parts[len(parts)-2] != "issue" && parts[len(parts)-2] != "pull" && parts[len(parts)-2] != "pr") {
+			continue
+		}
+		index, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
+		if err == nil && index > 0 {
+			return index, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+func nip32GiteaLabel(tags nostr.Tags) string {
+	for _, tag := range tags {
+		if len(tag) < 2 || tag[0] != "l" || strings.TrimSpace(tag[1]) == "" {
+			continue
+		}
+		if len(tag) >= 3 && tag[2] != "" && tag[2] != "gitea/label" {
+			continue
+		}
+		return strings.TrimSpace(tag[1])
+	}
+	return ""
+}
+
+func isLabelRemoval(tags nostr.Tags) bool {
+	switch strings.ToLower(strings.TrimSpace(tagValue(tags, "action"))) {
+	case "remove", "removed", "unlabel", "unlabeled", "delete":
+		return true
+	default:
+		return false
+	}
+}
+
+func labelEchoFingerprint(label string, remove bool) string {
+	action := "apply"
+	if remove {
+		action = "remove"
+	}
+	return action + "\x00" + strings.TrimSpace(label)
 }
 
 func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {
@@ -320,6 +549,16 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 	}); err != nil {
 		return false, fmt.Errorf("record reflected patch PR: %w", err)
 	}
+	if err := r.store.UpsertThreadRoot(ctx, store.ThreadRoot{
+		ObjectType:   "pr",
+		GiteaRepoID:  mapping.GiteaRepoID,
+		GiteaIndex:   index,
+		NostrEventID: ev.ID.Hex(),
+		Pubkey:       ev.PubKey.Hex(),
+		Kind:         relay.KindPROpen,
+	}); err != nil {
+		return false, fmt.Errorf("persist reflected PR thread root: %w", err)
+	}
 	r.logger.Info("reflector: created Gitea PR from Nostr patch", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "index", index, "head", branch, "base", base)
 	return true, nil
 }
@@ -362,6 +601,14 @@ func (r *Reflector) reflectPRUpdate(ctx context.Context, mapping store.Mapping, 
 	refspec := "+" + tip + ":" + refsnostr.RefPrefix + ev.ID.Hex()
 	var errs []string
 	for _, cloneURL := range clones {
+		validate := r.validateGitCloneURL
+		if validate == nil {
+			validate = safefetch.ValidateGitCloneURL
+		}
+		if err := validate(ctx, cloneURL); err != nil {
+			errs = append(errs, fmt.Sprintf("unsafe clone URL %q: %v", cloneURL, err))
+			continue
+		}
 		if err := gitFetch(ctx, repoPath, cloneURL, refspec); err != nil {
 			errs = append(errs, err.Error())
 			continue
@@ -400,6 +647,14 @@ func (r *Reflector) materializeTipBranch(ctx context.Context, mapping store.Mapp
 	refspec := "+" + tip + ":" + refsnostr.RefPrefix + ev.ID.Hex()
 	var errs []string
 	for _, cloneURL := range clones {
+		validate := r.validateGitCloneURL
+		if validate == nil {
+			validate = safefetch.ValidateGitCloneURL
+		}
+		if err := validate(ctx, cloneURL); err != nil {
+			errs = append(errs, fmt.Sprintf("unsafe clone URL %q: %v", cloneURL, err))
+			continue
+		}
 		if err := gitFetch(ctx, repoPath, cloneURL, refspec); err != nil {
 			errs = append(errs, err.Error())
 			continue
@@ -724,7 +979,8 @@ func isCollaborationKind(kind int) bool {
 		relay.KindStatusOpen,
 		relay.KindStatusApplied,
 		relay.KindStatusClosed,
-		relay.KindStatusDraft:
+		relay.KindStatusDraft,
+		relay.KindNIP32Label:
 		return true
 	default:
 		return false
@@ -740,16 +996,21 @@ func parseRepoAddr(addr string) (pubkey string, repoID string, ok bool) {
 }
 
 func rootEventID(tags nostr.Tags) string {
-	for _, key := range []string{"E", "e"} {
-		for _, tag := range tags {
-			if len(tag) < 2 || tag[0] != key {
-				continue
-			}
-			if len(tag) >= 4 && tag[3] != "" && tag[3] != "root" {
-				continue
-			}
+	// NIP-22 defines uppercase E as the root reference; element four is the
+	// root author pubkey, not a NIP-10 marker.
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == "E" {
 			return tag[1]
 		}
+	}
+	for _, tag := range tags {
+		if len(tag) < 2 || tag[0] != "e" {
+			continue
+		}
+		if len(tag) >= 4 && tag[3] != "" && tag[3] != "root" {
+			continue
+		}
+		return tag[1]
 	}
 	return ""
 }

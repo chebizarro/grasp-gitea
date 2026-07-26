@@ -23,11 +23,11 @@ import (
 	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/echofp"
+	"github.com/sharegap/grasp-gitea/internal/grasp"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/relay"
-	"github.com/sharegap/grasp-gitea/internal/grasp"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -89,14 +89,13 @@ type Handler struct {
 	eucMu    sync.Mutex
 	eucCache map[int64]string
 
-	threadMu sync.Mutex
-	threads  map[string]threadRef
+	deliveryMu        sync.Mutex
+	deliveryCreatedAt time.Time
+	retriesEnabled    bool
+	retryBase         time.Duration
 }
 
-// threadRef records the event id and author for an issue/PR root event seen by
-// this process. It lets follow-up Gitea webhooks emit NIP-34 status and NIP-22
-// comment tags with the required event-id/pubkey references without changing
-// the store schema in this phase.
+// threadRef records the durable event id and author for an issue/PR root.
 type threadRef struct {
 	EventID string
 	Pubkey  string
@@ -105,12 +104,22 @@ type threadRef struct {
 
 // New creates a webhook Handler.
 func New(pub *publisher.Service, st *store.SQLiteStore, secret string, logger *slog.Logger) *Handler {
-	h := &Handler{store: st, secret: secret, logger: logger, actorLookup: st, now: time.Now, echoGuardWindow: store.DefaultEchoGuardWindow}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	h := &Handler{
+		store: st, secret: secret, logger: logger, actorLookup: st,
+		now: time.Now, echoGuardWindow: store.DefaultEchoGuardWindow,
+		retriesEnabled: true, retryBase: 5 * time.Second,
+	}
 	// Guard against a typed-nil *publisher.Service being stored as a non-nil
 	// interface, which would defeat the h.pub == nil checks below.
 	if pub != nil {
 		h.pub = pub
 	}
+	// Allow the caller to finish optional signer wiring before replaying rows
+	// left pending by a previous process.
+	time.AfterFunc(time.Second, h.retryPendingWebhookDeliveries)
 	return h
 }
 
@@ -139,50 +148,154 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.secret != "" {
-		if !h.verifyHMAC(r.Header.Get("X-Gitea-Signature"), body) {
-			h.logger.Warn("webhook: HMAC validation failed")
-			http.Error(w, "signature mismatch", http.StatusUnauthorized)
-			return
-		}
+	if h.secret != "" && !h.verifyHMAC(r.Header.Get("X-Gitea-Signature"), body) {
+		h.logger.Warn("webhook: HMAC validation failed")
+		http.Error(w, "signature mismatch", http.StatusUnauthorized)
+		return
+	}
+	if h.store == nil {
+		http.Error(w, "webhook persistence unavailable", http.StatusServiceUnavailable)
+		return
 	}
 
 	eventType := r.Header.Get("X-Gitea-Event")
-	h.logger.Info("webhook: received", "event", eventType)
+	deliveryID := strings.TrimSpace(r.Header.Get("X-Gitea-Delivery"))
+	if deliveryID == "" {
+		deliveryID = strings.TrimSpace(r.Header.Get("X-Gitea-Delivery-ID"))
+	}
+	if deliveryID == "" {
+		sum := sha256.Sum256(append(append([]byte(eventType), 0), body...))
+		deliveryID = hex.EncodeToString(sum[:])
+	}
+	now := time.Now().UTC()
+	saved, _, err := h.store.SaveWebhookDelivery(r.Context(), store.WebhookDelivery{
+		DeliveryID:    deliveryID,
+		EventType:     eventType,
+		Payload:       append([]byte(nil), body...),
+		CreatedAt:     now,
+		NextAttemptAt: now,
+	})
+	if err != nil {
+		h.logger.Error("webhook: failed to persist delivery", "event", eventType, "delivery", deliveryID, "error", err)
+		http.Error(w, "webhook persistence failed", http.StatusServiceUnavailable)
+		return
+	}
+
+	h.logger.Info("webhook: received", "event", eventType, "delivery", deliveryID)
 	metrics.IncWebhookEventsReceived()
+	if saved.State != store.WebhookDeliveryDone {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		err = h.processPersistedDelivery(ctx, saved)
+		cancel()
+		if err != nil {
+			h.logger.Warn("webhook: delivery remains pending for retry", "event", eventType, "delivery", deliveryID, "error", err)
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	var publishErr error
+func (h *Handler) handleWebhookEvent(ctx context.Context, eventType string, body []byte) error {
 	switch eventType {
 	case "push":
-		publishErr = h.handlePush(ctx, body)
+		return h.handlePush(ctx, body)
 	case "create":
-		publishErr = h.handleCreate(ctx, body)
+		return h.handleCreate(ctx, body)
 	case "delete":
-		publishErr = h.handleDelete(ctx, body)
+		return h.handleDelete(ctx, body)
 	case "pull_request":
-		publishErr = h.handlePR(ctx, body)
+		return h.handlePR(ctx, body)
 	case "issues":
-		publishErr = h.handleIssue(ctx, body)
+		return h.handleIssue(ctx, body)
 	case "issue_comment":
-		publishErr = h.handleIssueComment(ctx, body)
+		return h.handleIssueComment(ctx, body)
 	case "label":
-		publishErr = h.handleLabel(ctx, body)
+		return h.handleLabel(ctx, body)
 	default:
 		h.logger.Debug("webhook: unhandled event type", "event", eventType)
+		return nil
+	}
+}
+
+func (h *Handler) processPersistedDelivery(ctx context.Context, delivery store.WebhookDelivery) error {
+	h.deliveryMu.Lock()
+	defer h.deliveryMu.Unlock()
+
+	current, err := h.store.GetWebhookDelivery(ctx, delivery.DeliveryID)
+	if err != nil {
+		return fmt.Errorf("load persisted webhook delivery: %w", err)
+	}
+	if current.State == store.WebhookDeliveryDone {
+		return nil
+	}
+	h.deliveryCreatedAt = current.CreatedAt
+	defer func() { h.deliveryCreatedAt = time.Time{} }()
+	err = h.handleWebhookEvent(ctx, current.EventType, current.Payload)
+	if err == nil {
+		if markErr := h.store.MarkWebhookDeliveryDone(ctx, current.DeliveryID, time.Now().UTC()); markErr != nil {
+			return fmt.Errorf("mark webhook delivery done: %w", markErr)
+		}
+		if current.EventType != "" {
+			metrics.IncWebhookEventsPublished()
+		}
+		return nil
 	}
 
-	if publishErr != nil {
-		h.logger.Warn("webhook: publish error", "event", eventType, "error", publishErr)
-		metrics.IncWebhookEventsFailed()
-		// Still return 200 — Gitea will retry on non-2xx which causes noise.
-	} else if publishErr == nil && eventType != "" {
-		metrics.IncWebhookEventsPublished()
+	metrics.IncWebhookEventsFailed()
+	delay := h.webhookRetryDelay(current.Attempts + 1)
+	if _, markErr := h.store.MarkWebhookDeliveryRetry(context.Background(), current.DeliveryID, time.Now().UTC().Add(delay), err.Error()); markErr != nil {
+		return errors.Join(err, fmt.Errorf("record webhook retry: %w", markErr))
 	}
+	return err
+}
 
-	w.WriteHeader(http.StatusOK)
+func (h *Handler) webhookRetryDelay(attempt int) time.Duration {
+	base := h.retryBase
+	if base <= 0 {
+		base = 5 * time.Second
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := base
+	for i := 1; i < attempt && delay < 5*time.Minute; i++ {
+		delay *= 2
+	}
+	if delay > 5*time.Minute {
+		delay = 5 * time.Minute
+	}
+	return delay
+}
+
+func (h *Handler) scheduleWebhookRetry(delay time.Duration) {
+	if !h.retriesEnabled {
+		return
+	}
+	if delay <= 0 {
+		delay = time.Second
+	}
+	time.AfterFunc(delay, h.retryPendingWebhookDeliveries)
+}
+
+func (h *Handler) retryPendingWebhookDeliveries() {
+	if h == nil || h.store == nil {
+		return
+	}
+	defer h.scheduleWebhookRetry(h.webhookRetryDelay(1))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	deliveries, err := h.store.ListDueWebhookDeliveries(ctx, time.Now().UTC(), 25)
+	if err != nil {
+		h.logger.Warn("webhook: list pending deliveries failed", "error", err)
+		return
+	}
+	for _, delivery := range deliveries {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, 30*time.Second)
+		err := h.processPersistedDelivery(attemptCtx, delivery)
+		attemptCancel()
+		if err != nil {
+			h.logger.Warn("webhook: retry failed", "delivery", delivery.DeliveryID, "event", delivery.EventType, "error", err)
+		}
+	}
 }
 
 func (h *Handler) verifyHMAC(sig string, body []byte) bool {
@@ -299,11 +412,17 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 	switch p.Action {
 	case "opened":
 		ev := h.buildPROpenEvent(mapping, p, euc)
-		emitted, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("pr:%d:opened", p.Number))
-		if err != nil || !emitted {
+		scopeSuffix := fmt.Sprintf("pr:%d:opened", p.Number)
+		emitted, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, scopeSuffix)
+		if err != nil {
 			return err
 		}
-		h.rememberThread("pr", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID.Hex(), Pubkey: ev.PubKey.Hex(), Kind: KindPROpen})
+		if !emitted {
+			return h.rememberPendingThread(ctx, p.Sender, mapping, ev, scopeSuffix, "pr", p.Number, KindPROpen)
+		}
+		if err := h.rememberThread(ctx, "pr", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID.Hex(), Pubkey: ev.PubKey.Hex(), Kind: KindPROpen}); err != nil {
+			return err
+		}
 		if err := h.recordNostrObjectMapping(ctx, mapping, ev.ID.Hex(), p.Number, KindPROpen, "PR root"); err != nil {
 			return err
 		}
@@ -312,7 +431,7 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		}
 		return nil
 	case "synchronized":
-		root, ok := h.lookupThread("pr", mapping.GiteaRepoID, p.Number)
+		root, ok := h.lookupThread(ctx, "pr", mapping.GiteaRepoID, p.Number)
 		if !ok || root.EventID == "" || root.Pubkey == "" {
 			h.warnMissingThread("PR update", mapping, p.Number)
 			return nil
@@ -321,7 +440,7 @@ func (h *Handler) handlePR(ctx context.Context, body []byte) error {
 		_, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("pr:%d:synchronized:%s", p.Number, p.PullRequest.Head.SHA))
 		return err
 	case "closed", "reopened", "edited":
-		root, ok := h.lookupThread("pr", mapping.GiteaRepoID, p.Number)
+		root, ok := h.lookupThread(ctx, "pr", mapping.GiteaRepoID, p.Number)
 		if !ok || root.EventID == "" {
 			h.warnMissingThread("PR status", mapping, p.Number)
 			return nil
@@ -349,7 +468,11 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 	// Handle label events inline
 	if p.Action == "labeled" || p.Action == "unlabeled" {
 		issueRef := fmt.Sprintf("%s/%s/issue/%d", mapping.Npub, mapping.RepoID, p.Number)
-		return h.publishNIP32LabelForActor(ctx, p.Sender, mapping, int(KindIssue), issueRef, p.Label.Name, "gitea/label")
+		remove := p.Action == "unlabeled"
+		if h.wasReflected(ctx, mapping.GiteaRepoID, p.Number, KindNIP32Label, webhookLabelFingerprint(p.Label.Name, remove), "issue label") {
+			return nil
+		}
+		return h.publishNIP32LabelForActor(ctx, p.Sender, mapping, int(KindIssue), issueRef, p.Label.Name, "gitea/label", remove)
 	}
 
 	if h.shouldSkipReflectedIssueWebhook(ctx, mapping, p) {
@@ -361,19 +484,28 @@ func (h *Handler) handleIssue(ctx context.Context, body []byte) error {
 	switch p.Action {
 	case "opened", "edited":
 		ev := h.buildIssueEvent(mapping, p)
-		emitted, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("issue:%d:%s", p.Number, p.Action))
-		if err != nil || !emitted {
+		scopeSuffix := fmt.Sprintf("issue:%d:%s", p.Number, p.Action)
+		emitted, err := h.publishActorEvent(ctx, p.Sender, mapping, ev, scopeSuffix)
+		if err != nil {
 			return err
 		}
+		if !emitted {
+			if p.Action == "opened" {
+				return h.rememberPendingThread(ctx, p.Sender, mapping, ev, scopeSuffix, "issue", p.Number, KindIssue)
+			}
+			return nil
+		}
 		if p.Action == "opened" {
-			h.rememberThread("issue", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID.Hex(), Pubkey: ev.PubKey.Hex(), Kind: KindIssue})
+			if err := h.rememberThread(ctx, "issue", mapping.GiteaRepoID, p.Number, threadRef{EventID: ev.ID.Hex(), Pubkey: ev.PubKey.Hex(), Kind: KindIssue}); err != nil {
+				return err
+			}
 			if err := h.recordNostrObjectMapping(ctx, mapping, ev.ID.Hex(), p.Number, KindIssue, "issue root"); err != nil {
 				return err
 			}
 		}
 		return nil
 	case "closed", "reopened":
-		root, ok := h.lookupThread("issue", mapping.GiteaRepoID, p.Number)
+		root, ok := h.lookupThread(ctx, "issue", mapping.GiteaRepoID, p.Number)
 		if !ok || root.EventID == "" {
 			h.warnMissingThread("issue status", mapping, p.Number)
 			return nil
@@ -423,14 +555,14 @@ func (h *Handler) handleIssueComment(ctx context.Context, body []byte) error {
 		}
 	}
 
-	root, ok := h.lookupThread(threadKind, mapping.GiteaRepoID, number)
+	root, ok := h.lookupThread(ctx, threadKind, mapping.GiteaRepoID, number)
 	if !ok || root.EventID == "" || root.Pubkey == "" {
 		h.warnMissingThread("comment", mapping, number)
 		return nil
 	}
 	root.Kind = rootKind
 
-	ev := h.buildCommentEvent(root, p.Comment)
+	ev := h.buildCommentEvent(mapping, root, p.Comment)
 	_, err = h.publishActorEvent(ctx, p.Sender, mapping, ev, fmt.Sprintf("comment:%s:%d:%d:%s", threadKind, number, p.Comment.ID, p.Action))
 	return err
 }
@@ -456,7 +588,7 @@ func (h *Handler) buildPROpenEvent(mapping store.Mapping, p PullRequestPayload, 
 
 	return &nostr.Event{
 		Kind:      KindPROpen,
-		CreatedAt: eventTimestamp(p.PullRequest.CreatedAt),
+		CreatedAt: h.eventTimestamp(p.PullRequest.CreatedAt),
 		Tags:      tags,
 		Content:   p.PullRequest.Body,
 	}
@@ -484,7 +616,7 @@ func (h *Handler) buildPRUpdateEvent(mapping store.Mapping, p PullRequestPayload
 
 	return &nostr.Event{
 		Kind:      KindPRUpdate,
-		CreatedAt: eventTimestamp(p.PullRequest.UpdatedAt),
+		CreatedAt: h.eventTimestamp(p.PullRequest.UpdatedAt),
 		Tags:      tags,
 	}
 }
@@ -499,7 +631,7 @@ func (h *Handler) buildIssueEvent(mapping store.Mapping, p IssuePayload) *nostr.
 	}
 	return &nostr.Event{
 		Kind:      KindIssue,
-		CreatedAt: eventTimestamp(p.Issue.CreatedAt),
+		CreatedAt: h.eventTimestamp(p.Issue.CreatedAt),
 		Tags:      tags,
 		Content:   p.Issue.Body,
 	}
@@ -533,17 +665,18 @@ func (h *Handler) buildStatusEvent(mapping store.Mapping, root threadRef, kind i
 	}
 	return &nostr.Event{
 		Kind:      nostr.Kind(kind),
-		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		CreatedAt: h.eventTimestamp(time.Time{}),
 		Tags:      tags,
 		Content:   content,
 	}
 }
 
-func (h *Handler) buildCommentEvent(root threadRef, comment Comment) *nostr.Event {
+func (h *Handler) buildCommentEvent(mapping store.Mapping, root threadRef, comment Comment) *nostr.Event {
 	return &nostr.Event{
 		Kind:      KindComment,
-		CreatedAt: eventTimestamp(comment.CreatedAt),
+		CreatedAt: h.eventTimestamp(comment.CreatedAt),
 		Tags: nostr.Tags{
+			{"a", repoAddr(mapping)},
 			{"E", root.EventID, "", root.Pubkey},
 			{"K", fmt.Sprint(root.Kind)},
 			{"P", root.Pubkey},
@@ -592,34 +725,58 @@ func (h *Handler) SetGraspPublicURL(publicURL string) {
 	h.graspPublicURL = strings.TrimRight(strings.TrimSpace(publicURL), "/")
 }
 
-func eventTimestamp(t time.Time) nostr.Timestamp {
-	if t.IsZero() {
-		return nostr.Timestamp(time.Now().Unix())
+func (h *Handler) eventTimestamp(t time.Time) nostr.Timestamp {
+	if !t.IsZero() {
+		return nostr.Timestamp(t.Unix())
 	}
-	return nostr.Timestamp(t.Unix())
+	if h != nil && !h.deliveryCreatedAt.IsZero() {
+		return nostr.Timestamp(h.deliveryCreatedAt.Unix())
+	}
+	return nostr.Timestamp(time.Now().Unix())
 }
 
-func threadKey(kind string, repoID int64, number int64) string {
-	return fmt.Sprintf("%s:%d:%d", kind, repoID, number)
+func (h *Handler) rememberThread(ctx context.Context, kind string, repoID int64, number int64, ref threadRef) error {
+	if ref.EventID == "" || h.store == nil {
+		return nil
+	}
+	if err := h.store.UpsertThreadRoot(ctx, store.ThreadRoot{
+		ObjectType:   kind,
+		GiteaRepoID:  repoID,
+		GiteaIndex:   number,
+		NostrEventID: ref.EventID,
+		Pubkey:       ref.Pubkey,
+		Kind:         ref.Kind,
+	}); err != nil {
+		return fmt.Errorf("persist %s thread root: %w", kind, err)
+	}
+	return nil
 }
 
-func (h *Handler) rememberThread(kind string, repoID int64, number int64, ref threadRef) {
-	if ref.EventID == "" {
-		return
+func (h *Handler) rememberPendingThread(ctx context.Context, actor User, mapping store.Mapping, ev *nostr.Event, scopeSuffix, objectType string, number int64, kind int) error {
+	if actor.ID == 0 || h.store == nil || !h.actorSigningEnabled() {
+		return nil
 	}
-	h.threadMu.Lock()
-	defer h.threadMu.Unlock()
-	if h.threads == nil {
-		h.threads = make(map[string]threadRef)
+	_, dedupeKey := h.pendingActorEventKeys(mapping, ev, scopeSuffix)
+	if err := h.store.SavePendingThreadRoot(ctx, dedupeKey, store.ThreadRoot{
+		ObjectType: objectType, GiteaRepoID: mapping.GiteaRepoID, GiteaIndex: number, Kind: kind,
+	}); err != nil {
+		return fmt.Errorf("persist pending %s thread root: %w", objectType, err)
 	}
-	h.threads[threadKey(kind, repoID, number)] = ref
+	return nil
 }
 
-func (h *Handler) lookupThread(kind string, repoID int64, number int64) (threadRef, bool) {
-	h.threadMu.Lock()
-	defer h.threadMu.Unlock()
-	ref, ok := h.threads[threadKey(kind, repoID, number)]
-	return ref, ok
+func (h *Handler) lookupThread(ctx context.Context, kind string, repoID int64, number int64) (threadRef, bool) {
+	if h.store == nil {
+		return threadRef{}, false
+	}
+	root, err := h.store.GetThreadRoot(ctx, kind, repoID, number)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) && h.logger != nil {
+			h.logger.Warn("webhook: persisted thread root lookup failed", "kind", kind, "repo_id", repoID, "number", number, "error", err)
+		}
+		return threadRef{}, false
+	}
+	return threadRef{EventID: root.NostrEventID, Pubkey: root.Pubkey, Kind: root.Kind}, true
 }
 
 func (h *Handler) warnMissingThread(action string, mapping store.Mapping, number int64) {
@@ -845,7 +1002,7 @@ func (h *Handler) handlePatchPush(ctx context.Context, eventID string, p PushPay
 
 	statusEv := &nostr.Event{
 		Kind:      KindStatusApplied,
-		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		CreatedAt: h.eventTimestamp(time.Time{}),
 		Tags:      tags,
 	}
 	_, err := h.publishActorEvent(ctx, p.Sender, mapping, statusEv, fmt.Sprintf("patch:%s:applied:%s", eventID, p.After))
@@ -857,28 +1014,45 @@ func (h *Handler) handlePatchPush(ctx context.Context, eventID string, p PushPay
 // coordinate (30617:<hex-pubkey>:<repo-id>) and records the human-readable
 // target (e.g. "npub/repo/issue/N") in an "r" tag for context.
 func (h *Handler) PublishNIP32Label(ctx context.Context, mapping store.Mapping, targetKind int, targetRef string, label string, namespace string) error {
-	ev := h.buildNIP32LabelEvent(mapping, targetKind, targetRef, label, namespace)
+	ev := h.buildNIP32LabelEvent(mapping, targetKind, targetRef, label, namespace, false)
 	return h.publish(ctx, ev)
 }
 
-func (h *Handler) publishNIP32LabelForActor(ctx context.Context, actor User, mapping store.Mapping, targetKind int, targetRef string, label string, namespace string) error {
-	ev := h.buildNIP32LabelEvent(mapping, targetKind, targetRef, label, namespace)
-	_, err := h.publishActorEvent(ctx, actor, mapping, ev, fmt.Sprintf("label:%d:%s:%s:%s", targetKind, targetRef, namespace, label))
+func (h *Handler) publishNIP32LabelForActor(ctx context.Context, actor User, mapping store.Mapping, targetKind int, targetRef string, label string, namespace string, remove bool) error {
+	ev := h.buildNIP32LabelEvent(mapping, targetKind, targetRef, label, namespace, remove)
+	action := "apply"
+	if remove {
+		action = "remove"
+	}
+	_, err := h.publishActorEvent(ctx, actor, mapping, ev, fmt.Sprintf("label:%d:%s:%s:%s:%s", targetKind, targetRef, namespace, label, action))
 	return err
 }
 
-func (h *Handler) buildNIP32LabelEvent(mapping store.Mapping, targetKind int, targetRef string, label string, namespace string) *nostr.Event {
+func (h *Handler) buildNIP32LabelEvent(mapping store.Mapping, targetKind int, targetRef string, label string, namespace string, remove bool) *nostr.Event {
+	action := "apply"
+	if remove {
+		action = "remove"
+	}
 	return &nostr.Event{
 		Kind:      KindNIP32Label,
-		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		CreatedAt: h.eventTimestamp(time.Time{}),
 		Tags: nostr.Tags{
 			{"L", namespace},
 			{"l", label, namespace},
+			{"action", action},
 			{"a", repoAddr(mapping)},
 			{"r", targetRef},
 			{"p", mapping.Pubkey},
 		},
 	}
+}
+
+func webhookLabelFingerprint(label string, remove bool) string {
+	action := "apply"
+	if remove {
+		action = "remove"
+	}
+	return action + "\x00" + strings.TrimSpace(label)
 }
 
 // NOTE: kind:30617 repository announcements are NOT minted by the bridge.
@@ -903,9 +1077,7 @@ func (h *Handler) publishActorEvent(ctx context.Context, actor User, mapping sto
 		return false, fmt.Errorf("actor outbox not configured")
 	}
 
-	scope := fmt.Sprintf("repo:%d:%s", mapping.GiteaRepoID, scopeSuffix)
-	pendingID := ev.GetID()
-	pendingDedupeKey := fmt.Sprintf("webhook:%s:%d:%s", scope, ev.Kind, pendingID.Hex())
+	scope, pendingDedupeKey := h.pendingActorEventKeys(mapping, ev, scopeSuffix)
 
 	authorPubkey, ok, err := h.resolveActorGrant(ctx, actor)
 	if err != nil {
@@ -932,6 +1104,12 @@ func (h *Handler) publishActorEvent(ctx context.Context, actor User, mapping sto
 		return false, err
 	}
 	return true, nil
+}
+
+func (h *Handler) pendingActorEventKeys(mapping store.Mapping, ev *nostr.Event, scopeSuffix string) (string, string) {
+	scope := fmt.Sprintf("repo:%d:%s", mapping.GiteaRepoID, scopeSuffix)
+	pendingID := ev.GetID()
+	return scope, fmt.Sprintf("webhook:%s:%d:%s", scope, ev.Kind, pendingID.Hex())
 }
 
 func (h *Handler) actorSigningEnabled() bool {
