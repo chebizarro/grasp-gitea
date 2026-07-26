@@ -152,6 +152,27 @@ func (s *Service) AuthorizeStateEvent(ctx context.Context, ev *nostr.Event) erro
 	return err
 }
 
+// IsWorkflowAuthorAuthorized resolves owner and recursive-maintainer authority
+// from the same validated announcement pool used by state synchronization.
+func (s *Service) IsWorkflowAuthorAuthorized(ctx context.Context, mapping store.Mapping, author string) (bool, error) {
+	authorKey, err := nostr.PubKeyFromHex(strings.TrimSpace(author))
+	if err != nil {
+		return false, fmt.Errorf("invalid workflow author: %w", err)
+	}
+	events, confirmedCurrentOwner, err := s.authorityEvents(ctx, mapping)
+	if err != nil {
+		return false, err
+	}
+	ok, err := nostrauthz.NewResolver(events).IsAuthorized(authorKey.Hex(), repoCoordinate(mapping))
+	if err != nil || !ok {
+		return ok, err
+	}
+	if authorKey.Hex() != mapping.Pubkey && !confirmedCurrentOwner {
+		return false, fmt.Errorf("%w: current maintainer announcements unavailable", nostrauthz.ErrAuthorityUnavailable)
+	}
+	return true, nil
+}
+
 var errStateMappingNotFound = fmt.Errorf("state mapping not found")
 
 func (s *Service) resolveStateMapping(ctx context.Context, ev *nostr.Event) (store.Mapping, error) {

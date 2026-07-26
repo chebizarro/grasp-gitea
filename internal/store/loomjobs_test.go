@@ -9,6 +9,53 @@ import (
 	"time"
 )
 
+func TestEnsureLoomTablesMigratesPhaseOneSchema(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "phase1.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	_, err = st.db.Exec(`CREATE TABLE loom_jobs (
+		workflow_run_id TEXT PRIMARY KEY, job_request_id TEXT NOT NULL DEFAULT '',
+		publisher_pub TEXT NOT NULL DEFAULT '', worker_pub TEXT NOT NULL DEFAULT '',
+		owner TEXT NOT NULL, repo_name TEXT NOT NULL, repo_id TEXT NOT NULL,
+		commit_sha TEXT NOT NULL, workflow_path TEXT NOT NULL,
+		workflow_run_event TEXT NOT NULL DEFAULT '', job_request_event TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'pending', terminal_source TEXT NOT NULL DEFAULT '',
+		last_protocol_event_id TEXT NOT NULL DEFAULT '', status_event_created_at INTEGER NOT NULL DEFAULT 0,
+		status_event_id TEXT NOT NULL DEFAULT '', delivery_state TEXT NOT NULL DEFAULT 'pending',
+		created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnsureLoomTables(context.Background()); err != nil {
+		t.Fatalf("migrate Phase 1 Loom table: %v", err)
+	}
+	columns := map[string]bool{}
+	rows, err := st.db.Query(`PRAGMA table_info(loom_jobs)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatal(err)
+		}
+		columns[name] = true
+	}
+	for _, name := range []string{"dispatch_key", "dispatch_state", "dispatch_attempts",
+		"dispatch_next_attempt_at", "dispatch_last_error", "published_at"} {
+		if !columns[name] {
+			t.Fatalf("migration did not add %s", name)
+		}
+	}
+}
+
 func TestLoomJobsTTLEvictionAndRowCap(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "loom.db"))
 	if err != nil {

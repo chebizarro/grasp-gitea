@@ -140,11 +140,17 @@ func (s *Service) processEvent(ctx context.Context, ev *nostr.Event) error {
 		if ev.PubKey.Hex() != job.WorkerPub {
 			return fmt.Errorf("event author is not selected worker")
 		}
-		if d := tagValue(ev.Tags, "d"); d != "" && d != job.JobRequestID {
-			return fmt.Errorf("job result d tag does not match dispatch")
+		if ev.Kind == relay.KindLoomJobStatus {
+			if tagValue(ev.Tags, "d") != job.JobRequestID || tagValue(ev.Tags, "e") != job.JobRequestID {
+				return fmt.Errorf("job status references do not match dispatch")
+			}
+		} else if tagValue(ev.Tags, "e") != job.JobRequestID {
+			return fmt.Errorf("job result reference does not match dispatch")
+		} else if d := tagValue(ev.Tags, "d"); d != "" && d != job.JobRequestID {
+			return fmt.Errorf("job result d reference does not match dispatch")
 		}
-		if e := tagValue(ev.Tags, "e"); e != "" && e != job.JobRequestID {
-			return fmt.Errorf("job result e tag does not match dispatch")
+		if err := validateRequesterEcho(job, ev.Tags); err != nil {
+			return err
 		}
 	case relay.KindHiveWorkflowResult:
 		ref := tagValue(ev.Tags, "e")
@@ -160,6 +166,9 @@ func (s *Service) processEvent(ctx context.Context, ev *nostr.Event) error {
 		}
 		if ev.PubKey.Hex() != job.PublisherPub {
 			return fmt.Errorf("event author is not delegated publisher")
+		}
+		if loomJobID := tagValue(ev.Tags, "loom_job_id"); loomJobID != "" && loomJobID != job.JobRequestID {
+			return fmt.Errorf("workflow result Loom job reference does not match dispatch")
 		}
 	default:
 		return nil
@@ -177,7 +186,7 @@ func (s *Service) processEvent(ctx context.Context, ev *nostr.Event) error {
 	}
 	return s.sink.Set(ctx, Status{
 		Ref: Ref{
-			WorkflowRunID: job.WorkflowRunID, JobRequestID: job.JobRequestID,
+			DispatchKey: job.DispatchKey, WorkflowRunID: job.WorkflowRunID, JobRequestID: job.JobRequestID,
 			PublisherPub: job.PublisherPub, WorkerPub: job.WorkerPub,
 			Owner: job.Owner, RepoName: job.RepoName, RepoID: job.RepoID,
 			CommitSHA: job.CommitSHA, WorkflowPath: job.WorkflowPath,
@@ -250,6 +259,20 @@ func MapResult(kind nostr.Kind, tags nostr.Tags, content string) (string, string
 	default:
 		return "", "", fmt.Errorf("unsupported Loom result kind %d", kind)
 	}
+}
+
+func validateRequesterEcho(job store.LoomJob, tags nostr.Tags) error {
+	if strings.TrimSpace(job.JobRequestEvent) == "" {
+		return nil
+	}
+	var request nostr.Event
+	if err := json.Unmarshal([]byte(job.JobRequestEvent), &request); err != nil {
+		return fmt.Errorf("stored job request is malformed")
+	}
+	if p := tagValue(tags, "p"); p == "" || p != request.PubKey.Hex() {
+		return fmt.Errorf("result requester does not match dispatch")
+	}
+	return nil
 }
 
 func validateEchoedIdentity(job store.LoomJob, tags nostr.Tags) error {

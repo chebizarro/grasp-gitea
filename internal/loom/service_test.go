@@ -2,6 +2,7 @@ package loom
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -87,6 +88,63 @@ func TestProcessEventAnchorsAuthorityToDispatch(t *testing.T) {
 	}
 	if len(sink.statuses) != 1 || sink.statuses[0].Ref.CommitSHA != "abc" {
 		t.Fatalf("status was not anchored to dispatch: %#v", sink.statuses)
+	}
+}
+
+func TestProcessEventVerifiesWorkflowPublisherAndRequesterEcho(t *testing.T) {
+	worker := nostr.Generate()
+	publisher := nostr.Generate()
+	operator := nostr.Generate()
+	attacker := nostr.Generate()
+	request := nostr.Event{Kind: relay.KindLoomJobRequest, CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{{"p", worker.Public().Hex()}, {"cmd", "act"}}}
+	if err := request.Sign(operator); err != nil {
+		t.Fatal(err)
+	}
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := store.LoomJob{WorkflowRunID: "run", JobRequestID: request.ID.Hex(),
+		WorkerPub: worker.Public().Hex(), PublisherPub: publisher.Public().Hex(),
+		Owner: "alice", RepoName: "repo", RepoID: "r", CommitSHA: "abc", WorkflowPath: "ci.yml",
+		JobRequestEvent: string(requestJSON)}
+	sink := &captureSink{}
+	svc := New(Config{Enabled: true}, fixedJobStore{job}, sink, nil)
+
+	result := &nostr.Event{PubKey: worker.Public(), ID: nostr.ID{3}, Kind: relay.KindLoomJobResult,
+		CreatedAt: nostr.Now(), Tags: nostr.Tags{{"e", request.ID.Hex()}, {"p", attacker.Public().Hex()}},
+		Content: `{"success":true}`}
+	if err := svc.processEvent(context.Background(), result); err == nil {
+		t.Fatal("worker result with wrong requester echo accepted")
+	}
+	result.Tags[1][1] = operator.Public().Hex()
+	result.Tags = append(result.Tags, nostr.Tag{"commit", "different"})
+	if err := svc.processEvent(context.Background(), result); err == nil {
+		t.Fatal("worker result with mismatched dispatch field accepted")
+	}
+	result.Tags = result.Tags[:2]
+	if err := svc.processEvent(context.Background(), result); err != nil {
+		t.Fatalf("valid worker result rejected: %v", err)
+	}
+
+	workflow := &nostr.Event{PubKey: attacker.Public(), ID: nostr.ID{4}, Kind: relay.KindHiveWorkflowResult,
+		CreatedAt: nostr.Now(), Tags: nostr.Tags{{"e", "run"}, {"status", "success"}}}
+	if err := svc.processEvent(context.Background(), workflow); err == nil {
+		t.Fatal("workflow result from non-publisher accepted")
+	}
+	workflow.PubKey = publisher.Public()
+	workflow.ID = nostr.ID{5}
+	workflow.Tags = append(workflow.Tags, nostr.Tag{"workflow", "other.yml"})
+	if err := svc.processEvent(context.Background(), workflow); err == nil {
+		t.Fatal("workflow result with mismatched dispatch field accepted")
+	}
+	workflow.Tags = workflow.Tags[:2]
+	if err := svc.processEvent(context.Background(), workflow); err != nil {
+		t.Fatalf("delegated publisher result rejected: %v", err)
+	}
+	if len(sink.statuses) != 2 {
+		t.Fatalf("accepted statuses = %d, want 2", len(sink.statuses))
 	}
 }
 

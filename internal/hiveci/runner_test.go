@@ -68,7 +68,7 @@ func TestRunnerRunsActForRepositoryStateAndPublishesCheckAndAudit(t *testing.T) 
 	signer := newFakeSigner(t)
 
 	var published []*nostr.Event
-	r := New(Config{Enabled: true, ActPath: actPath}, st, signer, []string{"wss://relay.invalid"}, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, signer, []string{"wss://relay.invalid"}, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	statusSink := &recordingStatusSink{}
 	r.SetStatusSink(statusSink, "hive-ci")
 	r.publish = func(ctx context.Context, ev *nostr.Event) error {
@@ -131,7 +131,7 @@ func TestRunnerPublishesFailureResultWhenActFails(t *testing.T) {
 	signer := newFakeSigner(t)
 
 	var published []*nostr.Event
-	r := New(Config{Enabled: true, ActPath: actPath}, st, signer, nil, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, signer, nil, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r.publish = func(ctx context.Context, ev *nostr.Event) error {
 		clone := *ev
 		published = append(published, &clone)
@@ -161,6 +161,75 @@ func TestRunnerPublishesFailureResultWhenActFails(t *testing.T) {
 	}
 }
 
+type recordingRemoteDispatcher struct {
+	requests []loom.DispatchRequest
+	enabled  bool
+}
+
+func (d *recordingRemoteDispatcher) Enabled() bool { return d.enabled }
+func (d *recordingRemoteDispatcher) Dispatch(_ context.Context, req loom.DispatchRequest) (bool, error) {
+	d.requests = append(d.requests, req)
+	return true, nil
+}
+
+func TestRunnerRemoteDispatchRequiresResolverAuthorization(t *testing.T) {
+	ctx := context.Background()
+	st, mapping, ownerPriv := newHiveTestStore(t)
+	repo := setupHiveRepo(t, mapping, ".github/workflows/ci.yml")
+	mapping.AnnouncedCloneURL = "https://grasp.example/" + mapping.Npub + "/" + mapping.RepoID + ".git"
+	if err := st.UpsertMapping(ctx, mapping); err != nil {
+		t.Fatal(err)
+	}
+	remote := &recordingRemoteDispatcher{enabled: true}
+	r := New(Config{Enabled: false, TriggerRepos: []string{"*"}}, st, nil, nil, repo.repositoriesDir,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.SetRemoteDispatcher(remote, "remote")
+
+	authorized := signedHiveEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
+	}, "")
+	if err := r.HandleEvent(ctx, authorized, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.requests) != 1 {
+		t.Fatalf("authorized dispatches = %d, want 1", len(remote.requests))
+	}
+	if remote.requests[0].CloneURL != mapping.AnnouncedCloneURL {
+		t.Fatalf("remote clone URL = %q, want public %q", remote.requests[0].CloneURL, mapping.AnnouncedCloneURL)
+	}
+
+	attacker := nostr.Generate()
+	unauthorized := signedHiveEvent(t, attacker.Hex(), relay.KindRepositoryState, nostr.Tags{
+		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
+	}, "")
+	if err := r.HandleEvent(ctx, unauthorized, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.requests) != 1 {
+		t.Fatal("unauthorized author caused a remote dispatch")
+	}
+}
+
+func TestRunnerRemoteOnlyNeverFallsBackToLocal(t *testing.T) {
+	ctx := context.Background()
+	st, mapping, ownerPriv := newHiveTestStore(t)
+	repo := setupHiveRepo(t, mapping, ".gitea/workflows/ci.yml")
+	actPath, argsPath := fakeAct(t, 0)
+	signer := newFakeSigner(t)
+	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}},
+		st, signer, nil, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.SetRemoteDispatcher(&recordingRemoteDispatcher{enabled: false}, "remote")
+	ev := signedHiveEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
+	}, "")
+	if err := r.HandleEvent(ctx, ev, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(argsPath); !os.IsNotExist(err) {
+		t.Fatal("remote-only mode executed local act with an unavailable dispatcher")
+	}
+}
+
 func newHiveTestStore(t *testing.T) (*store.SQLiteStore, store.Mapping, string) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
@@ -184,8 +253,19 @@ func newHiveTestStore(t *testing.T) (*store.SQLiteStore, store.Mapping, string) 
 		SourceEvent:   "seed",
 		HookInstalled: true,
 	}
+	announcement := signedHiveEvent(t, ownerPriv, relay.KindRepositoryAnnouncement,
+		nostr.Tags{{"d", mapping.RepoID}}, "")
+	announcementJSON, err := json.Marshal(announcement)
+	if err != nil {
+		t.Fatalf("marshal announcement: %v", err)
+	}
+	mapping.AnnouncementEventJSON = string(announcementJSON)
 	if err := st.UpsertMapping(context.Background(), mapping); err != nil {
 		t.Fatalf("seed mapping: %v", err)
+	}
+	if err := st.SetAnnouncementEvent(context.Background(), mapping.Npub, mapping.RepoID,
+		string(announcementJSON), announcement.ID.Hex()); err != nil {
+		t.Fatalf("seed announcement: %v", err)
 	}
 	return st, mapping, ownerPriv
 }

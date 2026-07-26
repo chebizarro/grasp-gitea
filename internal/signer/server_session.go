@@ -53,6 +53,23 @@ func (d *DurableSignetSigner) SignEvent(ctx context.Context, ev *nostr.Event) er
 	return nil
 }
 
+// NIP44Encrypt asks the same remote key that authors the job request to encrypt
+// the delegated Hive secret for the selected worker.
+func (d *DurableSignetSigner) NIP44Encrypt(ctx context.Context, target nostr.PubKey, plaintext string) (string, error) {
+	encryptor, ok := d.bunker.(interface {
+		NIP44Encrypt(context.Context, nostr.PubKey, string) (string, error)
+	})
+	if !ok {
+		return "", fmt.Errorf("remote signer does not support NIP-44 encryption")
+	}
+	ciphertext, err := encryptor.NIP44Encrypt(ctx, target, plaintext)
+	if err != nil {
+		return "", err
+	}
+	_ = d.st.TouchBridgeSignerSession(ctx, d.bunkerURI, time.Now())
+	return ciphertext, nil
+}
+
 // ConnectDurableSignetSigner establishes (or resumes) the bridge's NIP-46
 // session with a Signet bunker.
 //

@@ -21,6 +21,7 @@ const (
 )
 
 type Ref struct {
+	DispatchKey                                          string
 	WorkflowRunID, JobRequestID, PublisherPub, WorkerPub string
 	Owner, RepoName, RepoID, CommitSHA, WorkflowPath     string
 	WorkflowRunEvent, JobRequestEvent                    string
@@ -121,7 +122,7 @@ func (s *DurableStatusSink) Set(ctx context.Context, status Status) error {
 
 func persistedStatus(status Status) (store.LoomJob, store.LoomStatusUpdate) {
 	return store.LoomJob{
-			WorkflowRunID: status.Ref.WorkflowRunID, JobRequestID: status.Ref.JobRequestID,
+			DispatchKey: status.Ref.DispatchKey, WorkflowRunID: status.Ref.WorkflowRunID, JobRequestID: status.Ref.JobRequestID,
 			PublisherPub: status.Ref.PublisherPub, WorkerPub: status.Ref.WorkerPub,
 			Owner: status.Ref.Owner, RepoName: status.Ref.RepoName, RepoID: status.Ref.RepoID,
 			CommitSHA: status.Ref.CommitSHA, WorkflowPath: status.Ref.WorkflowPath,

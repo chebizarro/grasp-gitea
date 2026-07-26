@@ -25,6 +25,7 @@ const (
 
 // LoomJob is an immutable correlation record created before work is dispatched.
 type LoomJob struct {
+	DispatchKey          string
 	WorkflowRunID        string
 	JobRequestID         string
 	PublisherPub         string
@@ -42,6 +43,11 @@ type LoomJob struct {
 	StatusEventCreatedAt int64
 	StatusEventID        string
 	DeliveryState        string
+	DispatchState        string
+	DispatchAttempts     int
+	DispatchNextAttempt  time.Time
+	DispatchLastError    string
+	PublishedAt          time.Time
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
 }
@@ -82,6 +88,7 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS loom_jobs (
 			workflow_run_id TEXT PRIMARY KEY,
+			dispatch_key TEXT NOT NULL DEFAULT '',
 			job_request_id TEXT NOT NULL DEFAULT '',
 			publisher_pub TEXT NOT NULL DEFAULT '',
 			worker_pub TEXT NOT NULL DEFAULT '',
@@ -98,6 +105,11 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 			status_event_created_at INTEGER NOT NULL DEFAULT 0,
 			status_event_id TEXT NOT NULL DEFAULT '',
 			delivery_state TEXT NOT NULL DEFAULT 'pending',
+			dispatch_state TEXT NOT NULL DEFAULT '',
+			dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+			dispatch_next_attempt_at INTEGER NOT NULL DEFAULT 0,
+			dispatch_last_error TEXT NOT NULL DEFAULT '',
+			published_at INTEGER NOT NULL DEFAULT 0,
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		)`,
@@ -131,6 +143,28 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("initialize Loom persistence: %w", err)
 		}
+	}
+	// Phase 2 adds durable outbound delivery fields to Phase 1 databases.
+	for column, definition := range map[string]string{
+		"dispatch_key":             "TEXT NOT NULL DEFAULT ''",
+		"dispatch_state":           "TEXT NOT NULL DEFAULT ''",
+		"dispatch_attempts":        "INTEGER NOT NULL DEFAULT 0",
+		"dispatch_next_attempt_at": "INTEGER NOT NULL DEFAULT 0",
+		"dispatch_last_error":      "TEXT NOT NULL DEFAULT ''",
+		"published_at":             "INTEGER NOT NULL DEFAULT 0",
+	} {
+		if err := ensureSQLiteColumn(s.db, "loom_jobs", column, definition); err != nil &&
+			!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return fmt.Errorf("migrate Loom %s: %w", column, err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_loom_jobs_dispatch
+		ON loom_jobs(dispatch_key) WHERE dispatch_key != ''`); err != nil {
+		return fmt.Errorf("initialize Loom dispatch index: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_loom_dispatch_due
+		ON loom_jobs(dispatch_state, dispatch_next_attempt_at, workflow_run_id)`); err != nil {
+		return fmt.Errorf("initialize Loom dispatch due index: %w", err)
 	}
 	return nil
 }
@@ -271,6 +305,104 @@ func (s *SQLiteStore) ClaimLoomJobStatus(ctx context.Context, job LoomJob, updat
 	return true, nil
 }
 
+// ClaimLoomOutbound atomically persists an immutable outbound attempt, its exact
+// signed events, and the initial pending Gitea status before any relay publish.
+// A duplicate logical dispatch returns the previously stored attempt so callers
+// can republish the same event IDs instead of minting a second job.
+func (s *SQLiteStore) ClaimLoomOutbound(ctx context.Context, job LoomJob, update LoomStatusUpdate, now time.Time, ttl time.Duration, maxRows int) (LoomJob, bool, error) {
+	normalizeLoomJob(&job)
+	normalizeLoomStatus(&update)
+	if err := validateLoomJob(job); err != nil {
+		return LoomJob{}, false, err
+	}
+	if job.DispatchKey == "" || job.JobRequestID == "" || job.PublisherPub == "" || job.WorkerPub == "" ||
+		job.WorkflowRunEvent == "" || job.JobRequestEvent == "" {
+		return LoomJob{}, false, fmt.Errorf("complete outbound Loom dispatch is required")
+	}
+	if !validLoomState(update.State) || update.Context == "" {
+		return LoomJob{}, false, fmt.Errorf("complete initial Loom status is required")
+	}
+	now, ttl, maxRows = normalizeLoomBounds(now, ttl, maxRows)
+	if job.CreatedAt.IsZero() {
+		job.CreatedAt = now
+	}
+	if update.AvailableAt.IsZero() {
+		update.AvailableAt = now
+	}
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return LoomJob{}, false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return LoomJob{}, false, err
+	}
+	defer tx.Rollback()
+	existing, lookupErr := getLoomJobTx(ctx, tx, "dispatch_key", job.DispatchKey)
+	if lookupErr == nil {
+		if err := tx.Commit(); err != nil {
+			return LoomJob{}, false, err
+		}
+		return existing, false, nil
+	}
+	if lookupErr != sql.ErrNoRows {
+		return LoomJob{}, false, lookupErr
+	}
+	if err := sweepLoomJobsTx(ctx, tx, now, ttl, maxRows-1); err != nil {
+		return LoomJob{}, false, err
+	}
+	res, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO loom_jobs(
+			workflow_run_id, dispatch_key, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
+			commit_sha, workflow_path, workflow_run_event, job_request_event, status, terminal_source,
+			last_protocol_event_id, delivery_state, dispatch_state, dispatch_next_attempt_at, created_at, updated_at
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', 'pending', ?, ?, ?)
+	`, job.WorkflowRunID, job.DispatchKey, job.JobRequestID, job.PublisherPub, job.WorkerPub,
+		job.Owner, job.RepoName, job.RepoID, job.CommitSHA, job.WorkflowPath,
+		job.WorkflowRunEvent, job.JobRequestEvent, update.State, update.ProtocolEventID,
+		now.Unix(), job.CreatedAt.UTC().Unix(), now.Unix())
+	if err != nil {
+		return LoomJob{}, false, fmt.Errorf("claim outbound Loom job: %w", err)
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return LoomJob{}, false, err
+	}
+	if inserted == 0 {
+		existing, lookupErr := getLoomJobTx(ctx, tx, "dispatch_key", job.DispatchKey)
+		if lookupErr != nil {
+			return LoomJob{}, false, fmt.Errorf("Loom dispatch identity conflicts with an existing attempt: %w", lookupErr)
+		}
+		if err := tx.Commit(); err != nil {
+			return LoomJob{}, false, err
+		}
+		return existing, false, nil
+	}
+	if update.ProtocolEventID != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO loom_job_events(event_id, workflow_run_id, seen_at) VALUES(?, ?, ?)`,
+			update.ProtocolEventID, job.WorkflowRunID, now.Unix()); err != nil {
+			return LoomJob{}, false, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO loom_status_deliveries(
+			workflow_run_id, state, description, context, target_url, protocol_event_id,
+			attempts, next_attempt_at, last_error, updated_at
+		) VALUES(?, ?, ?, ?, ?, ?, 0, ?, '', ?)
+	`, job.WorkflowRunID, update.State, update.Description, update.Context, update.TargetURL,
+		update.ProtocolEventID, update.AvailableAt.Unix(), now.Unix()); err != nil {
+		return LoomJob{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return LoomJob{}, false, err
+	}
+	job.Status = update.State
+	job.DeliveryState = "pending"
+	job.DispatchState = "pending"
+	job.DispatchNextAttempt = now
+	job.UpdatedAt = now
+	return job, true, nil
+}
+
 // GetLoomJobByWorkflowRunID resolves a 5402 or local run.
 func (s *SQLiteStore) GetLoomJobByWorkflowRunID(ctx context.Context, id string) (LoomJob, error) {
 	if err := s.EnsureLoomTables(ctx); err != nil {
@@ -285,6 +417,80 @@ func (s *SQLiteStore) GetLoomJobByRequestID(ctx context.Context, id string) (Loo
 		return LoomJob{}, err
 	}
 	return getLoomJobRow(s.db.QueryRowContext(ctx, loomJobSelectSQL()+" WHERE job_request_id = ?", strings.TrimSpace(id)))
+}
+
+// GetLoomJobByDispatchKey resolves a logical trigger to its immutable signed events.
+func (s *SQLiteStore) GetLoomJobByDispatchKey(ctx context.Context, key string) (LoomJob, error) {
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return LoomJob{}, err
+	}
+	return getLoomJobRow(s.db.QueryRowContext(ctx, loomJobSelectSQL()+" WHERE dispatch_key = ?", strings.TrimSpace(key)))
+}
+
+// ListDueLoomDispatches returns persisted signed events that still need relay acceptance.
+func (s *SQLiteStore) ListDueLoomDispatches(ctx context.Context, now time.Time, limit int) ([]LoomJob, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, loomJobSelectSQL()+
+		" WHERE dispatch_state != '' AND dispatch_state != 'published' AND dispatch_next_attempt_at <= ?"+
+		" ORDER BY dispatch_next_attempt_at, workflow_run_id LIMIT ?", now.Unix(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]LoomJob, 0)
+	for rows.Next() {
+		job, err := getLoomJobRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, job)
+	}
+	return out, rows.Err()
+}
+
+// MarkLoomDispatchPublished records that both exact signed events reached a relay.
+func (s *SQLiteStore) MarkLoomDispatchPublished(ctx context.Context, workflowRunID string, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE loom_jobs SET dispatch_state = 'published', dispatch_last_error = '',
+			published_at = ?, updated_at = ? WHERE workflow_run_id = ?
+	`, now.Unix(), now.Unix(), strings.TrimSpace(workflowRunID))
+	return err
+}
+
+// MarkLoomDispatchRetry records a publish failure without changing signed bytes.
+func (s *SQLiteStore) MarkLoomDispatchRetry(ctx context.Context, workflowRunID string, next time.Time, lastErr string) error {
+	if next.IsZero() {
+		next = time.Now().UTC()
+	}
+	if len(lastErr) > 1000 {
+		lastErr = lastErr[:1000]
+	}
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE loom_jobs SET dispatch_state = 'retrying', dispatch_attempts = dispatch_attempts + 1,
+			dispatch_next_attempt_at = ?, dispatch_last_error = ?, updated_at = ?
+		WHERE workflow_run_id = ? AND dispatch_state != 'published'
+	`, next.Unix(), lastErr, time.Now().UTC().Unix(), strings.TrimSpace(workflowRunID))
+	return err
 }
 
 // ApplyLoomStatus atomically enforces deduplication, replaceable ordering,
@@ -553,24 +759,32 @@ func sweepLoomJobsTx(ctx context.Context, tx *sql.Tx, now time.Time, ttl time.Du
 }
 
 func loomJobSelectSQL() string {
-	return `SELECT workflow_run_id, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
+	return `SELECT dispatch_key, workflow_run_id, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
 		commit_sha, workflow_path, workflow_run_event, job_request_event, status, terminal_source,
-		last_protocol_event_id, status_event_created_at, status_event_id, delivery_state, created_at, updated_at
-		FROM loom_jobs`
+		last_protocol_event_id, status_event_created_at, status_event_id, delivery_state,
+		dispatch_state, dispatch_attempts, dispatch_next_attempt_at, dispatch_last_error, published_at,
+		created_at, updated_at FROM loom_jobs`
 }
 
 type loomScanner interface{ Scan(...any) error }
 
 func getLoomJobRow(row loomScanner) (LoomJob, error) {
 	var job LoomJob
-	var created, updated int64
-	err := row.Scan(&job.WorkflowRunID, &job.JobRequestID, &job.PublisherPub, &job.WorkerPub,
+	var dispatchNext, published, created, updated int64
+	err := row.Scan(&job.DispatchKey, &job.WorkflowRunID, &job.JobRequestID, &job.PublisherPub, &job.WorkerPub,
 		&job.Owner, &job.RepoName, &job.RepoID, &job.CommitSHA, &job.WorkflowPath,
 		&job.WorkflowRunEvent, &job.JobRequestEvent, &job.Status, &job.TerminalSource,
 		&job.LastProtocolEventID, &job.StatusEventCreatedAt, &job.StatusEventID,
-		&job.DeliveryState, &created, &updated)
+		&job.DeliveryState, &job.DispatchState, &job.DispatchAttempts, &dispatchNext,
+		&job.DispatchLastError, &published, &created, &updated)
 	if err != nil {
 		return LoomJob{}, err
+	}
+	if dispatchNext > 0 {
+		job.DispatchNextAttempt = time.Unix(dispatchNext, 0).UTC()
+	}
+	if published > 0 {
+		job.PublishedAt = time.Unix(published, 0).UTC()
 	}
 	job.CreatedAt = time.Unix(created, 0).UTC()
 	job.UpdatedAt = time.Unix(updated, 0).UTC()
@@ -578,7 +792,7 @@ func getLoomJobRow(row loomScanner) (LoomJob, error) {
 }
 
 func getLoomJobTx(ctx context.Context, tx *sql.Tx, column, value string) (LoomJob, error) {
-	if column != "workflow_run_id" && column != "job_request_id" {
+	if column != "workflow_run_id" && column != "job_request_id" && column != "dispatch_key" {
 		return LoomJob{}, fmt.Errorf("invalid Loom lookup column")
 	}
 	return getLoomJobRow(tx.QueryRowContext(ctx, loomJobSelectSQL()+" WHERE "+column+" = ?", value))
@@ -591,6 +805,7 @@ func loomJobCountTx(ctx context.Context, tx *sql.Tx) (int64, error) {
 }
 
 func normalizeLoomJob(job *LoomJob) {
+	job.DispatchKey = strings.TrimSpace(job.DispatchKey)
 	job.WorkflowRunID = strings.TrimSpace(job.WorkflowRunID)
 	job.JobRequestID = strings.TrimSpace(job.JobRequestID)
 	job.PublisherPub = strings.TrimSpace(job.PublisherPub)
@@ -611,7 +826,7 @@ func validateLoomJob(job LoomJob) error {
 }
 
 func sameLoomIdentity(a, b LoomJob) bool {
-	return a.WorkflowRunID == b.WorkflowRunID && a.JobRequestID == b.JobRequestID &&
+	return a.DispatchKey == b.DispatchKey && a.WorkflowRunID == b.WorkflowRunID && a.JobRequestID == b.JobRequestID &&
 		a.PublisherPub == b.PublisherPub && a.WorkerPub == b.WorkerPub &&
 		a.Owner == b.Owner && a.RepoName == b.RepoName && a.RepoID == b.RepoID &&
 		a.CommitSHA == b.CommitSHA && a.WorkflowPath == b.WorkflowPath &&

@@ -52,6 +52,7 @@ var validCommitSHA = regexp.MustCompile(`^[0-9a-fA-F]{40,64}$`)
 type Config struct {
 	Enabled       bool
 	ActPath       string
+	TriggerRepos  []string
 	RunTimeout    time.Duration
 	MaxConcurrent int
 }
@@ -71,6 +72,7 @@ type Signer interface {
 // Runner executes act workflows for received NIP-34 push/PR events.
 type Runner struct {
 	enabled         bool
+	localEnabled    bool
 	actPath         string
 	store           Store
 	signer          Signer
@@ -79,6 +81,7 @@ type Runner struct {
 	logger          *slog.Logger
 	runTimeout      time.Duration
 	runSlots        chan struct{}
+	triggerRepos    []string
 
 	mu      sync.Mutex
 	started map[string]time.Time
@@ -86,6 +89,18 @@ type Runner struct {
 	publish      func(context.Context, *nostr.Event) error
 	statusSink   loom.StatusSink
 	statusPrefix string
+	remote       RemoteDispatcher
+	dispatchMode string
+	authorizer   WorkflowAuthorizer
+}
+
+type WorkflowAuthorizer interface {
+	IsWorkflowAuthorAuthorized(context.Context, store.Mapping, string) (bool, error)
+}
+
+type RemoteDispatcher interface {
+	Enabled() bool
+	Dispatch(context.Context, loom.DispatchRequest) (bool, error)
 }
 
 type branchTip struct {
@@ -132,8 +147,10 @@ func New(cfg Config, st Store, signer Signer, relayURLs []string, repositoriesDi
 	} else if maxConcurrent > 16 {
 		maxConcurrent = 16
 	}
+	localEnabled := cfg.Enabled && st != nil && signer != nil && repositoriesDir != "" && actPath != ""
 	r := &Runner{
-		enabled:         cfg.Enabled && st != nil && signer != nil && repositoriesDir != "" && actPath != "",
+		enabled:         localEnabled,
+		localEnabled:    localEnabled,
 		actPath:         actPath,
 		store:           st,
 		signer:          signer,
@@ -142,6 +159,7 @@ func New(cfg Config, st Store, signer Signer, relayURLs []string, repositoriesDi
 		logger:          logger,
 		runTimeout:      runTimeout,
 		runSlots:        make(chan struct{}, maxConcurrent),
+		triggerRepos:    append([]string(nil), cfg.TriggerRepos...),
 		started:         make(map[string]time.Time),
 	}
 	r.publish = r.publishToRelays
@@ -155,6 +173,30 @@ func (r *Runner) SetStatusSink(sink loom.StatusSink, contextPrefix string) {
 	}
 	r.statusSink = sink
 	r.statusPrefix = strings.TrimSpace(contextPrefix)
+}
+
+// SetWorkflowAuthorizer shares the validated owner/recursive-maintainer pool
+// used by proactive synchronization with local and remote CI.
+func (r *Runner) SetWorkflowAuthorizer(authorizer WorkflowAuthorizer) {
+	if r != nil {
+		r.authorizer = authorizer
+	}
+}
+
+// SetRemoteDispatcher adds canonical Loom execution alongside the local act path.
+func (r *Runner) SetRemoteDispatcher(dispatcher RemoteDispatcher, mode string) {
+	if r == nil {
+		return
+	}
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != "remote" && mode != "both" {
+		mode = "local"
+	}
+	r.remote = dispatcher
+	r.dispatchMode = mode
+	if dispatcher != nil && dispatcher.Enabled() && mode != "local" && r.store != nil && r.repositoriesDir != "" {
+		r.enabled = true
+	}
 }
 
 // Enabled reports whether the runner can execute checks and publish results.
@@ -213,8 +255,13 @@ func (r *Runner) handlePullRequestEvent(ctx context.Context, ev *nostr.Event, so
 }
 
 func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *nostr.Event, sourceRelay, trigger, branch, commit string) error {
-	if !workflowAuthorAuthorized(mapping, ev.PubKey.Hex()) {
-		r.logger.Warn("HiveCI ignored workflow from unauthorized author", "repo", mapping.RepoID, "event", ev.ID.Hex(), "author", ev.PubKey.Hex())
+	if !r.isRepoCIAllowed(mapping.Owner, mapping.RepoID) {
+		return nil
+	}
+	authorized, authErr := r.workflowAuthorAuthorized(ctx, mapping, ev.PubKey.Hex())
+	if authErr != nil || !authorized {
+		r.logger.Warn("HiveCI ignored workflow from unauthorized author", "repo", mapping.RepoID,
+			"event", ev.ID.Hex(), "author", ev.PubKey.Hex(), "error", authErr)
 		return nil
 	}
 	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
@@ -227,6 +274,36 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 		return nil
 	}
 	for _, workflow := range workflows {
+		if r.remote != nil && r.remote.Enabled() && r.dispatchMode != "local" {
+			handled, dispatchErr := r.remote.Dispatch(ctx, loom.DispatchRequest{
+				SourceEventID: ev.ID.Hex(), OwnerPubkey: mapping.Pubkey,
+				Owner: mapping.Owner, RepoName: mapping.RepoName, RepoID: mapping.RepoID,
+				CloneURL:  firstNonEmpty(mapping.AnnouncedCloneURL, mapping.CloneURL),
+				CommitSHA: commit, WorkflowPath: workflow,
+				Branch: branch, Trigger: trigger, TriggeredBy: ev.PubKey.Hex(),
+			})
+			if handled {
+				if dispatchErr != nil {
+					r.logger.Warn("durable Loom dispatch awaits retry", "repo", mapping.RepoID, "workflow", workflow, "error", dispatchErr)
+				}
+				continue
+			}
+			if dispatchErr != nil {
+				return fmt.Errorf("prepare Loom dispatch: %w", dispatchErr)
+			}
+			if r.dispatchMode == "remote" {
+				r.logger.Warn("Loom remote-only workflow has no eligible worker", "repo", mapping.RepoID, "workflow", workflow)
+				continue
+			}
+		}
+		// Remote-only is an execution boundary, not permission to fall back to
+		// local act when the dispatcher is misconfigured or unavailable.
+		if r.dispatchMode == "remote" {
+			continue
+		}
+		if !r.localEnabled {
+			continue
+		}
 		key := runKey(ev.ID.Hex(), commit, workflow)
 		if r.markStarted(key) {
 			continue
@@ -504,15 +581,27 @@ func (r *Runner) mappingForAddress(ctx context.Context, ev *nostr.Event) (store.
 	return mapping, true, nil
 }
 
+func (r *Runner) isRepoCIAllowed(owner, repoID string) bool {
+	target := strings.TrimSpace(owner) + "/" + strings.TrimSpace(repoID)
+	for _, entry := range r.triggerRepos {
+		entry = strings.TrimSpace(entry)
+		if entry == "*" || entry == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Runner) workflowAuthorAuthorized(ctx context.Context, mapping store.Mapping, author string) (bool, error) {
+	if r.authorizer != nil {
+		return r.authorizer.IsWorkflowAuthorAuthorized(ctx, mapping, author)
+	}
+	return workflowAuthorAuthorized(mapping, author), nil
+}
+
 func workflowAuthorAuthorized(mapping store.Mapping, author string) bool {
 	author = strings.TrimSpace(author)
-	if author == "" {
-		return false
-	}
-	if author == strings.TrimSpace(mapping.Pubkey) {
-		return true
-	}
-	if strings.TrimSpace(mapping.AnnouncementEventJSON) == "" {
+	if author == "" || strings.TrimSpace(mapping.AnnouncementEventJSON) == "" {
 		return false
 	}
 	var announcement nostr.Event
@@ -553,11 +642,14 @@ func detectWorkflows(ctx context.Context, repoPath string, commitSHA string) ([]
 	if !validCommitSHA.MatchString(commitSHA) {
 		return nil, fmt.Errorf("invalid commit %q", commitSHA)
 	}
+	if out, err := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "cat-file", "-e", commitSHA+"^{commit}").CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("commit object unavailable: %s: %w", strings.TrimSpace(string(out)), err)
+	}
 	var workflows []string
 	for _, dir := range workflowDirs {
 		found, err := listWorkflowFiles(ctx, repoPath, commitSHA, dir)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		workflows = append(workflows, found...)
 	}

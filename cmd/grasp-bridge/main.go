@@ -134,6 +134,10 @@ func main() {
 	defer shutdownEmbedded(context.Background())
 
 	relayURLs := relaySubscriptionURLs(cfg.RelayURLs, embeddedRelayURL, cfg.GraspRelayURL)
+	loomRelayURLs := append([]string(nil), cfg.LoomRelayURLs...)
+	if len(loomRelayURLs) == 0 {
+		loomRelayURLs = append(loomRelayURLs, cfg.RelayURLs...)
+	}
 
 	var signerSvc *signer.Service
 	if cfg.SignerEnabled() {
@@ -185,30 +189,59 @@ func main() {
 		publisherSvc.SetCIConfig(true, cfg.CITriggerRepos)
 		logger.Warn("legacy Cascadia CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
 	} else if cfg.CIEnabled && cfg.CIProtocol == "canonical" {
-		logger.Warn("canonical outbound Loom submission is deferred to Phase 2; CI_ENABLED publisher disabled")
+		logger.Info("canonical CI uses the Loom dispatcher; legacy CI_ENABLED publisher remains disabled")
 	}
 	statusSink := loom.NewDurableStatusSink(st, giteaClient, cfg.LoomJobTTL, cfg.LoomMaxJobs, logger)
 	if cfg.LoomEnabled || cfg.HiveCIEnabled {
 		go statusSink.Run(ctx)
 	}
 
+	workerPool := loom.NewWorkerPool(loom.WorkerPoolConfig{
+		Allowlist: cfg.LoomWorkerPubkeys, RequiredSoftware: []string{"act"},
+		FutureSkew: cfg.LoomFutureSkew,
+	})
+	var dispatchSigner loom.DispatchSigner
+	if candidate, ok := serverSigner.(loom.DispatchSigner); ok {
+		dispatchSigner = candidate
+	}
+	remoteRequested := cfg.LoomEnabled && cfg.CIProtocol == "canonical" &&
+		(cfg.LoomDispatchMode == "remote" || cfg.LoomDispatchMode == "both")
+	loomDispatcher := loom.NewDispatcher(loom.DispatcherConfig{
+		Enabled: remoteRequested, MaxDuration: cfg.LoomJobMaxDuration,
+		CommandTemplate: cfg.LoomJobCmdTemplate, StaticPaymentToken: cfg.LoomStaticPaymentToken,
+		ContextPrefix: cfg.LoomStatusContextPrefix, RelayURLs: loomRelayURLs,
+		JobTTL: cfg.LoomJobTTL, MaxJobs: cfg.LoomMaxJobs,
+	}, workerPool, st, dispatchSigner, logger)
+	if remoteRequested && !loomDispatcher.Enabled() {
+		if cfg.LoomDispatchMode == "remote" {
+			logger.Error("remote-only Loom dispatch unavailable; check signer NIP-44 support, worker allowlist, and relay URLs")
+			os.Exit(1)
+		}
+		logger.Warn("preferred Loom dispatch unavailable; both mode will use local Hive-CI")
+	}
+	go loomDispatcher.Run(ctx)
+
 	hiveRunner := hiveci.New(hiveci.Config{
 		Enabled:       cfg.HiveCIEnabled,
 		ActPath:       cfg.HiveCIActPath,
+		TriggerRepos:  cfg.CITriggerRepos,
 		RunTimeout:    cfg.HiveCIRunTimeout,
 		MaxConcurrent: cfg.HiveCIMaxConcurrent,
 	}, st, serverSigner, relayURLs, cfg.GiteaRepositoriesDir, logger)
 	hiveRunner.SetStatusSink(statusSink, cfg.LoomStatusContextPrefix)
+	hiveRunner.SetWorkflowAuthorizer(proactiveSyncSvc)
+	hiveRunner.SetRemoteDispatcher(loomDispatcher, cfg.LoomDispatchMode)
 	loomSvc := loom.New(loom.Config{
 		Enabled: cfg.LoomEnabled, ContextPrefix: cfg.LoomStatusContextPrefix,
 		FutureSkew: cfg.LoomFutureSkew, ResultGrace: cfg.LoomResultGrace,
 	}, st, statusSink, logger)
 	loomSvc.Run(ctx)
 
-	if cfg.HiveCIEnabled && !hiveRunner.Enabled() {
-		logger.Warn("Hive-CI requested but disabled; check server signer, repositories path, and act path")
-	} else if hiveRunner.Enabled() {
-		logger.Info("Hive-CI Tier A runner enabled", "act_path", cfg.HiveCIActPath)
+	if cfg.HiveCIEnabled {
+		logger.Info("Hive-CI Tier A runner configured", "act_path", cfg.HiveCIActPath)
+	}
+	if loomDispatcher.Enabled() {
+		logger.Info("canonical Loom outbound dispatcher enabled", "mode", cfg.LoomDispatchMode, "relays", loomRelayURLs)
 	}
 
 	var outboxDone chan struct{}
@@ -349,16 +382,19 @@ func main() {
 	// configured external relay set rather than the merged embedded set.
 	var loomSubscriber *relay.Subscriber
 	if loomSvc.Enabled() {
-		loomRelayURLs := append([]string(nil), cfg.LoomRelayURLs...)
-		if len(loomRelayURLs) == 0 {
-			loomRelayURLs = append(loomRelayURLs, cfg.RelayURLs...)
-		}
 		if len(loomRelayURLs) == 0 {
 			logger.Warn("Loom enabled without an external LOOM_RELAY_URLS/RELAY_URLS subscriber")
 		} else {
+			loomHandler := func(ctx context.Context, ev *nostr.Event, sourceRelay string) error {
+				if ev != nil && ev.Kind == relay.KindLoomWorkerAd {
+					return workerPool.HandleEvent(ev, time.Now().UTC())
+				}
+				return loomSvc.HandleEvent(ctx, ev, sourceRelay)
+			}
 			loomSubscriber = relay.NewWithKinds(loomRelayURLs, []nostr.Kind{
-				relay.KindLoomJobStatus, relay.KindLoomJobResult, relay.KindHiveWorkflowResult,
-			}, loomSvc.HandleEvent, logger)
+				relay.KindLoomWorkerAd, relay.KindLoomJobStatus,
+				relay.KindLoomJobResult, relay.KindHiveWorkflowResult,
+			}, loomHandler, logger)
 			loomSubscriber.Run(ctx)
 			logger.Info("canonical Loom inbound subscriber enabled", "relays", loomRelayURLs)
 		}

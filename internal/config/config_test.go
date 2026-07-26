@@ -9,6 +9,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"fiatjaf.com/nostr"
 )
 
 // setEnvs sets multiple environment variables and returns a cleanup function.
@@ -282,6 +284,28 @@ func TestLoadLoomPhaseOneConfig(t *testing.T) {
 	}
 }
 
+func TestLoadLoomRemoteRequiresTrustedFleetGuards(t *testing.T) {
+	base := map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",
+		"RELAY_URLS": "wss://repo-relay", "LOOM_ENABLED": "true",
+		"LOOM_DISPATCH_MODE": "remote", "CI_PROTOCOL": "canonical",
+	}
+	setEnvs(t, base)
+	if _, err := Load(); err == nil {
+		t.Fatal("remote Loom without CI_TRIGGER_REPOS/worker allowlist accepted")
+	}
+	base["CI_TRIGGER_REPOS"] = "*"
+	base["LOOM_WORKER_PUBKEYS"] = nostr.Generate().Public().Hex()
+	setEnvs(t, base)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("trusted-fleet remote config rejected: %v", err)
+	}
+	if cfg.LoomDispatchMode != "remote" || len(cfg.LoomWorkerPubkeys) != 1 {
+		t.Fatalf("unexpected remote Loom config: %#v", cfg)
+	}
+}
+
 func TestLoadRejectsEmbeddedOnlyLoom(t *testing.T) {
 	setEnvs(t, map[string]string{
 		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",
@@ -359,6 +383,7 @@ func TestLoadOverridesAllFields(t *testing.T) {
 		"PROACTIVE_SYNC_INTERVAL": "30m",
 		"HIVE_CI_ENABLED":         "true",
 		"HIVE_CI_ACT_PATH":        "/opt/bin/act",
+		"CI_TRIGGER_REPOS":        "*",
 	})
 
 	cfg, err := Load()

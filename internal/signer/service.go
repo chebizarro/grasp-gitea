@@ -48,6 +48,18 @@ type managedBunkerSigner struct {
 	once   sync.Once
 }
 
+// NIP44Encrypt forwards optional encryption without erasing it behind the
+// narrower persistent BunkerSigner interface.
+func (m *managedBunkerSigner) NIP44Encrypt(ctx context.Context, target nostr.PubKey, plaintext string) (string, error) {
+	encryptor, ok := m.BunkerSigner.(interface {
+		NIP44Encrypt(context.Context, nostr.PubKey, string) (string, error)
+	})
+	if !ok {
+		return "", fmt.Errorf("remote signer does not support NIP-44 encryption")
+	}
+	return encryptor.NIP44Encrypt(ctx, target, plaintext)
+}
+
 func (m *managedBunkerSigner) close() {
 	if m != nil {
 		m.once.Do(m.cancel)

@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"fiatjaf.com/nostr"
 )
 
 type Config struct {
@@ -72,7 +74,7 @@ type Config struct {
 	HiveCIRunTimeout    time.Duration
 	HiveCIMaxConcurrent int
 
-	// Loom consumes canonical 30100/5101/5402 results. Phase 1 is inbound-only.
+	// Loom consumes canonical ads/results and dispatches trusted-fleet Hive-CI jobs.
 	LoomEnabled             bool
 	LoomDispatchMode        string
 	LoomWorkerPubkeys       []string
@@ -171,6 +173,30 @@ func Load() (Config, error) {
 	}
 	if cfg.LoomDispatchMode != "local" && cfg.LoomDispatchMode != "remote" && cfg.LoomDispatchMode != "both" {
 		return Config{}, fmt.Errorf("LOOM_DISPATCH_MODE must be local, remote, or both")
+	}
+	if !cfg.LoomEnabled && cfg.LoomDispatchMode != "local" {
+		return Config{}, fmt.Errorf("LOOM_ENABLED=true is required for non-local LOOM_DISPATCH_MODE")
+	}
+	if cfg.HiveCIEnabled && len(cfg.CITriggerRepos) == 0 {
+		return Config{}, fmt.Errorf("CI_TRIGGER_REPOS is required when HIVE_CI_ENABLED=true")
+	}
+	if cfg.LoomEnabled && cfg.LoomDispatchMode != "local" {
+		if cfg.CIProtocol != "canonical" {
+			return Config{}, fmt.Errorf("remote Loom dispatch requires CI_PROTOCOL=canonical")
+		}
+		if len(cfg.CITriggerRepos) == 0 {
+			return Config{}, fmt.Errorf("CI_TRIGGER_REPOS is required for remote Loom dispatch")
+		}
+		if len(cfg.LoomWorkerPubkeys) == 0 {
+			return Config{}, fmt.Errorf("LOOM_WORKER_PUBKEYS is required for trusted-fleet remote dispatch")
+		}
+		for i, raw := range cfg.LoomWorkerPubkeys {
+			pk, err := nostr.PubKeyFromHex(raw)
+			if err != nil {
+				return Config{}, fmt.Errorf("invalid LOOM_WORKER_PUBKEYS entry %q: %w", raw, err)
+			}
+			cfg.LoomWorkerPubkeys[i] = pk.Hex()
+		}
 	}
 	if cfg.CIProtocol != "canonical" && cfg.CIProtocol != "cascadia" {
 		return Config{}, fmt.Errorf("CI_PROTOCOL must be canonical or cascadia")

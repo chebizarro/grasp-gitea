@@ -7,6 +7,7 @@ import (
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip19"
+	"fiatjaf.com/nostr/nip44"
 
 	"git.sharegap.net/cascadia/cascadia-go/signet"
 )
@@ -35,6 +36,14 @@ func (s *localServerSigner) PublicKey() string { return s.pubKey }
 
 func (s *localServerSigner) SignEvent(_ context.Context, ev *nostr.Event) error {
 	return ev.Sign(s.privKey)
+}
+
+func (s *localServerSigner) NIP44Encrypt(_ context.Context, target nostr.PubKey, plaintext string) (string, error) {
+	key, err := nip44.GenerateConversationKey(target, s.privKey)
+	if err != nil {
+		return "", err
+	}
+	return nip44.Encrypt(plaintext, key)
 }
 
 type signetBunkerServerSigner struct {
@@ -70,4 +79,14 @@ func (s *signetBunkerServerSigner) SignEvent(ctx context.Context, ev *nostr.Even
 		return fmt.Errorf("event is required")
 	}
 	return s.signer.SignEvent(ctx, ev)
+}
+
+func (s *signetBunkerServerSigner) NIP44Encrypt(ctx context.Context, target nostr.PubKey, plaintext string) (string, error) {
+	encryptor, ok := s.signer.(interface {
+		NIP44Encrypt(context.Context, nostr.PubKey, string) (string, error)
+	})
+	if !ok {
+		return "", fmt.Errorf("Signet signer does not support NIP-44 encryption")
+	}
+	return encryptor.NIP44Encrypt(ctx, target, plaintext)
 }

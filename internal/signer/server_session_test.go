@@ -13,8 +13,9 @@ import (
 )
 
 type fakeSessionBunker struct {
-	pubkey nostr.PubKey
-	signed int
+	pubkey    nostr.PubKey
+	signed    int
+	encrypted int
 }
 
 func (f *fakeSessionBunker) Ping(context.Context) error { return nil }
@@ -25,6 +26,10 @@ func (f *fakeSessionBunker) SignEvent(context.Context, *nostr.Event) error {
 	f.signed++
 	return nil
 }
+func (f *fakeSessionBunker) NIP44Encrypt(_ context.Context, target nostr.PubKey, plaintext string) (string, error) {
+	f.encrypted++
+	return target.Hex() + ":" + plaintext, nil
+}
 
 func openSessionStore(t *testing.T) *store.SQLiteStore {
 	t.Helper()
@@ -34,6 +39,20 @@ func openSessionStore(t *testing.T) *store.SQLiteStore {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
+}
+
+func TestDurableSignerForwardsNIP44ThroughManagedBunker(t *testing.T) {
+	inner := &fakeSessionBunker{pubkey: nostr.Generate().Public()}
+	managed := &managedBunkerSigner{BunkerSigner: inner, cancel: func() {}}
+	durable := &DurableSignetSigner{bunker: managed, pubKey: inner.pubkey.Hex(), st: openSessionStore(t)}
+	target := nostr.Generate().Public()
+	got, err := durable.NIP44Encrypt(context.Background(), target, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != target.Hex()+":secret" || inner.encrypted != 1 {
+		t.Fatalf("forwarded NIP-44 = %q, calls=%d", got, inner.encrypted)
+	}
 }
 
 func TestSealUnsealSessionSecretRoundTrip(t *testing.T) {
