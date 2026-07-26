@@ -78,6 +78,19 @@ func TestRunAndWaitWithCancelledContext(t *testing.T) {
 	}
 }
 
+func TestDedicatedSubscriberUsesCanonicalLoomKinds(t *testing.T) {
+	s := NewWithKinds(nil, []nostr.Kind{KindLoomJobStatus, KindLoomJobResult, KindHiveWorkflowResult},
+		func(context.Context, *nostr.Event, string) error { return nil }, testLogger())
+	got := s.filter().Kinds
+	if len(got) != 3 || got[0] != KindLoomJobStatus || got[1] != KindLoomJobResult || got[2] != KindHiveWorkflowResult {
+		t.Fatalf("dedicated kinds = %v", got)
+	}
+	if KindLoomJobRequest != 5100 || KindLoomJobResult != 5101 || KindLoomJobStatus != 30100 ||
+		KindLoomJobCancel != 5102 || KindHiveWorkflowRun != 5401 || KindHiveWorkflowResult != 5402 {
+		t.Fatal("canonical Loom/Hive-CI kind constants changed")
+	}
+}
+
 func TestKindConstants(t *testing.T) {
 	if KindRepositoryAnnouncement != 30617 {
 		t.Errorf("KindRepositoryAnnouncement: expected 30617, got %d", KindRepositoryAnnouncement)

@@ -18,9 +18,22 @@ import (
 
 	"fiatjaf.com/nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/loom"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
+
+type recordingStatusSink struct{ statuses []loom.Status }
+
+func (s *recordingStatusSink) Claim(_ context.Context, status loom.Status) (bool, error) {
+	s.statuses = append(s.statuses, status)
+	return true, nil
+}
+
+func (s *recordingStatusSink) Set(_ context.Context, status loom.Status) error {
+	s.statuses = append(s.statuses, status)
+	return nil
+}
 
 type fakeSigner struct {
 	priv string
@@ -56,6 +69,8 @@ func TestRunnerRunsActForRepositoryStateAndPublishesCheckAndAudit(t *testing.T) 
 
 	var published []*nostr.Event
 	r := New(Config{Enabled: true, ActPath: actPath}, st, signer, []string{"wss://relay.invalid"}, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statusSink := &recordingStatusSink{}
+	r.SetStatusSink(statusSink, "hive-ci")
 	r.publish = func(ctx context.Context, ev *nostr.Event) error {
 		clone := *ev
 		clone.Tags = append(nostr.Tags(nil), ev.Tags...)
@@ -74,6 +89,15 @@ func TestRunnerRunsActForRepositoryStateAndPublishesCheckAndAudit(t *testing.T) 
 
 	if len(published) != 2 {
 		t.Fatalf("published events = %d, want 2", len(published))
+	}
+	if len(statusSink.statuses) != 2 || statusSink.statuses[0].State != store.LoomStatusPending ||
+		statusSink.statuses[1].State != store.LoomStatusSuccess {
+		t.Fatalf("commit statuses = %#v, want pending -> success", statusSink.statuses)
+	}
+	for _, status := range statusSink.statuses {
+		if status.Ref.CommitSHA != repo.commit || status.Ref.Owner != mapping.Owner || status.Ref.RepoName != mapping.RepoName {
+			t.Fatalf("status not anchored to local dispatch record: %#v", status)
+		}
 	}
 	if published[0].Kind != relay.KindCheckRunResult || published[1].Kind != relay.KindCASAudit {
 		t.Fatalf("published kinds = %d/%d", published[0].Kind, published[1].Kind)

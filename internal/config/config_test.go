@@ -266,6 +266,33 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadLoomPhaseOneConfig(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",
+		"RELAY_URLS": "wss://repo-relay", "LOOM_ENABLED": "true",
+		"LOOM_RELAY_URLS":            "wss://loom-one,wss://loom-two",
+		"LOOM_STATUS_CONTEXT_PREFIX": "checks", "CI_PROTOCOL": "canonical",
+	})
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.LoomEnabled || len(cfg.LoomRelayURLs) != 2 || cfg.LoomStatusContextPrefix != "checks" {
+		t.Fatalf("unexpected Loom config: enabled=%v relays=%v prefix=%q", cfg.LoomEnabled, cfg.LoomRelayURLs, cfg.LoomStatusContextPrefix)
+	}
+}
+
+func TestLoadRejectsEmbeddedOnlyLoom(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",
+		"RELAY_URLS": "", "EMBEDDED_RELAY": "true", "LOOM_ENABLED": "true",
+		"LOOM_RELAY_URLS": "",
+	})
+	if _, err := Load(); err == nil {
+		t.Fatal("expected embedded-only Loom configuration to fail closed")
+	}
+}
+
 func TestLoadSignerMasterKey(t *testing.T) {
 	key := []byte("12345678901234567890123456789012")
 	for _, tt := range []struct {

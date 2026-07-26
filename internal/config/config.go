@@ -72,50 +72,80 @@ type Config struct {
 	HiveCIRunTimeout    time.Duration
 	HiveCIMaxConcurrent int
 
+	// Loom consumes canonical 30100/5101/5402 results. Phase 1 is inbound-only.
+	LoomEnabled             bool
+	LoomDispatchMode        string
+	LoomWorkerPubkeys       []string
+	LoomRelayURLs           []string
+	LoomJobMaxDuration      time.Duration
+	LoomJobCmdTemplate      string
+	LoomStatusContextPrefix string
+	LoomMintURL             string
+	LoomStaticPaymentToken  string
+	LoomJobTTL              time.Duration
+	LoomMaxJobs             int
+	LoomFutureSkew          time.Duration
+	LoomResultGrace         time.Duration
+	CIProtocol              string
+
 	// NIP34StatusSyncEnabled updates Gitea issue state from inbound NIP-34 status events.
 	NIP34StatusSyncEnabled bool
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		GiteaURL:               envOrDefault("GITEA_URL", "http://gitea:3000"),
-		GiteaAdminToken:        strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
-		ClonePrefix:            strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
-		RelayURLs:              csvEnv("RELAY_URLS"),
-		Listen:                 envOrDefault("LISTEN", ":8090"),
-		DBPath:                 envOrDefault("DB_PATH", "./mappings.db"),
-		PubkeyAllowlist:        parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
-		ProvisionRateLimit:     intEnv("PROVISION_RATE_LIMIT", 0),
-		HookRelayURL:           envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),
-		HookBinaryPath:         envOrDefault("HOOK_BINARY_PATH", "/usr/local/bin/grasp-pre-receive"),
-		GiteaRepositoriesDir:   envOrDefault("GITEA_REPOSITORIES_PATH", "/gitea-data/git/repositories"),
-		EmbeddedRelay:          boolEnv("EMBEDDED_RELAY", false),
-		EmbeddedRelayPort:      intEnv("EMBEDDED_RELAY_PORT", 3334),
-		EmbeddedRelayDB:        envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
-		ArchiveMode:            boolEnv("GRASP05_ARCHIVE_MODE", false),
-		AdminAPIToken:          strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
-		AuthEnabled:            boolEnv("AUTH_ENABLED", false),
-		BridgePublicURL:        strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
-		ChallengeTTL:           durationEnv("CHALLENGE_TTL", 5*time.Minute),
-		NIP46TrustedProxyCIDRs: csvEnv("NIP46_TRUSTED_PROXY_CIDRS"),
-		ProactiveSyncInterval:  normalizeProactiveSyncInterval(durationEnv("PROACTIVE_SYNC_INTERVAL", time.Hour)),
-		SignerMasterKey:        nil,
-		SignetBunkerURL:        strings.TrimSpace(os.Getenv("SIGNET_BUNKER_URL")),
-		BridgeNsec:             strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
-		Environment:            firstEnv("GRASP_ENV", "APP_ENV", "ENVIRONMENT"),
-		MirrorCallbackToken:    strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
-		GiteaWebhookSecret:     strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
-		GraspPublicURL:         strings.TrimRight(strings.TrimSpace(os.Getenv("GRASP_PUBLIC_URL")), "/"),
-		GraspRelayURL:          strings.TrimRight(strings.TrimSpace(os.Getenv("GRASP_RELAY_URL")), "/"),
-		GitBackendUser:         strings.TrimSpace(os.Getenv("GIT_BACKEND_USER")),
-		GitBackendPassword:     strings.TrimSpace(os.Getenv("GIT_BACKEND_PASSWORD")),
-		CIEnabled:              boolEnv("CI_ENABLED", false),
-		CITriggerRepos:         csvEnv("CI_TRIGGER_REPOS"),
-		HiveCIEnabled:          boolEnv("HIVE_CI_ENABLED", false),
-		HiveCIActPath:          envOrDefault("HIVE_CI_ACT_PATH", "/usr/bin/act"),
-		HiveCIRunTimeout:       boundedDurationEnv("HIVE_CI_RUN_TIMEOUT", 15*time.Minute, time.Second, time.Hour),
-		HiveCIMaxConcurrent:    boundedIntEnv("HIVE_CI_MAX_CONCURRENT", 2, 1, 16),
-		NIP34StatusSyncEnabled: boolEnv("NIP34_STATUS_SYNC_ENABLED", false),
+		GiteaURL:                envOrDefault("GITEA_URL", "http://gitea:3000"),
+		GiteaAdminToken:         strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
+		ClonePrefix:             strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
+		RelayURLs:               csvEnv("RELAY_URLS"),
+		Listen:                  envOrDefault("LISTEN", ":8090"),
+		DBPath:                  envOrDefault("DB_PATH", "./mappings.db"),
+		PubkeyAllowlist:         parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
+		ProvisionRateLimit:      intEnv("PROVISION_RATE_LIMIT", 0),
+		HookRelayURL:            envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),
+		HookBinaryPath:          envOrDefault("HOOK_BINARY_PATH", "/usr/local/bin/grasp-pre-receive"),
+		GiteaRepositoriesDir:    envOrDefault("GITEA_REPOSITORIES_PATH", "/gitea-data/git/repositories"),
+		EmbeddedRelay:           boolEnv("EMBEDDED_RELAY", false),
+		EmbeddedRelayPort:       intEnv("EMBEDDED_RELAY_PORT", 3334),
+		EmbeddedRelayDB:         envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
+		ArchiveMode:             boolEnv("GRASP05_ARCHIVE_MODE", false),
+		AdminAPIToken:           strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
+		AuthEnabled:             boolEnv("AUTH_ENABLED", false),
+		BridgePublicURL:         strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
+		ChallengeTTL:            durationEnv("CHALLENGE_TTL", 5*time.Minute),
+		NIP46TrustedProxyCIDRs:  csvEnv("NIP46_TRUSTED_PROXY_CIDRS"),
+		ProactiveSyncInterval:   normalizeProactiveSyncInterval(durationEnv("PROACTIVE_SYNC_INTERVAL", time.Hour)),
+		SignerMasterKey:         nil,
+		SignetBunkerURL:         strings.TrimSpace(os.Getenv("SIGNET_BUNKER_URL")),
+		BridgeNsec:              strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
+		Environment:             firstEnv("GRASP_ENV", "APP_ENV", "ENVIRONMENT"),
+		MirrorCallbackToken:     strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
+		GiteaWebhookSecret:      strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
+		GraspPublicURL:          strings.TrimRight(strings.TrimSpace(os.Getenv("GRASP_PUBLIC_URL")), "/"),
+		GraspRelayURL:           strings.TrimRight(strings.TrimSpace(os.Getenv("GRASP_RELAY_URL")), "/"),
+		GitBackendUser:          strings.TrimSpace(os.Getenv("GIT_BACKEND_USER")),
+		GitBackendPassword:      strings.TrimSpace(os.Getenv("GIT_BACKEND_PASSWORD")),
+		CIEnabled:               boolEnv("CI_ENABLED", false),
+		CITriggerRepos:          csvEnv("CI_TRIGGER_REPOS"),
+		HiveCIEnabled:           boolEnv("HIVE_CI_ENABLED", false),
+		HiveCIActPath:           envOrDefault("HIVE_CI_ACT_PATH", "/usr/bin/act"),
+		HiveCIRunTimeout:        boundedDurationEnv("HIVE_CI_RUN_TIMEOUT", 15*time.Minute, time.Second, time.Hour),
+		HiveCIMaxConcurrent:     boundedIntEnv("HIVE_CI_MAX_CONCURRENT", 2, 1, 16),
+		LoomEnabled:             boolEnv("LOOM_ENABLED", false),
+		LoomDispatchMode:        strings.ToLower(envOrDefault("LOOM_DISPATCH_MODE", "local")),
+		LoomWorkerPubkeys:       csvEnv("LOOM_WORKER_PUBKEYS"),
+		LoomRelayURLs:           csvEnv("LOOM_RELAY_URLS"),
+		LoomJobMaxDuration:      boundedDurationEnv("LOOM_JOB_MAX_DURATION", 15*time.Minute, time.Second, time.Hour),
+		LoomJobCmdTemplate:      strings.TrimSpace(os.Getenv("LOOM_JOB_CMD_TEMPLATE")),
+		LoomStatusContextPrefix: envOrDefault("LOOM_STATUS_CONTEXT_PREFIX", "hive-ci"),
+		LoomMintURL:             strings.TrimSpace(os.Getenv("LOOM_MINT_URL")),
+		LoomStaticPaymentToken:  strings.TrimSpace(os.Getenv("LOOM_STATIC_PAYMENT_TOKEN")),
+		LoomJobTTL:              boundedDurationEnv("LOOM_JOB_TTL", 7*24*time.Hour, time.Hour, 30*24*time.Hour),
+		LoomMaxJobs:             boundedIntEnv("LOOM_MAX_JOBS", 4096, 1, 100000),
+		LoomFutureSkew:          boundedDurationEnv("LOOM_FUTURE_SKEW", 5*time.Minute, time.Second, time.Hour),
+		LoomResultGrace:         boundedDurationEnv("LOOM_RESULT_GRACE", 30*time.Second, time.Second, 10*time.Minute),
+		CIProtocol:              strings.ToLower(envOrDefault("CI_PROTOCOL", "canonical")),
+		NIP34StatusSyncEnabled:  boolEnv("NIP34_STATUS_SYNC_ENABLED", false),
 	}
 
 	signerMasterKey, err := parseSignerMasterKey(os.Getenv("SIGNER_MASTER_KEY"))
@@ -134,6 +164,16 @@ func Load() (Config, error) {
 
 	if len(cfg.RelayURLs) == 0 && !cfg.EmbeddedRelay {
 		return Config{}, fmt.Errorf("RELAY_URLS is required (or set EMBEDDED_RELAY=true for embedded-only mode)")
+	}
+
+	if cfg.LoomEnabled && len(cfg.LoomRelayURLs) == 0 && len(cfg.RelayURLs) == 0 {
+		return Config{}, fmt.Errorf("LOOM_RELAY_URLS or external RELAY_URLS is required when LOOM_ENABLED=true; the embedded relay rejects Loom kinds")
+	}
+	if cfg.LoomDispatchMode != "local" && cfg.LoomDispatchMode != "remote" && cfg.LoomDispatchMode != "both" {
+		return Config{}, fmt.Errorf("LOOM_DISPATCH_MODE must be local, remote, or both")
+	}
+	if cfg.CIProtocol != "canonical" && cfg.CIProtocol != "cascadia" {
+		return Config{}, fmt.Errorf("CI_PROTOCOL must be canonical or cascadia")
 	}
 
 	if cfg.AuthEnabled && cfg.BridgePublicURL == "" {

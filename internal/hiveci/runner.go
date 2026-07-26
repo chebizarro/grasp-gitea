@@ -26,6 +26,8 @@ import (
 
 	"fiatjaf.com/nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/loom"
+	"github.com/sharegap/grasp-gitea/internal/nostrauthz"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -81,7 +83,9 @@ type Runner struct {
 	mu      sync.Mutex
 	started map[string]time.Time
 
-	publish func(context.Context, *nostr.Event) error
+	publish      func(context.Context, *nostr.Event) error
+	statusSink   loom.StatusSink
+	statusPrefix string
 }
 
 type branchTip struct {
@@ -142,6 +146,15 @@ func New(cfg Config, st Store, signer Signer, relayURLs []string, repositoriesDi
 	}
 	r.publish = r.publishToRelays
 	return r
+}
+
+// SetStatusSink routes local Tier-A results through the shared durable sink.
+func (r *Runner) SetStatusSink(sink loom.StatusSink, contextPrefix string) {
+	if r == nil {
+		return
+	}
+	r.statusSink = sink
+	r.statusPrefix = strings.TrimSpace(contextPrefix)
 }
 
 // Enabled reports whether the runner can execute checks and publish results.
@@ -218,9 +231,28 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 		if r.markStarted(key) {
 			continue
 		}
-		record := r.runWorkflow(ctx, mapping, ev, sourceRelay, trigger, branch, commit, workflow)
-		if err := r.publishRun(ctx, mapping, record); err != nil {
+		ref := localStatusRef(mapping, ev, trigger, commit, workflow)
+		claimed, err := r.claimCommitStatus(ctx, ref, "hive-ci: workflow queued")
+		if err != nil {
 			r.unmarkStarted(key)
+			return fmt.Errorf("persist HiveCI execution claim: %w", err)
+		}
+		if !claimed {
+			// A prior process already started or completed this immutable attempt.
+			// Delivery retries must never acquire execution ownership.
+			continue
+		}
+		record := r.runWorkflow(ctx, mapping, ev, sourceRelay, trigger, branch, commit, workflow)
+		terminalState := store.LoomStatusFailure
+		if record.Result == "success" {
+			terminalState = store.LoomStatusSuccess
+		}
+		if err := r.setCommitStatus(ctx, ref, terminalState, "hive-ci: "+record.Reason, "terminal"); err != nil {
+			// Delivery persistence is deliberately outside the execution/retry path:
+			// a Gitea failure must never cause act to run again.
+			r.logger.Error("HiveCI terminal status enqueue failed", "repo", mapping.RepoID, "workflow", workflow, "error", err)
+		}
+		if err := r.publishRun(ctx, mapping, record); err != nil {
 			return err
 		}
 		r.logger.Info("HiveCI check run published", "repo", mapping.RepoID, "branch", branch, "workflow", workflow, "commit", commit, "result", record.Result)
@@ -483,30 +515,13 @@ func workflowAuthorAuthorized(mapping store.Mapping, author string) bool {
 	if strings.TrimSpace(mapping.AnnouncementEventJSON) == "" {
 		return false
 	}
-
 	var announcement nostr.Event
 	if err := json.Unmarshal([]byte(mapping.AnnouncementEventJSON), &announcement); err != nil {
 		return false
 	}
-	if int(announcement.Kind) != relay.KindRepositoryAnnouncement ||
-		announcement.PubKey.Hex() != mapping.Pubkey ||
-		tagValue(announcement.Tags, "d") != mapping.RepoID {
-		return false
-	}
-	if err := nostrverify.ValidateEventIDAndSignature(&announcement); err != nil {
-		return false
-	}
-	for _, tag := range announcement.Tags {
-		if len(tag) < 2 || tag[0] != "maintainers" {
-			continue
-		}
-		for _, maintainer := range tag[1:] {
-			if strings.TrimSpace(maintainer) == author {
-				return true
-			}
-		}
-	}
-	return false
+	coord := fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement, mapping.Pubkey, mapping.RepoID)
+	ok, err := nostrauthz.NewResolver([]nostr.Event{announcement}).IsAuthorized(author, coord)
+	return err == nil && ok
 }
 
 func branchTips(tags nostr.Tags) []branchTip {
@@ -605,6 +620,37 @@ func (r *Runner) unmarkStarted(key string) {
 
 func runKey(eventID, commit, workflow string) string {
 	return eventID + ":" + commit + ":" + workflow
+}
+
+func localStatusRef(mapping store.Mapping, ev *nostr.Event, trigger, commit, workflow string) loom.Ref {
+	rec := runRecord{SourceEventID: ev.ID.Hex(), Commit: commit, Workflow: workflow, Trigger: trigger}
+	return loom.Ref{
+		WorkflowRunID: "local:" + stableRunID(rec), Owner: mapping.Owner,
+		RepoName: mapping.RepoName, RepoID: mapping.RepoID, CommitSHA: commit,
+		WorkflowPath: workflow,
+	}
+}
+
+func (r *Runner) claimCommitStatus(ctx context.Context, ref loom.Ref, description string) (bool, error) {
+	if r.statusSink == nil {
+		return true, nil
+	}
+	return r.statusSink.Claim(ctx, loom.Status{
+		Ref: ref, State: store.LoomStatusPending, Description: description,
+		Context: loom.Context(r.statusPrefix, ref.WorkflowPath), Source: store.LoomSourceLocal,
+		ProtocolEventID: ref.WorkflowRunID + ":pending",
+	})
+}
+
+func (r *Runner) setCommitStatus(ctx context.Context, ref loom.Ref, state, description, phase string) error {
+	if r.statusSink == nil {
+		return nil
+	}
+	return r.statusSink.Set(ctx, loom.Status{
+		Ref: ref, State: state, Description: description,
+		Context: loom.Context(r.statusPrefix, ref.WorkflowPath), Source: store.LoomSourceLocal,
+		ProtocolEventID: ref.WorkflowRunID + ":" + phase,
+	})
 }
 
 func stableRunID(rec runRecord) string {

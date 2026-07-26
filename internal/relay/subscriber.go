@@ -18,6 +18,7 @@ type Subscriber struct {
 	relays  []string
 	handler Handler
 	logger  *slog.Logger
+	kinds   []nostr.Kind
 	wg      sync.WaitGroup
 }
 
@@ -61,6 +62,18 @@ func (s *Subscriber) Wait() {
 	s.wg.Wait()
 }
 
+// NewWithKinds creates a dedicated subscriber with an explicit kind filter.
+func NewWithKinds(relays []string, kinds []nostr.Kind, handler Handler, logger *slog.Logger) *Subscriber {
+	return &Subscriber{relays: relays, kinds: append([]nostr.Kind(nil), kinds...), handler: handler, logger: logger}
+}
+
+func (s *Subscriber) filter() nostr.Filter {
+	if len(s.kinds) != 0 {
+		return nostr.Filter{Kinds: append([]nostr.Kind(nil), s.kinds...)}
+	}
+	return subscriptionFilter()
+}
+
 func (s *Subscriber) watchRelay(ctx context.Context, relayURL string) {
 	for {
 		select {
@@ -76,7 +89,7 @@ func (s *Subscriber) watchRelay(ctx context.Context, relayURL string) {
 			continue
 		}
 
-		sub, err := relay.Subscribe(ctx, subscriptionFilter(), nostr.SubscriptionOptions{})
+		sub, err := relay.Subscribe(ctx, s.filter(), nostr.SubscriptionOptions{})
 		if err != nil {
 			s.logger.Error("failed to subscribe relay", "relay", relayURL, "error", err)
 			relay.Close()

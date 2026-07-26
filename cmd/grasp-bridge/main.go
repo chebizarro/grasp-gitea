@@ -22,6 +22,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/hiveci"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
+	"github.com/sharegap/grasp-gitea/internal/loom"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/outbox"
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
@@ -180,16 +181,30 @@ func main() {
 		defer closer.Close()
 	}
 	publisherSvc := publisher.NewWithServerSigner(serverSigner, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
-	if cfg.CIEnabled && publisherSvc.Enabled() {
+	if cfg.CIEnabled && cfg.CIProtocol == "cascadia" && publisherSvc.Enabled() {
 		publisherSvc.SetCIConfig(true, cfg.CITriggerRepos)
-		logger.Info("CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
+		logger.Warn("legacy Cascadia CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
+	} else if cfg.CIEnabled && cfg.CIProtocol == "canonical" {
+		logger.Warn("canonical outbound Loom submission is deferred to Phase 2; CI_ENABLED publisher disabled")
 	}
+	statusSink := loom.NewDurableStatusSink(st, giteaClient, cfg.LoomJobTTL, cfg.LoomMaxJobs, logger)
+	if cfg.LoomEnabled || cfg.HiveCIEnabled {
+		go statusSink.Run(ctx)
+	}
+
 	hiveRunner := hiveci.New(hiveci.Config{
 		Enabled:       cfg.HiveCIEnabled,
 		ActPath:       cfg.HiveCIActPath,
 		RunTimeout:    cfg.HiveCIRunTimeout,
 		MaxConcurrent: cfg.HiveCIMaxConcurrent,
 	}, st, serverSigner, relayURLs, cfg.GiteaRepositoriesDir, logger)
+	hiveRunner.SetStatusSink(statusSink, cfg.LoomStatusContextPrefix)
+	loomSvc := loom.New(loom.Config{
+		Enabled: cfg.LoomEnabled, ContextPrefix: cfg.LoomStatusContextPrefix,
+		FutureSkew: cfg.LoomFutureSkew, ResultGrace: cfg.LoomResultGrace,
+	}, st, statusSink, logger)
+	loomSvc.Run(ctx)
+
 	if cfg.HiveCIEnabled && !hiveRunner.Enabled() {
 		logger.Warn("Hive-CI requested but disabled; check server signer, repositories path, and act path")
 	} else if hiveRunner.Enabled() {
@@ -307,7 +322,7 @@ func main() {
 
 			// CI trigger runs before proactive sync so local refs
 			// still reflect the previous state for change detection.
-			if publisherSvc != nil {
+			if publisherSvc != nil && cfg.CIProtocol == "cascadia" {
 				if ciErr := publisherSvc.HandleStateEventCI(ctx, ev, sourceRelay); ciErr != nil {
 					logger.Warn("CI workflow-run trigger failed", "event", ev.ID, "error", ciErr)
 				}
@@ -329,6 +344,26 @@ func main() {
 	subscriber := relay.New(relayURLs, handler, logger)
 	subscriber.Run(ctx)
 
+	// Loom rides a dedicated subscriber: the embedded repository relay rejects
+	// these canonical kinds, so an empty LOOM_RELAY_URLS falls back only to the
+	// configured external relay set rather than the merged embedded set.
+	var loomSubscriber *relay.Subscriber
+	if loomSvc.Enabled() {
+		loomRelayURLs := append([]string(nil), cfg.LoomRelayURLs...)
+		if len(loomRelayURLs) == 0 {
+			loomRelayURLs = append(loomRelayURLs, cfg.RelayURLs...)
+		}
+		if len(loomRelayURLs) == 0 {
+			logger.Warn("Loom enabled without an external LOOM_RELAY_URLS/RELAY_URLS subscriber")
+		} else {
+			loomSubscriber = relay.NewWithKinds(loomRelayURLs, []nostr.Kind{
+				relay.KindLoomJobStatus, relay.KindLoomJobResult, relay.KindHiveWorkflowResult,
+			}, loomSvc.HandleEvent, logger)
+			loomSubscriber.Run(ctx)
+			logger.Info("canonical Loom inbound subscriber enabled", "relays", loomRelayURLs)
+		}
+	}
+
 	httpServer := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           apiServer.Handler(),
@@ -349,6 +384,9 @@ func main() {
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
 	subscriber.Wait()
+	if loomSubscriber != nil {
+		loomSubscriber.Wait()
+	}
 	select {
 	case <-proactiveSyncDone:
 	case <-shutdownCtx.Done():
