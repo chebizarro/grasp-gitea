@@ -5,18 +5,27 @@ package nip05resolve
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip05"
+
+	"github.com/sharegap/grasp-gitea/internal/nostrverify"
+	"github.com/sharegap/grasp-gitea/internal/safefetch"
 )
 
 // resolveTimeout is the per-relay timeout for NIP-05 resolution.
 const resolveTimeout = 8 * time.Second
+
+var nip05HTTPClient = safefetch.NewClient()
 
 // cacheEntry holds a cached org name resolution result.
 type cacheEntry struct {
@@ -138,6 +147,15 @@ func resolveFromRelay(ctx context.Context, pubkey string, relayURL string) (stri
 	if ev == nil {
 		return "", nil // no profile on this relay
 	}
+	if ev.Kind != 0 {
+		return "", fmt.Errorf("relay %s returned kind %d for kind-0 query", relayURL, ev.Kind)
+	}
+	if ev.PubKey != pk {
+		return "", fmt.Errorf("relay %s returned kind-0 event for unexpected author %s", relayURL, ev.PubKey.Hex())
+	}
+	if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
+		return "", fmt.Errorf("relay %s returned invalid kind-0 event: %w", relayURL, err)
+	}
 
 	var profile struct {
 		NIP05 string `json:"nip05"`
@@ -149,25 +167,92 @@ func resolveFromRelay(ctx context.Context, pubkey string, relayURL string) (stri
 		return "", nil // profile exists but no NIP-05 set
 	}
 
-	localPart, _, err := nip05.ParseIdentifier(profile.NIP05)
+	localPart, domain, err := nip05.ParseIdentifier(profile.NIP05)
 	if err != nil {
 		return "", nil // invalid NIP-05 format
 	}
 
-	// Verify the NIP-05 identifier resolves back to this pubkey.
-	pointer, err := nip05.QueryIdentifier(ctx, profile.NIP05)
-	if err != nil {
+	// Verify the NIP-05 identifier resolves back to this pubkey. The domain is
+	// attacker-controlled profile content, so the well-known request must use
+	// the same guarded egress policy as avatar downloads.
+	if err := verifyIdentifier(ctx, localPart, domain, pk); err != nil {
 		return "", nil // verification failed, not a relay error
 	}
-	if pointer.PublicKey != pk {
-		return "", nil // NIP-05 points to a different pubkey
-	}
 
-	name := sanitize(localPart)
+	name := qualifiedName(localPart, domain, pubkey)
 	if name == "" {
 		return "", nil
 	}
 	return name, nil
+}
+
+func verifyIdentifier(ctx context.Context, localPart, domain string, expected nostr.PubKey) error {
+	u := url.URL{Scheme: "https", Host: domain, Path: "/.well-known/nostr.json"}
+	q := u.Query()
+	q.Set("name", localPart)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := nip05HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("NIP-05 endpoint returned HTTP %d", resp.StatusCode)
+	}
+
+	const maxResponseSize = 1 << 20
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
+	if err != nil {
+		return err
+	}
+	if len(raw) > maxResponseSize {
+		return fmt.Errorf("NIP-05 response exceeds %d-byte limit", maxResponseSize)
+	}
+
+	var result nip05.WellKnownResponse
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return err
+	}
+	resolved, ok := result.Names[localPart]
+	if !ok {
+		return fmt.Errorf("NIP-05 response has no entry for %q", localPart)
+	}
+	if resolved != expected {
+		return fmt.Errorf("NIP-05 identifier resolves to a different pubkey")
+	}
+	return nil
+}
+
+// qualifiedName creates a stable, visibly domain-qualified Gitea namespace.
+// Fixed component budgets ensure truncation can never discard the domain, while
+// the 80-bit identity suffix prevents practical collisions and NIP-05
+// reassignment from taking over a namespace owned by a different key.
+func qualifiedName(localPart, domain, pubkey string) string {
+	canonicalDomain := strings.ToLower(strings.TrimSuffix(domain, "."))
+	localComponent := truncateComponent(sanitize(localPart), 8)
+	domainComponent := truncateComponent(sanitize(canonicalDomain), 9)
+	if localComponent == "" {
+		localComponent = "user"
+	}
+	if domainComponent == "" {
+		domainComponent = "domain"
+	}
+
+	canonicalIdentifier := strings.ToLower(localPart) + "@" + canonicalDomain
+	sum := sha256.Sum256([]byte(canonicalIdentifier + "\x00" + strings.ToLower(pubkey)))
+	return localComponent + "-" + domainComponent + fmt.Sprintf("-%x", sum[:10])
+}
+
+func truncateComponent(value string, limit int) string {
+	if len(value) > limit {
+		value = value[:limit]
+	}
+	return strings.Trim(value, "-.")
 }
 
 // hexFallback returns the first 39 hex chars of a pubkey.

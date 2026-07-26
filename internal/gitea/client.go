@@ -72,6 +72,22 @@ func NewClient(baseURL string, token string) *Client {
 	}
 }
 
+// CreateOrg creates a new organization and fails if the name is already in
+// use. Use this for an unlinked external identity so an existing tenant cannot
+// be silently adopted.
+func (c *Client) CreateOrg(ctx context.Context, org string) error {
+	payload := map[string]any{
+		"username":   org,
+		"visibility": "public",
+	}
+	if _, err := c.doJSON(ctx, http.MethodPost, "/api/v1/orgs", payload); err != nil {
+		return fmt.Errorf("create unlinked org %q: %w", org, err)
+	}
+	return nil
+}
+
+// EnsureOrg is idempotent and may accept an existing organization. Callers must
+// use it only after a durable ownership link has been established.
 func (c *Client) EnsureOrg(ctx context.Context, org string) error {
 	_, err := c.getOrg(ctx, org)
 	if err == nil {
@@ -96,6 +112,30 @@ func (c *Client) EnsureOrg(ctx context.Context, org string) error {
 	return err
 }
 
+// CreateRepo creates a new repository and fails if org/repo already exists.
+// Use this when no durable ownership link exists for the repository.
+func (c *Client) CreateRepo(ctx context.Context, org string, repo string) (Repository, error) {
+	body := map[string]any{
+		"name":      repo,
+		"private":   false,
+		"auto_init": false,
+	}
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/orgs/"+url.PathEscape(org)+"/repos", body)
+	if err != nil {
+		return Repository{}, fmt.Errorf("create unlinked repo %q/%q: %w", org, repo, err)
+	}
+	out, err := parseRepo(resp)
+	if err != nil {
+		return Repository{}, err
+	}
+	if out.Owner == "" {
+		out.Owner = org
+	}
+	return out, nil
+}
+
+// EnsureRepo is idempotent and may accept an existing repository. Callers must
+// use it only after a durable ownership link has been established.
 func (c *Client) EnsureRepo(ctx context.Context, org string, repo string) (Repository, error) {
 	existing, err := c.GetRepo(ctx, org, repo)
 	if err == nil {

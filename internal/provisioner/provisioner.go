@@ -2,11 +2,12 @@ package provisioner
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"log/slog"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -56,10 +57,10 @@ func New(cfg config.Config, st *store.SQLiteStore, g *gitea.Client, installer *h
 	}
 }
 
-// lockRepo acquires a per-repo mutex, preventing concurrent provisioning
-// for the same (npub, repoID) pair.
-func (s *Service) lockRepo(npub, repoID string) *sync.Mutex {
-	key := npub + "\x00" + repoID
+// lockRepo serializes namespace provisioning for one Nostr owner. This avoids
+// two repositories racing to create or claim the same organization.
+func (s *Service) lockRepo(npub, _ string) *sync.Mutex {
+	key := npub
 	s.repoMu.Lock()
 	mu, ok := s.repoLocks[key]
 	if !ok {
@@ -69,6 +70,39 @@ func (s *Service) lockRepo(npub, repoID string) *sync.Mutex {
 	s.repoMu.Unlock()
 	mu.Lock()
 	return mu
+}
+
+// linkedOwner returns the organization explicitly linked to this Nostr
+// identity by an existing repository mapping.
+func (s *Service) linkedOwner(ctx context.Context, npub, pubkey string) (string, bool, error) {
+	mappings, err := s.store.ListMappings(ctx)
+	if err != nil {
+		return "", false, fmt.Errorf("list ownership links: %w", err)
+	}
+	owner := ""
+	for _, m := range mappings {
+		if m.Npub != npub {
+			continue
+		}
+		if m.Pubkey != pubkey {
+			return "", false, fmt.Errorf("stored identity mismatch for %s", npub)
+		}
+		if m.Owner == "" {
+			return "", false, fmt.Errorf("stored ownership link for %s has no organization", npub)
+		}
+		if owner != "" && owner != m.Owner {
+			return "", false, fmt.Errorf("conflicting organization links for %s: %s and %s", npub, owner, m.Owner)
+		}
+		owner = m.Owner
+	}
+	if owner != "" {
+		for _, m := range mappings {
+			if strings.EqualFold(m.Owner, owner) && m.Pubkey != pubkey {
+				return "", false, fmt.Errorf("organization %s is linked to multiple Nostr identities", owner)
+			}
+		}
+	}
+	return owner, owner != "", nil
 }
 
 func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, relayURL string) error {
@@ -119,13 +153,22 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 			return fmt.Errorf("check existing mapping: %w", err)
 		}
 		if exists {
-			// Look up actual org name from the store mapping, since the repo
-			// was created under the NIP-05-resolved orgName, not the npub.
 			mapping, lookupErr := s.store.GetMapping(ctx, npub, repoID)
-			orgName := npub
-			if lookupErr == nil && mapping.Owner != "" {
-				orgName = mapping.Owner
+			if lookupErr != nil || mapping.Pubkey != ev.PubKey.Hex() || mapping.Owner == "" || mapping.GiteaRepoID <= 0 {
+				metrics.IncAnnouncementRejected()
+				return fmt.Errorf("refuse archive without a valid ownership link for %s/%s", npub, repoID)
 			}
+			linkedOwner, linked, linkErr := s.linkedOwner(ctx, npub, ev.PubKey.Hex())
+			if linkErr != nil || !linked || !strings.EqualFold(linkedOwner, mapping.Owner) {
+				metrics.IncAnnouncementRejected()
+				return fmt.Errorf("refuse archive with ambiguous ownership link for %s/%s", npub, repoID)
+			}
+			repo, repoErr := s.gitea.GetRepo(ctx, mapping.Owner, repoID)
+			if repoErr != nil || repo.ID != mapping.GiteaRepoID || !strings.EqualFold(repo.Owner, mapping.Owner) || repo.Name != mapping.RepoName {
+				metrics.IncAnnouncementRejected()
+				return fmt.Errorf("refuse archive: Gitea repository does not match mapping for %s/%s", npub, repoID)
+			}
+			orgName := mapping.Owner
 			if err := s.gitea.ArchiveRepo(ctx, orgName, repoID); err != nil {
 				metrics.IncAnnouncementRejected()
 				return fmt.Errorf("archive repo %s/%s after clone tag removal: %w", orgName, repoID, err)
@@ -208,28 +251,65 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		return err
 	}
 
-	// Serialize concurrent provisioning for the same (npub, repoID).
+	// Serialize all namespace provisioning for this Nostr owner.
 	mu := s.lockRepo(npub, repoID)
 	defer mu.Unlock()
 
-	// Resolve a short, human-readable org name via NIP-05 (cached).
-	// Falls back to a hex prefix if no verified NIP-05 is found.
 	relayURLs := s.cfg.RelayURLs
 	if sourceRelay != "manual" && sourceRelay != "" {
 		// Try the source relay first (it just delivered this event, likely has kind 0 too).
 		relayURLs = append([]string{sourceRelay}, relayURLs...)
 	}
-	orgName := s.resolver.ResolveOrgName(ctx, pubkey, relayURLs)
 
-	s.logger.Info("resolved org name", "npub", npub, "org_name", orgName)
+	// A stored mapping is the explicit ownership link that permits an existing
+	// Gitea namespace to be reused. Without one, creation is strict and any
+	// pre-existing org/repo causes provisioning to fail closed.
+	existing, err := s.store.GetMapping(ctx, npub, repoID)
+	exactLinked := err == nil
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("lookup ownership link: %w", err)
+	}
+
+	orgName := ""
+	orgLinked := false
+	if exactLinked {
+		if existing.Pubkey != pubkey || existing.Owner == "" || existing.GiteaRepoID <= 0 {
+			return fmt.Errorf("stored mapping %s/%s does not match announcing identity", npub, repoID)
+		}
+		orgName = existing.Owner
+		linkedOwner, linked, linkErr := s.linkedOwner(ctx, npub, pubkey)
+		if linkErr != nil {
+			return linkErr
+		}
+		if !linked || !strings.EqualFold(linkedOwner, orgName) {
+			return fmt.Errorf("stored mapping %s/%s has an inconsistent organization link", npub, repoID)
+		}
+		orgLinked = true
+	} else {
+		orgName, orgLinked, err = s.linkedOwner(ctx, npub, pubkey)
+		if err != nil {
+			return err
+		}
+	}
+	if !orgLinked {
+		// Resolve a stable domain-qualified NIP-05 name, falling back to a
+		// collision-resistant hex prefix when no verified identifier exists.
+		orgName = s.resolver.ResolveOrgName(ctx, pubkey, relayURLs)
+	}
+
+	s.logger.Info("resolved org ownership", "npub", npub, "org_name", orgName, "linked", orgLinked)
 
 	// Preserve the original announced clone URL for traceability.
-	// The actual Gitea clone URL uses the resolved org name.
+	// The actual Gitea clone URL uses the linked/resolved org name.
 	announcedCloneURL := cloneURL
 	giteaCloneURL := fmt.Sprintf("%s/%s/%s.git", s.cfg.ClonePrefix, orgName, repoID)
 
-	if err := s.gitea.EnsureOrg(ctx, orgName); err != nil {
-		return fmt.Errorf("ensure org %s: %w", orgName, err)
+	if orgLinked {
+		if err := s.gitea.EnsureOrg(ctx, orgName); err != nil {
+			return fmt.Errorf("ensure linked org %s: %w", orgName, err)
+		}
+	} else if err := s.gitea.CreateOrg(ctx, orgName); err != nil {
+		return fmt.Errorf("create unlinked org %s: %w", orgName, err)
 	}
 
 	// Sync kind:0 profile into the Gitea org (non-fatal — don't block provisioning).
@@ -243,9 +323,20 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		}
 	}
 
-	repo, err := s.gitea.EnsureRepo(ctx, orgName, repoID)
-	if err != nil {
-		return fmt.Errorf("ensure repo %s/%s: %w", orgName, repoID, err)
+	var repo gitea.Repository
+	if exactLinked {
+		repo, err = s.gitea.EnsureRepo(ctx, orgName, repoID)
+		if err != nil {
+			return fmt.Errorf("ensure linked repo %s/%s: %w", orgName, repoID, err)
+		}
+		if repo.ID != existing.GiteaRepoID {
+			return fmt.Errorf("linked repo %s/%s has Gitea id %d, expected %d", orgName, repoID, repo.ID, existing.GiteaRepoID)
+		}
+	} else {
+		repo, err = s.gitea.CreateRepo(ctx, orgName, repoID)
+		if err != nil {
+			return fmt.Errorf("create unlinked repo %s/%s: %w", orgName, repoID, err)
+		}
 	}
 
 	// Phase 1: Record mapping with hook_installed=false.
@@ -315,7 +406,13 @@ func (s *Service) ReconcileHooks(ctx context.Context) error {
 
 	var reconcileErrors []error
 	for _, m := range pending {
-		// Re-ensure org and repo exist (idempotent), then install hook.
+		// Reuse resources only after validating the durable identity link and
+		// exact Gitea repository ID.
+		linkedOwner, linked, linkErr := s.linkedOwner(ctx, m.Npub, m.Pubkey)
+		if linkErr != nil || !linked || !strings.EqualFold(linkedOwner, m.Owner) {
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: invalid ownership link: %v", m.Owner, m.RepoID, linkErr))
+			continue
+		}
 		if err := s.gitea.EnsureOrg(ctx, m.Owner); err != nil {
 			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: ensure org: %w", m.Owner, m.RepoID, err))
 			continue

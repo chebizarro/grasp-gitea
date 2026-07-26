@@ -235,7 +235,8 @@ func Open(path string) (*SQLiteStore, error) {
 			nip05 TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
-			last_login_at TEXT NOT NULL DEFAULT ''
+			last_login_at TEXT NOT NULL DEFAULT '',
+			UNIQUE (gitea_user_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS nip46_sessions (
 			session_token TEXT PRIMARY KEY,
@@ -350,6 +351,19 @@ func Open(path string) (*SQLiteStore, error) {
 	_, _ = db.Exec(`ALTER TABLE nostr_identity_links ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`UPDATE nostr_identity_links SET gitea_user = gitea_username WHERE gitea_user = ''`)
 	_, _ = db.Exec(`UPDATE nostr_identity_links SET updated_at = created_at WHERE updated_at = ''`)
+	var duplicateGiteaUserIDs string
+	if err := db.QueryRow(`SELECT COALESCE(group_concat(gitea_user_id, ', '), '') FROM (SELECT gitea_user_id FROM nostr_identity_links GROUP BY gitea_user_id HAVING COUNT(*) > 1 ORDER BY gitea_user_id)`).Scan(&duplicateGiteaUserIDs); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("check duplicate Gitea identity mappings: %w", err)
+	}
+	if duplicateGiteaUserIDs != "" {
+		_ = db.Close()
+		return nil, fmt.Errorf("duplicate Gitea identity mappings for user IDs %s; resolve them before restart", duplicateGiteaUserIDs)
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_nostr_identity_links_gitea_user_id ON nostr_identity_links(gitea_user_id)`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("enforce unique Gitea identity mapping: %w", err)
+	}
 
 	// Migration: early NIP-46 sessions used status/auth_code/error_msg. Retain
 	// their state while moving to the canonical state/result_pubkey/error names.

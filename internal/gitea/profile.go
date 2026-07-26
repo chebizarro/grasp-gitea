@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sharegap/grasp-gitea/internal/nostrprofile"
+	"github.com/sharegap/grasp-gitea/internal/safefetch"
 )
 
 // UpdateOrgProfile syncs a Nostr kind:0 Profile into a Gitea org.
@@ -121,8 +122,11 @@ func (c *Client) SyncNostrProfile(ctx context.Context, username string, org stri
 	return nil
 }
 
+var avatarHTTPClient = safefetch.NewClient()
+
 // downloadImage fetches an image URL and returns the raw bytes and content-type.
-// Enforces a 5s timeout and a 2MB size limit.
+// Enforces a 5s timeout and a strict 2MB size limit. The safefetch client
+// requires HTTPS and rejects private/reserved destinations on every redirect.
 func downloadImage(ctx context.Context, imageURL string) ([]byte, string, error) {
 	dlCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -132,7 +136,7 @@ func downloadImage(ctx context.Context, imageURL string) ([]byte, string, error)
 		return nil, "", err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := avatarHTTPClient.Do(req)
 	if err != nil {
 		return nil, "", err
 	}
@@ -143,21 +147,14 @@ func downloadImage(ctx context.Context, imageURL string) ([]byte, string, error)
 	}
 
 	const maxSize = 2 << 20 // 2MB
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
 	if err != nil {
 		return nil, "", err
 	}
-
-	ct := resp.Header.Get("Content-Type")
-	// Strip charset suffix if present (e.g. "image/jpeg; charset=utf-8")
-	if i := len(ct); i > 0 {
-		for j := 0; j < len(ct); j++ {
-			if ct[j] == ';' {
-				ct = ct[:j]
-				break
-			}
-		}
+	if len(data) > maxSize {
+		return nil, "", fmt.Errorf("avatar exceeds %d-byte size limit", maxSize)
 	}
 
-	return data, ct, nil
+	// Do not trust the remote Content-Type header; sniff the bounded payload.
+	return data, http.DetectContentType(data), nil
 }

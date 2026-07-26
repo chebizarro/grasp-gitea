@@ -114,20 +114,12 @@ func (s *IdentityService) ResolveOrCreate(ctx context.Context, pubkey string, re
 
 	email := username + "@nostr.local"
 
-	// Attempt to create the Gitea user.
+	// Creation is deliberately strict: a same-named existing account is not an
+	// ownership proof and must never be adopted. Existing accounts require a
+	// separately persisted identity link before this path is entered.
 	user, err := s.giteaClient.CreateUser(ctx, username, email, password)
 	if err != nil {
-		// If the username already exists (conflict), try to look it up.
-		if !gitea.IsNotFound(err) {
-			// It might be a 409/422 for existing user. Try GetUser.
-			existingUser, getErr := s.giteaClient.GetUser(ctx, username)
-			if getErr != nil {
-				return ResolvedIdentity{}, fmt.Errorf("create user %q failed (%w) and lookup also failed: %v", username, err, getErr)
-			}
-			user = existingUser
-		} else {
-			return ResolvedIdentity{}, fmt.Errorf("create user %q: %w", username, err)
-		}
+		return ResolvedIdentity{}, fmt.Errorf("create unlinked user %q: %w", username, err)
 	}
 
 	// Persist the identity link.

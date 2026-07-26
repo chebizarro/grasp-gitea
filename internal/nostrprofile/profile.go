@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"fiatjaf.com/nostr"
+
+	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 )
 
 // Profile holds the fields from a Nostr kind:0 metadata event that are
@@ -82,6 +84,15 @@ func fetchFromRelay(ctx context.Context, pk nostr.PubKey, relayURL string) (*Pro
 
 	select {
 	case ev := <-sub.Events:
+		if ev.Kind != 0 {
+			return nil, fmt.Errorf("relay %s returned kind %d for kind-0 query", relayURL, ev.Kind)
+		}
+		if ev.PubKey != pk {
+			return nil, fmt.Errorf("relay %s returned kind-0 event for unexpected author %s", relayURL, ev.PubKey.Hex())
+		}
+		if err := nostrverify.ValidateEventIDAndSignature(&ev); err != nil {
+			return nil, fmt.Errorf("relay %s returned invalid kind-0 event: %w", relayURL, err)
+		}
 		return parse(ev.Content)
 	case <-sub.EndOfStoredEvents:
 		return nil, nil // no kind:0 stored on this relay

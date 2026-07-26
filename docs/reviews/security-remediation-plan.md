@@ -48,12 +48,12 @@ Owns: NEW `internal/safefetch/*`, `internal/gitea/profile.go`,
 `internal/nostrprofile/profile.go`, `internal/provisioner/provisioner.go`,
 `internal/auth/identity.go`, identity uniqueness constraint in `internal/store/sqlite.go`.
 Done when:
-- [ ] `internal/safefetch` blocks non-HTTPS + private/loopback/link-local/metadata
+- [x] `internal/safefetch` blocks non-HTTPS + private/loopback/link-local/metadata
       addrs including across redirects; avatar download uses it.
-- [ ] NIP-05 org/user/repo names are domain-qualified/collision-resistant;
+- [x] NIP-05 org/user/repo names are domain-qualified/collision-resistant;
       existing Gitea org/user never silently adopted; explicit ownership-link
       required; DB uniqueness constraint on gitea identity.
-- [ ] kind-0 events rejected unless event id/sig/author validate.
+- [x] kind-0 events rejected unless event id/sig/author validate.
 
 ### Item D — API / signer / CI / config hardening  [Wave 1]
 Beads: phase1-7fr (P0 fail-closed admin), phase1-5tt (P0 Hive owner-only),
@@ -133,6 +133,7 @@ path, config, then implement. Do design pass before code.
 - 2026-07-25 Item C: `internal/safefetch` now compiles. Items A/B can use `safefetch.ValidateGitCloneURL(ctx, rawURL)` immediately before Git clone/fetch; guarded HTTP callers should use `safefetch.NewClient()`.
 
 ## Progress log
+- 2026-07-25: Item C completed guarded HTTP/clone URL validation, avatar and NIP-05 egress protection, domain-qualified identity naming with explicit mapping-backed adoption, unique Gitea identity enforcement, and kind-0 cryptographic/author validation. Focused tests, scoped vet, and full build pass; full tests are blocked only by concurrent Item D API expectation updates.
 - 2026-07-25: Item A completed inbound state authorization, owner-coordinate
   purgatory routing, owner-signed outbox tracking, and safefetch clone guarding;
   focused/default full-tag package gates pass.
