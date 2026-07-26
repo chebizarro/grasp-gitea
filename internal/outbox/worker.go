@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
+	"github.com/sharegap/grasp-gitea/internal/nostrstate"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -56,6 +58,7 @@ type Store interface {
 	EnqueueOutboundEvent(ctx context.Context, ev store.OutboundEvent, now time.Time) (bool, error)
 	ClaimDueOutboundEvents(ctx context.Context, now time.Time, limit int, lease time.Duration) ([]store.OutboundEvent, error)
 	MarkOutboundPublished(ctx context.Context, id int64, publishedEventID string) error
+	RecordStatePublished(ctx context.Context, npub, repoID, digest, stateEventID string, at time.Time) error
 	MarkOutboundRetry(ctx context.Context, id int64, nextAttemptAt time.Time, lastErr string) error
 	MarkOutboundDead(ctx context.Context, id int64, lastErr string) error
 	OutboundQueueCounts(ctx context.Context) (store.OutboundQueueCounts, error)
@@ -255,6 +258,20 @@ func (w *Worker) process(ctx context.Context, row store.OutboundEvent) error {
 	ev.Kind = nostr.Kind(row.Kind)
 	ev.PubKey = authorPK
 
+	var stateNpub, stateRepoID, stateDigest string
+	if ev.Kind == nostr.KindRepositoryState {
+		d := ev.Tags.Find("d")
+		if d == nil || len(d) < 2 || strings.TrimSpace(d[1]) == "" {
+			return w.fail(ctx, row, fmt.Errorf("owner-signed repository state missing d tag"))
+		}
+		stateRepoID = strings.TrimSpace(d[1])
+		stateDigest, err = nostrstate.EventStateDigest(&ev)
+		if err != nil {
+			return w.fail(ctx, row, fmt.Errorf("digest owner-signed repository state: %w", err))
+		}
+		stateNpub = nip19.EncodeNpub(authorPK)
+	}
+
 	signCtx, signCancel := context.WithTimeout(ctx, w.cfg.SignTimeout)
 	err = w.signer.SignWithGrant(signCtx, row.AuthorPubkey, &ev)
 	signCancel()
@@ -269,6 +286,11 @@ func (w *Worker) process(ctx context.Context, row store.OutboundEvent) error {
 		return w.fail(ctx, row, err)
 	}
 
+	if ev.Kind == nostr.KindRepositoryState {
+		if err := w.store.RecordStatePublished(ctx, stateNpub, stateRepoID, stateDigest, ev.ID.Hex(), w.clock.Now()); err != nil {
+			return fmt.Errorf("record owner-signed state publication: %w", err)
+		}
+	}
 	if err := w.store.MarkOutboundPublished(ctx, row.ID, ev.ID.Hex()); err != nil {
 		return fmt.Errorf("mark outbound published: %w", err)
 	}

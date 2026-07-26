@@ -33,13 +33,13 @@ Owns: `internal/proactivesync/service.go`, `cmd/grasp-bridge/embedded_full.go`,
 `internal/publisher/service.go`, `internal/outbox/worker.go`,
 `internal/nostrstate/state.go`, NEW `internal/nostrauthz/*`.
 Done when:
-- [ ] Unauthorized kind:30618 (author not owner/maintainer) rejected before any
+- [x] Unauthorized kind:30618 (author not owner/maintainer) rejected before any
       ref mutation; `p` treated as hint only; ref-deletion attack test added.
-- [ ] Maintainer/bridge-signed state resolves to correct repo via validated owner
+- [x] Maintainer/bridge-signed state resolves to correct repo via validated owner
       coordinate and is held in purgatory when git objects are absent.
-- [ ] `mappings.last_state_digest` advances after owner-signed outbox publication.
-- [ ] `internal/nostrauthz` exports the resolver used by Item B.
-- [ ] Wire `internal/safefetch` (from Item C) into the proactivesync clone fetch.
+- [x] `mappings.last_state_digest` advances after owner-signed outbox publication.
+- [x] `internal/nostrauthz` exports the resolver used by Item B.
+- [x] Wire `internal/safefetch` (from Item C) into the proactivesync clone fetch.
 
 ### Item C — SSRF guard + identity/NIP-05 hardening  [Wave 1]
 Beads: phase1-l91 (P0 SSRF), phase1-6k7 (P0 NIP-05 collisions), phase1-9w4 (P1 kind-0 validation).
@@ -123,7 +123,17 @@ path, config, then implement. Do design pass before code.
 ---
 
 ## Cross-item notes (append as you go)
+- 2026-07-25 Item A → Item B: build a `nostrauthz.Resolver` from the current,
+  valid signed kind:30617 announcement pool, then call
+  `resolver.IsAuthorized(pubkey, repoCoord)`; event `p`/`a` values are hints,
+  never authority.
+- 2026-07-25 Item A → Item D: `proactivesync.Service.AuthorizeStateEvent` is
+  available as a mutation-free gate. Wire it in `cmd/grasp-bridge/main.go`
+  before `HandleStateEventCI`; Item A could not edit Item D's owned file.
 - 2026-07-25 Item C: `internal/safefetch` now compiles. Items A/B can use `safefetch.ValidateGitCloneURL(ctx, rawURL)` immediately before Git clone/fetch; guarded HTTP callers should use `safefetch.NewClient()`.
 
 ## Progress log
+- 2026-07-25: Item A completed inbound state authorization, owner-coordinate
+  purgatory routing, owner-signed outbox tracking, and safefetch clone guarding;
+  focused/default full-tag package gates pass.
 - 2026-07-25: Plan created; beads filed; Wave 1 dispatch pending.

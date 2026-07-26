@@ -2,7 +2,11 @@ package nostrstate
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
+	"strings"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip34"
@@ -15,6 +19,7 @@ func FetchLatestRepositoryStateForRepo(ctx context.Context, relayURL string, own
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("connect relay: %w", err)
 	}
+	defer relay.Close()
 
 	filter := nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindRepositoryAnnouncement, nostr.KindRepositoryState},
@@ -108,6 +113,46 @@ func Maintainers(events []nostr.Event, ownerPubkey string, repoID string) ([]str
 // the maintainer set, using canonical NIP-01 replaceable ordering.
 func SelectLatest(events []nostr.Event, maintainerSet map[string]struct{}) *nostr.Event {
 	return selectLatestState(events, maintainerSet)
+}
+
+// RepositoryStateDigest returns the canonical digest used to track the exact
+// repository state published to Nostr.
+func RepositoryStateDigest(head string, branches map[string]string, tags map[string]string) string {
+	var b strings.Builder
+	b.WriteString("HEAD=" + head + "\n")
+	branchNames := sortedKeys(branches)
+	for _, name := range branchNames {
+		b.WriteString("B:" + name + "=" + branches[name] + "\n")
+	}
+	tagNames := sortedKeys(tags)
+	for _, name := range tagNames {
+		b.WriteString("T:" + name + "=" + tags[name] + "\n")
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// EventStateDigest validates and computes the canonical digest of a kind:30618
+// repository-state event.
+func EventStateDigest(ev *nostr.Event) (string, error) {
+	if ev == nil || ev.Kind != nostr.KindRepositoryState {
+		return "", fmt.Errorf("repository state event is required")
+	}
+	d := ev.Tags.Find("d")
+	if d == nil || len(d) < 2 || strings.TrimSpace(d[1]) == "" {
+		return "", fmt.Errorf("repository state event missing d tag")
+	}
+	state := nip34.ParseRepositoryState(*ev)
+	return RepositoryStateDigest(state.HEAD, state.Branches, state.Tags), nil
+}
+
+func sortedKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func extractMaintainers(events []nostr.Event, ownerPubkey string, repoID string) ([]string, error) {

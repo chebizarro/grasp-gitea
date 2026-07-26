@@ -5,9 +5,7 @@ package publisher
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -22,6 +20,7 @@ import (
 	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
+	"github.com/sharegap/grasp-gitea/internal/nostrstate"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -405,7 +404,10 @@ func (s *Service) buildStateEvent(ownerPubkey string, repoID string, head string
 	eventTags := make(nostr.Tags, 0, 3+len(branches)+len(tags))
 	eventTags = append(eventTags, nostr.Tag{"d", repoID})
 	if ownerPubkey != "" {
-		eventTags = append(eventTags, nostr.Tag{"p", ownerPubkey})
+		eventTags = append(eventTags,
+			nostr.Tag{"p", ownerPubkey},
+			nostr.Tag{"a", fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement, ownerPubkey, repoID)},
+		)
 	}
 
 	branchNames := sortedKeys(branches)
@@ -590,21 +592,7 @@ func snapshotRefs(ctx context.Context, repoPath string) (head string, branches m
 
 // computeDigest produces a deterministic hash from the repo's current refs.
 func computeDigest(head string, branches map[string]string, tags map[string]string) string {
-	var b strings.Builder
-	b.WriteString("HEAD=" + head + "\n")
-
-	branchNames := sortedKeys(branches)
-	for _, name := range branchNames {
-		b.WriteString("B:" + name + "=" + branches[name] + "\n")
-	}
-
-	tagNames := sortedKeys(tags)
-	for _, name := range tagNames {
-		b.WriteString("T:" + name + "=" + tags[name] + "\n")
-	}
-
-	h := sha256.Sum256([]byte(b.String()))
-	return hex.EncodeToString(h[:])
+	return nostrstate.RepositoryStateDigest(head, branches, tags)
 }
 
 func sortedKeys(m map[string]string) []string {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -19,6 +20,9 @@ import (
 	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
+	"github.com/sharegap/grasp-gitea/internal/nostrauthz"
+	"github.com/sharegap/grasp-gitea/internal/nostrverify"
+	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/purgatory"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -29,6 +33,152 @@ type hostedRepoChecker interface {
 }
 
 type storedEventLookup func(ctx context.Context, eventID string) (*nostr.Event, error)
+
+type mappingLister interface {
+	ListMappings(ctx context.Context) ([]store.Mapping, error)
+}
+
+type announcementLookup func(ctx context.Context, repoID string) ([]nostr.Event, error)
+type stateEventResolver func(ctx context.Context, ev *nostr.Event) (store.Mapping, error)
+
+func makeStateEventResolver(mappings mappingLister, lookup announcementLookup, trustedBridgePubkey string) stateEventResolver {
+	return func(ctx context.Context, ev *nostr.Event) (store.Mapping, error) {
+		if ev == nil || ev.Kind != nostr.KindRepositoryState {
+			return store.Mapping{}, fmt.Errorf("repository state event is required")
+		}
+		if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
+			return store.Mapping{}, err
+		}
+		repoID := ""
+		if d := ev.Tags.Find("d"); d != nil && len(d) >= 2 {
+			repoID = strings.TrimSpace(d[1])
+		}
+		if repoID == "" {
+			return store.Mapping{}, fmt.Errorf("repository state event missing d tag")
+		}
+		if mappings == nil {
+			return store.Mapping{}, fmt.Errorf("%w: mapping store unavailable", nostrauthz.ErrAuthorityUnavailable)
+		}
+
+		allMappings, err := mappings.ListMappings(ctx)
+		if err != nil {
+			return store.Mapping{}, fmt.Errorf("list repository mappings: %w", err)
+		}
+		hints := relayStateOwnerHints(ev, repoID)
+		signer := ev.PubKey.Hex()
+		trustedBridge := trustedBridgePubkey != "" && signer == trustedBridgePubkey
+
+		var authorized []store.Mapping
+		var resolvedAuthority bool
+		for _, mapping := range allMappings {
+			if mapping.RepoID != repoID || mapping.Pubkey == "" {
+				continue
+			}
+			ownerPK, err := nostr.PubKeyFromHex(mapping.Pubkey)
+			if err != nil {
+				continue
+			}
+			mapping.Pubkey = ownerPK.Hex()
+			coord := nostrauthz.RepositoryCoordinate{OwnerPubkey: mapping.Pubkey, RepoID: mapping.RepoID}.String()
+
+			events := make([]nostr.Event, 0)
+			if lookup != nil {
+				lookedUp, lookupErr := lookup(ctx, mapping.RepoID)
+				if lookupErr != nil {
+					continue
+				}
+				events = append(events, lookedUp...)
+			}
+			if strings.TrimSpace(mapping.AnnouncementEventJSON) != "" {
+				var cached nostr.Event
+				if json.Unmarshal([]byte(mapping.AnnouncementEventJSON), &cached) == nil {
+					events = append(events, cached)
+				}
+			}
+
+			authority, err := nostrauthz.NewResolver(events).Resolve(coord)
+			if err != nil {
+				continue
+			}
+			resolvedAuthority = true
+			if authority.IsAuthorized(signer) {
+				authorized = append(authorized, mapping)
+				continue
+			}
+			// Bridge trust is explicit and state-only. The signed owner hint
+			// must select this already-resolved provisioned coordinate.
+			if trustedBridge {
+				if _, hinted := hints[mapping.Pubkey]; hinted {
+					authorized = append(authorized, mapping)
+				}
+			}
+		}
+		if len(authorized) == 0 {
+			if !resolvedAuthority {
+				return store.Mapping{}, fmt.Errorf("%w: no valid owner announcement for %q", nostrauthz.ErrAuthorityUnavailable, repoID)
+			}
+			return store.Mapping{}, fmt.Errorf("%w: signer %s for repository id %q", nostrauthz.ErrUnauthorized, signer, repoID)
+		}
+		if len(authorized) == 1 {
+			return authorized[0], nil
+		}
+		var hinted []store.Mapping
+		for _, mapping := range authorized {
+			if _, ok := hints[mapping.Pubkey]; ok {
+				hinted = append(hinted, mapping)
+			}
+		}
+		if len(hinted) == 1 {
+			return hinted[0], nil
+		}
+		return store.Mapping{}, fmt.Errorf("%w: signer %s and repository id %q", nostrauthz.ErrAmbiguousRepository, signer, repoID)
+	}
+}
+
+func configuredBridgePubkey(cfg config.Config) (string, error) {
+	// The bunker authority in a NIP-46 URL is the exact public key returned by
+	// the durable Signet-backed ServerSigner, so it can be known before the
+	// signer session is connected later in startup.
+	if strings.TrimSpace(cfg.SignetBunkerURL) != "" {
+		u, err := url.Parse(cfg.SignetBunkerURL)
+		if err != nil || !strings.EqualFold(u.Scheme, "bunker") {
+			return "", fmt.Errorf("invalid Signet bunker URL")
+		}
+		pk, err := nostr.PubKeyFromHex(u.Hostname())
+		if err != nil {
+			return "", fmt.Errorf("invalid Signet bunker pubkey: %w", err)
+		}
+		return pk.Hex(), nil
+	}
+	if strings.TrimSpace(cfg.BridgeNsec) != "" {
+		bridgeSigner, err := publisher.NewLocalServerSigner(cfg.BridgeNsec)
+		if err != nil {
+			return "", err
+		}
+		return bridgeSigner.PublicKey(), nil
+	}
+	return "", nil
+}
+
+func relayStateOwnerHints(ev *nostr.Event, repoID string) map[string]struct{} {
+	hints := map[string]struct{}{}
+	for _, tag := range ev.Tags {
+		if len(tag) < 2 {
+			continue
+		}
+		switch tag[0] {
+		case "p":
+			if pk, err := nostr.PubKeyFromHex(tag[1]); err == nil {
+				hints[pk.Hex()] = struct{}{}
+			}
+		case "a":
+			if coord, err := nostrauthz.ParseRepositoryCoordinate(tag[1]); err == nil && coord.RepoID == repoID {
+				hints[coord.OwnerPubkey] = struct{}{}
+			}
+		}
+	}
+	return hints
+}
 
 func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Logger) (string, http.Handler, func(context.Context) error, error) {
 	if !cfg.EmbeddedRelay {
@@ -61,7 +211,25 @@ func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Log
 		return nil, nil
 	}
 
-	policy := makeEmbeddedRelayRejectPolicy(repoStore, lookupStoredEvent)
+	announcementLookup := func(_ context.Context, repoID string) ([]nostr.Event, error) {
+		filter := nostr.Filter{
+			Kinds: []nostr.Kind{nostr.KindRepositoryAnnouncement},
+			Tags:  nostr.TagMap{"d": []string{repoID}},
+			Limit: 500,
+		}
+		events := make([]nostr.Event, 0)
+		for ev := range db.QueryEvents(filter, 500) {
+			events = append(events, ev)
+		}
+		return events, nil
+	}
+	trustedBridgePubkey, bridgeKeyErr := configuredBridgePubkey(cfg)
+	if bridgeKeyErr != nil {
+		logger.Warn("embedded relay cannot derive configured bridge pubkey", "error", bridgeKeyErr)
+	}
+	resolveStateEvent := makeStateEventResolver(repoStore, announcementLookup, trustedBridgePubkey)
+
+	policy := makeEmbeddedRelayRejectPolicy(repoStore, lookupStoredEvent, resolveStateEvent)
 	r.OnEvent = func(ctx context.Context, event nostr.Event) (bool, string) {
 		return policy(ctx, &event)
 	}
@@ -83,9 +251,29 @@ func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Log
 		return err
 	}
 	purgatorySvc := purgatory.New(repoStore, releaseEvent, logger)
-	repoPathForEvent := makeRepoPathResolver(cfg, repoStore)
+	repoPathForEvent := makeRepoPathResolver(cfg, repoStore, resolveStateEvent)
 	holdIfAwaitingGitData := func(ctx context.Context, ev nostr.Event) (bool, error) {
-		repoPath := repoPathForEvent(ctx, &ev)
+		repoPath := ""
+		if ev.Kind == nostr.KindRepositoryState {
+			// Admission already authorized this event, but storage happens in a
+			// separate callback. Fail storage closed if authority changes or the
+			// owner mapping cannot be resolved a second time; never bypass
+			// purgatory by treating a resolution failure as "no repository".
+			mapping, err := resolveStateEvent(ctx, &ev)
+			if err != nil {
+				return false, fmt.Errorf("re-resolve repository state for purgatory: %w", err)
+			}
+			repoName := mapping.RepoName
+			if repoName == "" {
+				repoName = mapping.RepoID
+			}
+			if mapping.Owner == "" || repoName == "" {
+				return false, fmt.Errorf("resolved repository path is incomplete")
+			}
+			repoPath = filepath.Join(cfg.GiteaRepositoriesDir, mapping.Owner, repoName+".git")
+		} else {
+			repoPath = repoPathForEvent(ctx, &ev)
+		}
 		if repoPath == "" {
 			return false, nil
 		}
@@ -132,12 +320,25 @@ func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Log
 	return localURL, relayRootHandler, shutdown, nil
 }
 
-func makeEmbeddedRelayRejectPolicy(repoChecker hostedRepoChecker, lookup storedEventLookup) func(context.Context, *nostr.Event) (bool, string) {
+func makeEmbeddedRelayRejectPolicy(repoChecker hostedRepoChecker, lookup storedEventLookup, stateResolvers ...stateEventResolver) func(context.Context, *nostr.Event) (bool, string) {
+	var resolveState stateEventResolver
+	if len(stateResolvers) > 0 {
+		resolveState = stateResolvers[0]
+	}
 	return func(ctx context.Context, event *nostr.Event) (reject bool, msg string) {
 		if event == nil {
 			return true, "nil event"
 		}
-		if event.Kind == relay.KindRepositoryAnnouncement || event.Kind == relay.KindRepositoryState {
+		if event.Kind == relay.KindRepositoryAnnouncement {
+			return false, ""
+		}
+		if event.Kind == relay.KindRepositoryState {
+			if resolveState == nil {
+				return true, "repository state authority resolver unavailable"
+			}
+			if _, err := resolveState(ctx, event); err != nil {
+				return true, "repository state signer is not authorized for a hosted repository"
+			}
 			return false, ""
 		}
 		if !isEmbeddedRelayCollaborationKind(int(event.Kind)) {
@@ -220,40 +421,57 @@ func referencesStoredCollaboration(ctx context.Context, event *nostr.Event, look
 	return false
 }
 
-// makeRepoPathResolver maps a repo-scoped event to its bare repository path.
-// State events (30618) are keyed by their own pubkey+d; PR events (1618/1619)
-// carry the repository coordinate in their a tag.
-func makeRepoPathResolver(cfg config.Config, mappings *store.SQLiteStore) func(ctx context.Context, ev *nostr.Event) string {
+// makeRepoPathResolver maps a repo-scoped event to its validated owner
+// repository path. State signers may be owners, recursive maintainers, or an
+// explicitly trusted bridge; their p/a tags are hints only.
+func makeRepoPathResolver(cfg config.Config, mappings *store.SQLiteStore, stateResolvers ...stateEventResolver) func(ctx context.Context, ev *nostr.Event) string {
+	var resolveState stateEventResolver
+	if len(stateResolvers) > 0 {
+		resolveState = stateResolvers[0]
+	}
 	return func(ctx context.Context, ev *nostr.Event) string {
-		var ownerPubkey, repoID string
+		var mapping store.Mapping
 		switch int(ev.Kind) {
 		case relay.KindRepositoryState:
-			ownerPubkey = ev.PubKey.Hex()
-			if d := ev.Tags.Find("d"); d != nil && len(d) >= 2 {
-				repoID = d[1]
+			if resolveState == nil {
+				return ""
 			}
+			resolved, err := resolveState(ctx, ev)
+			if err != nil {
+				return ""
+			}
+			mapping = resolved
 		case relay.KindPROpen, relay.KindPRUpdate:
+			var ownerPubkey, repoID string
 			if a := ev.Tags.Find("a"); a != nil && len(a) >= 2 {
-				parts := strings.SplitN(a[1], ":", 3)
-				if len(parts) == 3 && parts[0] == fmt.Sprint(relay.KindRepositoryAnnouncement) {
-					ownerPubkey, repoID = parts[1], parts[2]
+				coord, err := nostrauthz.ParseRepositoryCoordinate(a[1])
+				if err == nil {
+					ownerPubkey, repoID = coord.OwnerPubkey, coord.RepoID
 				}
 			}
+			if ownerPubkey == "" || repoID == "" {
+				return ""
+			}
+			pk, err := nostr.PubKeyFromHex(ownerPubkey)
+			if err != nil {
+				return ""
+			}
+			resolved, err := mappings.GetMapping(ctx, nip19.EncodeNpub(pk), repoID)
+			if err != nil {
+				return ""
+			}
+			mapping = resolved
 		default:
 			return ""
 		}
-		if ownerPubkey == "" || repoID == "" {
+		repoName := mapping.RepoName
+		if repoName == "" {
+			repoName = mapping.RepoID
+		}
+		if mapping.Owner == "" || repoName == "" {
 			return ""
 		}
-		pk, err := nostr.PubKeyFromHex(ownerPubkey)
-		if err != nil {
-			return ""
-		}
-		mapping, err := mappings.GetMapping(ctx, nip19.EncodeNpub(pk), repoID)
-		if err != nil {
-			return ""
-		}
-		return filepath.Join(cfg.GiteaRepositoriesDir, mapping.Owner, mapping.RepoID+".git")
+		return filepath.Join(cfg.GiteaRepositoriesDir, mapping.Owner, repoName+".git")
 	}
 }
 

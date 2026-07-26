@@ -16,9 +16,11 @@ import (
 	"fiatjaf.com/nostr/nip19"
 	"fiatjaf.com/nostr/nip34"
 
+	"github.com/sharegap/grasp-gitea/internal/nostrauthz"
 	"github.com/sharegap/grasp-gitea/internal/nostrstate"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
+	"github.com/sharegap/grasp-gitea/internal/safefetch"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -104,46 +106,242 @@ func (s *Service) HandleStateEvent(ctx context.Context, ev *nostr.Event) error {
 	if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
 		return err
 	}
-
-	repoID := tagValue(ev.Tags, "d")
-	if repoID == "" {
+	if tagValue(ev.Tags, "d") == "" {
 		return fmt.Errorf("state event missing d tag")
 	}
 
-	lookupPubkey := ev.PubKey.Hex()
-	if ownerPubkey := tagValue(ev.Tags, "p"); ownerPubkey != "" {
-		lookupPubkey = ownerPubkey
-	}
-	lookupPK, err := nostr.PubKeyFromHex(lookupPubkey)
+	// Resolve the provisioned owner coordinate first, then authorize the signer
+	// against that owner's recursive maintainer set. Event p/a tags only help
+	// disambiguate candidates; they never confer authority.
+	mapping, err := s.resolveStateMapping(ctx, ev)
 	if err != nil {
-		return fmt.Errorf("invalid pubkey: %w", err)
-	}
-	npub := nip19.EncodeNpub(lookupPK)
-
-	// Look up the actual Gitea org name from the store, since repos are
-	// created under the NIP-05-resolved org name, not the raw npub.
-	orgName := npub
-	repoName := repoID
-	if s.orgResolver != nil {
-		mapping, lookupErr := s.orgResolver.GetMapping(ctx, npub, repoID)
-		if lookupErr != nil {
-			// Repo not provisioned yet; skip silently.
-			return nil
+		if err == errStateMappingNotFound {
+			return nil // The repository is not provisioned on this bridge.
 		}
-		if mapping.Owner != "" {
-			orgName = mapping.Owner
-		}
-		if mapping.RepoName != "" {
-			repoName = mapping.RepoName
-		}
+		return err
 	}
 
-	repoPath := filepath.Join(s.repositoriesDir, orgName, repoName+".git")
+	repoPath := repoPathForMapping(s.repositoriesDir, mapping)
 	if st, err := os.Stat(repoPath); err != nil || !st.IsDir() {
 		return nil
 	}
-
+	if err := s.requireStateObjects(ctx, repoPath, ev); err != nil {
+		return err
+	}
 	return s.applyStateEvent(ctx, repoPath, ev)
+}
+
+// AuthorizeStateEvent validates a live kind:30618 signer without mutating
+// repository state. Callers that perform CI/change detection before
+// HandleStateEvent should invoke this gate first and skip all state handling on
+// error. Unprovisioned repositories are ignored.
+func (s *Service) AuthorizeStateEvent(ctx context.Context, ev *nostr.Event) error {
+	if ev == nil || ev.Kind != nostr.KindRepositoryState {
+		return nil
+	}
+	if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
+		return err
+	}
+	if tagValue(ev.Tags, "d") == "" {
+		return fmt.Errorf("state event missing d tag")
+	}
+	_, err := s.resolveStateMapping(ctx, ev)
+	if err == errStateMappingNotFound {
+		return nil
+	}
+	return err
+}
+
+var errStateMappingNotFound = fmt.Errorf("state mapping not found")
+
+func (s *Service) resolveStateMapping(ctx context.Context, ev *nostr.Event) (store.Mapping, error) {
+	if s.orgResolver == nil {
+		return store.Mapping{}, errStateMappingNotFound
+	}
+	repoID := tagValue(ev.Tags, "d")
+	signer := ev.PubKey.Hex()
+	hints := stateOwnerHints(ev, repoID)
+
+	candidates := map[string]store.Mapping{}
+	add := func(mapping store.Mapping) {
+		if mapping.RepoID != repoID || mapping.Pubkey == "" {
+			return
+		}
+		pk, err := nostr.PubKeyFromHex(mapping.Pubkey)
+		if err != nil {
+			return
+		}
+		mapping.Pubkey = pk.Hex()
+		candidates[mapping.Pubkey+"\x00"+mapping.RepoID] = mapping
+	}
+	lookup := func(pubkey string) {
+		pk, err := nostr.PubKeyFromHex(pubkey)
+		if err != nil {
+			return
+		}
+		mapping, err := s.orgResolver.GetMapping(ctx, nip19.EncodeNpub(pk), repoID)
+		if err == nil {
+			add(mapping)
+		}
+	}
+
+	// The signer and signed owner hints are efficient candidate lookups only.
+	lookup(signer)
+	for owner := range hints {
+		lookup(owner)
+	}
+	if s.mappingLister != nil {
+		mappings, err := s.mappingLister.ListMappings(ctx)
+		if err != nil {
+			return store.Mapping{}, fmt.Errorf("list state mapping candidates: %w", err)
+		}
+		for _, mapping := range mappings {
+			add(mapping)
+		}
+	}
+	if len(candidates) == 0 {
+		return store.Mapping{}, errStateMappingNotFound
+	}
+
+	var authorized []store.Mapping
+	var resolvedAuthority bool
+	var authorityErr error
+	for _, mapping := range candidates {
+		events, confirmedCurrentOwner, err := s.authorityEvents(ctx, mapping)
+		if err != nil {
+			authorityErr = err
+			continue
+		}
+		ok, err := nostrauthz.NewResolver(events).IsAuthorized(signer, repoCoordinate(mapping))
+		if err != nil {
+			authorityErr = err
+			continue
+		}
+		resolvedAuthority = true
+		if ok && signer != mapping.Pubkey && !confirmedCurrentOwner {
+			authorityErr = fmt.Errorf("%w: current maintainer announcements unavailable", nostrauthz.ErrAuthorityUnavailable)
+			continue
+		}
+		if ok {
+			authorized = append(authorized, mapping)
+		}
+	}
+	if len(authorized) == 0 {
+		if !resolvedAuthority && authorityErr != nil {
+			return store.Mapping{}, authorityErr
+		}
+		return store.Mapping{}, fmt.Errorf("%w: signer %s for repository id %q", nostrauthz.ErrUnauthorized, signer, repoID)
+	}
+	if len(authorized) == 1 {
+		return authorized[0], nil
+	}
+
+	// A signed p/a owner value can disambiguate multiple already-authorized
+	// repositories, but it cannot make an unauthorized candidate valid.
+	var hinted []store.Mapping
+	for _, mapping := range authorized {
+		if _, ok := hints[mapping.Pubkey]; ok {
+			hinted = append(hinted, mapping)
+		}
+	}
+	if len(hinted) == 1 {
+		return hinted[0], nil
+	}
+	return store.Mapping{}, fmt.Errorf("%w: signer %s and repository id %q", nostrauthz.ErrAmbiguousRepository, signer, repoID)
+}
+
+func (s *Service) authorityEvents(ctx context.Context, mapping store.Mapping) ([]nostr.Event, bool, error) {
+	cached, err := cachedAnnouncement(mapping)
+	if err != nil {
+		return nil, false, err
+	}
+	if cached == nil {
+		return nil, false, fmt.Errorf("%w: cached owner announcement missing", nostrauthz.ErrAuthorityUnavailable)
+	}
+
+	pool := []nostr.Event{*cached}
+	seen := map[string]struct{}{cached.ID.Hex(): {}}
+	filter := nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindRepositoryAnnouncement, nostr.KindRepositoryState},
+		Tags:  nostr.TagMap{"d": []string{mapping.RepoID}},
+		Limit: stateQueryLimit,
+	}
+	confirmedCurrentOwner := false
+	for _, relayURL := range announcementRelayURLs(cached) {
+		events, err := s.queryRelayHistory(ctx, relayURL, filter, stateQueryLimit)
+		if err != nil {
+			s.logger.Warn("state authority relay query failed", "relay", relayURL, "repo_id", mapping.RepoID, "error", err)
+			continue
+		}
+		for _, event := range events {
+			if event == nil || event.Kind != nostr.KindRepositoryAnnouncement || tagValue(event.Tags, "d") != mapping.RepoID {
+				continue
+			}
+			if event.PubKey.Hex() == mapping.Pubkey && nostrverify.ValidateEventIDAndSignature(event) == nil {
+				confirmedCurrentOwner = true
+			}
+			if _, ok := seen[event.ID.Hex()]; ok {
+				continue
+			}
+			seen[event.ID.Hex()] = struct{}{}
+			pool = append(pool, *event)
+		}
+	}
+	return pool, confirmedCurrentOwner, nil
+}
+
+func stateOwnerHints(ev *nostr.Event, repoID string) map[string]struct{} {
+	hints := map[string]struct{}{}
+	if ev == nil {
+		return hints
+	}
+	for _, tag := range ev.Tags {
+		if len(tag) < 2 {
+			continue
+		}
+		switch tag[0] {
+		case "p":
+			if pk, err := nostr.PubKeyFromHex(tag[1]); err == nil {
+				hints[pk.Hex()] = struct{}{}
+			}
+		case "a":
+			if coord, err := nostrauthz.ParseRepositoryCoordinate(tag[1]); err == nil && coord.RepoID == repoID {
+				hints[coord.OwnerPubkey] = struct{}{}
+			}
+		}
+	}
+	return hints
+}
+
+func (s *Service) requireStateObjects(ctx context.Context, repoPath string, ev *nostr.Event) error {
+	state := nip34.ParseRepositoryState(*ev)
+	check := func(ref, sha string) error {
+		if !validRef.MatchString(ref) || !validHex.MatchString(sha) {
+			return fmt.Errorf("invalid repository state ref %q or object %q", ref, sha)
+		}
+		exists, err := s.git.ObjectExists(ctx, repoPath, sha)
+		if err != nil {
+			return fmt.Errorf("check repository state object %s: %w", sha, err)
+		}
+		if !exists {
+			return fmt.Errorf("repository state object %s is not present locally", sha)
+		}
+		return nil
+	}
+	for branch, sha := range state.Branches {
+		if err := check("refs/heads/"+branch, sha); err != nil {
+			return err
+		}
+	}
+	for tag, sha := range state.Tags {
+		if strings.HasSuffix(tag, "^{}") {
+			continue
+		}
+		if err := check("refs/tags/"+tag, sha); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Run starts the scheduled GRASP-02 backfill worker. It intentionally waits for
@@ -225,8 +423,9 @@ func (s *Service) syncMapping(ctx context.Context, mapping store.Mapping) error 
 			state := nip34.ParseRepositoryState(*latestState)
 			if err := s.fetchMissingStateObjects(ctx, repoPath, cloneURLs, state); err != nil {
 				s.logger.Warn("proactive sync state object fetch failed", "repo", repoPath, "error", err)
-			}
-			if err := s.applyStateEvent(ctx, repoPath, latestState); err != nil {
+			} else if err := s.requireStateObjects(ctx, repoPath, latestState); err != nil {
+				s.logger.Warn("proactive sync state objects incomplete; refs left unchanged", "repo", repoPath, "event", latestState.ID, "error", err)
+			} else if err := s.applyStateEvent(ctx, repoPath, latestState); err != nil {
 				s.logger.Warn("proactive sync state ref reconciliation failed", "repo", repoPath, "event", latestState.ID, "error", err)
 			}
 		}
@@ -251,6 +450,7 @@ func (s *Service) fetchLatestStateEvent(ctx context.Context, mapping store.Mappi
 		Limit: stateQueryLimit,
 	}
 	var pool []nostr.Event
+	confirmedCurrentOwner := false
 	for _, relayURL := range relayURLs {
 		events, err := s.queryRelayHistory(ctx, relayURL, filter, stateQueryLimit)
 		if err != nil {
@@ -264,6 +464,9 @@ func (s *Service) fetchLatestStateEvent(ctx context.Context, mapping store.Mappi
 			if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
 				continue
 			}
+			if ev.Kind == nostr.KindRepositoryAnnouncement && ev.PubKey.Hex() == mapping.Pubkey {
+				confirmedCurrentOwner = true
+			}
 			pool = append(pool, *ev)
 		}
 	}
@@ -273,16 +476,29 @@ func (s *Service) fetchLatestStateEvent(ctx context.Context, mapping store.Mappi
 		pool = append(pool, *cached)
 	}
 
-	maintainers, err := nostrstate.Maintainers(pool, mapping.Pubkey, mapping.RepoID)
+	authority, err := nostrauthz.NewResolver(pool).Resolve(repoCoordinate(mapping))
 	if err != nil {
-		// No owner announcement anywhere: only owner-authored state is safe.
-		maintainers = []string{mapping.Pubkey}
+		s.logger.Warn("proactive sync repository authority unavailable", "repo_id", mapping.RepoID, "owner_pubkey", mapping.Pubkey, "error", err)
+		return nil
 	}
-	maintainerSet := make(map[string]struct{}, len(maintainers))
-	for _, m := range maintainers {
-		maintainerSet[m] = struct{}{}
+	maintainerSet := make(map[string]struct{}, len(authority.Maintainers))
+	for _, maintainer := range authority.Maintainers {
+		maintainerSet[maintainer] = struct{}{}
 	}
-	return nostrstate.SelectLatest(pool, maintainerSet)
+	latest := nostrstate.SelectLatest(pool, maintainerSet)
+	if latest == nil {
+		return nil
+	}
+	if latest.PubKey.Hex() != mapping.Pubkey && !confirmedCurrentOwner {
+		s.logger.Warn("proactive sync cannot confirm current maintainer authority", "repo_id", mapping.RepoID, "signer", latest.PubKey.Hex())
+		return nil
+	}
+	resolved, err := s.resolveStateMapping(ctx, latest)
+	if err != nil || resolved.Pubkey != mapping.Pubkey || resolved.RepoID != mapping.RepoID {
+		s.logger.Warn("proactive sync state did not resolve uniquely to mapping", "repo_id", mapping.RepoID, "owner_pubkey", mapping.Pubkey, "error", err)
+		return nil
+	}
+	return latest
 }
 
 func (s *Service) fetchPREvents(ctx context.Context, mapping store.Mapping, relayURLs []string) []*nostr.Event {
@@ -703,6 +919,11 @@ func (execGitRunner) SetSymbolicHEAD(ctx context.Context, repoPath string, ref s
 }
 
 func (execGitRunner) Fetch(ctx context.Context, repoPath string, remoteURL string, refspecs []string) error {
+	// Validate immediately before invoking Git so every production clone fetch
+	// uses Item C's shared SSRF policy. Injected test runners remain network-free.
+	if err := safefetch.ValidateGitCloneURL(ctx, remoteURL); err != nil {
+		return fmt.Errorf("unsafe git clone URL: %w", err)
+	}
 	if len(refspecs) == 0 {
 		return nil
 	}
