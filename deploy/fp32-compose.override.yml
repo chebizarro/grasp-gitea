@@ -1,4 +1,7 @@
 services:
+  grasp-hook-install:
+    image: grasp-bridge:fp32
+
   grasp-bridge:
     image: grasp-bridge:fp32
     environment:

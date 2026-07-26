@@ -5,6 +5,7 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -76,6 +77,10 @@ func (h *NIP55Handler) handleChallenge(w http.ResponseWriter, r *http.Request) {
 		RedirectURI: redirectURI,
 	}, "/auth/nip55/callback")
 	if err != nil {
+		if errors.Is(err, ErrInvalidRedirectURI) {
+			h.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 		h.logger.Error("issue NIP-55 challenge failed", "error", err)
 		h.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to issue challenge"})
 		return
@@ -83,11 +88,24 @@ func (h *NIP55Handler) handleChallenge(w http.ResponseWriter, r *http.Request) {
 
 	metrics.IncNIP55ChallengesIssued()
 
-	// Build the nostrsigner: URI for Android deep linking.
-	// Format: nostrsigner:<challenge-payload>?type=sign_event&callbackUrl=<url>
-	// The challenge payload includes the nonce and verify URL so the signer
-	// can construct the NIP-98 event.
-	challengePayload := url.QueryEscape(fmt.Sprintf(`{"nonce":"%s","url":"%s","method":"POST"}`, challenge.Nonce, challenge.URL))
+	// Build a complete unsigned NIP-98 event template for the Android signer.
+	// The signer fills pubkey/id/sig and returns the signed event to callbackURL.
+	payloadJSON, err := json.Marshal(map[string]any{
+		"kind":       27235,
+		"created_at": time.Now().UTC().Unix(),
+		"tags": [][]string{
+			{"u", challenge.URL},
+			{"method", http.MethodPost},
+			{"nonce", challenge.Nonce},
+		},
+		"content": "",
+	})
+	if err != nil {
+		h.logger.Error("marshal NIP-55 challenge failed", "error", err)
+		h.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to issue challenge"})
+		return
+	}
+	challengePayload := url.QueryEscape(string(payloadJSON))
 	callbackURL := h.authService.publicURL + "/auth/nip55/callback"
 	signerURI := fmt.Sprintf("nostrsigner:%s?type=sign_event&callbackUrl=%s",
 		challengePayload, url.QueryEscape(callbackURL))

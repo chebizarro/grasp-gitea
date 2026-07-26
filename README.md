@@ -17,9 +17,9 @@ Phase 1 + Phase 2 + Phase 3 implementation currently provides:
 - multi-maintainer state acceptance (maintainers from NIP-34 announcements)
 - Phase 3 integration assets:
   - gitea config snippet (`deploy/gitea/app.ini.phase3.snippet`)
-  - nginx vhost (`deploy/nginx/git.sharegap.net.conf`)
-  - e2e checklist (`docs/phase3-e2e-checklist.md`)
-- Hive CI trigger publishing (ContextVM `ci/workflow-run`) when repo changes reveal CI workflows
+  - canonical nginx vhost (`deploy/nginx/gitea-vhost.conf.example`)
+  - hardened compose overlay (`deploy/docker-compose.hardening.yml`)
+- experimental Hive-CI trigger/execution path for owner-authored workflows; the standard image does **not** bundle `act` or a container runtime, so operators must explicitly provide `HIVE_CI_ACT_PATH` and its runtime before enabling it
 - admin API:
   - `GET /health`
   - `GET /metrics`
@@ -43,8 +43,10 @@ GITEA_URL=http://gitea:3000
 GITEA_ADMIN_TOKEN=<token>
 CLONE_PREFIX=https://git.sharegap.net
 RELAY_URLS=ws://gastown-relay:3334
-HOOK_RELAY_URL=ws://localhost:3334
-HOOK_BINARY_PATH=/usr/local/bin/grasp-pre-receive
+HOOK_RELAY_URL=ws://grasp-bridge:3334
+HOOK_BINARY_PATH=/opt/grasp/grasp-pre-receive
+GRASP_HOOK_ADMIN_URL=http://grasp-bridge:8090
+GRASP_HOOK_ADMIN_TOKEN_FILE=/run/secrets/grasp-admin-api-token
 GITEA_REPOSITORIES_PATH=/gitea-data/git/repositories
 EMBEDDED_RELAY=false
 EMBEDDED_RELAY_PORT=3334
@@ -63,6 +65,13 @@ GITEA_WEBHOOK_SECRET=<webhook HMAC secret>
 SIGNER_MASTER_KEY=<32-byte base64 or hex key, optional>
 PROACTIVE_SYNC_INTERVAL=1h
 GRASP05_ARCHIVE_MODE=false
+GRASP_HOOK_TIMEOUT=15s
+GRASP_HOOK_MAX_NOSTR_UPDATES=16
+GRASP_HOOK_MAX_NOSTR_REFS=256
+GRASP_HOOK_MAX_PACK_BYTES=268435456
+GRASP_HOOK_MAX_OBJECTS=50000
+GRASP_HOOK_MAX_OBJECT_BYTES=536870912
+GRASP_HOOK_MAX_SINGLE_OBJECT_BYTES=67108864
 ```
 
 `SIGNER_MASTER_KEY` enables the persistent NIP-46 signer subsystem. With it set, owner and contributor events are unsigned templates until the outbound queue obtains the user's bunker signature. Without it, the bridge intentionally remains in legacy bridge-signed transition mode for bridge-originated owner state; contributor events from unlinked actors are skipped and counted as `unlinked_actor_skipped`.
@@ -89,8 +98,8 @@ The response includes the authorized user pubkey, bridge client pubkey, relays, 
 ## Compatibility and limitations
 
 - Events emitted before this migration and signed by historical `BRIDGE_NSEC` are not re-signed.
-- Events created before a contributor links a signer are not backfilled; unlinked webhook actors are skipped (`phase1-5ud`).
-- Nostr patches/PRs (kind 1617/1618) are reflected as Gitea pull requests: the referenced tip is fetched (or a format-patch is applied via a temporary worktree + `git am`) onto a head branch and a Gitea PR is opened against the base branch (`phase1-2gq`). PR-update (kind 1619) branch-tip updates remain a follow-up.
+- Unlinked actor events are retained in a bounded pending queue and backfilled when that Gitea user links a NIP-46 signer; rows trimmed by the queue's age/count bounds cannot be recovered.
+- Nostr patches/PRs (kind 1617/1618) are reflected as Gitea pull requests, and kind 1619 PR updates move the existing reflected PR head when the root event is known.
 - `maintainers` on `30617` is owner-driven; the bridge honors owner announcements and will not add maintainers itself.
 - Kind `10317` owner-list cache/rebroadcast is tracked separately (`phase1-kyg`).
 
@@ -98,10 +107,12 @@ The response includes the authorized user pubkey, bridge client pubkey, relays, 
 
 `grasp-pre-receive`:
 
-- accepts `refs/nostr/<event-id>` when event id is valid hex
+- accepts `refs/nostr/<event-id>` only for commit tips within the configured per-push/ref/object/byte quotas
 - rejects `refs/heads/pr/*` (must be sent over nostr refs)
 - for `refs/heads/*` and `refs/tags/*`, requires exact SHA match with latest NIP-34 state event
 - rejects push when no state event exists
+- applies one 15-second end-to-end verification deadline and closes relay resources
+- deletes stale temporary refs after 20 minutes and runs bounded, grace-period Git cleanup
 
 ## Self-contained test container
 
@@ -128,10 +139,17 @@ make build-full
 - Compose examples:
   - Sidecar mode: `docker-compose.phase1.yml`
   - Embedded relay mode (Mode A): `docker-compose.mode-a.yml`
+  - Security/hook/session overlay: `deploy/docker-compose.hardening.yml`
+
+The hardened overlay installs `grasp-pre-receive` into an executable volume mounted read-only in the Gitea container and mounts the same admin-token secret used by the bridge. Hook relay/admin URLs use container-network addresses, not `localhost` or the public edge.
+
+## Nostr web login
+
+The canonical deployment supports real Gitea sessions after NIP-07 or NIP-46 verification. The bridge returns a 30-second, audience-bound, single-use handoff tied to an HttpOnly SameSite cookie; nginx consumes it internally and sends `X-Grasp-Auth-User` to Gitea for exactly one request. Gitea then writes its ordinary session cookie. Keep bridge auth and Gitea on the same HTTPS origin, keep Gitea private, and clear the reverse-auth header on every other proxy route as shown in the canonical nginx example. Redirect targets are normalized same-origin absolute paths only. The Android button fetches the NIP-55 challenge and launches the returned `nostrsigner:` URI.
 
 ## Phase 3 notes
 
-- Ensure gitea `ROOT_URL` is `https://git.sharegap.net`.
+- Ensure Gitea `ROOT_URL` equals the canonical single-host origin.
 - Ensure proxy forwards `Host` and `X-Forwarded-Proto` headers.
 - Follow `docs/phase3-e2e-checklist.md` to validate ngit init + push accept/reject behavior.
 - Use the automation helper:

@@ -1,13 +1,24 @@
 [service]
 MAX_USERNAME_LENGTH = 70
+; The canonical nginx handoff injects the dedicated header for exactly one
+; request. Gitea creates its ordinary web session cookie on that request.
+ENABLE_REVERSE_PROXY_AUTHENTICATION = true
+ENABLE_REVERSE_PROXY_AUTHENTICATION_API = false
+ENABLE_REVERSE_PROXY_AUTO_REGISTRATION = false
+
+[security]
+REVERSE_PROXY_AUTHENTICATION_USER = X-Grasp-Auth-User
 
 [server]
-; Set ROOT_URL to match your CLONE_PREFIX value.
+; Set ROOT_URL to the canonical single-host origin.
 ROOT_URL = https://git.example.com
 
 [git.config]
+; Reject oversized receive packs before pre-receive; the hook also enforces
+; quarantine, object-count, decompressed-size, and individual-object quotas.
+receive.maxInputSize = 268435456
+
 ; GRASP-01 git advertisement: advertise partial clone filtering and SHA-1-in-want support.
-; Gitea maps this to uploadpack.allowfilter and uploadpack.allowAnySHA1InWant.
 uploadpack.allowFilter = true
 uploadpack.allowAnySHA1InWant = true
 ; For strict literal GRASP-01 compliance, operators may also set these per served repo:

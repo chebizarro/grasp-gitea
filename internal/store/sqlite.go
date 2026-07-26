@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -114,6 +115,45 @@ type UserGraspList struct {
 	LastRepublishedID string `json:"last_republished_id,omitempty"`
 }
 
+// ReplaceableEventKey is the canonical NIP-01 ordering key. Newer created_at
+// wins; equal timestamps are resolved by the lexicographically lower event ID.
+type ReplaceableEventKey struct {
+	CreatedAt int64
+	EventID   string
+}
+
+func ReplaceableEventIsNewer(candidate, current ReplaceableEventKey) bool {
+	return candidate.CreatedAt > current.CreatedAt ||
+		(candidate.CreatedAt == current.CreatedAt && candidate.EventID < current.EventID)
+}
+
+func replaceableEventKeyFromJSON(raw, expectedID string) (ReplaceableEventKey, error) {
+	var event struct {
+		ID        string `json:"id"`
+		CreatedAt int64  `json:"created_at"`
+	}
+	if err := json.Unmarshal([]byte(raw), &event); err != nil {
+		return ReplaceableEventKey{}, fmt.Errorf("decode replaceable event: %w", err)
+	}
+	if event.ID != "" && expectedID != "" && event.ID != expectedID {
+		return ReplaceableEventKey{}, fmt.Errorf("replaceable event id mismatch")
+	}
+	if expectedID == "" {
+		expectedID = event.ID
+	}
+	if expectedID == "" {
+		return ReplaceableEventKey{}, fmt.Errorf("replaceable event id is required")
+	}
+	return ReplaceableEventKey{CreatedAt: event.CreatedAt, EventID: expectedID}, nil
+}
+
+func replaceableEventSQL(existingCreatedAt, existingID, candidateCreatedAt, candidateID string) string {
+	return "(" + existingCreatedAt + " < " + candidateCreatedAt + " OR (" +
+		existingCreatedAt + " = " + candidateCreatedAt + " AND " + existingID + " > " + candidateID + "))"
+}
+
+const replaceableEventOrderSQL = "event_created_at DESC, event_id ASC"
+
 type Mapping struct {
 	Npub              string    `json:"npub"`
 	RepoID            string    `json:"repo_id"`
@@ -131,6 +171,7 @@ type Mapping struct {
 	// Mirror republish fields: cached owner-signed announcement and publish tracking.
 	AnnouncementEventJSON         string    `json:"announcement_event_json,omitempty"`
 	AnnouncementEventID           string    `json:"announcement_event_id,omitempty"`
+	AnnouncementCreatedAt         int64     `json:"announcement_created_at,omitempty"`
 	LastRepublishedAnnouncementID string    `json:"last_republished_announcement_id,omitempty"`
 	LastRepublishedAnnouncementAt time.Time `json:"last_republished_announcement_at,omitempty"`
 	LastStateDigest               string    `json:"last_state_digest,omitempty"`
@@ -288,6 +329,7 @@ func Open(path string) (*SQLiteStore, error) {
 			kind INTEGER NOT NULL,
 			d_tag TEXT NOT NULL DEFAULT '',
 			event_json TEXT NOT NULL,
+			event_created_at INTEGER NOT NULL DEFAULT 0,
 			required_shas TEXT NOT NULL,
 			repo_path TEXT NOT NULL,
 			accepted_at TIMESTAMP NOT NULL
@@ -365,6 +407,25 @@ func Open(path string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("enforce unique Gitea identity mapping: %w", err)
 	}
 
+	// Item E migration: persist Nostr created_at beside replaceable events. This
+	// is intentionally separate from the identity-uniqueness migration above.
+	if err := ensureSQLiteColumn(db, "mappings", "announcement_created_at", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate announcement ordering: %w", err)
+	}
+	if err := ensureSQLiteColumn(db, "purgatory_events", "event_created_at", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate purgatory ordering: %w", err)
+	}
+	if _, err := db.Exec(`UPDATE mappings SET announcement_created_at = CAST(json_extract(announcement_event_json, '$.created_at') AS INTEGER) WHERE announcement_created_at = 0 AND announcement_event_json != '' AND json_valid(announcement_event_json)`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("backfill announcement ordering: %w", err)
+	}
+	if _, err := db.Exec(`UPDATE purgatory_events SET event_created_at = CAST(json_extract(event_json, '$.created_at') AS INTEGER) WHERE event_created_at = 0 AND json_valid(event_json)`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("backfill purgatory ordering: %w", err)
+	}
+
 	// Migration: early NIP-46 sessions used status/auth_code/error_msg. Retain
 	// their state while moving to the canonical state/result_pubkey/error names.
 	_, _ = db.Exec(`ALTER TABLE nip46_sessions ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'`)
@@ -384,6 +445,38 @@ func Open(path string) (*SQLiteStore, error) {
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_actor_events_user_created ON pending_actor_events(gitea_user_id, created_at, id)`)
 
 	return &SQLiteStore{db: db}, nil
+}
+
+func ensureSQLiteColumn(db *sql.DB, table, column, definition string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
 }
 
 func (s *SQLiteStore) Close() error {
@@ -1118,7 +1211,7 @@ func (s *SQLiteStore) SetHookInstalled(ctx context.Context, npub string, repoID 
 func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string) ([]Mapping, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed,
-			announcement_event_json, announcement_event_id,
+			announcement_event_json, announcement_event_id, announcement_created_at,
 			last_republished_announcement_id, last_republished_announcement_at,
 			last_state_digest, last_state_event_id, last_state_published_at,
 			created_at, updated_at
@@ -1140,7 +1233,7 @@ func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string) ([]Ma
 		if err := rows.Scan(
 			&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID,
 			&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal,
-			&m.AnnouncementEventJSON, &m.AnnouncementEventID,
+			&m.AnnouncementEventJSON, &m.AnnouncementEventID, &m.AnnouncementCreatedAt,
 			&m.LastRepublishedAnnouncementID, &lastRepubAnnAt,
 			&m.LastStateDigest, &m.LastStateEventID, &lastStatePubAt,
 			&createdAt, &updatedAt,
@@ -1242,7 +1335,7 @@ func (s *SQLiteStore) getMappingWhere(ctx context.Context, where string, args ..
 	var lastRepubAnnAt, lastStatePubAt string
 	err := s.db.QueryRowContext(ctx, `
 		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed,
-			announcement_event_json, announcement_event_id,
+			announcement_event_json, announcement_event_id, announcement_created_at,
 			last_republished_announcement_id, last_republished_announcement_at,
 			last_state_digest, last_state_event_id, last_state_published_at,
 			created_at, updated_at
@@ -1250,7 +1343,7 @@ func (s *SQLiteStore) getMappingWhere(ctx context.Context, where string, args ..
 	`, args...).Scan(
 		&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID,
 		&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal,
-		&m.AnnouncementEventJSON, &m.AnnouncementEventID,
+		&m.AnnouncementEventJSON, &m.AnnouncementEventID, &m.AnnouncementCreatedAt,
 		&m.LastRepublishedAnnouncementID, &lastRepubAnnAt,
 		&m.LastStateDigest, &m.LastStateEventID, &lastStatePubAt,
 		&createdAt, &updatedAt,
@@ -1487,7 +1580,7 @@ func (s *SQLiteStore) UpsertUserGraspListEvent(ctx context.Context, list UserGra
 			event_json = excluded.event_json,
 			event_id = excluded.event_id,
 			created_at = excluded.created_at
-		WHERE user_grasp_list.created_at < excluded.created_at
+		WHERE `+replaceableEventSQL("user_grasp_list.created_at", "user_grasp_list.event_id", "excluded.created_at", "excluded.event_id")+`
 	`, list.Pubkey, list.EventJSON, list.EventID, list.CreatedAt)
 	if err != nil {
 		return false, err
@@ -1530,7 +1623,7 @@ func (s *SQLiteStore) GetMappingByGiteaRepoID(ctx context.Context, giteaRepoID i
 	var lastRepubAnnAt, lastStatePubAt string
 	err := s.db.QueryRowContext(ctx, `
 		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed,
-			announcement_event_json, announcement_event_id,
+			announcement_event_json, announcement_event_id, announcement_created_at,
 			last_republished_announcement_id, last_republished_announcement_at,
 			last_state_digest, last_state_event_id, last_state_published_at,
 			created_at, updated_at
@@ -1538,7 +1631,7 @@ func (s *SQLiteStore) GetMappingByGiteaRepoID(ctx context.Context, giteaRepoID i
 	`, giteaRepoID).Scan(
 		&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.GiteaRepoID,
 		&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal,
-		&m.AnnouncementEventJSON, &m.AnnouncementEventID,
+		&m.AnnouncementEventJSON, &m.AnnouncementEventID, &m.AnnouncementCreatedAt,
 		&m.LastRepublishedAnnouncementID, &lastRepubAnnAt,
 		&m.LastStateDigest, &m.LastStateEventID, &lastStatePubAt,
 		&createdAt, &updatedAt,
@@ -1565,13 +1658,25 @@ func (s *SQLiteStore) GetMappingByGiteaRepoID(ctx context.Context, giteaRepoID i
 	return m, nil
 }
 
-// SetAnnouncementEvent caches the raw owner-signed announcement event JSON and ID.
+// SetAnnouncementEvent transactionally caches the owner-signed announcement
+// only when it wins canonical replaceable-event ordering.
 func (s *SQLiteStore) SetAnnouncementEvent(ctx context.Context, npub, repoID, eventJSON, eventID string) error {
+	key, err := replaceableEventKeyFromJSON(eventJSON, eventID)
+	if err != nil {
+		return err
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE mappings SET announcement_event_json = ?, announcement_event_id = ?, updated_at = ?
-		WHERE npub = ? AND repo_id = ?
-	`, eventJSON, eventID, now, npub, repoID)
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE mappings SET
+			announcement_event_json = ?,
+			announcement_event_id = ?,
+			announcement_created_at = ?,
+			last_republished_announcement_id = '',
+			last_republished_announcement_at = '',
+			updated_at = ?
+		WHERE npub = ? AND repo_id = ? AND
+			(announcement_event_id = '' OR `+replaceableEventSQL("announcement_created_at", "announcement_event_id", "?", "?")+`)
+	`, eventJSON, eventID, key.CreatedAt, now, npub, repoID, key.CreatedAt, key.CreatedAt, key.EventID)
 	return err
 }
 

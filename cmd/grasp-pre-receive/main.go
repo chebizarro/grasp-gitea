@@ -10,6 +10,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +21,7 @@ import (
 	"fiatjaf.com/nostr/nip34"
 
 	"github.com/sharegap/grasp-gitea/internal/nostrstate"
+	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 )
@@ -36,6 +40,13 @@ func isDeletion(newSHA string) bool {
 }
 
 func main() {
+	timeout, err := envDuration("GRASP_HOOK_TIMEOUT", 15*time.Second)
+	if err != nil {
+		reject(err.Error())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	relayURL := envOrDefault("GRASP_HOOK_RELAY_URL", envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"))
 	npub := strings.TrimSpace(os.Getenv("GRASP_REPO_NPUB"))
 	repoID := strings.TrimSpace(os.Getenv("GRASP_REPO_ID"))
@@ -57,10 +68,12 @@ func main() {
 	if err != nil {
 		reject(err.Error())
 	}
+	if err := enforceNostrPushLimits(ctx, updates); err != nil {
+		reject(err.Error())
+	}
 
 	var state *nip34.RepositoryState
 	if requiresStateCheck(updates) {
-		ctx := context.Background()
 		_, state, _, err = nostrstate.FetchLatestRepositoryStateForRepo(ctx, relayURL, pubkey, repoID)
 		if err != nil || evaluatePushUpdates(updates, state, nil) != nil {
 			proposed, proposedErr := fetchProposedRepositoryState(ctx, pubkey, repoID)
@@ -72,8 +85,11 @@ func main() {
 		}
 	}
 
-	checker := newRelayNostrRefChecker(relayURL)
+	checker := newRelayNostrRefChecker(ctx, relayURL)
 	if err := evaluatePushUpdates(updates, state, checker); err != nil {
+		if ctx.Err() != nil {
+			reject("push verification timed out")
+		}
 		reject(err.Error())
 	}
 }
@@ -117,7 +133,7 @@ func fetchProposedRepositoryState(ctx context.Context, pubkey string, repoID str
 	}
 	if payload.Event.Kind != nostr.KindRepositoryState ||
 		payload.Event.PubKey.Hex() != pubkey ||
-		!payload.Event.VerifySignature() {
+		nostrverify.ValidateEventIDAndSignature(&payload.Event) != nil {
 		return nil, fmt.Errorf("invalid proposed state event")
 	}
 	parsed := nip34.ParseRepositoryState(payload.Event)
@@ -149,9 +165,9 @@ type nostrRefChecker func(eventID string, tipSHA string) error
 // rejected during pre-receive rather than being noticed later by a webhook.
 // Valid IDs with no relay event are accepted. Relay unreachability fails
 // closed, matching the state-check path.
-func newRelayNostrRefChecker(relayURL string) nostrRefChecker {
+func newRelayNostrRefChecker(parent context.Context, relayURL string) nostrRefChecker {
 	return func(eventID string, tipSHA string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 		defer cancel()
 		fetcher := relayEventFetcher{relayURL: relayURL}
 		_, err := refsnostr.FetchEventForTip(ctx, fetcher, eventID, tipSHA)
@@ -185,6 +201,9 @@ func (f relayEventFetcher) FetchEvent(ctx context.Context, id string) (*nostr.Ev
 		Limit: 1,
 	}) {
 		e := ev
+		if e.ID.Hex() != id || nostrverify.ValidateEventIDAndSignature(&e) != nil {
+			return nil, fmt.Errorf("relay returned invalid event")
+		}
 		return &e, nil
 	}
 	return nil, nil
@@ -206,6 +225,258 @@ func collectPushUpdates(r io.Reader) ([]pushUpdate, error) {
 		return nil, fmt.Errorf("failed to read hook input")
 	}
 	return updates, nil
+}
+
+type nostrPushLimits struct {
+	maxUpdates          int64
+	maxActiveRefs       int64
+	maxQuarantineBytes  int64
+	maxObjects          int64
+	maxObjectBytes      int64
+	maxSingleObjectByte int64
+}
+
+func loadNostrPushLimits() (nostrPushLimits, error) {
+	maxUpdates, err := envPositiveInt64("GRASP_HOOK_MAX_NOSTR_UPDATES", 16)
+	if err != nil {
+		return nostrPushLimits{}, err
+	}
+	maxActiveRefs, err := envPositiveInt64("GRASP_HOOK_MAX_NOSTR_REFS", 256)
+	if err != nil {
+		return nostrPushLimits{}, err
+	}
+	maxQuarantineBytes, err := envPositiveInt64("GRASP_HOOK_MAX_PACK_BYTES", 256<<20)
+	if err != nil {
+		return nostrPushLimits{}, err
+	}
+	maxObjects, err := envPositiveInt64("GRASP_HOOK_MAX_OBJECTS", 50000)
+	if err != nil {
+		return nostrPushLimits{}, err
+	}
+	maxObjectBytes, err := envPositiveInt64("GRASP_HOOK_MAX_OBJECT_BYTES", 512<<20)
+	if err != nil {
+		return nostrPushLimits{}, err
+	}
+	maxSingleObjectByte, err := envPositiveInt64("GRASP_HOOK_MAX_SINGLE_OBJECT_BYTES", 64<<20)
+	if err != nil {
+		return nostrPushLimits{}, err
+	}
+	return nostrPushLimits{maxUpdates, maxActiveRefs, maxQuarantineBytes, maxObjects, maxObjectBytes, maxSingleObjectByte}, nil
+}
+
+func enforceNostrPushLimits(ctx context.Context, updates []pushUpdate) error {
+	limits, err := loadNostrPushLimits()
+	if err != nil {
+		return err
+	}
+
+	seenUpdates := make(map[string]struct{}, len(updates))
+	nostrUpdates := make([]pushUpdate, 0, len(updates))
+	for _, update := range updates {
+		if _, duplicate := seenUpdates[update.refName]; duplicate {
+			return fmt.Errorf("duplicate update for ref %s", update.refName)
+		}
+		seenUpdates[update.refName] = struct{}{}
+		if strings.HasPrefix(update.refName, refsnostr.RefPrefix) {
+			nostrUpdates = append(nostrUpdates, update)
+		}
+	}
+	if len(nostrUpdates) == 0 {
+		return nil
+	}
+	if int64(len(nostrUpdates)) > limits.maxUpdates {
+		return fmt.Errorf("push rejected: refs/nostr update quota exceeded (%d > %d)", len(nostrUpdates), limits.maxUpdates)
+	}
+
+	active, err := activeNostrRefs(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect refs/nostr quota: %w", err)
+	}
+	for _, update := range nostrUpdates {
+		if isDeletion(update.newSHA) {
+			delete(active, update.refName)
+		} else {
+			active[update.refName] = struct{}{}
+		}
+	}
+	if int64(len(active)) > limits.maxActiveRefs {
+		return fmt.Errorf("push rejected: active refs/nostr quota exceeded (%d > %d)", len(active), limits.maxActiveRefs)
+	}
+
+	if err := enforceQuarantineBytes(ctx, limits.maxQuarantineBytes); err != nil {
+		return err
+	}
+
+	tips := make([]string, 0, len(nostrUpdates))
+	for _, update := range nostrUpdates {
+		if isDeletion(update.newSHA) {
+			continue
+		}
+		if !isGitObjectID(update.newSHA) {
+			return fmt.Errorf("push rejected: invalid object id for %s", update.refName)
+		}
+		if out, err := exec.CommandContext(ctx, "git", "cat-file", "-e", update.newSHA+"^{commit}").CombinedOutput(); err != nil {
+			return fmt.Errorf("push rejected: %s must point to a commit: %s", update.refName, strings.TrimSpace(string(out)))
+		}
+		tips = append(tips, update.newSHA)
+	}
+	if len(tips) == 0 {
+		return nil
+	}
+	return enforceNewObjectLimits(ctx, tips, limits)
+}
+
+func activeNostrRefs(ctx context.Context) (map[string]struct{}, error) {
+	out, err := exec.CommandContext(ctx, "git", "for-each-ref", "--format=%(refname)", refsnostr.RefPrefix).Output()
+	if err != nil {
+		return nil, err
+	}
+	refs := make(map[string]struct{})
+	for _, ref := range strings.Fields(string(out)) {
+		refs[ref] = struct{}{}
+	}
+	return refs, nil
+}
+
+func enforceQuarantineBytes(ctx context.Context, maxBytes int64) error {
+	root := strings.TrimSpace(os.Getenv("GIT_QUARANTINE_PATH"))
+	if root == "" {
+		root = strings.TrimSpace(os.Getenv("GIT_OBJECT_DIRECTORY"))
+	}
+	if root == "" {
+		return nil
+	}
+	var total int64
+	err := filepath.WalkDir(root, func(_ string, entry os.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+		if total > maxBytes {
+			return fmt.Errorf("push rejected: quarantine pack quota exceeded (%d > %d bytes)", total, maxBytes)
+		}
+		return nil
+	})
+	return err
+}
+
+func enforceNewObjectLimits(ctx context.Context, tips []string, limits nostrPushLimits) error {
+	args := append([]string{"rev-list", "--objects"}, tips...)
+	args = append(args, "--not", "--all")
+	revCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(revCtx, "git", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("enumerate new objects: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("enumerate new objects: %w", err)
+	}
+
+	ids := make([]string, 0, min(int(limits.maxObjects), 1024))
+	seen := make(map[string]struct{})
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) == 0 {
+			continue
+		}
+		if _, ok := seen[fields[0]]; ok {
+			continue
+		}
+		seen[fields[0]] = struct{}{}
+		ids = append(ids, fields[0])
+		if int64(len(ids)) > limits.maxObjects {
+			cancel()
+			_ = cmd.Wait()
+			return fmt.Errorf("push rejected: new object quota exceeded (%d > %d)", len(ids), limits.maxObjects)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		cancel()
+		_ = cmd.Wait()
+		return fmt.Errorf("enumerate new objects: %w", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("enumerate new objects: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	catCmd := exec.CommandContext(ctx, "git", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+	catCmd.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
+	checked, err := catCmd.Output()
+	if err != nil {
+		return fmt.Errorf("inspect new objects: %w", err)
+	}
+	var total int64
+	for _, line := range strings.Split(strings.TrimSpace(string(checked)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			return fmt.Errorf("inspect new objects: unexpected git output")
+		}
+		size, err := strconv.ParseInt(fields[2], 10, 64)
+		if err != nil || size < 0 {
+			return fmt.Errorf("inspect new objects: invalid object size")
+		}
+		if size > limits.maxSingleObjectByte {
+			return fmt.Errorf("push rejected: object %s exceeds single-object quota (%d > %d bytes)", fields[0], size, limits.maxSingleObjectByte)
+		}
+		total += size
+		if total > limits.maxObjectBytes {
+			return fmt.Errorf("push rejected: decompressed object quota exceeded (%d > %d bytes)", total, limits.maxObjectBytes)
+		}
+	}
+	return nil
+}
+
+func isGitObjectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func envPositiveInt64(key string, fallback int64) (int64, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", key)
+	}
+	return value, nil
+}
+
+func envDuration(key string, fallback time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration", key)
+	}
+	return value, nil
 }
 
 func requiresStateCheck(updates []pushUpdate) bool {

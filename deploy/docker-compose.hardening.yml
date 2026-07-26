@@ -1,0 +1,73 @@
+# Security/deployment overlay for the canonical single-host stack.
+# Combine with the deployment's base Gitea/bridge compose file. The one-shot
+# installer copies the hook from the bridge image into a volume mounted by both
+# containers, so the path written into repository hook scripts exists inside
+# the Gitea container where receive-pack executes.
+services:
+  grasp-hook-install:
+    image: ${GRASP_BRIDGE_IMAGE:-grasp-bridge:local-full}
+    restart: "no"
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - cp /usr/local/bin/grasp-pre-receive /hook-bin/grasp-pre-receive; chmod 0755 /hook-bin/grasp-pre-receive
+    volumes:
+      - grasp-hook-bin:/hook-bin
+
+  grasp-bridge:
+    depends_on:
+      grasp-hook-install:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - export ADMIN_API_TOKEN="$$(cat /run/secrets/grasp-admin-api-token)"; exec grasp-bridge
+    environment:
+      GRASP_ENV: production
+      EMBEDDED_RELAY: "true"
+      EMBEDDED_RELAY_PORT: "3334"
+      HOOK_RELAY_URL: ws://grasp-bridge:3334
+      HOOK_BINARY_PATH: /opt/grasp/grasp-pre-receive
+      ADMIN_API_TOKEN: ""
+    secrets:
+      - grasp-admin-api-token
+    volumes:
+      - grasp-hook-bin:/opt/grasp:ro
+      - gitea-data:/gitea-data
+
+  gitea:
+    image: ${GITEA_IMAGE:-gitea/gitea:1.24.6}
+    depends_on:
+      grasp-hook-install:
+        condition: service_completed_successfully
+    # Do not publish port 3000. Only canonical nginx may reach this service.
+    environment:
+      GITEA__SERVICE__ENABLE_REVERSE_PROXY_AUTHENTICATION: "true"
+      GITEA__SERVICE__ENABLE_REVERSE_PROXY_AUTHENTICATION_API: "false"
+      GITEA__SERVICE__ENABLE_REVERSE_PROXY_AUTO_REGISTRATION: "false"
+      GITEA__SECURITY__REVERSE_PROXY_AUTHENTICATION_USER: X-Grasp-Auth-User
+      "GITEA__git.config__receive.maxInputSize": "268435456"
+      GRASP_HOOK_RELAY_URL: ws://grasp-bridge:3334
+      GRASP_HOOK_ADMIN_URL: http://grasp-bridge:8090
+      GRASP_HOOK_ADMIN_TOKEN_FILE: /run/secrets/grasp-admin-api-token
+      GRASP_HOOK_TIMEOUT: 15s
+      GRASP_HOOK_MAX_NOSTR_UPDATES: "16"
+      GRASP_HOOK_MAX_NOSTR_REFS: "256"
+      GRASP_HOOK_MAX_PACK_BYTES: "268435456"
+      GRASP_HOOK_MAX_OBJECTS: "50000"
+      GRASP_HOOK_MAX_OBJECT_BYTES: "536870912"
+      GRASP_HOOK_MAX_SINGLE_OBJECT_BYTES: "67108864"
+    secrets:
+      - grasp-admin-api-token
+    volumes:
+      - grasp-hook-bin:/opt/grasp:ro
+      - ./gitea/custom/public:/data/gitea/public:ro
+      - ./gitea/custom/templates:/data/gitea/templates:ro
+
+secrets:
+  grasp-admin-api-token:
+    file: ${GRASP_ADMIN_TOKEN_FILE:?set GRASP_ADMIN_TOKEN_FILE}
+
+volumes:
+  grasp-hook-bin:
+  gitea-data:
+    external: true

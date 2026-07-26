@@ -1,13 +1,22 @@
 (() => {
-  const bridgeURL = window.GRASP_BRIDGE_PUBLIC_URL || 'https://grasp.sharegap.net';
+  const bridgeURL = (window.GRASP_BRIDGE_PUBLIC_URL || window.location.origin).replace(/\/$/, '');
 
   function onLoginPage() {
     return window.location.pathname === '/user/login' || window.location.pathname === '/user/sign_in';
   }
 
   function targetRedirect() {
-    const next = new URLSearchParams(window.location.search).get('redirect_to');
-    return next || '/';
+    const raw = new URLSearchParams(window.location.search).get('redirect_to');
+    if (!raw || !raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\')) return '/';
+    try {
+      const target = new URL(raw, window.location.origin);
+      if (target.origin !== window.location.origin ||
+          target.pathname === '/auth/session/handoff' ||
+          target.pathname.startsWith('/auth/session/handoff/')) return '/';
+      return target.pathname + target.search;
+    } catch {
+      return '/';
+    }
   }
 
   function insertPanel() {
@@ -54,8 +63,8 @@
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({redirect_uri: targetRedirect()}),
     });
-    if (!challengeResp.ok) throw new Error(`challenge failed: ${challengeResp.status}`);
     const challenge = await challengeResp.json();
+    if (!challengeResp.ok) throw new Error(challenge.error || `challenge failed: ${challengeResp.status}`);
 
     status('Requesting Nostr signature…');
     const event = await window.nostr.signEvent({
@@ -71,13 +80,12 @@
       body: JSON.stringify({signed_event: event}),
     });
     const result = await verifyResp.json();
-    if (!verifyResp.ok || !result.ok) throw new Error(result.error || `verify failed: ${verifyResp.status}`);
+    if (!verifyResp.ok || !result.ok || !result.handoff_url) {
+      throw new Error(result.error || `verify failed: ${verifyResp.status}`);
+    }
 
-    // Bridge verification has created/linked the Gitea identity. The deployed
-    // Gitea session handoff should consume the resolved identity and establish
-    // the web session; until then, this lands on the normal post-login target.
     status(`Verified ${result.identity.gitea_user}; completing Gitea session…`);
-    window.location.assign(result.redirect_uri || targetRedirect());
+    window.location.assign(result.handoff_url);
   }
 
   async function nip46Login() {
@@ -87,10 +95,20 @@
       status('Paste a Signet bunker URI first.', true);
       return;
     }
+    const bindResp = await fetch(`${bridgeURL}/auth/session/nip46/bind`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({redirect_uri: targetRedirect()}),
+    });
+    const binding = await bindResp.json();
+    if (!bindResp.ok || !binding.redirect_uri) {
+      throw new Error(binding.error || `NIP-46 binding failed: ${bindResp.status}`);
+    }
+
     const initResp = await fetch(`${bridgeURL}/auth/nip46/init`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({bunker_uri: bunkerURI, redirect_uri: targetRedirect()}),
+      body: JSON.stringify({bunker_uri: bunkerURI, redirect_uri: binding.redirect_uri}),
     });
     const init = await initResp.json();
     if (!initResp.ok) throw new Error(init.error || `NIP-46 init failed: ${initResp.status}`);
@@ -98,16 +116,38 @@
     const deadline = Date.now() + 120000;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 1500));
-      const poll = await fetch(init.poll_url);
+      const safeStatusURL = new URL(`${bridgeURL}/auth/session/nip46/status`);
+      safeStatusURL.searchParams.set('session', init.session_token);
+      const poll = await fetch(safeStatusURL);
       const state = await poll.json();
       if (state.status === 'complete') {
+        const exchangeResp = await fetch(`${bridgeURL}/auth/session/nip46/exchange`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({session_token: init.session_token}),
+        });
+        const handoff = await exchangeResp.json();
+        if (!exchangeResp.ok || !handoff.handoff_url) {
+          throw new Error(handoff.error || `session exchange failed: ${exchangeResp.status}`);
+        }
         status(`Verified ${state.identity.gitea_user}; completing Gitea session…`);
-        window.location.assign(state.redirect_uri || targetRedirect());
+        window.location.assign(handoff.handoff_url);
         return;
       }
       if (state.status === 'error') throw new Error(state.error || 'NIP-46 login failed');
     }
     throw new Error('NIP-46 login timed out');
+  }
+
+  async function nip55Login() {
+    const challengeURL = new URL(`${bridgeURL}/auth/nip55/challenge`);
+    challengeURL.searchParams.set('redirect_uri', targetRedirect());
+    const response = await fetch(challengeURL);
+    const challenge = await response.json();
+    if (!response.ok || !challenge.nostrsigner_uri) {
+      throw new Error(challenge.error || `NIP-55 challenge failed: ${response.status}`);
+    }
+    window.location.assign(challenge.nostrsigner_uri);
   }
 
   function wire() {
@@ -116,9 +156,7 @@
     document.getElementById('grasp-nip46-login').addEventListener('click', () => nip46Login().catch((err) => status(err.message, true)));
     document.getElementById('grasp-nip55-login').addEventListener('click', (event) => {
       event.preventDefault();
-      const u = new URL(`${bridgeURL}/auth/nip55/challenge`);
-      u.searchParams.set('redirect_uri', targetRedirect());
-      window.location.assign(u.toString());
+      nip55Login().catch((err) => status(err.message, true));
     });
   }
 

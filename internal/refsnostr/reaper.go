@@ -8,12 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/gitea"
+	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -37,6 +40,10 @@ type PRChecker interface {
 
 type RefDeleter interface {
 	DeleteNostrRef(ctx context.Context, ref store.PendingNostrRef) error
+}
+
+type RepositoryCleaner interface {
+	CleanupRepository(ctx context.Context, ref store.PendingNostrRef) error
 }
 
 type Clock func() time.Time
@@ -122,6 +129,7 @@ func (r *Reaper) Sweep(ctx context.Context) error {
 		return fmt.Errorf("list pending refs/nostr refs: %w", err)
 	}
 
+	deletedRepos := make(map[string]store.PendingNostrRef)
 	for _, ref := range pending {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -146,6 +154,14 @@ func (r *Reaper) Sweep(ctx context.Context) error {
 		if err := r.store.DeletePendingNostrRef(ctx, ref.GiteaRepoID, ref.EventID); err != nil {
 			r.warn("failed to clear deleted refs/nostr pending row", "event_id", ref.EventID, "repo", ref.Owner+"/"+ref.RepoName, "error", err)
 		}
+		deletedRepos[ref.Owner+"/"+ref.RepoName] = ref
+	}
+	if cleaner, ok := r.deleter.(RepositoryCleaner); ok {
+		for repo, ref := range deletedRepos {
+			if err := cleaner.CleanupRepository(ctx, ref); err != nil {
+				r.warn("failed to clean unreachable refs/nostr objects", "repo", repo, "error", err)
+			}
+		}
 	}
 	return nil
 }
@@ -158,10 +174,11 @@ func (r *Reaper) warn(msg string, args ...any) {
 
 type GitRefDeleter struct {
 	RepositoriesDir string
+	CleanupTimeout  time.Duration
 }
 
 func NewGitRefDeleter(repositoriesDir string) *GitRefDeleter {
-	return &GitRefDeleter{RepositoriesDir: repositoriesDir}
+	return &GitRefDeleter{RepositoriesDir: repositoriesDir, CleanupTimeout: 2 * time.Minute}
 }
 
 func (d *GitRefDeleter) DeleteNostrRef(ctx context.Context, ref store.PendingNostrRef) error {
@@ -170,6 +187,29 @@ func (d *GitRefDeleter) DeleteNostrRef(ctx context.Context, ref store.PendingNos
 	}
 	repoPath := filepath.Join(d.RepositoriesDir, ref.Owner, ref.RepoName+".git")
 	return gitea.DeleteBareRef(ctx, repoPath, RefPrefix+ref.EventID)
+}
+
+// CleanupRepository reclaims objects made unreachable by expired temporary
+// refs. Reaper calls it at most once per affected repository and sweep.
+func (d *GitRefDeleter) CleanupRepository(ctx context.Context, ref store.PendingNostrRef) error {
+	if d == nil || d.RepositoriesDir == "" {
+		return fmt.Errorf("repositories dir is not configured")
+	}
+	repoPath := filepath.Join(d.RepositoriesDir, ref.Owner, ref.RepoName+".git")
+	// Cleanup is bounded and uses a grace period so concurrent Git operations are safe.
+	cleanupTimeout := d.CleanupTimeout
+	if cleanupTimeout <= 0 {
+		cleanupTimeout = 2 * time.Minute
+	}
+	cleanupCtx, cancel := context.WithTimeout(ctx, cleanupTimeout)
+	defer cancel()
+	if out, err := exec.CommandContext(cleanupCtx, "git", "--git-dir", repoPath, "reflog", "expire", "--expire-unreachable=now", "--all").CombinedOutput(); err != nil {
+		return fmt.Errorf("expire unreachable reflogs: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.CommandContext(cleanupCtx, "git", "--git-dir", repoPath, "gc", "--prune=1.hour.ago").CombinedOutput(); err != nil {
+		return fmt.Errorf("git gc: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 type EventFetcher interface {
@@ -208,7 +248,7 @@ func EventListsDifferentTip(ev *nostr.Event, tipSHA string) bool {
 }
 
 func EventIsAcceptedPRWithTip(ev *nostr.Event, eventID, tipSHA string) bool {
-	if ev == nil || ev.ID.Hex() != eventID {
+	if ev == nil || ev.ID.Hex() != eventID || nostrverify.ValidateEventIDAndSignature(ev) != nil {
 		return false
 	}
 	if ev.Kind != relay.KindPROpen && ev.Kind != relay.KindPRUpdate {

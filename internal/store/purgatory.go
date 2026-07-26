@@ -32,29 +32,35 @@ func unmarshalStringSlice(raw string) ([]string, error) {
 // PurgatoryEvent is an accepted Nostr event retained durably but not served
 // until its referenced Git data arrives (GRASP-01 purgatory).
 type PurgatoryEvent struct {
-	EventID      string
-	Pubkey       string
-	Kind         int
-	DTag         string
-	EventJSON    string
-	RequiredSHAs []string
-	RepoPath     string
-	AcceptedAt   time.Time
+	EventID        string
+	Pubkey         string
+	Kind           int
+	DTag           string
+	EventJSON      string
+	EventCreatedAt int64
+	RequiredSHAs   []string
+	RepoPath       string
+	AcceptedAt     time.Time
 }
 
 // UpsertPurgatoryEvent records an event awaiting Git data. Re-acceptance of
 // the same event refreshes nothing: the original accepted_at is preserved so
 // expiry cannot be extended by replays.
 func (s *SQLiteStore) UpsertPurgatoryEvent(ctx context.Context, ev PurgatoryEvent) error {
+	key, err := replaceableEventKeyFromJSON(ev.EventJSON, ev.EventID)
+	if err != nil {
+		return err
+	}
+	ev.EventCreatedAt = key.CreatedAt
 	shas, err := marshalStringSlice(ev.RequiredSHAs)
 	if err != nil {
 		return fmt.Errorf("marshal required shas: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO purgatory_events (event_id, pubkey, kind, d_tag, event_json, required_shas, repo_path, accepted_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO purgatory_events (event_id, pubkey, kind, d_tag, event_json, event_created_at, required_shas, repo_path, accepted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(event_id) DO NOTHING`,
-		ev.EventID, ev.Pubkey, ev.Kind, ev.DTag, ev.EventJSON, shas, ev.RepoPath, ev.AcceptedAt.UTC())
+		ev.EventID, ev.Pubkey, ev.Kind, ev.DTag, ev.EventJSON, ev.EventCreatedAt, shas, ev.RepoPath, ev.AcceptedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("insert purgatory event: %w", err)
 	}
@@ -64,7 +70,7 @@ func (s *SQLiteStore) UpsertPurgatoryEvent(ctx context.Context, ev PurgatoryEven
 // ListPurgatoryEvents returns all events currently held in purgatory.
 func (s *SQLiteStore) ListPurgatoryEvents(ctx context.Context) ([]PurgatoryEvent, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT event_id, pubkey, kind, d_tag, event_json, required_shas, repo_path, accepted_at
+		SELECT event_id, pubkey, kind, d_tag, event_json, event_created_at, required_shas, repo_path, accepted_at
 		FROM purgatory_events ORDER BY accepted_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list purgatory events: %w", err)
@@ -74,7 +80,7 @@ func (s *SQLiteStore) ListPurgatoryEvents(ctx context.Context) ([]PurgatoryEvent
 	for rows.Next() {
 		var ev PurgatoryEvent
 		var shas string
-		if err := rows.Scan(&ev.EventID, &ev.Pubkey, &ev.Kind, &ev.DTag, &ev.EventJSON, &shas, &ev.RepoPath, &ev.AcceptedAt); err != nil {
+		if err := rows.Scan(&ev.EventID, &ev.Pubkey, &ev.Kind, &ev.DTag, &ev.EventJSON, &ev.EventCreatedAt, &shas, &ev.RepoPath, &ev.AcceptedAt); err != nil {
 			return nil, fmt.Errorf("scan purgatory event: %w", err)
 		}
 		ev.RequiredSHAs, err = unmarshalStringSlice(shas)
@@ -94,12 +100,12 @@ func (s *SQLiteStore) LatestPurgatoryEvent(ctx context.Context, pubkey string, k
 	var ev PurgatoryEvent
 	var shas string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT event_id, pubkey, kind, d_tag, event_json, required_shas, repo_path, accepted_at
+		SELECT event_id, pubkey, kind, d_tag, event_json, event_created_at, required_shas, repo_path, accepted_at
 		FROM purgatory_events
 		WHERE pubkey = ? AND kind = ? AND d_tag = ?
-		ORDER BY accepted_at DESC, event_id ASC
+		ORDER BY `+replaceableEventOrderSQL+`
 		LIMIT 1`, pubkey, kind, dTag).
-		Scan(&ev.EventID, &ev.Pubkey, &ev.Kind, &ev.DTag, &ev.EventJSON, &shas, &ev.RepoPath, &ev.AcceptedAt)
+		Scan(&ev.EventID, &ev.Pubkey, &ev.Kind, &ev.DTag, &ev.EventJSON, &ev.EventCreatedAt, &shas, &ev.RepoPath, &ev.AcceptedAt)
 	if err != nil {
 		return PurgatoryEvent{}, err
 	}

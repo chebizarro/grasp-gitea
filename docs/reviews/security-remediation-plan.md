@@ -105,15 +105,15 @@ replaceable-ordering helpers in `internal/store/sqlite.go` +
 adds an identity uniqueness constraint to the same file; edits are in different
 regions), `README.md`, `Dockerfile`.
 Done when:
-- [ ] Verified NIP-07/46 user obtains a real Gitea session; NIP-55 launches deep link.
-- [ ] `redirect_uri` restricted to same-origin relative paths / allowlist.
-- [ ] Canonical single-host nginx serves relay WS + NIP-11 at `/`, bridge API/auth,
+- [x] Verified NIP-07/46 user obtains a real Gitea session; NIP-55 launches deep link.
+- [x] `redirect_uri` restricted to same-origin relative paths / allowlist.
+- [x] Canonical single-host nginx serves relay WS + NIP-11 at `/`, bridge API/auth,
       bare npub repo URLs; compose installs hook binary + admin-token secret in the
       Gitea container with correct relay addressing.
-- [ ] refs/nostr pushes quota-limited; pre-receive relay lookups bounded + closed.
-- [ ] Replaceable ordering (created_at desc, id asc tie-break) centralized for
+- [x] refs/nostr pushes quota-limited; pre-receive relay lookups bounded + closed.
+- [x] Replaceable ordering (created_at desc, id asc tie-break) centralized for
       announcements/grasp-lists/proposed state.
-- [ ] README/Dockerfile claims reconciled (install `act` or label Hive-CI experimental).
+- [x] README/Dockerfile claims reconciled (install `act` or label Hive-CI experimental).
 
 ### Item F — Loom integration (design first)  [Wave 3]
 Bead: phase1-yk8 (P1). Greenfield; produce a design doc under `docs/designs/`
@@ -137,6 +137,7 @@ path, config, then implement. Do design pass before code.
   methods to Item C's merged `internal/gitea/client.go`.
 
 ## Progress log
+- 2026-07-25: Item E completed cookie/audience-bound single-use Gitea session handoff for NIP-07 and browser-bound NIP-46 exchange, normalized redirects and NIP-55 deep linking, canonical single-host nginx plus hardened hook/secret compose wiring, refs/nostr rate/object quotas with bounded verification and cleanup, canonical replaceable ordering, and README/runtime claim reconciliation. Focused, default full, and `-tags full` test suites pass; Compose and JavaScript static validation pass.
 - 2026-07-25: Item B completed NIP-34 issue-status authorization, durable
   thread roots and standard NIP-22 root resolution, inbound NIP-32 label
   add/removal, durable receipt-before-200 webhook retry handling, and guarded

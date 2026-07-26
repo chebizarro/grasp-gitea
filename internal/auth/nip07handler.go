@@ -5,8 +5,10 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"fiatjaf.com/nostr"
 
@@ -20,6 +22,7 @@ type NIP07Handler struct {
 	identityService *IdentityService
 	relayURLs       []string
 	logger          *slog.Logger
+	sessionHandoff  *SessionHandoffHandler
 }
 
 // NewNIP07Handler creates a new handler for NIP-07 auth endpoints.
@@ -34,6 +37,7 @@ func NewNIP07Handler(
 		identityService: identitySvc,
 		relayURLs:       relayURLs,
 		logger:          logger.With("component", "auth.nip07"),
+		sessionHandoff:  NewSessionHandoffHandler(authSvc),
 	}
 }
 
@@ -41,6 +45,7 @@ func NewNIP07Handler(
 func (h *NIP07Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/auth/nip07/challenge", h.methodGuard(http.MethodPost, h.handleChallenge))
 	mux.HandleFunc("/auth/nip07/verify", h.methodGuard(http.MethodPost, h.handleVerify))
+	h.sessionHandoff.RegisterRoutes(mux)
 }
 
 // handleChallenge issues a new login challenge.
@@ -58,6 +63,10 @@ func (h *NIP07Handler) handleChallenge(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.authService.IssueChallenge(r.Context(), req)
 	if err != nil {
+		if errors.Is(err, ErrInvalidRedirectURI) {
+			h.writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 		h.logger.Error("issue challenge failed", "error", err)
 		h.writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to issue challenge"})
 		return
@@ -128,15 +137,27 @@ func (h *NIP07Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	handoff, err := h.authService.mintSessionHandoff(identity.GiteaUser, challenge.RedirectURI)
+	if err != nil {
+		metrics.IncAuthVerifyFailure()
+		h.logger.Error("session handoff creation failed", "pubkey", ev.PubKey.Hex(), "error", err)
+		h.writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "failed to establish login session"})
+		return
+	}
+	h.sessionHandoff.setBindingCookie(w, handoff)
+	w.Header().Set("Cache-Control", "no-store")
+
 	metrics.IncAuthVerifySuccess()
 	h.logger.Info("NIP-07 login verified",
 		"pubkey", ev.PubKey.Hex(), "gitea_user", identity.GiteaUser,
 		"created", identity.Created)
 
 	resp := verifyResponse{
-		OK:          true,
-		Identity:    identity,
-		RedirectURI: challenge.RedirectURI,
+		OK:               true,
+		Identity:         identity,
+		RedirectURI:      challenge.RedirectURI,
+		HandoffURL:       handoff.URL,
+		HandoffExpiresAt: handoff.ExpiresAt,
 	}
 	h.writeJSON(w, http.StatusOK, resp)
 }
@@ -148,9 +169,11 @@ type verifyRequest struct {
 
 // verifyResponse is the JSON response for a successful verification.
 type verifyResponse struct {
-	OK          bool             `json:"ok"`
-	Identity    ResolvedIdentity `json:"identity"`
-	RedirectURI string           `json:"redirect_uri,omitempty"`
+	OK               bool             `json:"ok"`
+	Identity         ResolvedIdentity `json:"identity"`
+	RedirectURI      string           `json:"redirect_uri,omitempty"`
+	HandoffURL       string           `json:"handoff_url"`
+	HandoffExpiresAt time.Time        `json:"handoff_expires_at"`
 }
 
 // tagValue returns the first value for a tag key, or "" if not found.

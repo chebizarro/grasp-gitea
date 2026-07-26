@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"fiatjaf.com/nostr"
@@ -45,6 +46,10 @@ type Service struct {
 	challengeTTL time.Duration
 	logger       *slog.Logger
 	nip98        *sharednip98.Verifier
+
+	handoffMu     sync.Mutex
+	handoffs      map[string]sessionHandoffRecord
+	nip46Bindings map[string]nip46BindingRecord
 }
 
 // NewService creates a new auth service. Returns nil if auth is disabled in config.
@@ -53,11 +58,13 @@ func NewService(cfg config.Config, st *store.SQLiteStore, logger *slog.Logger) *
 		return nil
 	}
 	return &Service{
-		store:        st,
-		publicURL:    cfg.BridgePublicURL,
-		challengeTTL: cfg.ChallengeTTL,
-		logger:       logger.With("component", "auth"),
-		nip98:        sharednip98.NewVerifier(60 * time.Second),
+		store:         st,
+		publicURL:     cfg.BridgePublicURL,
+		challengeTTL:  cfg.ChallengeTTL,
+		logger:        logger.With("component", "auth"),
+		nip98:         sharednip98.NewVerifier(60 * time.Second),
+		handoffs:      make(map[string]sessionHandoffRecord),
+		nip46Bindings: make(map[string]nip46BindingRecord),
 	}
 }
 
@@ -67,6 +74,12 @@ func (s *Service) IssueChallenge(ctx context.Context, req ChallengeRequest) (Cha
 }
 
 func (s *Service) issueChallenge(ctx context.Context, req ChallengeRequest, verifyPath string) (ChallengeResponse, error) {
+	redirectURI, err := normalizeRedirectURI(req.RedirectURI)
+	if err != nil {
+		return ChallengeResponse{}, err
+	}
+	req.RedirectURI = redirectURI
+
 	nonce, err := generateNonce()
 	if err != nil {
 		return ChallengeResponse{}, fmt.Errorf("generate nonce: %w", err)
