@@ -98,6 +98,39 @@ type Config struct {
 
 	// NIP34StatusSyncEnabled updates Gitea issue state from inbound NIP-34 status events.
 	NIP34StatusSyncEnabled bool
+
+	// Bridge token service: nostr-authenticated opaque tokens (grasp_v1_...)
+	// exchanged at the proxy edge for hidden per-user Gitea PATs.
+	BridgeTokensEnabled bool
+	// GiteaAdminUser is the login of the administrator that owns
+	// GITEA_ADMIN_TOKEN. The user-token lifecycle endpoints
+	// (/api/v1/users/{username}/tokens) are gated by Gitea's
+	// reqBasicOrRevProxyAuth, so PAT administration must authenticate with
+	// HTTP Basic (admin login + admin PAT) rather than the token header.
+	GiteaAdminUser string
+	// CredentialKeys is the versioned AES-256-GCM key ring protecting hidden
+	// Gitea PATs at rest. First entry encrypts; the rest only decrypt.
+	// Deliberately separate from SignerMasterKey.
+	CredentialKeys []CredentialKey
+	// EdgeSharedSecret authenticates trusted nginx-originated headers
+	// (session-handoff continuation) once the bridge fronts all Gitea traffic.
+	EdgeSharedSecret string
+	// FullProxyEnabled routes ALL unmatched HTTP traffic through the bridge to
+	// Gitea (full reverse proxy mode) instead of only canonical npub paths.
+	FullProxyEnabled bool
+	TokenTTLDefault  time.Duration
+	TokenTTLMin      time.Duration
+	TokenTTLMax      time.Duration
+	AuthAuditRetention time.Duration
+	// ShutdownGrace bounds graceful HTTP shutdown; long enough for active
+	// streaming git/package uploads to complete.
+	ShutdownGrace time.Duration
+}
+
+// CredentialKey is one entry of the credential-encryption key ring.
+type CredentialKey struct {
+	ID  string
+	Key []byte
 }
 
 func Load() (Config, error) {
@@ -158,6 +191,15 @@ func Load() (Config, error) {
 		LoomResultGrace:         boundedDurationEnv("LOOM_RESULT_GRACE", 30*time.Second, time.Second, 10*time.Minute),
 		CIProtocol:              strings.ToLower(envOrDefault("CI_PROTOCOL", "canonical")),
 		NIP34StatusSyncEnabled:  boolEnv("NIP34_STATUS_SYNC_ENABLED", false),
+		BridgeTokensEnabled:     boolEnv("BRIDGE_TOKENS_ENABLED", false),
+		GiteaAdminUser:          strings.TrimSpace(os.Getenv("GITEA_ADMIN_USER")),
+		EdgeSharedSecret:        strings.TrimSpace(os.Getenv("GRASP_EDGE_SHARED_SECRET")),
+		FullProxyEnabled:        boolEnv("GITEA_FULL_PROXY_ENABLED", false),
+		TokenTTLDefault:         durationEnv("BRIDGE_TOKEN_TTL_DEFAULT", 30*24*time.Hour),
+		TokenTTLMin:             durationEnv("BRIDGE_TOKEN_TTL_MIN", time.Hour),
+		TokenTTLMax:             durationEnv("BRIDGE_TOKEN_TTL_MAX", 90*24*time.Hour),
+		AuthAuditRetention:      boundedDurationEnv("AUTH_AUDIT_RETENTION", 90*24*time.Hour, 24*time.Hour, 365*24*time.Hour),
+		ShutdownGrace:           boundedDurationEnv("SHUTDOWN_GRACE", 5*time.Minute, time.Second, 30*time.Minute),
 	}
 
 	signerMasterKey, err := parseSignerMasterKey(os.Getenv("SIGNER_MASTER_KEY"))
@@ -246,6 +288,39 @@ func Load() (Config, error) {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			return Config{}, fmt.Errorf("invalid NIP46_TRUSTED_PROXY_CIDRS entry %q: %w", cidr, err)
 		}
+	}
+
+	credentialKeys, err := parseCredentialKeys(os.Getenv("GRASP_CREDENTIAL_KEYS"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CredentialKeys = credentialKeys
+
+	if cfg.TokenTTLMin <= 0 || cfg.TokenTTLMin > cfg.TokenTTLMax {
+		return Config{}, fmt.Errorf("BRIDGE_TOKEN_TTL_MIN must be positive and not exceed BRIDGE_TOKEN_TTL_MAX")
+	}
+	if cfg.TokenTTLDefault < cfg.TokenTTLMin || cfg.TokenTTLDefault > cfg.TokenTTLMax {
+		return Config{}, fmt.Errorf("BRIDGE_TOKEN_TTL_DEFAULT must be within [BRIDGE_TOKEN_TTL_MIN, BRIDGE_TOKEN_TTL_MAX]")
+	}
+	if cfg.BridgeTokensEnabled {
+		if !cfg.AuthEnabled {
+			return Config{}, fmt.Errorf("AUTH_ENABLED=true is required when BRIDGE_TOKENS_ENABLED=true; token minting is NIP-98 authenticated")
+		}
+		if len(cfg.CredentialKeys) == 0 {
+			return Config{}, fmt.Errorf("GRASP_CREDENTIAL_KEYS is required when BRIDGE_TOKENS_ENABLED=true")
+		}
+		if cfg.GiteaAdminUser == "" {
+			return Config{}, fmt.Errorf("GITEA_ADMIN_USER is required when BRIDGE_TOKENS_ENABLED=true (PAT administration uses Basic auth)")
+		}
+		if cfg.BridgePublicURL == "" {
+			return Config{}, fmt.Errorf("BRIDGE_PUBLIC_URL is required when BRIDGE_TOKENS_ENABLED=true")
+		}
+		if !cfg.FullProxyEnabled {
+			return Config{}, fmt.Errorf("GITEA_FULL_PROXY_ENABLED=true is required when BRIDGE_TOKENS_ENABLED=true; minting tokens without downstream Gitea isolation would allow scope bypass")
+		}
+	}
+	if cfg.Production() && cfg.FullProxyEnabled && cfg.EdgeSharedSecret == "" {
+		return Config{}, fmt.Errorf("GRASP_EDGE_SHARED_SECRET is required in production when GITEA_FULL_PROXY_ENABLED=true")
 	}
 
 	if cfg.Production() && cfg.AdminAPIToken == "" {
@@ -353,6 +428,76 @@ func csvEnv(key string) []string {
 		}
 	}
 	return res
+}
+
+// parseCredentialKeys parses GRASP_CREDENTIAL_KEYS, a comma-separated list of
+// id:key entries where key is base64 (std or raw) or hex encoded 32 bytes.
+// The first entry is the active encryption key; the rest are decrypt-only.
+func parseCredentialKeys(raw string) ([]CredentialKey, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	var keys []CredentialKey
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		id, encoded, ok := strings.Cut(entry, ":")
+		id = strings.TrimSpace(id)
+		encoded = strings.TrimSpace(encoded)
+		if !ok || id == "" || encoded == "" {
+			return nil, fmt.Errorf("GRASP_CREDENTIAL_KEYS entries must be id:base64-or-hex-32-bytes")
+		}
+		if !validCredentialKeyID(id) {
+			return nil, fmt.Errorf("GRASP_CREDENTIAL_KEYS key id %q must be 1-32 chars of [A-Za-z0-9_-]", id)
+		}
+		if _, dup := seen[id]; dup {
+			return nil, fmt.Errorf("GRASP_CREDENTIAL_KEYS key id %q is duplicated", id)
+		}
+		decoded, err := decodeKeyMaterial(encoded)
+		if err != nil || len(decoded) != 32 {
+			return nil, fmt.Errorf("GRASP_CREDENTIAL_KEYS key %q must decode to 32 bytes (base64 or hex)", id)
+		}
+		seen[id] = struct{}{}
+		keys = append(keys, CredentialKey{ID: id, Key: decoded})
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("GRASP_CREDENTIAL_KEYS is set but contains no key entries")
+	}
+	return keys, nil
+}
+
+func validCredentialKeyID(id string) bool {
+	if len(id) == 0 || len(id) > 32 {
+		return false
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func decodeKeyMaterial(raw string) ([]byte, error) {
+	decodeAttempts := []func(string) ([]byte, error){
+		hex.DecodeString,
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawURLEncoding.DecodeString,
+	}
+	for _, decode := range decodeAttempts {
+		if b, err := decode(raw); err == nil {
+			return b, nil
+		}
+	}
+	return nil, fmt.Errorf("undecodable key material")
 }
 
 func parseSignerMasterKey(raw string) ([]byte, error) {

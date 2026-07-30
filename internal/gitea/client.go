@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +24,12 @@ type Client struct {
 	baseURL string
 	token   string
 	http    *http.Client
+
+	// adminUser is the login owning the admin token. Gitea gates the
+	// user-token lifecycle endpoints behind Basic (or reverse-proxy) auth, so
+	// PAT administration sends Basic adminUser:token instead of the token
+	// header. Empty adminUser disables those methods.
+	adminUser string
 }
 
 type User struct {
@@ -39,6 +46,18 @@ type Repository struct {
 	CloneURL string `json:"clone_url"`
 	SSHURL   string `json:"ssh_url"`
 	HTMLURL  string `json:"html_url"`
+	Private  bool   `json:"private"`
+}
+
+// AccessToken is a Gitea personal access token. Token carries the plaintext
+// and is only non-empty in the creation response; it must never be persisted
+// unencrypted or logged.
+type AccessToken struct {
+	ID             int64    `json:"id"`
+	Name           string   `json:"name"`
+	Token          string   `json:"sha1"`
+	TokenLastEight string   `json:"token_last_eight"`
+	Scopes         []string `json:"scopes"`
 }
 
 type Issue struct {
@@ -76,6 +95,64 @@ func NewClient(baseURL string, token string) *Client {
 		token:   token,
 		http:    &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// WithAdminUser enables PAT administration by naming the login that owns the
+// admin token. It returns the receiver for chained construction.
+func (c *Client) WithAdminUser(login string) *Client {
+	c.adminUser = strings.TrimSpace(login)
+	return c
+}
+
+// PATAdministrationEnabled reports whether admin Basic-auth PAT lifecycle
+// calls are configured.
+func (c *Client) PATAdministrationEnabled() bool {
+	return c.adminUser != ""
+}
+
+// CreateUserAccessToken mints a personal access token for another user via
+// the admin account. Gitea returns the token plaintext exactly once. The
+// endpoint requires Basic authentication (reqBasicOrRevProxyAuth), performed
+// as adminUser:adminToken.
+func (c *Client) CreateUserAccessToken(ctx context.Context, username, tokenName string, scopes []string) (AccessToken, error) {
+	if c.adminUser == "" {
+		return AccessToken{}, fmt.Errorf("gitea admin user is not configured for PAT administration")
+	}
+	if len(scopes) == 0 {
+		return AccessToken{}, fmt.Errorf("gitea access tokens require at least one scope")
+	}
+	body := map[string]any{
+		"name":   tokenName,
+		"scopes": scopes,
+	}
+	resp, err := c.doJSONBasic(ctx, http.MethodPost, "/api/v1/users/"+url.PathEscape(username)+"/tokens", body)
+	if err != nil {
+		return AccessToken{}, fmt.Errorf("create access token for %q: %w", username, err)
+	}
+	var token AccessToken
+	if err := json.Unmarshal(resp, &token); err != nil {
+		return AccessToken{}, fmt.Errorf("decode gitea access token: %w", err)
+	}
+	if token.Token == "" {
+		return AccessToken{}, fmt.Errorf("gitea returned no token plaintext for %q", username)
+	}
+	return token, nil
+}
+
+// DeleteUserAccessToken deletes a user's token by numeric id or, when the id
+// is unavailable, by unique name. A 404 surfaces as an HTTPError so callers
+// can treat missing tokens as already-cleaned via IsNotFound.
+func (c *Client) DeleteUserAccessToken(ctx context.Context, username, tokenRef string) error {
+	if c.adminUser == "" {
+		return fmt.Errorf("gitea admin user is not configured for PAT administration")
+	}
+	if strings.TrimSpace(tokenRef) == "" {
+		return fmt.Errorf("token reference is required")
+	}
+	if _, err := c.doJSONBasic(ctx, http.MethodDelete, "/api/v1/users/"+url.PathEscape(username)+"/tokens/"+url.PathEscape(tokenRef), nil); err != nil {
+		return fmt.Errorf("delete access token for %q: %w", username, err)
+	}
+	return nil
 }
 
 // CreateOrg creates a new organization and fails if the name is already in
@@ -316,6 +393,16 @@ func (c *Client) getOrg(ctx context.Context, org string) ([]byte, error) {
 }
 
 func (c *Client) doJSON(ctx context.Context, method string, path string, body any) ([]byte, error) {
+	return c.do(ctx, method, path, body, false)
+}
+
+// doJSONBasic authenticates with HTTP Basic (adminUser + admin token) for the
+// endpoints Gitea gates behind reqBasicOrRevProxyAuth.
+func (c *Client) doJSONBasic(ctx context.Context, method string, path string, body any) ([]byte, error) {
+	return c.do(ctx, method, path, body, true)
+}
+
+func (c *Client) do(ctx context.Context, method string, path string, body any, basicAuth bool) ([]byte, error) {
 	var payload io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -333,7 +420,11 @@ func (c *Client) doJSON(ctx context.Context, method string, path string, body an
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Authorization", "token "+c.token)
+	if basicAuth {
+		req.SetBasicAuth(c.adminUser, c.token)
+	} else {
+		req.Header.Set("Authorization", "token "+c.token)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -405,6 +496,7 @@ func parseRepo(resp []byte) (Repository, error) {
 		CloneURL string `json:"clone_url"`
 		SSHURL   string `json:"ssh_url"`
 		HTMLURL  string `json:"html_url"`
+		Private  bool   `json:"private"`
 		Owner    struct {
 			UserName string `json:"username"`
 		} `json:"owner"`
@@ -419,17 +511,18 @@ func parseRepo(resp []byte) (Repository, error) {
 		CloneURL: raw.CloneURL,
 		SSHURL:   raw.SSHURL,
 		HTMLURL:  raw.HTMLURL,
+		Private:  raw.Private,
 	}, nil
 }
 
 func isNotFound(err error) bool {
-	e, ok := err.(*HTTPError)
-	return ok && e.StatusCode == http.StatusNotFound
+	var e *HTTPError
+	return errors.As(err, &e) && e.StatusCode == http.StatusNotFound
 }
 
 func isConflict(err error) bool {
-	e, ok := err.(*HTTPError)
-	return ok && e.StatusCode == http.StatusConflict
+	var e *HTTPError
+	return errors.As(err, &e) && e.StatusCode == http.StatusConflict
 }
 
 func parseUser(resp []byte) (User, error) {

@@ -105,7 +105,7 @@ func main() {
 	}
 	defer st.Close()
 
-	giteaClient := gitea.NewClient(cfg.GiteaURL, cfg.GiteaAdminToken)
+	giteaClient := gitea.NewClient(cfg.GiteaURL, cfg.GiteaAdminToken).WithAdminUser(cfg.GiteaAdminUser)
 	hookInstaller := hooks.NewInstaller(cfg.GiteaRepositoriesDir, cfg.HookBinaryPath, cfg.HookRelayURL)
 	nip05Resolver := nip05resolve.NewResolver(5 * time.Minute)
 	provisionerSvc := provisioner.New(cfg, st, giteaClient, hookInstaller, nip05Resolver, logger)
@@ -437,7 +437,7 @@ func main() {
 
 	<-ctx.Done()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
 	subscriber.Wait()

@@ -350,6 +350,66 @@ func Open(path string) (*SQLiteStore, error) {
 			created_at INTEGER NOT NULL,
 			last_republished_id TEXT NOT NULL DEFAULT ''
 		);`,
+		`CREATE TABLE IF NOT EXISTS bridge_tokens (
+			id TEXT PRIMARY KEY,
+			token_hash BLOB NOT NULL UNIQUE,
+			token_suffix TEXT NOT NULL,
+			pubkey TEXT NOT NULL,
+			gitea_user_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			scopes TEXT NOT NULL,
+			issued_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			revoked_at TEXT NOT NULL DEFAULT '',
+			last_used_at TEXT NOT NULL DEFAULT '',
+			created_event_id TEXT NOT NULL DEFAULT ''
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_bridge_tokens_pubkey_issued ON bridge_tokens(pubkey, issued_at DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_bridge_tokens_pubkey_state ON bridge_tokens(pubkey, revoked_at, expires_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_bridge_tokens_gitea_user_state ON bridge_tokens(gitea_user_id, revoked_at, expires_at);`,
+		`CREATE TABLE IF NOT EXISTS gitea_pat_credentials (
+			gitea_user_id INTEGER NOT NULL,
+			generation INTEGER NOT NULL,
+			gitea_user TEXT NOT NULL,
+			pat_name TEXT NOT NULL UNIQUE,
+			pat_ciphertext BLOB NOT NULL,
+			key_id TEXT NOT NULL,
+			gitea_scopes TEXT NOT NULL,
+			state TEXT NOT NULL CHECK(state IN ('provisioning', 'active', 'retiring', 'orphaned', 'error')),
+			created_at TEXT NOT NULL,
+			activated_at TEXT NOT NULL DEFAULT '',
+			retired_at TEXT NOT NULL DEFAULT '',
+			delete_attempts INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			gitea_token_id INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (gitea_user_id, generation)
+		);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_gitea_pat_one_active ON gitea_pat_credentials(gitea_user_id) WHERE state = 'active';`,
+		`CREATE INDEX IF NOT EXISTS idx_gitea_pat_state ON gitea_pat_credentials(state);`,
+		`CREATE TABLE IF NOT EXISTS nip98_replay_claims (
+			event_id TEXT PRIMARY KEY,
+			pubkey TEXT NOT NULL,
+			method TEXT NOT NULL,
+			target_hash BLOB NOT NULL,
+			claimed_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_nip98_replay_expiry ON nip98_replay_claims(expires_at);`,
+		`CREATE TABLE IF NOT EXISTS auth_audit_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			occurred_at TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			pubkey TEXT NOT NULL DEFAULT '',
+			token_id TEXT NOT NULL DEFAULT '',
+			gitea_user_id INTEGER NOT NULL DEFAULT 0,
+			surface TEXT NOT NULL DEFAULT '',
+			action TEXT NOT NULL DEFAULT '',
+			outcome TEXT NOT NULL,
+			request_id TEXT NOT NULL DEFAULT '',
+			source_fingerprint TEXT NOT NULL DEFAULT '',
+			detail TEXT NOT NULL DEFAULT ''
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_auth_audit_occurred ON auth_audit_events(occurred_at);`,
 	}
 
 	for _, stmt := range stmts {
