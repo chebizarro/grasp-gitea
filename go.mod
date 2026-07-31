@@ -8,7 +8,10 @@ require (
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4
 	github.com/elnosh/gonuts v0.4.2
 	github.com/mattn/go-sqlite3 v1.14.24
+	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/crypto v0.39.0
+	golang.org/x/sys v0.35.0
+	golang.org/x/term v0.32.0
 )
 
 require (
@@ -35,6 +38,7 @@ require (
 	github.com/btcsuite/websocket v0.0.0-20150119174127-31079b680792 // indirect
 	github.com/btcsuite/winsvc v1.0.0 // indirect
 	github.com/coder/websocket v1.8.13 // indirect
+	github.com/danieljoos/wincred v1.2.3 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
@@ -42,6 +46,7 @@ require (
 	github.com/fasthttp/websocket v1.5.12 // indirect
 	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
 	github.com/go-errors/errors v1.5.1 // indirect
+	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/jackc/pgx/v5 v5.5.4 // indirect
 	github.com/jessevdk/go-flags v1.4.0 // indirect
@@ -72,7 +77,7 @@ require (
 	github.com/rs/cors v1.11.1 // indirect
 	github.com/savsgio/gotils v0.0.0-20240704082632-aef3928b8a38 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
-	github.com/stretchr/testify v1.10.0 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7 // indirect
 	github.com/templexxx/cpu v0.0.1 // indirect
 	github.com/templexxx/xhex v0.0.0-20200614015412-aed53437177b // indirect
@@ -88,8 +93,6 @@ require (
 	golang.org/x/mod v0.25.0 // indirect
 	golang.org/x/net v0.41.0 // indirect
 	golang.org/x/sync v0.15.0 // indirect
-	golang.org/x/sys v0.35.0 // indirect
-	golang.org/x/term v0.32.0 // indirect
 	golang.org/x/text v0.26.0 // indirect
 	golang.org/x/tools v0.33.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

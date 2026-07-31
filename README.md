@@ -186,6 +186,32 @@ as SHA-256 digests. Hidden PATs are retired 24 hours after a user's last token
 stops being usable. NIP-98 proofs are single-use and bound to the exact
 request URL and body.
 
+**Client tooling.** `cmd/grasp` builds the `grasp` CLI:
+
+```bash
+grasp auth login --server https://git.example.com     # mint + store a token
+grasp auth list  --server https://git.example.com     # server-side token list
+grasp auth status                                     # local credentials (no secrets)
+grasp setup npm --host git.example.com --owner myorg  # package client config
+```
+
+The signing identity (nsec, hex key, ncryptsec, or NIP-46 `bunker://` URL)
+is read from `--signer-file` (0600 enforced), the `GRASP_SIGNER` environment
+variable, or a no-echo terminal prompt — never from the command line. Tokens
+are stored in the OS keychain when available (explicit `--no-keychain` opts
+into the 0600 file instead; a *failing* keychain is an error, never a silent
+downgrade). Replacing or rotating a login revokes the prior token on the
+bridge; a token that cannot be stored is revoked rather than stranded.
+
+Git integration uses the credential-helper protocol with strict origin
+matching (an https credential is never disclosed over http):
+
+```ini
+[credential "https://git.example.com"]
+    helper =                       # reset inherited helpers (e.g. plaintext store)
+    helper = !grasp git-credential
+```
+
 See [`docs/fullproxy-cutover-runbook.md`](docs/fullproxy-cutover-runbook.md)
 to enable this, and [`docs/UPGRADING.md`](docs/UPGRADING.md) for what changes.
 
