@@ -645,6 +645,14 @@ func trustedPeer(remoteAddr string) bool {
 func (p *Proxy) modifyResponse(resp *http.Response) error {
 	pl, _ := resp.Request.Context().Value(planKey{}).(*plan)
 
+	if pl != nil && pl.cred.kind == credentialSessionProxy {
+		if resp.Request.URL.Path == "/user/logout" {
+			resp.Header.Add("Set-Cookie", browserSessionCookie+"=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax")
+		} else if token, err := p.mintBrowserSession(pl.cred.sessionUser, time.Now().Add(12*time.Hour)); err == nil {
+			resp.Header.Add("Set-Cookie", browserSessionCookie+"="+token+"; Path=/; Max-Age=43200; Secure; HttpOnly; SameSite=Lax")
+		}
+	}
+
 	if pl != nil && pl.npubSurface {
 		setGitHTTPCORS(resp.Header)
 		sanitizeGitBackendResponse(resp)

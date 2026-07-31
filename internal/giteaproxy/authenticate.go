@@ -4,10 +4,15 @@
 package giteaproxy
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/sharegap/grasp-gitea/internal/auth"
 )
@@ -31,6 +36,13 @@ var InternalHeaders = []string{
 
 // maxBasicHeaderBytes bounds the base64 blob we are willing to decode.
 const maxBasicHeaderBytes = 8 << 10
+
+const browserSessionCookie = "__Host-grasp-session"
+
+type browserSessionClaims struct {
+	User      string `json:"u"`
+	ExpiresAt int64  `json:"e"`
+}
 
 // nugetAPIKeyHeader is where NuGet clients (`dotnet nuget push --api-key`)
 // present the credential instead of Authorization.
@@ -79,6 +91,9 @@ type credential struct {
 // then anonymous.
 func (p *Proxy) extractCredential(r *http.Request) credential {
 	if cred, ok := p.trustedSessionCredential(r); ok {
+		return cred
+	}
+	if cred, ok := p.browserSessionCredential(r); ok {
 		return cred
 	}
 
@@ -151,6 +166,58 @@ func (p *Proxy) extractCredential(r *http.Request) credential {
 		return credential{kind: credentialBridgeMalformed}
 	}
 	return credential{kind: credentialPassthrough}
+}
+
+func (p *Proxy) browserSessionCredential(r *http.Request) (credential, bool) {
+	if p.edgeSecret == "" {
+		return credential{}, false
+	}
+	cookie, err := r.Cookie(browserSessionCookie)
+	if err != nil {
+		return credential{}, false
+	}
+	parts := strings.Split(cookie.Value, ".")
+	if len(parts) != 2 {
+		return credential{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return credential{}, false
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return credential{}, false
+	}
+	mac := hmac.New(sha256.New, []byte(p.edgeSecret))
+	_, _ = mac.Write(payload)
+	if !hmac.Equal(sig, mac.Sum(nil)) {
+		return credential{}, false
+	}
+	var claims browserSessionClaims
+	if json.Unmarshal(payload, &claims) != nil || claims.ExpiresAt <= time.Now().Unix() || validateSessionUsername(claims.User) != nil {
+		return credential{}, false
+	}
+	return credential{kind: credentialSessionProxy, sessionUser: claims.User}, true
+}
+
+func (p *Proxy) mintBrowserSession(user string, expiresAt time.Time) (string, error) {
+	if err := validateSessionUsername(user); err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(browserSessionClaims{User: user, ExpiresAt: expiresAt.Unix()})
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha256.New, []byte(p.edgeSecret))
+	_, _ = mac.Write(payload)
+	return base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
+func validateSessionUsername(user string) error {
+	if user == "" || len(user) > 70 || strings.ContainsAny(user, "\r\n\t ") {
+		return errors.New("unsafe session username")
+	}
+	return nil
 }
 
 // classifyBridgeSecret validates a value already known to carry the bridge

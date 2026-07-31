@@ -1165,6 +1165,44 @@ func TestSessionProxyIgnoredWithoutConfiguredSecret(t *testing.T) {
 	}
 }
 
+func TestSessionProxyPersistsInSignedBrowserCookie(t *testing.T) {
+	env := newProxyEnv(t, Config{FullProxy: true, EdgeSharedSecret: "edge-secret"}, nil, stubInspector{})
+
+	handoff := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	handoff.Header.Set("X-Grasp-Session-Proxy", "1")
+	handoff.Header.Set("X-Grasp-Edge-Secret", "edge-secret")
+	handoff.Header.Set("X-Grasp-Auth-User", "alice")
+	handoffResponse := httptest.NewRecorder()
+	env.proxy.ServeHTTP(handoffResponse, handoff)
+
+	var session *http.Cookie
+	for _, cookie := range handoffResponse.Result().Cookies() {
+		if cookie.Name == browserSessionCookie {
+			session = cookie
+			break
+		}
+	}
+	if session == nil || session.Value == "" {
+		t.Fatal("session handoff did not mint a browser session cookie")
+	}
+
+	next := httptest.NewRequest(http.MethodGet, "/cascadia", nil)
+	next.AddCookie(session)
+	nextResponse := httptest.NewRecorder()
+	env.proxy.ServeHTTP(nextResponse, next)
+	if got := env.seen.snapshot().authUser; got != "alice" {
+		t.Fatalf("browser session identity = %q, want alice", got)
+	}
+
+	session.Value += "tampered"
+	tampered := httptest.NewRequest(http.MethodGet, "/cascadia", nil)
+	tampered.AddCookie(session)
+	env.proxy.ServeHTTP(httptest.NewRecorder(), tampered)
+	if got := env.seen.snapshot().authUser; got != "" {
+		t.Fatalf("tampered browser session accepted as %q", got)
+	}
+}
+
 func TestBackendOriginRewriteRequiresExactHostMatch(t *testing.T) {
 	lookalike := "http://gitea-lookalike.evil.example/owner/repo"
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
