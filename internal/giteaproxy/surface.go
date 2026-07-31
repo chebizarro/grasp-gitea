@@ -10,6 +10,8 @@ package giteaproxy
 import (
 	"net/http"
 	"strings"
+
+	"github.com/sharegap/grasp-gitea/internal/auth"
 )
 
 // Surface is the closed set of Gitea HTTP surfaces the classifier recognizes.
@@ -55,9 +57,10 @@ func (c Classification) BridgeTokensSupported() bool {
 // authentication so scope requirements are deterministic and never depend on
 // who is calling.
 //
-// Phase 1 recognizes Git smart HTTP only. Package, container, API, and LFS
-// paths are classified so bridge tokens fail closed there with a clear error
-// until their adapters land, rather than being forwarded verbatim.
+// Git smart HTTP and the /api/packages/ registry family carry bridge scopes.
+// Container (/v2), REST API, and LFS paths are classified so bridge tokens
+// fail closed there with a clear error until their adapters land, rather
+// than being forwarded verbatim.
 func Classify(r *http.Request) Classification {
 	path := r.URL.Path
 
@@ -67,7 +70,7 @@ func Classify(r *http.Request) Classification {
 	case strings.HasPrefix(path, "/v2/"), path == "/v2":
 		return Classification{Surface: SurfaceContainer, Action: containerAction(r)}
 	case strings.HasPrefix(path, "/api/packages/"):
-		return Classification{Surface: SurfacePackages, Action: methodAction(r)}
+		return Classification{Surface: SurfacePackages, Action: methodAction(r), Scope: packagesScope(r)}
 	case strings.HasPrefix(path, "/api/v1/"):
 		return Classification{Surface: SurfaceAPI, Action: methodAction(r)}
 	}
@@ -83,6 +86,17 @@ func methodAction(r *http.Request) Action {
 		return ActionRead
 	}
 	return ActionWrite
+}
+
+// packagesScope maps a package-registry request to the bridge scope it
+// requires. Reads (download, metadata) need packages:read; anything mutating
+// (publish, delete, and any unrecognized method) needs packages:write, so an
+// unknown verb fails toward the stronger requirement rather than the weaker.
+func packagesScope(r *http.Request) string {
+	if methodAction(r) == ActionRead {
+		return auth.ScopePackagesRead
+	}
+	return auth.ScopePackagesWrite
 }
 
 func containerAction(r *http.Request) Action {

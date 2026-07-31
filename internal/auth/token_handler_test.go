@@ -186,7 +186,7 @@ func TestTokenHandlerValidationAndLimits(t *testing.T) {
 	env := newTokenHandlerEnv(t)
 
 	// Unknown scope → 400.
-	body := []byte(`{"name":"laptop","scopes":["packages:write"]}`)
+	body := []byte(`{"name":"laptop","scopes":["api:write"]}`)
 	resp := env.doNIP98(t, http.MethodPost, "/auth/token", body)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("disabled scope status = %d, want 400", resp.StatusCode)

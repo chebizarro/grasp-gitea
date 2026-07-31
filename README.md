@@ -153,10 +153,21 @@ private network. Otherwise a client could bypass the bridge and present
 credentials directly, defeating scope enforcement — so the bridge refuses to
 start with `BRIDGE_TOKENS_ENABLED=true` unless full-proxy mode is on.
 
-**Scopes.** Tokens carry an explicit closed set of scopes. Phase 1 implements
-`git:read` and `git:write`; `packages:*`, `api:*`, and `lfs:*` are reserved
-for later phases and are rejected until their adapters land. A token used on
-a surface without an adapter fails with `403` rather than being forwarded.
+**Scopes.** Tokens carry an explicit closed set of scopes. Currently enabled:
+`git:read`, `git:write`, `packages:read`, and `packages:write`. The
+`packages:*` scopes cover the `/api/packages/` registry family (npm, PyPI,
+Cargo, Maven, Composer, NuGet, generic, …) regardless of how the client
+presents the token — npm's `Bearer`, PyPI's Basic password, Cargo's raw
+`Authorization` value, and token-in-username Basic all work. The Docker/OCI
+`/v2` surface, `api:*`, and `lfs:*` are reserved for later phases and are
+rejected until their adapters land. A token used on a surface without an
+adapter fails with `403` rather than being forwarded.
+
+Hidden PATs are provisioned with the matching Gitea scope union
+(`write:repository`, `write:package`). A PAT provisioned by an older
+deployment is automatically re-provisioned with the wider scopes the next
+time it is needed (create-before-retire; the stale PAT is deleted from
+Gitea by the retirement sweep).
 
 **Lifecycle.** Tokens expire (default 30 days, bounded by
 `BRIDGE_TOKEN_TTL_MIN`/`MAX`), can be revoked or rotated, and are stored only

@@ -151,6 +151,16 @@ if [[ -n "${BRIDGE_TOKEN:-}" && -n "${TOKEN_NPUB:-}" ]]; then
     note "PRIVATE_REPO_PATH unset; private clone not checked"
   fi
 
+  # A bridge token works on the package registry family (packages scopes).
+  code="$(status_of -H "Authorization: Bearer ${BRIDGE_TOKEN}" "${PUBLIC_URL}/api/packages/${TOKEN_NPUB}/npm/does-not-exist")"
+  if [[ "${code}" == "404" || "${code}" == "200" ]]; then
+    ok "bridge token accepted on the package registry surface (got ${code})"
+  elif [[ "${code}" == "403" ]]; then
+    bad "bridge token refused on /api/packages — token likely lacks packages:read scope"
+  else
+    bad "bridge token on /api/packages returned ${code}, expected 404/200"
+  fi
+
   # A bridge token on a surface without an adapter must fail closed.
   code="$(status_of -H "Authorization: Bearer ${BRIDGE_TOKEN}" "${PUBLIC_URL}/api/v1/user")"
   if [[ "${code}" == "403" ]]; then

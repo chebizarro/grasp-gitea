@@ -104,15 +104,17 @@ func (f *fakeTokenGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type tokenTestEnv struct {
-	svc   *TokenService
-	store *store.SQLiteStore
-	fake  *fakeTokenGitea
-	keys  []config.CredentialKey
+	svc    *TokenService
+	store  *store.SQLiteStore
+	fake   *fakeTokenGitea
+	keys   []config.CredentialKey
+	dbPath string
 }
 
 func newTokenTestEnv(t *testing.T) *tokenTestEnv {
 	t.Helper()
-	st, err := store.Open(t.TempDir() + "/tokens.db")
+	dbPath := t.TempDir() + "/tokens.db"
+	st, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -145,7 +147,26 @@ func newTokenTestEnv(t *testing.T) *tokenTestEnv {
 	if !svc.Enabled() {
 		t.Fatal("token service disabled")
 	}
-	return &tokenTestEnv{svc: svc, store: st, fake: fake, keys: cfg.CredentialKeys}
+	return &tokenTestEnv{svc: svc, store: st, fake: fake, keys: cfg.CredentialKeys, dbPath: dbPath}
+}
+
+// downgradeActivePATScopes rewrites the active credential's stored Gitea
+// scopes to the pre-package-support set, simulating a credential provisioned
+// by an older deployment.
+func downgradeActivePATScopes(t *testing.T, dbPath string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer db.Close()
+	res, err := db.Exec(`UPDATE gitea_pat_credentials SET gitea_scopes = '["write:repository"]' WHERE state = 'active'`)
+	if err != nil {
+		t.Fatalf("downgrade scopes: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Fatalf("downgraded %d rows, want 1", n)
+	}
 }
 
 func TestMintProvisionsIdentityAndPATOnce(t *testing.T) {
@@ -180,8 +201,8 @@ func TestMintProvisionsIdentityAndPATOnce(t *testing.T) {
 	if !basic {
 		t.Fatal("PAT creation did not use Basic auth")
 	}
-	if len(scopes) != 1 || scopes[0] != "write:repository" {
-		t.Fatalf("PAT scopes = %v, want [write:repository]", scopes)
+	if fmt.Sprintf("%v", scopes) != fmt.Sprintf("%v", giteaPATScopes) {
+		t.Fatalf("PAT scopes = %v, want %v", scopes, giteaPATScopes)
 	}
 
 	// Both tokens authenticate to the same subject.
@@ -260,7 +281,7 @@ func TestMintValidation(t *testing.T) {
 	cases := []MintRequest{
 		{Name: ""},
 		{Name: strings.Repeat("n", maxTokenNameLen+1)},
-		{Name: "ok", Scopes: []string{"packages:read"}}, // not enabled in phase 1
+		{Name: "ok", Scopes: []string{"api:read"}}, // not enabled yet (phase 4)
 		{Name: "ok", Scopes: []string{"bogus"}},
 		{Name: "ok", TTLSeconds: 1},                  // below min
 		{Name: "ok", TTLSeconds: 366 * 24 * 60 * 60}, // above max
@@ -329,6 +350,77 @@ func TestRotateReplacesToken(t *testing.T) {
 	// Rotating an unknown/foreign token 404s.
 	if _, err := env.svc.Rotate(ctx, "someone-else", rotated.ID, "ev3", MintRequest{Name: "x"}); !errors.Is(err, store.ErrBridgeTokenNotFound) {
 		t.Fatalf("foreign rotate error = %v, want ErrBridgeTokenNotFound", err)
+	}
+}
+
+// TestMintRotatesPATWhenScopesGrow covers the upgrade path: a hidden PAT
+// provisioned before package scopes were required is replaced at the next
+// mint (create-before-retire), and the stale generation is deleted in Gitea.
+func TestMintRotatesPATWhenScopesGrow(t *testing.T) {
+	env := newTokenTestEnv(t)
+	ctx := context.Background()
+
+	first, err := env.svc.Mint(ctx, testPubkey, "ev1", MintRequest{Name: "laptop"})
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	downgradeActivePATScopes(t, env.dbPath)
+
+	if _, err := env.svc.Mint(ctx, testPubkey, "ev2", MintRequest{Name: "desktop"}); err != nil {
+		t.Fatalf("second mint: %v", err)
+	}
+	if env.fake.tokenCreates != 2 {
+		t.Fatalf("gitea PAT creates = %d, want 2 (scope upgrade rotates)", env.fake.tokenCreates)
+	}
+	if fmt.Sprintf("%v", env.fake.lastScopes) != fmt.Sprintf("%v", giteaPATScopes) {
+		t.Fatalf("replacement PAT scopes = %v, want %v", env.fake.lastScopes, giteaPATScopes)
+	}
+
+	// The replacement must be served, and the stale generation deleted from
+	// Gitea by the retirement sweep.
+	principal, err := env.svc.Authenticate(ctx, first.Token)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	_, pat, err := env.svc.DownstreamPAT(ctx, principal.GiteaUserID)
+	if err != nil {
+		t.Fatalf("downstream pat: %v", err)
+	}
+	if pat != env.fake.issuedPATs[9001] {
+		t.Fatalf("downstream pat = %q, want replacement generation %q", pat, env.fake.issuedPATs[9001])
+	}
+	env.svc.retireIdlePATs(ctx)
+	if len(env.fake.deletedPATs) != 1 || !strings.HasSuffix(env.fake.deletedPATs[0], "/tokens/9000") {
+		t.Fatalf("deleted PATs = %v, want the stale generation 9000", env.fake.deletedPATs)
+	}
+}
+
+// TestDownstreamPATUpgradesScopesLazily covers tokens that gained scopes
+// without passing through Mint (e.g. Rotate): the stale PAT is replaced at
+// request time, under the user's lifecycle lock.
+func TestDownstreamPATUpgradesScopesLazily(t *testing.T) {
+	env := newTokenTestEnv(t)
+	ctx := context.Background()
+
+	first, err := env.svc.Mint(ctx, testPubkey, "ev1", MintRequest{Name: "laptop"})
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	principal, err := env.svc.Authenticate(ctx, first.Token)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	downgradeActivePATScopes(t, env.dbPath)
+
+	_, pat, err := env.svc.DownstreamPAT(ctx, principal.GiteaUserID)
+	if err != nil {
+		t.Fatalf("downstream pat: %v", err)
+	}
+	if env.fake.tokenCreates != 2 {
+		t.Fatalf("gitea PAT creates = %d, want 2 (lazy scope upgrade)", env.fake.tokenCreates)
+	}
+	if pat != env.fake.issuedPATs[9001] {
+		t.Fatalf("downstream pat = %q, want upgraded generation %q", pat, env.fake.issuedPATs[9001])
 	}
 }
 

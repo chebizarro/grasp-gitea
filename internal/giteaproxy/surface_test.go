@@ -66,17 +66,21 @@ func TestClassifyNonGitSurfaces(t *testing.T) {
 		target      string
 		wantSurface Surface
 		wantAction  Action
+		wantScope   string
 	}{
-		{http.MethodGet, "/api/packages/owner/npm/pkg", SurfacePackages, ActionRead},
-		{http.MethodPut, "/api/packages/owner/npm/pkg", SurfacePackages, ActionWrite},
-		{http.MethodGet, "/api/v1/user", SurfaceAPI, ActionRead},
-		{http.MethodPost, "/api/v1/repos/o/r/issues", SurfaceAPI, ActionWrite},
-		{http.MethodGet, "/v2/", SurfaceContainer, ActionTokenExchange},
-		{http.MethodGet, "/v2/token", SurfaceContainer, ActionTokenExchange},
-		{http.MethodPatch, "/v2/owner/img/blobs/uploads/abc", SurfaceContainer, ActionWrite},
-		{http.MethodPost, "/owner/repo.git/info/lfs/objects/batch", SurfaceLFS, ActionWrite},
-		{http.MethodGet, "/explore/repos", SurfaceWeb, ActionRead},
-		{http.MethodGet, "/", SurfaceWeb, ActionRead},
+		{http.MethodGet, "/api/packages/owner/npm/pkg", SurfacePackages, ActionRead, auth.ScopePackagesRead},
+		{http.MethodHead, "/api/packages/owner/pypi/simple/pkg/", SurfacePackages, ActionRead, auth.ScopePackagesRead},
+		{http.MethodPut, "/api/packages/owner/npm/pkg", SurfacePackages, ActionWrite, auth.ScopePackagesWrite},
+		{http.MethodPost, "/api/packages/owner/pypi", SurfacePackages, ActionWrite, auth.ScopePackagesWrite},
+		{http.MethodDelete, "/api/packages/owner/cargo/pkg/1.0.0", SurfacePackages, ActionWrite, auth.ScopePackagesWrite},
+		{http.MethodGet, "/api/v1/user", SurfaceAPI, ActionRead, ""},
+		{http.MethodPost, "/api/v1/repos/o/r/issues", SurfaceAPI, ActionWrite, ""},
+		{http.MethodGet, "/v2/", SurfaceContainer, ActionTokenExchange, ""},
+		{http.MethodGet, "/v2/token", SurfaceContainer, ActionTokenExchange, ""},
+		{http.MethodPatch, "/v2/owner/img/blobs/uploads/abc", SurfaceContainer, ActionWrite, ""},
+		{http.MethodPost, "/owner/repo.git/info/lfs/objects/batch", SurfaceLFS, ActionWrite, ""},
+		{http.MethodGet, "/explore/repos", SurfaceWeb, ActionRead, ""},
+		{http.MethodGet, "/", SurfaceWeb, ActionRead, ""},
 	}
 	for _, tc := range cases {
 		class := Classify(httptest.NewRequest(tc.method, tc.target, nil))
@@ -84,9 +88,10 @@ func TestClassifyNonGitSurfaces(t *testing.T) {
 			t.Errorf("%s %s = (%s, %s), want (%s, %s)",
 				tc.method, tc.target, class.Surface, class.Action, tc.wantSurface, tc.wantAction)
 		}
-		// Phase 1 supports bridge tokens on the git surface only.
-		if class.BridgeTokensSupported() {
-			t.Errorf("%s %s unexpectedly accepts bridge tokens", tc.method, tc.target)
+		// Bridge tokens are accepted on git and packages; every other surface
+		// must fail closed until its adapter lands.
+		if class.Scope != tc.wantScope {
+			t.Errorf("%s %s scope = %q, want %q", tc.method, tc.target, class.Scope, tc.wantScope)
 		}
 	}
 }

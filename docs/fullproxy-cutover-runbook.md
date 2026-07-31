@@ -25,8 +25,12 @@ client -> nginx -> grasp-bridge -> gitea      (everything)
 ```
 
 The bridge can then authenticate `npub + grasp_v1_ token` on any surface it
-has an adapter for, exchanging it for a hidden per-user Gitea PAT. Phase 1
-ships the Git adapter; package, REST, and LFS adapters follow.
+has an adapter for, exchanging it for a hidden per-user Gitea PAT. Git and
+the `/api/packages/` registry family (npm Bearer, PyPI/Maven/Composer/generic
+Basic, Cargo raw token, NuGet `X-NuGet-ApiKey`) have adapters; Docker/OCI
+`/v2`, REST, and LFS adapters follow. Hidden PATs carry
+`write:package, write:repository`; credentials provisioned before package
+support are rotated automatically on next use.
 
 ## Prerequisites
 

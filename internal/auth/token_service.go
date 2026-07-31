@@ -76,10 +76,13 @@ const (
 // giteaPATScopes is the minimum Gitea scope union for the currently enabled
 // bridge features. Phase 1 enables Git smart HTTP only; write:repository
 // covers read in Gitea's scope hierarchy. Never include admin scopes.
-var giteaPATScopes = []string{"write:repository"}
+var giteaPATScopes = []string{"write:package", "write:repository"}
 
 // enabledTokenScopes lists the bridge scopes a deployment currently accepts.
-var enabledTokenScopes = []string{ScopeGitRead, ScopeGitWrite}
+var enabledTokenScopes = []string{
+	ScopeGitRead, ScopeGitWrite,
+	ScopePackagesRead, ScopePackagesWrite,
+}
 
 var (
 	// ErrInvalidTokenRequest reports malformed mint/rotate input (400).
@@ -341,6 +344,16 @@ func (t *TokenService) DownstreamPAT(ctx context.Context, giteaUserID int64) (lo
 		}
 		return "", "", err
 	}
+	if !patScopesCover(cred.GiteaScopes) {
+		// The stored PAT predates the current required scope set. Tokens
+		// normally trigger the upgrade at mint time, but Rotate and any
+		// long-lived token can reach here first; upgrade lazily under the
+		// user's lifecycle lock so the request proceeds with full authority.
+		cred, err = t.upgradePATScopes(ctx, giteaUserID, cred.GiteaUser)
+		if err != nil {
+			return "", "", err
+		}
+	}
 	plaintext, err := t.cipher.Open(cred.Ciphertext, cred.KeyID,
 		PATCredentialAAD(cred.GiteaUserID, cred.Generation, cred.PATName, cred.KeyID))
 	if err != nil {
@@ -350,6 +363,40 @@ func (t *TokenService) DownstreamPAT(ctx context.Context, giteaUserID int64) (lo
 		t.reseal(ctx, cred, plaintext)
 	}
 	return cred.GiteaUser, string(plaintext), nil
+}
+
+// upgradePATScopes provisions a replacement hidden PAT whose scopes cover the
+// current requirement, then returns the fresh active credential. It takes the
+// user's lifecycle lock; a concurrent upgrade simply finds the fresh
+// credential already active and returns it.
+func (t *TokenService) upgradePATScopes(ctx context.Context, giteaUserID int64, giteaUser string) (store.GiteaPATCredential, error) {
+	lock := t.userLock(giteaUserID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if err := t.ensureActivePATLocked(ctx, giteaUserID, giteaUser); err != nil {
+		return store.GiteaPATCredential{}, err
+	}
+	cred, err := t.store.GetActivePATCredential(ctx, giteaUserID)
+	if err != nil {
+		return store.GiteaPATCredential{}, fmt.Errorf("%w: reload after scope upgrade: %v", ErrPATProvisioning, err)
+	}
+	return cred, nil
+}
+
+// patScopesCover reports whether a stored credential's Gitea scopes cover the
+// deployment's required scope set.
+func patScopesCover(stored []string) bool {
+	have := make(map[string]struct{}, len(stored))
+	for _, s := range stored {
+		have[s] = struct{}{}
+	}
+	for _, want := range giteaPATScopes {
+		if _, ok := have[want]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // reseal lazily re-encrypts a PAT under the active key after a successful
@@ -618,8 +665,18 @@ func (t *TokenService) userLock(giteaUserID int64) *sync.Mutex {
 //
 // The caller must hold the user's lifecycle lock.
 func (t *TokenService) ensureActivePATLocked(ctx context.Context, giteaUserID int64, giteaUser string) error {
-	if _, err := t.store.GetActivePATCredential(ctx, giteaUserID); err == nil {
-		return nil
+	if cred, err := t.store.GetActivePATCredential(ctx, giteaUserID); err == nil {
+		if patScopesCover(cred.GiteaScopes) {
+			return nil
+		}
+		// The deployment's required Gitea scope set has grown since this
+		// credential was provisioned (e.g. package scopes were enabled).
+		// Provision a replacement: activation atomically demotes this
+		// generation to retiring (create-before-retire), and the retirement
+		// sweep deletes it from Gitea.
+		t.logger.Info("rotating hidden PAT for scope upgrade",
+			"gitea_user_id", giteaUserID, "generation", cred.Generation,
+			"have_scopes", cred.GiteaScopes, "want_scopes", giteaPATScopes)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}

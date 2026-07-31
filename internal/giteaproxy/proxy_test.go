@@ -85,6 +85,7 @@ type backendRequest struct {
 	authUser      string
 	sessionProxy  string
 	edgeSecret    string
+	nugetAPIKey   string
 	body          string
 }
 
@@ -123,6 +124,7 @@ func newProxyEnv(t *testing.T, cfg Config, tokens *stubAuthenticator, repos Repo
 			authUser:      r.Header.Get("X-Grasp-Auth-User"),
 			sessionProxy:  r.Header.Get("X-Grasp-Session-Proxy"),
 			edgeSecret:    r.Header.Get("X-Grasp-Edge-Secret"),
+			nugetAPIKey:   r.Header.Get("X-NuGet-ApiKey"),
 			body:          string(body),
 		}
 		seen.mu.Unlock()
@@ -464,10 +466,15 @@ func TestServeHTTPBridgeTokenOnUnsupportedSurfaceFailsClosed(t *testing.T) {
 	}
 	env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
 
-	// Package/API/container/LFS adapters land in later phases; a bridge token
-	// must not be silently exchanged for the hidden PAT's full authority.
+	// API/container/LFS adapters land in later phases; a bridge token must
+	// not be silently exchanged for the hidden PAT's full authority. The
+	// principal deliberately holds every enabled scope so the rejection can
+	// only come from the surface, not from a missing scope.
+	tokens.principal.Scopes = []string{
+		auth.ScopeGitRead, auth.ScopeGitWrite,
+		auth.ScopePackagesRead, auth.ScopePackagesWrite,
+	}
 	for _, path := range []string{
-		"/api/packages/owner/npm/pkg",
 		"/api/v1/user",
 		"/v2/owner/image/blobs/uploads/",
 		"/owner/repo.git/info/lfs/objects/batch",
@@ -482,6 +489,161 @@ func TestServeHTTPBridgeTokenOnUnsupportedSurfaceFailsClosed(t *testing.T) {
 	}
 	if env.seen.snapshot().hit {
 		t.Fatal("bridge token reached Gitea on an unsupported surface")
+	}
+}
+
+// TestPackageRegistryCredentialFamilies exercises the credential shapes the
+// package clients actually send: npm (Bearer), PyPI/Maven/Composer/Generic
+// (Basic, token as password), Cargo (raw token, no scheme), and token-in-
+// username Basic. Every family must exchange the bridge token for the hidden
+// PAT as downstream Basic auth.
+func TestPackageRegistryCredentialFamilies(t *testing.T) {
+	pkgPrincipal := linkedPrincipal()
+	pkgPrincipal.Scopes = []string{auth.ScopePackagesRead, auth.ScopePackagesWrite}
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		header string
+	}{
+		{"npm bearer download", http.MethodGet, "/api/packages/owner/npm/@scope%2Fpkg", "Bearer " + testBridgeToken},
+		{"npm bearer publish", http.MethodPut, "/api/packages/owner/npm/@scope%2Fpkg", "Bearer " + testBridgeToken},
+		{"pypi basic upload", http.MethodPost, "/api/packages/owner/pypi", basicHeader("npub1owner", testBridgeToken)},
+		{"pypi basic download", http.MethodGet, "/api/packages/owner/pypi/simple/pkg/", basicHeader("npub1owner", testBridgeToken)},
+		{"cargo raw token", http.MethodPut, "/api/packages/owner/cargo/api/v1/crates/new", testBridgeToken},
+		{"generic basic upload", http.MethodPut, "/api/packages/owner/generic/pkg/1.0/file.bin", basicHeader("npub1owner", testBridgeToken)},
+		{"maven token in username", http.MethodPut, "/api/packages/owner/maven/g/a/1.0/a-1.0.jar", basicHeader(testBridgeToken, "")},
+		{"nuget delete", http.MethodDelete, "/api/packages/owner/nuget/pkg/1.0.0", basicHeader("npub1owner", testBridgeToken)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tokens := &stubAuthenticator{
+				enabled: true, principal: pkgPrincipal,
+				patLogin: "npub1owner-login", patSecret: "hidden-pat",
+			}
+			env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+
+			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader("artifact"))
+			r.Header.Set("Authorization", tc.header)
+			w := httptest.NewRecorder()
+			env.proxy.ServeHTTP(w, r)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+			}
+			seen := env.seen.snapshot()
+			if seen.authorization != basicHeader("npub1owner-login", "hidden-pat") {
+				t.Fatalf("downstream authorization = %q, want hidden PAT Basic", seen.authorization)
+			}
+			if strings.Contains(seen.authorization, testBridgeToken) {
+				t.Fatal("bridge token leaked downstream")
+			}
+		})
+	}
+}
+
+// TestNuGetAPIKeyHeaderCarriesBridgeToken covers the NuGet client shape:
+// the credential arrives in X-NuGet-ApiKey, not Authorization. A bridge
+// token there must be exchanged locally and the header must never reach
+// Gitea; ambiguous dual credentials are rejected; an ordinary API key
+// passes through untouched.
+func TestNuGetAPIKeyHeaderCarriesBridgeToken(t *testing.T) {
+	pkgPrincipal := linkedPrincipal()
+	pkgPrincipal.Scopes = []string{auth.ScopePackagesRead, auth.ScopePackagesWrite}
+	newEnv := func() *proxyEnv {
+		return newProxyEnv(t, Config{FullProxy: true}, &stubAuthenticator{
+			enabled: true, principal: pkgPrincipal,
+			patLogin: "npub1owner-login", patSecret: "hidden-pat",
+		}, stubInspector{})
+	}
+
+	t.Run("bridge token in api key header", func(t *testing.T) {
+		env := newEnv()
+		r := httptest.NewRequest(http.MethodPut, "/api/packages/owner/nuget", strings.NewReader("nupkg"))
+		r.Header.Set("X-NuGet-ApiKey", testBridgeToken)
+		w := httptest.NewRecorder()
+		env.proxy.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+		}
+		seen := env.seen.snapshot()
+		if seen.authorization != basicHeader("npub1owner-login", "hidden-pat") {
+			t.Fatalf("downstream authorization = %q, want hidden PAT Basic", seen.authorization)
+		}
+		if seen.nugetAPIKey != "" {
+			t.Fatalf("X-NuGet-ApiKey reached Gitea: %q", seen.nugetAPIKey)
+		}
+	})
+
+	t.Run("malformed bridge api key fails locally", func(t *testing.T) {
+		env := newEnv()
+		r := httptest.NewRequest(http.MethodPut, "/api/packages/owner/nuget", strings.NewReader("x"))
+		r.Header.Set("X-NuGet-ApiKey", auth.BridgeTokenPrefix+"tooshort")
+		w := httptest.NewRecorder()
+		env.proxy.ServeHTTP(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", w.Code)
+		}
+		if env.seen.snapshot().hit {
+			t.Fatal("malformed bridge api key was forwarded")
+		}
+	})
+
+	t.Run("dual credentials are ambiguous", func(t *testing.T) {
+		env := newEnv()
+		r := httptest.NewRequest(http.MethodPut, "/api/packages/owner/nuget", strings.NewReader("x"))
+		r.Header.Set("Authorization", basicHeader("npub1owner", testBridgeToken))
+		r.Header.Set("X-NuGet-ApiKey", testBridgeToken)
+		w := httptest.NewRecorder()
+		env.proxy.ServeHTTP(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401 for ambiguous dual credentials", w.Code)
+		}
+		if env.seen.snapshot().hit {
+			t.Fatal("ambiguous dual credentials were forwarded")
+		}
+	})
+
+	t.Run("ordinary api key passes through", func(t *testing.T) {
+		env := newEnv()
+		r := httptest.NewRequest(http.MethodPut, "/api/packages/owner/nuget", strings.NewReader("x"))
+		r.Header.Set("X-NuGet-ApiKey", "ordinary-gitea-pat")
+		w := httptest.NewRecorder()
+		env.proxy.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d", w.Code)
+		}
+		if got := env.seen.snapshot().nugetAPIKey; got != "ordinary-gitea-pat" {
+			t.Fatalf("ordinary api key altered: %q", got)
+		}
+	})
+}
+
+// TestPackageWriteRequiresWriteScope ensures a read-only package token cannot
+// publish or delete.
+func TestPackageWriteRequiresWriteScope(t *testing.T) {
+	readOnly := linkedPrincipal()
+	readOnly.Scopes = []string{auth.ScopePackagesRead}
+	tokens := &stubAuthenticator{
+		enabled: true, principal: readOnly, patLogin: "login", patSecret: "hidden-pat",
+	}
+	env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPut, "/api/packages/owner/npm/pkg"},
+		{http.MethodDelete, "/api/packages/owner/cargo/pkg/1.0.0"},
+	} {
+		r := httptest.NewRequest(tc.method, tc.path, strings.NewReader("x"))
+		r.Header.Set("Authorization", "Bearer "+testBridgeToken)
+		w := httptest.NewRecorder()
+		env.proxy.ServeHTTP(w, r)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s %s status = %d, want 403", tc.method, tc.path, w.Code)
+		}
+	}
+	if env.seen.snapshot().hit {
+		t.Fatal("package write forwarded without packages:write")
 	}
 }
 

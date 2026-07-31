@@ -32,6 +32,10 @@ var InternalHeaders = []string{
 // maxBasicHeaderBytes bounds the base64 blob we are willing to decode.
 const maxBasicHeaderBytes = 8 << 10
 
+// nugetAPIKeyHeader is where NuGet clients (`dotnet nuget push --api-key`)
+// present the credential instead of Authorization.
+const nugetAPIKeyHeader = "X-NuGet-ApiKey"
+
 // credentialKind is how a caller presented itself.
 type credentialKind int
 
@@ -72,6 +76,17 @@ type credential struct {
 func (p *Proxy) extractCredential(r *http.Request) credential {
 	if cred, ok := p.trustedSessionCredential(r); ok {
 		return cred
+	}
+
+	// A bridge token in the NuGet API-key header must resolve locally like
+	// any other shape claiming the prefix. Presenting it alongside an
+	// Authorization header is ambiguous and rejected. A non-bridge API key
+	// is an ordinary Gitea credential and passes through below.
+	if apiKey := strings.TrimSpace(r.Header.Get(nugetAPIKeyHeader)); auth.HasBridgeTokenPrefix(apiKey) {
+		if len(r.Header.Values("Authorization")) > 0 {
+			return credential{kind: credentialUnsupported}
+		}
+		return classifyBridgeSecret(apiKey, "")
 	}
 
 	values := r.Header.Values("Authorization")
@@ -192,4 +207,5 @@ func stripCallerCredentials(h http.Header) {
 	h.Del("Authorization")
 	h.Del("Proxy-Authorization")
 	h.Del("Cookie")
+	h.Del(nugetAPIKeyHeader)
 }
