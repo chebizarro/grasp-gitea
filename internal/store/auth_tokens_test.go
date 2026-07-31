@@ -540,8 +540,8 @@ func TestResealPATCredentialCompareAndSwap(t *testing.T) {
 		t.Fatalf("activate: %v", err)
 	}
 
-	if err := st.ResealPATCredential(ctx, 3, gen, original, []byte{4, 5, 6}, "new"); err != nil {
-		t.Fatalf("reseal: %v", err)
+	if n, err := st.ResealPATCredential(ctx, 3, gen, original, []byte{4, 5, 6}, "new"); err != nil || n != 1 {
+		t.Fatalf("reseal: n=%d err=%v, want 1 row updated", n, err)
 	}
 	cred, err := st.GetActivePATCredential(ctx, 3)
 	if err != nil {
@@ -551,9 +551,10 @@ func TestResealPATCredentialCompareAndSwap(t *testing.T) {
 		t.Fatalf("cred = %+v", cred)
 	}
 
-	// A stale reseal (expecting the old ciphertext) must not clobber.
-	if err := st.ResealPATCredential(ctx, 3, gen, original, []byte{7}, "stale"); err != nil {
-		t.Fatalf("stale reseal: %v", err)
+	// A stale reseal (expecting the old ciphertext) must not clobber, and
+	// reports zero rows affected so callers can detect the CAS miss.
+	if n, err := st.ResealPATCredential(ctx, 3, gen, original, []byte{7}, "stale"); err != nil || n != 0 {
+		t.Fatalf("stale reseal: n=%d err=%v, want 0 rows updated", n, err)
 	}
 	cred, err = st.GetActivePATCredential(ctx, 3)
 	if err != nil {

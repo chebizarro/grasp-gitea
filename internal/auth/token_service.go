@@ -71,6 +71,17 @@ const (
 	patNamePrefix = "grasp-bridge"
 
 	tokenMaintenanceInterval = time.Hour
+
+	// reconcileStuckProvisioningAfter is how long a row may sit in
+	// provisioning before the reconciliation sweep treats it as stranded by
+	// a crash. It must exceed patProvisionCleanupTimeout so an in-flight
+	// mint is never reconciled out from under itself.
+	reconcileStuckProvisioningAfter = 15 * time.Minute
+
+	// reencryptSweepBatch and reconcileSweepBatch bound the per-tick work so
+	// a large backlog is drained across ticks rather than in one long pass.
+	reencryptSweepBatch = 200
+	reconcileSweepBatch = 200
 )
 
 // Hidden PAT scopes are demand-driven: a PAT carries only the Gitea
@@ -462,19 +473,29 @@ func scopesCover(stored, required []string) bool {
 // reseal lazily re-encrypts a PAT under the active key after a successful
 // decryption, so retired keys can eventually be removed from the ring.
 // Failure is non-fatal: the caller already holds a usable credential.
-func (t *TokenService) reseal(ctx context.Context, cred store.GiteaPATCredential, plaintext []byte) {
+// reseal re-encrypts a PAT under the active key. It returns true only when
+// the compare-and-swap actually updated the row, so callers can report
+// re-encryption accurately (a concurrent lazy reseal wins the CAS and this
+// one is a harmless no-op).
+func (t *TokenService) reseal(ctx context.Context, cred store.GiteaPATCredential, plaintext []byte) bool {
 	ciphertext, keyID, err := t.cipher.Seal(plaintext,
 		PATCredentialAAD(cred.GiteaUserID, cred.Generation, cred.PATName, t.cipher.ActiveKeyID()))
 	if err != nil {
 		t.logger.Warn("PAT reseal failed", "gitea_user_id", cred.GiteaUserID, "error", err)
-		return
+		return false
 	}
-	if err := t.store.ResealPATCredential(ctx, cred.GiteaUserID, cred.Generation, cred.Ciphertext, ciphertext, keyID); err != nil {
+	n, err := t.store.ResealPATCredential(ctx, cred.GiteaUserID, cred.Generation, cred.Ciphertext, ciphertext, keyID)
+	if err != nil {
 		t.logger.Warn("PAT reseal persist failed", "gitea_user_id", cred.GiteaUserID, "error", err)
-		return
+		return false
+	}
+	if n == 0 {
+		// CAS miss: another writer resealed or rotated this row first.
+		return false
 	}
 	t.logger.Info("PAT re-encrypted under active credential key",
 		"gitea_user_id", cred.GiteaUserID, "generation", cred.Generation, "key_id", keyID)
+	return true
 }
 
 // List returns plaintext-free token metadata for a pubkey.
@@ -550,6 +571,8 @@ func (t *TokenService) RunMaintenance(ctx context.Context) {
 func (t *TokenService) maintain(ctx context.Context) {
 	now := t.now().UTC()
 	t.retireIdlePATs(ctx)
+	t.reencryptStaleCredentials(ctx)
+	t.reconcilePATCredentials(ctx, now)
 	if n, err := t.store.CleanupExpiredReplayClaims(ctx, now); err != nil {
 		t.logger.Warn("replay claim cleanup failed", "error", err)
 	} else if n > 0 {
@@ -932,6 +955,145 @@ func (t *TokenService) retireIdlePATs(ctx context.Context) {
 		metrics.IncPATCredentialsRetired()
 		t.logger.Info("hidden Gitea PAT retired", "gitea_user", cred.GiteaUser, "generation", cred.Generation)
 	}
+}
+
+// reencryptStaleCredentials proactively re-seals credentials sealed under a
+// non-active key so retired credential keys can eventually be removed from
+// the ring. Lazy reseal-on-use covers active users; an idle credential would
+// otherwise pin an old key forever. Each reseal is a compare-and-swap, so a
+// concurrent lazy reseal or rotation is never clobbered.
+func (t *TokenService) reencryptStaleCredentials(ctx context.Context) {
+	activeKey := t.cipher.ActiveKeyID()
+	stale, err := t.store.ListPATCredentialsUnderStaleKey(ctx, activeKey, reencryptSweepBatch)
+	if err != nil {
+		t.logger.Warn("re-encryption scan failed", "error", err)
+		return
+	}
+	resealed := 0
+	for _, cred := range stale {
+		plaintext, err := t.cipher.Open(cred.Ciphertext, cred.KeyID,
+			PATCredentialAAD(cred.GiteaUserID, cred.Generation, cred.PATName, cred.KeyID))
+		if err != nil {
+			// The key that sealed this row is gone from the ring: the row is
+			// undecryptable and must be reconciled, not re-encrypted.
+			t.logger.Error("credential is undecryptable under any ring key; quarantining",
+				"gitea_user_id", cred.GiteaUserID, "generation", cred.Generation, "key_id", cred.KeyID)
+			if stateErr := t.store.SetPATCredentialState(ctx, cred.GiteaUserID, cred.Generation,
+				store.PATStateError, "undecryptable: key "+cred.KeyID+" not in ring"); stateErr != nil {
+				t.logger.Warn("failed to quarantine undecryptable credential", "error", stateErr)
+			}
+			continue
+		}
+		if t.reseal(ctx, cred, plaintext) {
+			resealed++
+			metrics.IncPATCredentialsReencrypted()
+		}
+	}
+	if resealed > 0 {
+		t.logger.Info("re-encrypted hidden PATs under the active credential key", "count", resealed)
+	}
+}
+
+// reconcilePATCredentials clears terminal error/orphaned rows once their
+// Gitea PAT is confirmed gone, and recovers provisioning rows stranded by a
+// crash mid-mint. It is idempotent and safe to run every tick: a 404 from
+// Gitea means the PAT is already gone, which is success.
+func (t *TokenService) reconcilePATCredentials(ctx context.Context, now time.Time) {
+	for _, state := range []string{store.PATStateError, store.PATStateOrphaned} {
+		// Ordered by delete_attempts so a permanently-failing row cannot
+		// starve the rows behind it — each tick gives fresh rows a turn.
+		rows, err := t.store.ListTerminalPATCredentials(ctx, state, reconcileSweepBatch)
+		if err != nil {
+			t.logger.Warn("reconciliation scan failed", "state", state, "error", err)
+			continue
+		}
+		for _, cred := range rows {
+			t.reconcileTerminalPAT(ctx, cred)
+		}
+	}
+
+	// Provisioning rows never finalized (crash between reserve and activate)
+	// leave a possibly-created Gitea PAT with no usable local record. Delete
+	// by the reserved unique name and clear the row.
+	cutoff := now.Add(-reconcileStuckProvisioningAfter)
+	stuck, err := t.store.ListStalePATCredentialsInState(ctx, store.PATStateProvisioning, cutoff, reconcileSweepBatch)
+	if err != nil {
+		t.logger.Warn("stuck-provisioning scan failed", "error", err)
+		return
+	}
+	metrics.SetPATStuckProvisioning(int64(len(stuck)))
+	for _, cred := range stuck {
+		lock := t.userLock(cred.GiteaUserID)
+		lock.Lock()
+		// Re-read under the lock: a concurrent mint may have just finalized
+		// this exact generation.
+		if current, err := t.store.GetActivePATCredential(ctx, cred.GiteaUserID); err == nil && current.Generation == cred.Generation {
+			lock.Unlock()
+			continue
+		}
+		t.logger.Warn("recovering hidden PAT stranded in provisioning",
+			"gitea_user_id", cred.GiteaUserID, "generation", cred.Generation, "pat_name", cred.PATName)
+		ref := cred.PATName
+		if cred.GiteaTokenID > 0 {
+			ref = fmt.Sprintf("%d", cred.GiteaTokenID)
+		}
+		if err := t.gitea.DeleteUserAccessToken(ctx, cred.GiteaUser, ref); err != nil && !gitea.IsNotFound(err) {
+			metrics.IncPATReconcileFailures()
+			lock.Unlock()
+			t.logger.Warn("could not delete stranded provisioning PAT; will retry",
+				"gitea_user_id", cred.GiteaUserID, "error", err)
+			continue
+		}
+		if err := t.store.DeletePATCredential(ctx, cred.GiteaUserID, cred.Generation); err != nil {
+			t.logger.Warn("could not clear stranded provisioning row", "error", err)
+		} else {
+			metrics.IncPATCredentialsReconciled()
+		}
+		lock.Unlock()
+	}
+}
+
+// reconcileTerminalPAT deletes an error/orphaned credential's Gitea PAT and
+// clears its row. A 404 is success. Failure is logged and retried next tick.
+func (t *TokenService) reconcileTerminalPAT(ctx context.Context, cred store.GiteaPATCredential) {
+	ref := cred.PATName
+	if cred.GiteaTokenID > 0 {
+		ref = fmt.Sprintf("%d", cred.GiteaTokenID)
+	}
+	var wasPresent bool
+	if err := t.gitea.DeleteUserAccessToken(ctx, cred.GiteaUser, ref); err != nil {
+		if !gitea.IsNotFound(err) {
+			metrics.IncPATReconcileFailures()
+			// Preserve the terminal state; bump delete_attempts so this row
+			// sorts to the back of the fair-retry queue.
+			if recErr := t.store.RecordTerminalDeleteFailure(ctx, cred.GiteaUserID, cred.Generation,
+				"reconcile delete failed: "+err.Error()); recErr != nil {
+				t.logger.Warn("could not record reconcile delete failure", "error", recErr)
+			}
+			return
+		}
+		// 404: Gitea already has no such PAT — cleanup is complete.
+	} else {
+		wasPresent = true
+	}
+	// Durable record before the row disappears: reconciliation is the only
+	// event that erases a generation's provisioning/quarantine history.
+	outcome := "deleted"
+	if !wasPresent {
+		outcome = "already_absent"
+	}
+	t.audit(ctx, store.AuthAuditEvent{
+		EventType: "pat_reconciled", GiteaUserID: cred.GiteaUserID,
+		Outcome: outcome, Detail: cred.State + " gen=" + fmt.Sprintf("%d", cred.Generation),
+	})
+	if err := t.store.DeletePATCredential(ctx, cred.GiteaUserID, cred.Generation); err != nil {
+		t.logger.Warn("could not clear reconciled credential row",
+			"gitea_user_id", cred.GiteaUserID, "generation", cred.Generation, "error", err)
+		return
+	}
+	metrics.IncPATCredentialsReconciled()
+	t.logger.Info("reconciled terminal hidden PAT",
+		"gitea_user_id", cred.GiteaUserID, "generation", cred.Generation, "state", cred.State)
 }
 
 func (t *TokenService) audit(ctx context.Context, ev store.AuthAuditEvent) {

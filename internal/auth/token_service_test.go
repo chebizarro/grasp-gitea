@@ -37,6 +37,7 @@ type fakeTokenGitea struct {
 	issuedPATs   map[int64]string // token id -> plaintext
 	deletedPATs  []string
 	failCreate   bool
+	failDelete   bool
 }
 
 func newFakeTokenGitea() *fakeTokenGitea {
@@ -77,6 +78,10 @@ func (f *fakeTokenGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"token_last_eight": plaintext[len(plaintext)-8:], "scopes": req.Scopes,
 		})
 	case r.Method == http.MethodDelete && strings.Contains(path, "/tokens/"):
+		if f.failDelete {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		f.deletedPATs = append(f.deletedPATs, path)
 		w.WriteHeader(http.StatusNoContent)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v1/users/"):

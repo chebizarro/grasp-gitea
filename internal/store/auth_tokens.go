@@ -285,15 +285,18 @@ func (s *SQLiteStore) TouchBridgeTokenUsage(ctx context.Context, id string, now,
 // ResealPATCredential swaps a PAT's ciphertext to a new key, but only if the
 // row still holds the ciphertext the caller decrypted (compare-and-swap), so
 // a concurrent rotation is never clobbered.
-func (s *SQLiteStore) ResealPATCredential(ctx context.Context, giteaUserID, generation int64, expectedCiphertext, ciphertext []byte, keyID string) error {
+func (s *SQLiteStore) ResealPATCredential(ctx context.Context, giteaUserID, generation int64, expectedCiphertext, ciphertext []byte, keyID string) (int64, error) {
 	if len(ciphertext) == 0 || keyID == "" {
-		return fmt.Errorf("pat reseal requires ciphertext and key id")
+		return 0, fmt.Errorf("pat reseal requires ciphertext and key id")
 	}
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE gitea_pat_credentials SET pat_ciphertext = ?, key_id = ?
 		WHERE gitea_user_id = ? AND generation = ? AND pat_ciphertext = ?
 	`, ciphertext, keyID, giteaUserID, generation, expectedCiphertext)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // ListGiteaUsersWithoutActiveTokens returns Gitea user ids that hold an active
@@ -478,6 +481,117 @@ func (s *SQLiteStore) ListPATCredentialsPendingDeletion(ctx context.Context, lim
 	return out, rows.Err()
 }
 
+// ListPATCredentialsUnderStaleKey returns credentials whose ciphertext is
+// sealed under a key other than the active one, so a proactive sweep can
+// re-encrypt them and let retired credential keys be removed from the ring.
+// Only states that must remain decryptable are considered.
+func (s *SQLiteStore) ListPATCredentialsUnderStaleKey(ctx context.Context, activeKeyID string, limit int) ([]GiteaPATCredential, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT gitea_user_id, generation, gitea_user, pat_name, gitea_token_id, pat_ciphertext, key_id, gitea_scopes, state, created_at, activated_at, retired_at, delete_attempts, last_error
+		FROM gitea_pat_credentials
+		WHERE key_id != ? AND key_id != '' AND length(pat_ciphertext) > 0
+		  AND (state = ? OR (state = ? AND retired_at = ''))
+		ORDER BY created_at ASC LIMIT ?
+	`, activeKeyID, PATStateActive, PATStateRetiring, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []GiteaPATCredential
+	for rows.Next() {
+		cred, err := scanPATCredential(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cred)
+	}
+	return out, rows.Err()
+}
+
+// ListStalePATCredentialsInState returns rows in a given state created before
+// `before`, so a reconciliation sweep can recover work stranded by a crash
+// (e.g. a provisioning row never finalized) without racing a fresh in-flight
+// row.
+func (s *SQLiteStore) ListStalePATCredentialsInState(ctx context.Context, state string, before time.Time, limit int) ([]GiteaPATCredential, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT gitea_user_id, generation, gitea_user, pat_name, gitea_token_id, pat_ciphertext, key_id, gitea_scopes, state, created_at, activated_at, retired_at, delete_attempts, last_error
+		FROM gitea_pat_credentials
+		WHERE state = ? AND created_at < ?
+		ORDER BY created_at ASC LIMIT ?
+	`, state, before.UTC().Format(time.RFC3339), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []GiteaPATCredential
+	for rows.Next() {
+		cred, err := scanPATCredential(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cred)
+	}
+	return out, rows.Err()
+}
+
+// ListTerminalPATCredentials returns error/orphaned rows for reconciliation,
+// ordered by delete_attempts ascending so a permanently-failing row drops to
+// the back of the queue and never starves rows behind it (fair retry).
+func (s *SQLiteStore) ListTerminalPATCredentials(ctx context.Context, state string, limit int) ([]GiteaPATCredential, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT gitea_user_id, generation, gitea_user, pat_name, gitea_token_id, pat_ciphertext, key_id, gitea_scopes, state, created_at, activated_at, retired_at, delete_attempts, last_error
+		FROM gitea_pat_credentials WHERE state = ?
+		ORDER BY delete_attempts ASC, created_at ASC LIMIT ?
+	`, state, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []GiteaPATCredential
+	for rows.Next() {
+		cred, err := scanPATCredential(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cred)
+	}
+	return out, rows.Err()
+}
+
+// RecordTerminalDeleteFailure bumps delete_attempts and records the error
+// while preserving the row's terminal state, so failing rows sort to the
+// back of the fair-retry queue.
+func (s *SQLiteStore) RecordTerminalDeleteFailure(ctx context.Context, giteaUserID, generation int64, lastError string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE gitea_pat_credentials
+		SET delete_attempts = delete_attempts + 1, last_error = ?
+		WHERE gitea_user_id = ? AND generation = ?
+	`, lastError, giteaUserID, generation)
+	return err
+}
+
+// DeletePATCredential removes a terminal reconciled row after its Gitea PAT
+// is confirmed gone. Used by the reconciliation sweep to clear error and
+// orphaned rows once their Gitea-side deletion succeeds.
+func (s *SQLiteStore) DeletePATCredential(ctx context.Context, giteaUserID, generation int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM gitea_pat_credentials WHERE gitea_user_id = ? AND generation = ?
+	`, giteaUserID, generation)
+	return err
+}
+
 // ListPATCredentialsByState supports cleanup/reconciliation sweeps.
 func (s *SQLiteStore) ListPATCredentialsByState(ctx context.Context, state string, limit int) ([]GiteaPATCredential, error) {
 	if limit <= 0 {
@@ -598,6 +712,46 @@ func (s *SQLiteStore) InsertAuthAuditEvent(ctx context.Context, ev AuthAuditEven
 	`, occurred.UTC().Format(time.RFC3339), ev.EventType, ev.Pubkey, ev.TokenID, ev.GiteaUserID,
 		ev.Surface, ev.Action, ev.Outcome, ev.RequestID, ev.SourceFingerprint, ev.Detail)
 	return err
+}
+
+// ListAuthAuditEvents returns recent audit events of a given type, newest
+// first. An empty eventType returns all types. Intended for operator/
+// diagnostic reads and tests, not the hot path.
+func (s *SQLiteStore) ListAuthAuditEvents(ctx context.Context, eventType string, limit int) ([]AuthAuditEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	query := `
+		SELECT occurred_at, event_type, pubkey, token_id, gitea_user_id, surface, action, outcome, request_id, source_fingerprint, detail
+		FROM auth_audit_events`
+	args := []any{}
+	if eventType != "" {
+		query += ` WHERE event_type = ?`
+		args = append(args, eventType)
+	}
+	query += ` ORDER BY occurred_at DESC, rowid DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []AuthAuditEvent
+	for rows.Next() {
+		var ev AuthAuditEvent
+		var occurred string
+		if err := rows.Scan(&occurred, &ev.EventType, &ev.Pubkey, &ev.TokenID, &ev.GiteaUserID,
+			&ev.Surface, &ev.Action, &ev.Outcome, &ev.RequestID, &ev.SourceFingerprint, &ev.Detail); err != nil {
+			return nil, err
+		}
+		if occurred != "" {
+			ev.OccurredAt, _ = time.Parse(time.RFC3339, occurred)
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
 }
 
 // CleanupAuthAuditEvents enforces audit retention.

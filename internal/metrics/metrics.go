@@ -37,6 +37,10 @@ var bridgeTokenAuthFailures atomic.Int64
 var patCredentialsProvisioned atomic.Int64
 var patProvisionFailures atomic.Int64
 var patCredentialsRetired atomic.Int64
+var patCredentialsReencrypted atomic.Int64
+var patCredentialsReconciled atomic.Int64
+var patReconcileFailures atomic.Int64
+var patStuckProvisioning atomic.Int64
 
 func IncAnnouncementReceived() {
 	announcementEventsReceived.Add(1)
@@ -181,6 +185,22 @@ func IncPATCredentialsRetired() {
 	patCredentialsRetired.Add(1)
 }
 
+// IncPATCredentialsReencrypted counts credentials re-sealed under the active
+// key by the proactive re-encryption sweep.
+func IncPATCredentialsReencrypted() { patCredentialsReencrypted.Add(1) }
+
+// IncPATCredentialsReconciled counts error/orphaned credentials whose Gitea
+// PAT was confirmed deleted and whose row was cleared.
+func IncPATCredentialsReconciled() { patCredentialsReconciled.Add(1) }
+
+// IncPATReconcileFailures counts reconciliation attempts that could not
+// complete (Gitea unreachable, deletion failed).
+func IncPATReconcileFailures() { patReconcileFailures.Add(1) }
+
+// SetPATStuckProvisioning records the number of provisioning rows stranded
+// past the recovery threshold at the last sweep — a gauge operators alert on.
+func SetPATStuckProvisioning(n int64) { patStuckProvisioning.Store(n) }
+
 func Snapshot() map[string]int64 {
 	return map[string]int64{
 		"announcement_events_received":    announcementEventsReceived.Load(),
@@ -218,5 +238,9 @@ func Snapshot() map[string]int64 {
 		"pat_credentials_provisioned":     patCredentialsProvisioned.Load(),
 		"pat_provision_failures":          patProvisionFailures.Load(),
 		"pat_credentials_retired":         patCredentialsRetired.Load(),
+		"pat_credentials_reencrypted":     patCredentialsReencrypted.Load(),
+		"pat_credentials_reconciled":      patCredentialsReconciled.Load(),
+		"pat_reconcile_failures":          patReconcileFailures.Load(),
+		"pat_stuck_provisioning":          patStuckProvisioning.Load(),
 	}
 }
