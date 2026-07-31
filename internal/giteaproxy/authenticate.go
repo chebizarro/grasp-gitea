@@ -53,9 +53,13 @@ const (
 	// cookie, registry token) that is forwarded unchanged.
 	credentialPassthrough
 	// credentialUnsupported: a credential form the bridge recognizes but does
-	// not yet accept (currently Authorization: Nostr, pending direct NIP-98),
-	// or an ambiguous multi-valued Authorization header. Rejected locally.
+	// not accept, or an ambiguous multi-valued Authorization header.
+	// Rejected locally.
 	credentialUnsupported
+	// credentialNostrProof: a direct per-request NIP-98 proof
+	// (Authorization: Nostr <base64 event>), verified by the proxy on
+	// bounded requests.
+	credentialNostrProof
 )
 
 // credential is the parsed caller credential.
@@ -135,10 +139,11 @@ func (p *Proxy) extractCredential(r *http.Request) credential {
 		return classifyBridgeSecret(rest, "")
 
 	case strings.EqualFold(scheme, "Nostr"):
-		// Direct per-request NIP-98 on proxied endpoints is a later phase.
-		// Forwarding it would leave Gitea to ignore it and serve the request
-		// anonymously, which silently downgrades the caller's intent.
-		return credential{kind: credentialUnsupported}
+		// Direct per-request NIP-98. Verification happens in the serve path
+		// where the body can be bounded and read; it is never forwarded —
+		// Gitea would ignore it and serve the request anonymously, silently
+		// downgrading the caller's intent.
+		return credential{kind: credentialNostrProof}
 	}
 
 	// An unrecognized scheme carrying a bridge token must not reach Gitea.

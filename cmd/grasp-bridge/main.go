@@ -283,6 +283,7 @@ func main() {
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
 	var bridgeTokenSvc *auth.TokenService
+	var proxyNostrVerifier *auth.ProxyNIP98Verifier
 	if relayRootHandler != nil {
 		// GRASP-01: serve the Nostr relay (WebSocket) and NIP-11 negotiation
 		// at the canonical service root on the public listener.
@@ -320,6 +321,7 @@ func main() {
 			apiServer.AddRouteRegistrar(tokenHandler.RegisterRoutes)
 			go tokenSvc.RunMaintenance(ctx)
 			bridgeTokenSvc = tokenSvc
+			proxyNostrVerifier = auth.NewProxyNIP98Verifier(authSvc, tokenSvc)
 			logger.Info("bridge token service enabled", "scopes", tokenSvc.EnabledScopes())
 		}
 	}
@@ -344,6 +346,10 @@ func main() {
 	if err != nil {
 		logger.Error("failed to initialize Gitea proxy", "error", err)
 		os.Exit(1)
+	}
+	if proxyNostrVerifier != nil {
+		giteaProxy.WithNostrVerifier(proxyNostrVerifier)
+		logger.Info("direct NIP-98 authentication enabled on proxied endpoints")
 	}
 	apiServer.SetGiteaProxy(giteaProxy)
 	if cfg.FullProxyEnabled {

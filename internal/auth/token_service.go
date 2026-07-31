@@ -73,15 +73,72 @@ const (
 	tokenMaintenanceInterval = time.Hour
 )
 
-// giteaPATScopes is the minimum Gitea scope union for the currently enabled
-// bridge features. Phase 1 enables Git smart HTTP only; write:repository
-// covers read in Gitea's scope hierarchy. Never include admin scopes.
-var giteaPATScopes = []string{"write:package", "write:repository"}
+// Hidden PAT scopes are demand-driven: a PAT carries only the Gitea
+// authority the user's bridge scopes have actually required, so a git-only
+// user's PAT never gains API-wide authority. giteaAPIScopeUnion is every
+// non-admin category the REST adapter can reach. write:admin and
+// write:activitypub are deliberately excluded — a hidden PAT must never
+// carry admin authority, and the classifier additionally refuses bridge
+// credentials on /api/v1/admin and credential-management paths.
+var giteaAPIScopeUnion = []string{
+	"write:issue",
+	"write:misc",
+	"write:notification",
+	"write:organization",
+	"write:package",
+	"write:repository",
+	"write:user",
+}
+
+// requiredGiteaScopes maps bridge scopes to the minimum Gitea PAT scope set
+// they need. Unknown bridge scopes contribute nothing: authority is only
+// ever granted for scopes this mapping understands.
+func requiredGiteaScopes(bridgeScopes []string) []string {
+	set := make(map[string]struct{})
+	for _, s := range bridgeScopes {
+		switch s {
+		case ScopeGitRead, ScopeGitWrite:
+			set["write:repository"] = struct{}{}
+		case ScopePackagesRead, ScopePackagesWrite:
+			set["write:package"] = struct{}{}
+		case ScopeAPIRead, ScopeAPIWrite:
+			for _, g := range giteaAPIScopeUnion {
+				set[g] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for g := range set {
+		out = append(out, g)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// unionScopes merges two Gitea scope lists, sorted and deduplicated. PAT
+// upgrades always union with the stored scopes so a rotation for one bridge
+// token never downgrades the authority other active tokens rely on.
+func unionScopes(a, b []string) []string {
+	set := make(map[string]struct{}, len(a)+len(b))
+	for _, s := range a {
+		set[s] = struct{}{}
+	}
+	for _, s := range b {
+		set[s] = struct{}{}
+	}
+	out := make([]string, 0, len(set))
+	for s := range set {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // enabledTokenScopes lists the bridge scopes a deployment currently accepts.
 var enabledTokenScopes = []string{
 	ScopeGitRead, ScopeGitWrite,
 	ScopePackagesRead, ScopePackagesWrite,
+	ScopeAPIRead, ScopeAPIWrite,
 }
 
 var (
@@ -252,7 +309,7 @@ func (t *TokenService) Mint(ctx context.Context, pubkey, eventID string, req Min
 	lock.Lock()
 	defer lock.Unlock()
 
-	if err := t.ensureActivePATLocked(ctx, identity.GiteaUserID, identity.GiteaUser); err != nil {
+	if err := t.ensureActivePATLocked(ctx, identity.GiteaUserID, identity.GiteaUser, requiredGiteaScopes(scopes)); err != nil {
 		return MintResult{}, err
 	}
 
@@ -336,7 +393,7 @@ func (t *TokenService) Authenticate(ctx context.Context, plaintext string) (Toke
 // DownstreamPAT decrypts the active hidden Gitea PAT for a user. The proxy
 // injects it as Basic <login>:<pat> toward Gitea. The plaintext must never be
 // logged or persisted.
-func (t *TokenService) DownstreamPAT(ctx context.Context, giteaUserID int64) (login, pat string, err error) {
+func (t *TokenService) DownstreamPAT(ctx context.Context, giteaUserID int64, bridgeScope string) (login, pat string, err error) {
 	cred, err := t.store.GetActivePATCredential(ctx, giteaUserID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -344,12 +401,12 @@ func (t *TokenService) DownstreamPAT(ctx context.Context, giteaUserID int64) (lo
 		}
 		return "", "", err
 	}
-	if !patScopesCover(cred.GiteaScopes) {
-		// The stored PAT predates the current required scope set. Tokens
-		// normally trigger the upgrade at mint time, but Rotate and any
-		// long-lived token can reach here first; upgrade lazily under the
-		// user's lifecycle lock so the request proceeds with full authority.
-		cred, err = t.upgradePATScopes(ctx, giteaUserID, cred.GiteaUser)
+	if required := requiredGiteaScopes([]string{bridgeScope}); !scopesCover(cred.GiteaScopes, required) {
+		// The stored PAT predates this scope requirement. Tokens normally
+		// trigger the upgrade at mint time, but Rotate and long-lived tokens
+		// can reach here first; upgrade lazily under the user's lifecycle
+		// lock so the request proceeds with sufficient authority.
+		cred, err = t.upgradePATScopes(ctx, giteaUserID, cred.GiteaUser, required)
 		if err != nil {
 			return "", "", err
 		}
@@ -369,12 +426,12 @@ func (t *TokenService) DownstreamPAT(ctx context.Context, giteaUserID int64) (lo
 // current requirement, then returns the fresh active credential. It takes the
 // user's lifecycle lock; a concurrent upgrade simply finds the fresh
 // credential already active and returns it.
-func (t *TokenService) upgradePATScopes(ctx context.Context, giteaUserID int64, giteaUser string) (store.GiteaPATCredential, error) {
+func (t *TokenService) upgradePATScopes(ctx context.Context, giteaUserID int64, giteaUser string, required []string) (store.GiteaPATCredential, error) {
 	lock := t.userLock(giteaUserID)
 	lock.Lock()
 	defer lock.Unlock()
 
-	if err := t.ensureActivePATLocked(ctx, giteaUserID, giteaUser); err != nil {
+	if err := t.ensureActivePATLocked(ctx, giteaUserID, giteaUser, required); err != nil {
 		return store.GiteaPATCredential{}, err
 	}
 	cred, err := t.store.GetActivePATCredential(ctx, giteaUserID)
@@ -384,14 +441,13 @@ func (t *TokenService) upgradePATScopes(ctx context.Context, giteaUserID int64, 
 	return cred, nil
 }
 
-// patScopesCover reports whether a stored credential's Gitea scopes cover the
-// deployment's required scope set.
-func patScopesCover(stored []string) bool {
+// scopesCover reports whether stored Gitea scopes cover a required set.
+func scopesCover(stored, required []string) bool {
 	have := make(map[string]struct{}, len(stored))
 	for _, s := range stored {
 		have[s] = struct{}{}
 	}
-	for _, want := range giteaPATScopes {
+	for _, want := range required {
 		if _, ok := have[want]; !ok {
 			return false
 		}
@@ -650,6 +706,22 @@ func (t *TokenService) quarantineIdentity(ctx context.Context, identity Resolved
 	})
 }
 
+// EnsureHiddenPAT guarantees an active hidden PAT covering the required
+// bridge scopes for an already-linked user. Direct NIP-98 callers need
+// this: nothing else keeps their PAT provisioned when they hold no bridge
+// tokens. The identity link is re-verified against Gitea first — a deleted
+// and recreated login must quarantine, exactly as Mint does, never adopt
+// the replacement account.
+func (t *TokenService) EnsureHiddenPAT(ctx context.Context, identity ResolvedIdentity, bridgeScopes []string) error {
+	if err := t.verifyIdentityLink(ctx, identity); err != nil {
+		return err
+	}
+	lock := t.userLock(identity.GiteaUserID)
+	lock.Lock()
+	defer lock.Unlock()
+	return t.ensureActivePATLocked(ctx, identity.GiteaUserID, identity.GiteaUser, requiredGiteaScopes(bridgeScopes))
+}
+
 // userLock returns the striped lifecycle lock for a Gitea user. It serializes
 // PAT provisioning, token insertion, and PAT retirement against each other.
 func (t *TokenService) userLock(giteaUserID int64) *sync.Mutex {
@@ -664,30 +736,35 @@ func (t *TokenService) userLock(giteaUserID int64) *sync.Mutex {
 // context so a disconnecting client cannot strand a live Gitea PAT.
 //
 // The caller must hold the user's lifecycle lock.
-func (t *TokenService) ensureActivePATLocked(ctx context.Context, giteaUserID int64, giteaUser string) error {
+func (t *TokenService) ensureActivePATLocked(ctx context.Context, giteaUserID int64, giteaUser string, required []string) error {
+	provisionScopes := required
+	if len(provisionScopes) == 0 {
+		provisionScopes = []string{"write:repository"}
+	}
 	if cred, err := t.store.GetActivePATCredential(ctx, giteaUserID); err == nil {
-		if patScopesCover(cred.GiteaScopes) {
+		if scopesCover(cred.GiteaScopes, required) {
 			return nil
 		}
-		// The deployment's required Gitea scope set has grown since this
-		// credential was provisioned (e.g. package scopes were enabled).
-		// Provision a replacement: activation atomically demotes this
-		// generation to retiring (create-before-retire), and the retirement
-		// sweep deletes it from Gitea.
+		// The caller's bridge scopes need more Gitea authority than this
+		// credential carries. Provision a replacement with the union — never
+		// a downgrade, other active tokens may rely on the stored scopes.
+		// Activation atomically demotes this generation to retiring
+		// (create-before-retire), and the retirement sweep deletes it.
+		provisionScopes = unionScopes(cred.GiteaScopes, required)
 		t.logger.Info("rotating hidden PAT for scope upgrade",
 			"gitea_user_id", giteaUserID, "generation", cred.Generation,
-			"have_scopes", cred.GiteaScopes, "want_scopes", giteaPATScopes)
+			"have_scopes", cred.GiteaScopes, "want_scopes", provisionScopes)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 
 	now := t.now().UTC()
-	generation, patName, err := t.store.ReservePATCredential(ctx, giteaUserID, giteaUser, patNamePrefix, giteaPATScopes, now)
+	generation, patName, err := t.store.ReservePATCredential(ctx, giteaUserID, giteaUser, patNamePrefix, provisionScopes, now)
 	if err != nil {
 		return err
 	}
 
-	created, createErr := t.gitea.CreateUserAccessToken(ctx, giteaUser, patName, giteaPATScopes)
+	created, createErr := t.gitea.CreateUserAccessToken(ctx, giteaUser, patName, provisionScopes)
 
 	// Past this point Gitea may hold a PAT even on error, so all persistence
 	// and rollback use a detached context: cancelling the caller's request
@@ -778,6 +855,14 @@ func (t *TokenService) retireUserPAT(ctx context.Context, giteaUserID int64, now
 	if active > 0 {
 		// A token was minted between the scan and this lock.
 		return
+	}
+	if cred, err := t.store.GetActivePATCredential(ctx, giteaUserID); err == nil {
+		if now.Sub(cred.ActivatedAt) < patRetirementGrace {
+			// Freshly provisioned — most likely by a direct NIP-98 request
+			// racing this sweep (signature users hold no tokens). Give it
+			// the full grace period from activation.
+			return
+		}
 	}
 	n, err := t.store.RetireActivePATCredential(ctx, giteaUserID)
 	if err != nil {

@@ -201,8 +201,10 @@ func TestMintProvisionsIdentityAndPATOnce(t *testing.T) {
 	if !basic {
 		t.Fatal("PAT creation did not use Basic auth")
 	}
-	if fmt.Sprintf("%v", scopes) != fmt.Sprintf("%v", giteaPATScopes) {
-		t.Fatalf("PAT scopes = %v, want %v", scopes, giteaPATScopes)
+	// Git-only tokens provision a repository-only PAT: authority is
+	// demand-driven, never the full union.
+	if fmt.Sprintf("%v", scopes) != "[write:repository]" {
+		t.Fatalf("PAT scopes = %v, want [write:repository]", scopes)
 	}
 
 	// Both tokens authenticate to the same subject.
@@ -222,7 +224,7 @@ func TestMintProvisionsIdentityAndPATOnce(t *testing.T) {
 	}
 
 	// The hidden PAT decrypts to exactly what Gitea issued.
-	login, pat, err := env.svc.DownstreamPAT(ctx, p1.GiteaUserID)
+	login, pat, err := env.svc.DownstreamPAT(ctx, p1.GiteaUserID, ScopeGitRead)
 	if err != nil {
 		t.Fatalf("DownstreamPAT: %v", err)
 	}
@@ -281,7 +283,7 @@ func TestMintValidation(t *testing.T) {
 	cases := []MintRequest{
 		{Name: ""},
 		{Name: strings.Repeat("n", maxTokenNameLen+1)},
-		{Name: "ok", Scopes: []string{"api:read"}}, // not enabled yet (phase 4)
+		{Name: "ok", Scopes: []string{"lfs:read"}}, // not enabled yet (phase 5)
 		{Name: "ok", Scopes: []string{"bogus"}},
 		{Name: "ok", TTLSeconds: 1},                  // below min
 		{Name: "ok", TTLSeconds: 366 * 24 * 60 * 60}, // above max
@@ -353,27 +355,28 @@ func TestRotateReplacesToken(t *testing.T) {
 	}
 }
 
-// TestMintRotatesPATWhenScopesGrow covers the upgrade path: a hidden PAT
-// provisioned before package scopes were required is replaced at the next
-// mint (create-before-retire), and the stale generation is deleted in Gitea.
+// TestMintRotatesPATWhenScopesGrow covers the upgrade path: minting a token
+// whose bridge scopes need more Gitea authority replaces the hidden PAT
+// (create-before-retire) with the union, and the stale generation is
+// deleted in Gitea.
 func TestMintRotatesPATWhenScopesGrow(t *testing.T) {
 	env := newTokenTestEnv(t)
 	ctx := context.Background()
 
-	first, err := env.svc.Mint(ctx, testPubkey, "ev1", MintRequest{Name: "laptop"})
+	first, err := env.svc.Mint(ctx, testPubkey, "ev1", MintRequest{Name: "laptop", Scopes: []string{ScopeGitRead}})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
-	downgradeActivePATScopes(t, env.dbPath)
 
-	if _, err := env.svc.Mint(ctx, testPubkey, "ev2", MintRequest{Name: "desktop"}); err != nil {
+	if _, err := env.svc.Mint(ctx, testPubkey, "ev2", MintRequest{Name: "desktop", Scopes: []string{ScopePackagesWrite}}); err != nil {
 		t.Fatalf("second mint: %v", err)
 	}
 	if env.fake.tokenCreates != 2 {
 		t.Fatalf("gitea PAT creates = %d, want 2 (scope upgrade rotates)", env.fake.tokenCreates)
 	}
-	if fmt.Sprintf("%v", env.fake.lastScopes) != fmt.Sprintf("%v", giteaPATScopes) {
-		t.Fatalf("replacement PAT scopes = %v, want %v", env.fake.lastScopes, giteaPATScopes)
+	// Union, never a downgrade: the first token still needs write:repository.
+	if fmt.Sprintf("%v", env.fake.lastScopes) != "[write:package write:repository]" {
+		t.Fatalf("replacement PAT scopes = %v, want [write:package write:repository]", env.fake.lastScopes)
 	}
 
 	// The replacement must be served, and the stale generation deleted from
@@ -382,7 +385,7 @@ func TestMintRotatesPATWhenScopesGrow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	_, pat, err := env.svc.DownstreamPAT(ctx, principal.GiteaUserID)
+	_, pat, err := env.svc.DownstreamPAT(ctx, principal.GiteaUserID, ScopeGitRead)
 	if err != nil {
 		t.Fatalf("downstream pat: %v", err)
 	}
@@ -397,12 +400,14 @@ func TestMintRotatesPATWhenScopesGrow(t *testing.T) {
 
 // TestDownstreamPATUpgradesScopesLazily covers tokens that gained scopes
 // without passing through Mint (e.g. Rotate): the stale PAT is replaced at
-// request time, under the user's lifecycle lock.
+// request time, under the user's lifecycle lock, with the union of stored
+// and required scopes.
 func TestDownstreamPATUpgradesScopesLazily(t *testing.T) {
 	env := newTokenTestEnv(t)
 	ctx := context.Background()
 
-	first, err := env.svc.Mint(ctx, testPubkey, "ev1", MintRequest{Name: "laptop"})
+	// A git-only mint provisions a repository-only PAT...
+	first, err := env.svc.Mint(ctx, testPubkey, "ev1", MintRequest{Name: "laptop", Scopes: []string{ScopeGitRead, ScopePackagesRead}})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -410,9 +415,10 @@ func TestDownstreamPATUpgradesScopesLazily(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
+	// ...but simulate a credential from before packages support.
 	downgradeActivePATScopes(t, env.dbPath)
 
-	_, pat, err := env.svc.DownstreamPAT(ctx, principal.GiteaUserID)
+	_, pat, err := env.svc.DownstreamPAT(ctx, principal.GiteaUserID, ScopePackagesRead)
 	if err != nil {
 		t.Fatalf("downstream pat: %v", err)
 	}
@@ -421,6 +427,9 @@ func TestDownstreamPATUpgradesScopesLazily(t *testing.T) {
 	}
 	if pat != env.fake.issuedPATs[9001] {
 		t.Fatalf("downstream pat = %q, want upgraded generation %q", pat, env.fake.issuedPATs[9001])
+	}
+	if fmt.Sprintf("%v", env.fake.lastScopes) != "[write:package write:repository]" {
+		t.Fatalf("upgraded scopes = %v, want [write:package write:repository]", env.fake.lastScopes)
 	}
 }
 
@@ -552,6 +561,44 @@ func TestRetireIdlePATsAfterGrace(t *testing.T) {
 	}
 }
 
+// TestSweepSkipsFreshlyEnsuredPAT: a signature-only user's PAT provisioned
+// by EnsureHiddenPAT moments before the retirement sweep runs must survive
+// the sweep — it gets the full grace period from activation.
+func TestSweepSkipsFreshlyEnsuredPAT(t *testing.T) {
+	env := newTokenTestEnv(t)
+	ctx := context.Background()
+
+	minted, err := env.svc.Mint(ctx, testPubkey, "ev1", MintRequest{Name: "laptop"})
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	principal, err := env.svc.Authenticate(ctx, minted.Token)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if err := env.svc.Revoke(ctx, testPubkey, minted.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	// Long past the grace period: the sweep retires the idle PAT.
+	env.svc.now = func() time.Time { return time.Now().Add(patRetirementGrace + time.Hour) }
+	env.svc.retireIdlePATs(ctx)
+	if _, err := env.store.GetActivePATCredential(ctx, principal.GiteaUserID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected retirement, got %v", err)
+	}
+
+	// A direct NIP-98 request re-provisions (activation at the current
+	// clock), racing the next sweep pass.
+	identity := ResolvedIdentity{Pubkey: testPubkey, GiteaUser: principal.GiteaUser, GiteaUserID: principal.GiteaUserID}
+	if err := env.svc.EnsureHiddenPAT(ctx, identity, []string{ScopeAPIRead}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	env.svc.retireIdlePATs(ctx)
+	if _, err := env.store.GetActivePATCredential(ctx, principal.GiteaUserID); err != nil {
+		t.Fatalf("freshly ensured PAT was swept: %v", err)
+	}
+}
+
 func TestDownstreamPATResealsUnderActiveKey(t *testing.T) {
 	env := newTokenTestEnv(t)
 	ctx := context.Background()
@@ -581,7 +628,7 @@ func TestDownstreamPATResealsUnderActiveKey(t *testing.T) {
 	}
 	env.svc.cipher = cipher
 
-	_, pat, err := env.svc.DownstreamPAT(ctx, principal.GiteaUserID)
+	_, pat, err := env.svc.DownstreamPAT(ctx, principal.GiteaUserID, ScopeGitRead)
 	if err != nil {
 		t.Fatalf("DownstreamPAT: %v", err)
 	}
@@ -609,7 +656,7 @@ func TestDownstreamPATResealsUnderActiveKey(t *testing.T) {
 		t.Fatalf("new-only cipher: %v", err)
 	}
 	env.svc.cipher = onlyNew
-	if _, pat, err = env.svc.DownstreamPAT(ctx, principal.GiteaUserID); err != nil {
+	if _, pat, err = env.svc.DownstreamPAT(ctx, principal.GiteaUserID, ScopeGitRead); err != nil {
 		t.Fatalf("DownstreamPAT after key retirement: %v", err)
 	}
 	if pat != issued {

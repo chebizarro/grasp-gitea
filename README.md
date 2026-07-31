@@ -154,7 +154,8 @@ credentials directly, defeating scope enforcement — so the bridge refuses to
 start with `BRIDGE_TOKENS_ENABLED=true` unless full-proxy mode is on.
 
 **Scopes.** Tokens carry an explicit closed set of scopes. Currently enabled:
-`git:read`, `git:write`, `packages:read`, and `packages:write`. The
+`git:read`, `git:write`, `packages:read`, `packages:write`, `api:read`, and
+`api:write`. The
 `packages:*` scopes cover the `/api/packages/` registry family (npm, PyPI,
 Cargo, Maven, Composer, NuGet, generic, …) regardless of how the client
 presents the token — npm's `Bearer`, PyPI's Basic password, Cargo's raw
@@ -168,17 +169,39 @@ bridge maps the docker-requested access to bridge scopes (`pull` →
 `packages:read`; `push`/`delete` → `packages:write`; unknown actions fail
 closed) and rewrites the challenge realm to the public origin. The JWT
 itself passes through untouched — its short lifetime is the revocation
-bound after a bridge token is revoked.
+bound after a bridge token is revoked. **Caveat:** deployed Gitea versions
+may hard-code a long registry-JWT lifetime (24 h observed in production) —
+measure it with `scripts/z88-gitea-validate.sh` and treat it as the real
+revocation bound before enabling tokens for container traffic.
 
-`api:*` and `lfs:*` are reserved for later phases and are rejected until
-their adapters land. A token used on a surface without an adapter fails
-with `403` rather than being forwarded.
+The REST API (`/api/v1/`) accepts bridge tokens under `api:read`/`api:write`
+by method. `/api/v1/admin` and every credential-management family — user
+PATs (`/users/{u}/tokens`), SSH/GPG keys, deploy keys, OAuth applications,
+email management — refuse bridge credentials outright: a hidden PAT minting
+a durable Gitea credential would escape bridge scoping, expiry, and
+revocation entirely. Non-canonical path spellings (dot segments, encoded
+separators) also fail closed. Ordinary user credentials pass through these
+endpoints untouched. `lfs:*` is reserved for a later phase; a token used on
+a surface without an adapter fails with `403` rather than being forwarded.
 
-Hidden PATs are provisioned with the matching Gitea scope union
-(`write:repository`, `write:package`). A PAT provisioned by an older
-deployment is automatically re-provisioned with the wider scopes the next
-time it is needed (create-before-retire; the stale PAT is deleted from
-Gitea by the retirement sweep).
+**Direct NIP-98.** On adapter-supported surfaces, a per-request
+`Authorization: Nostr` proof is accepted instead of a bridge token for
+GET/HEAD and bounded bodies (≤ 1 MiB with a known `Content-Length`;
+chunked, unknown-length, and `Expect: 100-continue` requests are refused —
+their bytes cannot be payload-bound). Proofs are verified against the
+canonical public URL and exact body, are single-use (durable replay
+ledger), and require an already-linked identity: a drive-by signature never
+provisions an account. A valid signature carries every enabled scope — it
+is stronger evidence than any bearer token.
+
+Hidden PAT authority is **demand-driven**: a PAT carries only the Gitea
+scopes the user's bridge scopes have actually required — `write:repository`
+for git, `+write:package` for packages, and the full non-admin union
+(`write:issue`, `write:misc`, `write:notification`, `write:organization`,
+`write:package`, `write:repository`, `write:user`; never `write:admin`)
+only once `api:*` or a direct REST signature is used. Upgrades are unions
+(never downgrades) via create-before-retire rotation; the stale PAT is
+deleted from Gitea by the retirement sweep.
 
 **Lifecycle.** Tokens expire (default 30 days, bounded by
 `BRIDGE_TOKEN_TTL_MIN`/`MAX`), can be revoked or rotated, and are stored only

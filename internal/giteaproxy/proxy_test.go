@@ -45,7 +45,7 @@ func (s *stubAuthenticator) Authenticate(_ context.Context, token string) (auth.
 	return s.principal, nil
 }
 
-func (s *stubAuthenticator) DownstreamPAT(_ context.Context, _ int64) (string, string, error) {
+func (s *stubAuthenticator) DownstreamPAT(_ context.Context, _ int64, _ string) (string, string, error) {
 	if s.patErr != nil {
 		return "", "", s.patErr
 	}
@@ -799,6 +799,215 @@ func TestPackageWriteRequiresWriteScope(t *testing.T) {
 	if env.seen.snapshot().hit {
 		t.Fatal("package write forwarded without packages:write")
 	}
+}
+
+// TestCredentialEndpointsRefuseBridgeAuthority: an api:write bridge token
+// (or signature) must not reach endpoints that can mint durable credentials
+// — a hidden PAT creating an ordinary Gitea PAT would escape bridge scope,
+// expiry, and revocation entirely.
+func TestCredentialEndpointsRefuseBridgeAuthority(t *testing.T) {
+	full := linkedPrincipal()
+	full.Scopes = []string{
+		auth.ScopeGitRead, auth.ScopeGitWrite,
+		auth.ScopePackagesRead, auth.ScopePackagesWrite,
+		auth.ScopeAPIRead, auth.ScopeAPIWrite,
+	}
+	tokens := &stubAuthenticator{enabled: true, principal: full, patLogin: "login", patSecret: "hidden-pat"}
+	env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+	env.proxy.WithNostrVerifier(&stubNostrVerifier{principal: full})
+
+	targets := []struct{ method, path string }{
+		{http.MethodPost, "/api/v1/users/npub1owner-login/tokens"},
+		{http.MethodGet, "/api/v1/users/npub1owner-login/tokens"},
+		{http.MethodPost, "/api/v1/user/keys"},
+		{http.MethodPost, "/api/v1/repos/o/r/keys"},
+		{http.MethodPost, "/api/v1/user/applications/oauth2"},
+	}
+	for _, tc := range targets {
+		for _, cred := range []string{"Bearer " + testBridgeToken, "Nostr proof"} {
+			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}"))
+			r.Header.Set("Authorization", cred)
+			w := httptest.NewRecorder()
+			env.proxy.ServeHTTP(w, r)
+			if w.Code != http.StatusForbidden {
+				t.Errorf("%s %s with %q = %d, want 403", tc.method, tc.path, cred[:6], w.Code)
+			}
+		}
+	}
+	if env.seen.snapshot().hit {
+		t.Fatal("credential-management endpoint reached Gitea with bridge authority")
+	}
+
+	// Ordinary Gitea credentials still pass through: the restriction gates
+	// bridge-injected authority, not the user's own credentials.
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/users/alice/tokens", nil)
+	r.Header.Set("Authorization", basicHeader("alice", "her-own-pat"))
+	w := httptest.NewRecorder()
+	env.proxy.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || !env.seen.snapshot().hit {
+		t.Fatalf("ordinary credential on tokens endpoint = %d, want passthrough", w.Code)
+	}
+}
+
+// stubNostrVerifier records what it was asked to verify.
+type stubNostrVerifier struct {
+	principal auth.TokenPrincipal
+	err       error
+	gotBody   []byte
+	calls     int
+}
+
+func (s *stubNostrVerifier) VerifyProxyNIP98(_ context.Context, _ *http.Request, body []byte) (auth.TokenPrincipal, error) {
+	s.calls++
+	s.gotBody = append([]byte(nil), body...)
+	if s.err != nil {
+		return auth.TokenPrincipal{}, s.err
+	}
+	return s.principal, nil
+}
+
+func apiPrincipal() auth.TokenPrincipal {
+	p := linkedPrincipal()
+	p.Scopes = []string{auth.ScopeAPIRead, auth.ScopeAPIWrite}
+	return p
+}
+
+func TestDirectNIP98OnAPIEndpoints(t *testing.T) {
+	verifier := &stubNostrVerifier{principal: apiPrincipal()}
+	tokens := &stubAuthenticator{enabled: true, patLogin: "login", patSecret: "hidden-pat"}
+	env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+	env.proxy.WithNostrVerifier(verifier)
+
+	// GET with no body.
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/user", nil)
+	r.Header.Set("Authorization", "Nostr "+base64.StdEncoding.EncodeToString([]byte(`{}`)))
+	w := httptest.NewRecorder()
+	env.proxy.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d: %s", w.Code, w.Body.String())
+	}
+	seen := env.seen.snapshot()
+	if seen.authorization != basicHeader("login", "hidden-pat") {
+		t.Fatalf("downstream authorization = %q, want hidden PAT", seen.authorization)
+	}
+
+	// POST with a bounded body: the verifier sees the exact bytes and the
+	// backend receives them intact.
+	body := `{"title":"hi"}`
+	r = httptest.NewRequest(http.MethodPost, "/api/v1/repos/o/r/issues", strings.NewReader(body))
+	r.Header.Set("Authorization", "Nostr proof")
+	w = httptest.NewRecorder()
+	env.proxy.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST status = %d: %s", w.Code, w.Body.String())
+	}
+	if string(verifier.gotBody) != body {
+		t.Fatalf("verifier saw body %q, want %q", verifier.gotBody, body)
+	}
+	if got := env.seen.snapshot().body; got != body {
+		t.Fatalf("backend saw body %q, want %q", got, body)
+	}
+}
+
+func TestDirectNIP98RejectsUnverifiableShapes(t *testing.T) {
+	verifier := &stubNostrVerifier{principal: apiPrincipal()}
+	tokens := &stubAuthenticator{enabled: true, patLogin: "login", patSecret: "hidden-pat"}
+	env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+	env.proxy.WithNostrVerifier(verifier)
+
+	send := func(mutate func(r *http.Request)) int {
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/repos/o/r/issues", strings.NewReader("{}"))
+		r.Header.Set("Authorization", "Nostr proof")
+		mutate(r)
+		w := httptest.NewRecorder()
+		env.proxy.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	if code := send(func(r *http.Request) { r.TransferEncoding = []string{"chunked"}; r.ContentLength = -1 }); code != http.StatusUnauthorized {
+		t.Errorf("chunked = %d, want 401", code)
+	}
+	if code := send(func(r *http.Request) { r.Header.Set("Expect", "100-continue") }); code != http.StatusUnauthorized {
+		t.Errorf("100-continue = %d, want 401", code)
+	}
+	if code := send(func(r *http.Request) { r.ContentLength = -1 }); code != http.StatusUnauthorized {
+		t.Errorf("unknown length = %d, want 401", code)
+	}
+	if code := send(func(r *http.Request) { r.ContentLength = maxNIP98ProxyBody + 1 }); code != http.StatusUnauthorized {
+		t.Errorf("oversized = %d, want 401", code)
+	}
+	if verifier.calls != 0 {
+		t.Fatalf("verifier consulted %d times for unverifiable shapes", verifier.calls)
+	}
+	if env.seen.snapshot().hit {
+		t.Fatal("unverifiable NIP-98 request reached Gitea")
+	}
+}
+
+func TestDirectNIP98FailuresAndBoundaries(t *testing.T) {
+	tokens := &stubAuthenticator{enabled: true, patLogin: "login", patSecret: "hidden-pat"}
+
+	t.Run("invalid proof", func(t *testing.T) {
+		env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+		env.proxy.WithNostrVerifier(&stubNostrVerifier{err: auth.ErrTokenUnauthorized})
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/user", nil)
+		r.Header.Set("Authorization", "Nostr bad")
+		w := httptest.NewRecorder()
+		env.proxy.ServeHTTP(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", w.Code)
+		}
+		if got := w.Header().Get("WWW-Authenticate"); got != "Nostr" {
+			t.Fatalf("challenge = %q, want Nostr", got)
+		}
+		if env.seen.snapshot().hit {
+			t.Fatal("invalid proof forwarded")
+		}
+	})
+
+	t.Run("admin endpoints refuse signatures", func(t *testing.T) {
+		env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+		env.proxy.WithNostrVerifier(&stubNostrVerifier{principal: apiPrincipal()})
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/admin/users", nil)
+		r.Header.Set("Authorization", "Nostr proof")
+		w := httptest.NewRecorder()
+		env.proxy.ServeHTTP(w, r)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("admin = %d, want 403", w.Code)
+		}
+		if env.seen.snapshot().hit {
+			t.Fatal("admin request with signature reached Gitea")
+		}
+	})
+
+	t.Run("no verifier configured", func(t *testing.T) {
+		env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/user", nil)
+		r.Header.Set("Authorization", "Nostr proof")
+		w := httptest.NewRecorder()
+		env.proxy.ServeHTTP(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", w.Code)
+		}
+		if env.seen.snapshot().hit {
+			t.Fatal("Nostr proof forwarded without a verifier")
+		}
+	})
+
+	t.Run("mapped surface refuses signatures", func(t *testing.T) {
+		env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{id: 7})
+		env.proxy.WithNostrVerifier(&stubNostrVerifier{principal: apiPrincipal()})
+		r := httptest.NewRequest(http.MethodGet, "/npub1x/repo.git/info/refs?service=git-upload-pack", nil)
+		r.Header.Set("Authorization", "Nostr proof")
+		w := httptest.NewRecorder()
+		env.proxy.ServeMappedGit(w, r, mapped(7), "info/refs")
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("mapped = %d, want 401", w.Code)
+		}
+		if env.seen.snapshot().hit {
+			t.Fatal("Nostr proof on mapped surface reached Gitea")
+		}
+	})
 }
 
 // TestBridgeCredentialsNeverReachGitea enumerates the credential shapes that

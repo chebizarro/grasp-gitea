@@ -79,7 +79,7 @@ func Classify(r *http.Request) Classification {
 	case strings.HasPrefix(path, "/api/packages/"):
 		return Classification{Surface: SurfacePackages, Action: methodAction(r), Scope: packagesScope(r)}
 	case strings.HasPrefix(path, "/api/v1/"):
-		return Classification{Surface: SurfaceAPI, Action: methodAction(r)}
+		return Classification{Surface: SurfaceAPI, Action: methodAction(r), Scope: apiScope(r)}
 	}
 
 	if action, scope, ok := classifyGit(r); ok {
@@ -93,6 +93,83 @@ func methodAction(r *http.Request) Action {
 		return ActionRead
 	}
 	return ActionWrite
+}
+
+// apiScope maps a REST API request to its bridge scope. Admin and
+// credential-management endpoints never accept a bridge credential
+// regardless of scopes; non-canonical paths are refused because the bridge
+// and Gitea must never interpret a security-sensitive path differently.
+func apiScope(r *http.Request) string {
+	if !canonicalAPIPath(r) {
+		return ""
+	}
+	if restrictedAPIPath(r.URL.Path) {
+		return ""
+	}
+	if methodAction(r) == ActionRead {
+		return auth.ScopeAPIRead
+	}
+	return auth.ScopeAPIWrite
+}
+
+// canonicalAPIPath rejects any path spelling whose interpretation could
+// diverge between the bridge's classifier and Gitea's router: dot segments,
+// empty segments, backslashes, and percent-encoded separators.
+func canonicalAPIPath(r *http.Request) bool {
+	path := r.URL.Path
+	if strings.Contains(path, "\\") || strings.Contains(path, "//") {
+		return false
+	}
+	for _, seg := range strings.Split(path, "/") {
+		if seg == "." || seg == ".." {
+			return false
+		}
+	}
+	// An escaped form that differs from the decoded path means it carried
+	// encoded separators or dot segments (%2F, %5C, %2E...).
+	if raw := r.URL.EscapedPath(); raw != path && strings.ContainsAny(raw, "%") {
+		lowered := strings.ToLower(raw)
+		for _, enc := range []string{"%2f", "%5c", "%2e"} {
+			if strings.Contains(lowered, enc) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// restrictedAPIPath lists REST families a bridge credential must never
+// reach: admin, plus anything that can mint or manage durable credentials.
+// A hidden PAT creating an ordinary Gitea PAT, SSH key, deploy key, or
+// OAuth application would hand the caller authority that outlives bridge
+// scope enforcement, expiry, auditing, and revocation entirely.
+func restrictedAPIPath(path string) bool {
+	if path == "/api/v1/admin" || strings.HasPrefix(path, "/api/v1/admin/") {
+		return true
+	}
+	// Self credential management.
+	for _, prefix := range []string{
+		"/api/v1/user/keys",
+		"/api/v1/user/gpg_keys",
+		"/api/v1/user/applications",
+		"/api/v1/user/emails",
+	} {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+			return true
+		}
+	}
+	segments := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	// /api/v1/users/{username}/tokens[...]: PAT mint/list/delete. Listing
+	// leaks the hidden PAT's existence; minting escapes the bridge.
+	if len(segments) >= 5 && segments[2] == "users" && segments[4] == "tokens" {
+		return true
+	}
+	// /api/v1/repos/{owner}/{repo}/keys[...]: deploy keys grant durable
+	// repository access outside the bridge.
+	if len(segments) >= 6 && segments[2] == "repos" && segments[5] == "keys" {
+		return true
+	}
+	return false
 }
 
 // packagesScope maps a package-registry request to the bridge scope it

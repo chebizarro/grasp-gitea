@@ -81,8 +81,9 @@ else
 fi
 
 hdr "2. Mint scoped PAT with Basic admin auth (the bridge's exact scope set)"
+BRIDGE_SCOPES='["write:issue","write:misc","write:notification","write:organization","write:package","write:repository","write:user"]'
 resp="$(admin_curl -X POST -H 'Content-Type: application/json' \
-  -d "{\"name\":\"${PAT_NAME}\",\"scopes\":[\"write:package\",\"write:repository\"]}" \
+  -d "{\"name\":\"${PAT_NAME}\",\"scopes\":${BRIDGE_SCOPES}}" \
   -w '\n%{http_code}' "${GITEA_URL}/api/v1/users/${TEST_USER}/tokens")"
 code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
 if [[ "${code}" == "201" ]]; then
@@ -98,10 +99,14 @@ else
   bad "no sha1 in mint response"
 fi
 scopes="$(jq -r '(.scopes // []) | sort | join(",")' <<<"${body}")"
-if [[ "${scopes}" == *"write:package"* && "${scopes}" == *"write:repository"* ]]; then
+missing=""
+for want in write:issue write:misc write:notification write:organization write:package write:repository write:user; do
+  [[ "${scopes}" == *"${want}"* ]] || missing="${missing} ${want}"
+done
+if [[ -z "${missing}" ]]; then
   ok "scope strings normalized and preserved: ${scopes}"
 else
-  bad "scopes came back as '${scopes}', want write:package+write:repository"
+  bad "scopes came back as '${scopes}', missing:${missing}"
 fi
 
 hdr "3. Bogus scope is rejected (Normalize is strict)"
@@ -127,7 +132,7 @@ fi
 # Re-mint for the remaining live checks, and prove delete-by-name works
 # (the bridge's ambiguous-creation reconciliation depends on it).
 resp="$(admin_curl -X POST -H 'Content-Type: application/json' \
-  -d "{\"name\":\"${PAT_NAME2}\",\"scopes\":[\"write:package\",\"write:repository\"]}" \
+  -d "{\"name\":\"${PAT_NAME2}\",\"scopes\":${BRIDGE_SCOPES}}" \
   "${GITEA_URL}/api/v1/users/${TEST_USER}/tokens")"
 byname_pat="$(jq -r '.sha1 // empty' <<<"${resp}")"
 code="$(admin_curl -o /dev/null -w '%{http_code}' -X DELETE \
@@ -138,7 +143,7 @@ else
   bad "delete by name returned ${code}"
 fi
 resp="$(admin_curl -X POST -H 'Content-Type: application/json' \
-  -d "{\"name\":\"${PAT_NAME}\",\"scopes\":[\"write:package\",\"write:repository\"]}" \
+  -d "{\"name\":\"${PAT_NAME}\",\"scopes\":${BRIDGE_SCOPES}}" \
   "${GITEA_URL}/api/v1/users/${TEST_USER}/tokens")"
 USER_PAT="$(jq -r '.sha1 // empty' <<<"${resp}")"
 [[ -n "${USER_PAT}" ]] || { bad "re-mint for live checks failed"; }

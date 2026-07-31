@@ -73,8 +73,15 @@ func TestClassifyNonGitSurfaces(t *testing.T) {
 		{http.MethodPut, "/api/packages/owner/npm/pkg", SurfacePackages, ActionWrite, auth.ScopePackagesWrite},
 		{http.MethodPost, "/api/packages/owner/pypi", SurfacePackages, ActionWrite, auth.ScopePackagesWrite},
 		{http.MethodDelete, "/api/packages/owner/cargo/pkg/1.0.0", SurfacePackages, ActionWrite, auth.ScopePackagesWrite},
-		{http.MethodGet, "/api/v1/user", SurfaceAPI, ActionRead, ""},
-		{http.MethodPost, "/api/v1/repos/o/r/issues", SurfaceAPI, ActionWrite, ""},
+		{http.MethodGet, "/api/v1/user", SurfaceAPI, ActionRead, auth.ScopeAPIRead},
+		{http.MethodPost, "/api/v1/repos/o/r/issues", SurfaceAPI, ActionWrite, auth.ScopeAPIWrite},
+		{http.MethodDelete, "/api/v1/repos/o/r", SurfaceAPI, ActionWrite, auth.ScopeAPIWrite},
+		// Admin endpoints never accept a bridge credential.
+		{http.MethodGet, "/api/v1/admin/users", SurfaceAPI, ActionRead, ""},
+		{http.MethodPost, "/api/v1/admin/users", SurfaceAPI, ActionWrite, ""},
+		{http.MethodGet, "/api/v1/admin", SurfaceAPI, ActionRead, ""},
+		// A non-admin path that merely shares the prefix string is not admin.
+		{http.MethodGet, "/api/v1/adminrepo/x", SurfaceAPI, ActionRead, auth.ScopeAPIRead},
 		{http.MethodGet, "/v2/", SurfaceContainer, ActionTokenExchange, auth.ScopePackagesRead},
 		{http.MethodGet, "/v2/token", SurfaceContainer, ActionTokenExchange, auth.ScopePackagesRead},
 		{http.MethodPatch, "/v2/owner/img/blobs/uploads/abc", SurfaceContainer, ActionWrite, ""},
@@ -92,6 +99,65 @@ func TestClassifyNonGitSurfaces(t *testing.T) {
 		// must fail closed until its adapter lands.
 		if class.Scope != tc.wantScope {
 			t.Errorf("%s %s scope = %q, want %q", tc.method, tc.target, class.Scope, tc.wantScope)
+		}
+	}
+}
+
+// TestRestrictedAPIPathsRefuseBridgeCredentials: endpoints that can mint or
+// manage durable credentials (or reveal the hidden PAT) never accept a
+// bridge credential, and non-canonical path spellings fail closed.
+func TestRestrictedAPIPathsRefuseBridgeCredentials(t *testing.T) {
+	denied := []string{
+		"/api/v1/admin",
+		"/api/v1/admin/users",
+		"/api/v1/users/alice/tokens",
+		"/api/v1/users/alice/tokens/42",
+		"/api/v1/user/keys",
+		"/api/v1/user/keys/7",
+		"/api/v1/user/gpg_keys",
+		"/api/v1/user/applications/oauth2",
+		"/api/v1/user/emails",
+		"/api/v1/repos/o/r/keys",
+		"/api/v1/repos/o/r/keys/3",
+	}
+	for _, path := range denied {
+		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+			class := Classify(httptest.NewRequest(method, path, nil))
+			if class.Scope != "" {
+				t.Errorf("%s %s scope = %q, want refused", method, path, class.Scope)
+			}
+		}
+	}
+
+	// Non-canonical spellings whose interpretation could diverge between
+	// the classifier and Gitea's router fail closed.
+	nonCanonical := []string{
+		"/api/v1/../v1/admin/users",
+		"/api/v1/./admin/users",
+		"/api/v1//admin/users",
+		"/api/v1/%2e%2e/v1/admin/users",
+		"/api/v1/x%2Fadmin",
+		"/api/v1/x%5Cadmin",
+	}
+	for _, target := range nonCanonical {
+		class := Classify(httptest.NewRequest(http.MethodGet, target, nil))
+		if class.Surface == SurfaceAPI && class.Scope != "" {
+			t.Errorf("GET %s scope = %q, want refused (non-canonical)", target, class.Scope)
+		}
+	}
+
+	// Similar-looking but legitimate paths keep their scopes.
+	allowed := map[string]string{
+		"/api/v1/adminrepo/x":        auth.ScopeAPIRead,
+		"/api/v1/users/alice/repos":  auth.ScopeAPIRead,
+		"/api/v1/user/repos":         auth.ScopeAPIRead,
+		"/api/v1/repos/o/r/issues":   auth.ScopeAPIRead,
+		"/api/v1/repos/o/r/branches": auth.ScopeAPIRead,
+	}
+	for path, want := range allowed {
+		class := Classify(httptest.NewRequest(http.MethodGet, path, nil))
+		if class.Scope != want {
+			t.Errorf("GET %s scope = %q, want %q", path, class.Scope, want)
 		}
 	}
 }

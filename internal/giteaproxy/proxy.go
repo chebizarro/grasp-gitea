@@ -4,7 +4,9 @@
 package giteaproxy
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -26,7 +28,11 @@ import (
 type Authenticator interface {
 	Enabled() bool
 	Authenticate(ctx context.Context, token string) (auth.TokenPrincipal, error)
-	DownstreamPAT(ctx context.Context, giteaUserID int64) (login string, pat string, err error)
+	// DownstreamPAT returns the hidden credential for a user, lazily
+	// upgrading its Gitea scopes to cover the presented bridge scope. The
+	// scope is the classification's requirement, so a PAT only ever gains
+	// the authority a permitted request actually needs.
+	DownstreamPAT(ctx context.Context, giteaUserID int64, bridgeScope string) (login string, pat string, err error)
 }
 
 // RepositoryInspector reports current repository metadata. *gitea.Client
@@ -35,6 +41,19 @@ type Authenticator interface {
 type RepositoryInspector interface {
 	GetRepo(ctx context.Context, org string, repo string) (gitea.Repository, error)
 }
+
+// NostrVerifier verifies a direct per-request NIP-98 proof against the
+// canonical public URL and exact body, with replay protection.
+// *auth.ProxyNIP98Verifier satisfies it.
+type NostrVerifier interface {
+	VerifyProxyNIP98(ctx context.Context, r *http.Request, body []byte) (auth.TokenPrincipal, error)
+}
+
+// maxNIP98ProxyBody bounds the body a direct NIP-98 request may carry: the
+// payload tag binds the exact bytes, so the proxy must buffer them.
+// Streaming shapes (chunked, unknown length, 100-continue) are rejected —
+// their bytes cannot be bound before forwarding begins.
+const maxNIP98ProxyBody = 1 << 20
 
 // Auditor records authorization outcomes. *store.SQLiteStore satisfies it.
 type Auditor interface {
@@ -75,9 +94,17 @@ type Proxy struct {
 
 	proxy   *httputil.ReverseProxy
 	tokens  Authenticator
+	nostr   NostrVerifier
 	repos   RepositoryInspector
 	auditor Auditor
 	logger  *slog.Logger
+}
+
+// WithNostrVerifier enables direct NIP-98 authentication on proxied
+// endpoints. Without it, Authorization: Nostr is rejected locally.
+func (p *Proxy) WithNostrVerifier(v NostrVerifier) *Proxy {
+	p.nostr = v
+	return p
 }
 
 // disabledAuthenticator stands in when bridge tokens are not configured.
@@ -89,7 +116,7 @@ func (disabledAuthenticator) Authenticate(context.Context, string) (auth.TokenPr
 	return auth.TokenPrincipal{}, auth.ErrTokenUnauthorized
 }
 
-func (disabledAuthenticator) DownstreamPAT(context.Context, int64) (string, string, error) {
+func (disabledAuthenticator) DownstreamPAT(context.Context, int64, string) (string, string, error) {
 	return "", "", auth.ErrTokenUnauthorized
 }
 
@@ -219,6 +246,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.rejectUnauthorized(w, r, class, "unsupported authorization")
 		return
 
+	case credentialNostrProof:
+		if !p.serveNostrProof(w, r, class, &pl) {
+			return
+		}
+
 	case credentialBridgeToken:
 		if !p.tokens.Enabled() {
 			p.rejectUnauthorized(w, r, class, "bridge tokens are not enabled")
@@ -246,7 +278,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.rejectForbidden(w, r, class, "token is missing scope "+class.Scope)
 			return
 		}
-		login, pat, err := p.tokens.DownstreamPAT(r.Context(), principal.GiteaUserID)
+		login, pat, err := p.tokens.DownstreamPAT(r.Context(), principal.GiteaUserID, class.Scope)
 		if err != nil {
 			p.logger.Error("downstream credential unavailable",
 				"gitea_user_id", principal.GiteaUserID, "error", err)
@@ -261,6 +293,102 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), planKey{}, &pl)))
+}
+
+// serveNostrProof authenticates a direct NIP-98 request in place. It
+// returns false when the request has been fully handled (rejected); on true
+// the plan carries the hidden downstream credential and the body has been
+// rewound for forwarding.
+func (p *Proxy) serveNostrProof(w http.ResponseWriter, r *http.Request, class Classification, pl *plan) bool {
+	if p.nostr == nil || !p.tokens.Enabled() {
+		p.rejectUnauthorized(w, r, class, "direct NIP-98 authentication is not enabled")
+		return false
+	}
+	if !class.BridgeTokensSupported() {
+		p.rejectForbidden(w, r, class,
+			fmt.Sprintf("NIP-98 authentication is not supported on the %s surface", class.Surface))
+		return false
+	}
+
+	// The payload tag binds exact bytes, so only bounded, fully-buffered
+	// bodies are verifiable. Anything streaming-shaped fails closed.
+	var body []byte
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		// No payload binding needed; any body on these methods is rejected
+		// below by the same bounds.
+		fallthrough
+	default:
+		if len(r.TransferEncoding) > 0 {
+			p.rejectUnauthorized(w, r, class, "NIP-98 requires a known Content-Length, not chunked encoding")
+			return false
+		}
+		if r.Header.Get("Expect") != "" {
+			p.rejectUnauthorized(w, r, class, "NIP-98 does not support Expect: 100-continue")
+			return false
+		}
+		if r.ContentLength < 0 {
+			p.rejectUnauthorized(w, r, class, "NIP-98 requires a known Content-Length")
+			return false
+		}
+		if r.ContentLength > maxNIP98ProxyBody {
+			p.rejectUnauthorized(w, r, class,
+				fmt.Sprintf("NIP-98 request bodies are limited to %d bytes; use a bridge token", maxNIP98ProxyBody))
+			return false
+		}
+		if r.ContentLength > 0 {
+			data, err := io.ReadAll(io.LimitReader(r.Body, maxNIP98ProxyBody+1))
+			if err != nil || int64(len(data)) != r.ContentLength {
+				p.rejectUnauthorized(w, r, class, "request body did not match its Content-Length")
+				return false
+			}
+			body = data
+		}
+	}
+
+	principal, err := p.nostr.VerifyProxyNIP98(r.Context(), r, body)
+	if err != nil {
+		// Infrastructure faults are not invalid signatures: reporting them
+		// as 401 would hide an outage behind pointless re-signing.
+		switch {
+		case errors.Is(err, auth.ErrNIP98StoreUnavailable):
+			p.logger.Error("NIP-98 replay ledger unavailable", "error", err)
+			p.audit(r, class, "nip98_fault", "", "")
+			http.Error(w, "authorization ledger unavailable", http.StatusServiceUnavailable)
+		case errors.Is(err, auth.ErrPATProvisioning):
+			p.logger.Error("downstream credential provisioning failed", "error", err)
+			p.audit(r, class, "credential_fault", "", "")
+			http.Error(w, "downstream credential unavailable", http.StatusBadGateway)
+		default:
+			p.logger.Info("direct NIP-98 rejected", "path", r.URL.Path, "error", err)
+			p.audit(r, class, "denied_nip98", "", "")
+			w.Header().Set("WWW-Authenticate", "Nostr")
+			http.Error(w, "invalid NIP-98 authorization", http.StatusUnauthorized)
+		}
+		return false
+	}
+	if !principal.HasScope(class.Scope) {
+		p.rejectForbidden(w, r, class, "NIP-98 authentication does not grant scope "+class.Scope)
+		return false
+	}
+	login, pat, err := p.tokens.DownstreamPAT(r.Context(), principal.GiteaUserID, class.Scope)
+	if err != nil {
+		p.logger.Error("downstream credential unavailable",
+			"gitea_user_id", principal.GiteaUserID, "error", err)
+		p.audit(r, class, "credential_fault", "", principal.Pubkey)
+		http.Error(w, "downstream credential unavailable", http.StatusBadGateway)
+		return false
+	}
+
+	// Rewind the verified bytes for forwarding.
+	if body != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	pl.principal = &principal
+	pl.downstreamUser, pl.downstreamPAT = login, pat
+	pl.injectedHidden = true
+	p.audit(r, class, "allowed_nip98", "", principal.Pubkey)
+	return true
 }
 
 // MappedRepo identifies the Gitea repository behind a canonical npub
@@ -308,7 +436,10 @@ func (p *Proxy) ServeMappedGit(w http.ResponseWriter, r *http.Request, mapped Ma
 	}
 
 	switch cred.kind {
-	case credentialBridgeMalformed, credentialUnsupported:
+	case credentialBridgeMalformed, credentialUnsupported, credentialNostrProof:
+		// Direct NIP-98 is not offered on the mapped npub surface: git
+		// clients cannot produce per-request proofs, and treating one as
+		// anonymous would silently downgrade the caller's intent.
 		setGitHTTPCORS(w.Header())
 		p.rejectUnauthorized(w, r, class, "unusable credential")
 		return
@@ -335,7 +466,7 @@ func (p *Proxy) ServeMappedGit(w http.ResponseWriter, r *http.Request, mapped Ma
 			p.rejectForbidden(w, r, class, "token is missing scope "+class.Scope)
 			return
 		}
-		login, pat, err := p.tokens.DownstreamPAT(r.Context(), principal.GiteaUserID)
+		login, pat, err := p.tokens.DownstreamPAT(r.Context(), principal.GiteaUserID, class.Scope)
 		if err != nil {
 			setGitHTTPCORS(w.Header())
 			p.logger.Error("downstream credential unavailable",
