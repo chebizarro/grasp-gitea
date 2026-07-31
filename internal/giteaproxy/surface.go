@@ -66,7 +66,7 @@ func Classify(r *http.Request) Classification {
 
 	switch {
 	case isLFSPath(path):
-		return Classification{Surface: SurfaceLFS, Action: lfsAction(r)}
+		return Classification{Surface: SurfaceLFS, Action: lfsAction(r), Scope: lfsScope(r)}
 	case strings.HasPrefix(path, "/v2/"), path == "/v2":
 		class := Classification{Surface: SurfaceContainer, Action: containerAction(r)}
 		if class.Action == ActionTokenExchange {
@@ -248,4 +248,25 @@ func isLFSPath(path string) bool {
 
 func lfsAction(r *http.Request) Action {
 	return methodAction(r)
+}
+
+// IsLFSBatchPath recognizes the LFS batch API, whose read-vs-write nature
+// lives in its JSON body rather than the method.
+func IsLFSBatchPath(path string) bool {
+	return strings.HasSuffix(path, "/info/lfs/objects/batch")
+}
+
+// lfsScope maps LFS endpoints to bridge scopes. The batch endpoint carries
+// no static scope: the proxy resolves it from the bounded request body
+// (operation download → lfs:read, upload → lfs:write) before authorizing.
+// Everything else — object download/upload and the locks API — follows the
+// method: GET/HEAD → lfs:read, anything mutating → lfs:write.
+func lfsScope(r *http.Request) string {
+	if IsLFSBatchPath(r.URL.Path) {
+		return ""
+	}
+	if methodAction(r) == ActionRead {
+		return auth.ScopeLFSRead
+	}
+	return auth.ScopeLFSWrite
 }

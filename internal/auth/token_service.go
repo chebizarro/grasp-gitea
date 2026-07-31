@@ -101,6 +101,9 @@ func requiredGiteaScopes(bridgeScopes []string) []string {
 			set["write:repository"] = struct{}{}
 		case ScopePackagesRead, ScopePackagesWrite:
 			set["write:package"] = struct{}{}
+		case ScopeLFSRead, ScopeLFSWrite:
+			// LFS objects are repository content.
+			set["write:repository"] = struct{}{}
 		case ScopeAPIRead, ScopeAPIWrite:
 			for _, g := range giteaAPIScopeUnion {
 				set[g] = struct{}{}
@@ -139,6 +142,7 @@ var enabledTokenScopes = []string{
 	ScopeGitRead, ScopeGitWrite,
 	ScopePackagesRead, ScopePackagesWrite,
 	ScopeAPIRead, ScopeAPIWrite,
+	ScopeLFSRead, ScopeLFSWrite,
 }
 
 var (

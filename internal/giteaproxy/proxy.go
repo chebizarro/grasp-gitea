@@ -234,6 +234,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	class := Classify(r)
 	cred := p.extractCredential(r)
 
+	// The LFS batch endpoint's read-vs-write nature lives in its JSON body.
+	// Resolve it only when a bridge credential needs authorizing; anonymous
+	// and ordinary-credential batches stream through untouched.
+	if cred.kind == credentialBridgeToken && class.Surface == SurfaceLFS && IsLFSBatchPath(r.URL.Path) {
+		scope, ok := resolveLFSBatchScope(r)
+		if !ok {
+			p.rejectUnauthorized(w, r, class, "unresolvable LFS batch operation")
+			return
+		}
+		class.Scope = scope
+	}
+
 	pl := plan{cred: cred, class: class}
 
 	switch cred.kind {
@@ -302,6 +314,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) serveNostrProof(w http.ResponseWriter, r *http.Request, class Classification, pl *plan) bool {
 	if p.nostr == nil || !p.tokens.Enabled() {
 		p.rejectUnauthorized(w, r, class, "direct NIP-98 authentication is not enabled")
+		return false
+	}
+	if class.Surface == SurfaceLFS {
+		// LFS transfers are object streams; git-lfs cannot produce
+		// per-request proofs and a payload-bound signature cannot cover a
+		// stream. Use a bridge token.
+		p.rejectForbidden(w, r, class, "NIP-98 authentication is not supported on the lfs surface; use a bridge token")
 		return false
 	}
 	if !class.BridgeTokensSupported() {
@@ -409,9 +428,10 @@ type MappedRepo struct {
 func (p *Proxy) ServeMappedGit(w http.ResponseWriter, r *http.Request, mapped MappedRepo, gitSubpath string) {
 	owner, repoName := mapped.Owner, mapped.Name
 	class := Classify(r)
-	if class.Surface != SurfaceGit {
-		// The caller already validated the subpath shape; anything else here
-		// is not a git request.
+	// A canonical npub .git/ path carries either git smart-HTTP or LFS
+	// (batch, object transfer, locks): git-lfs derives its endpoint from the
+	// clone URL, so it requests /<npub>/<repo>.git/info/lfs/... too.
+	if class.Surface != SurfaceGit && class.Surface != SurfaceLFS {
 		setGitHTTPCORS(w.Header())
 		http.Error(w, "unsupported git request", http.StatusBadRequest)
 		return
@@ -421,6 +441,22 @@ func (p *Proxy) ServeMappedGit(w http.ResponseWriter, r *http.Request, mapped Ma
 	pl := plan{backendPath: backendPath, class: class, npubSurface: true}
 	cred := p.extractCredential(r)
 	pl.cred = cred
+
+	// The LFS batch operation lives in the body; resolve its scope for every
+	// credential kind, not just bridge tokens. Anonymous callers must never
+	// reach an upload batch via the write-capable service identity — unlike
+	// git-receive-pack, LFS mutations are not guarded by the pre-receive
+	// hook.
+	if class.Surface == SurfaceLFS && IsLFSBatchPath(r.URL.Path) {
+		scope, ok := resolveLFSBatchScope(r)
+		if !ok {
+			setGitHTTPCORS(w.Header())
+			p.rejectUnauthorized(w, r, class, "unresolvable LFS batch operation")
+			return
+		}
+		class.Scope = scope
+		pl.class = class
+	}
 
 	// The mapped repository must still be the one that was provisioned. A
 	// recreated repository at the same owner/name lacks the GRASP pre-receive
@@ -481,8 +517,22 @@ func (p *Proxy) ServeMappedGit(w http.ResponseWriter, r *http.Request, mapped Ma
 
 	default:
 		// Anonymous (or ordinary-credential, which this surface strips):
-		// permitted only while the mapped repository is publicly readable.
-		// Internal repositories (public repo, private owner org) are not.
+		// permitted only for reads while the mapped repository is publicly
+		// readable. Any write — an LFS object PUT, a lock mutation, or an
+		// upload batch — requires a bridge credential: the service identity
+		// is write-capable and LFS mutations bypass the pre-receive hook.
+		// Keyed on the resolved LFS scope, not the HTTP method: a download
+		// batch is a POST but needs only lfs:read. Git pushes are exempt —
+		// git-receive-pack authority is enforced by the grasp-pre-receive
+		// hook, which LFS has no equivalent of.
+		if class.Surface == SurfaceLFS && class.Scope == auth.ScopeLFSWrite {
+			setGitHTTPCORS(w.Header())
+			p.audit(r, class, "denied_anonymous_write", "", "")
+			p.writeGitAuthRequired(w)
+			return
+		}
+		// Internal repositories (public repo, private owner org) are not
+		// anonymously readable.
 		if !repo.PubliclyReadable() {
 			setGitHTTPCORS(w.Header())
 			p.audit(r, class, "denied_private", "", "")
@@ -598,6 +648,13 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	if pl != nil && pl.npubSurface {
 		setGitHTTPCORS(resp.Header)
 		sanitizeGitBackendResponse(resp)
+		// A mapped LFS batch response carries transfer hrefs pointing at the
+		// backend origin; rewrite them so the private address never reaches
+		// a public client.
+		if pl.class.Surface == SurfaceLFS && IsLFSBatchPath(resp.Request.URL.Path) &&
+			resp.StatusCode == http.StatusOK {
+			p.rewriteLFSBatchBody(resp)
+		}
 		// Mapped responses can still carry backend-origin redirects, which
 		// would leak the private Gitea address to public clients.
 		p.rewriteBackendOrigin(resp)
@@ -613,6 +670,11 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 			"path", resp.Request.URL.Path, "status", resp.StatusCode)
 		replaceWithPlainText(resp, http.StatusBadGateway, "downstream credential rejected\n")
 		return nil
+	}
+
+	if pl != nil && pl.class.Surface == SurfaceLFS && IsLFSBatchPath(resp.Request.URL.Path) &&
+		resp.StatusCode == http.StatusOK {
+		p.rewriteLFSBatchBody(resp)
 	}
 
 	p.rewriteBackendOrigin(resp)

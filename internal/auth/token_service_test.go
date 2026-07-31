@@ -283,7 +283,7 @@ func TestMintValidation(t *testing.T) {
 	cases := []MintRequest{
 		{Name: ""},
 		{Name: strings.Repeat("n", maxTokenNameLen+1)},
-		{Name: "ok", Scopes: []string{"lfs:read"}}, // not enabled yet (phase 5)
+		{Name: "ok", Scopes: []string{"admin:sudo"}}, // never a bridge scope
 		{Name: "ok", Scopes: []string{"bogus"}},
 		{Name: "ok", TTLSeconds: 1},                  // below min
 		{Name: "ok", TTLSeconds: 366 * 24 * 60 * 60}, // above max

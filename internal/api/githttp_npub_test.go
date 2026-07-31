@@ -108,6 +108,52 @@ func TestGitHTTPNpubProxyRewritesToMappedGiteaRepo(t *testing.T) {
 	}
 }
 
+func TestGitHTTPNpubProxyRoutesLFSToMappedRepo(t *testing.T) {
+	ctx := context.Background()
+	backendRequests := make(chan observedGitBackendRequest, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendRequests <- observedGitBackendRequest{method: r.Method, path: r.URL.Path, rawQuery: r.URL.RawQuery}
+		w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
+		_, _ = w.Write([]byte(`{"objects":[]}`))
+	}))
+	defer backend.Close()
+
+	st := openGitHTTPProxyTestStore(t)
+	seedGitHTTPProxyMapping(t, ctx, st, store.Mapping{
+		Npub: "npub1owner", RepoID: "repo one", Pubkey: "pubkey",
+		Owner: "nip05-org", RepoName: "gitea-repo", GiteaRepoID: 101,
+		CloneURL: backend.URL + "/nip05-org/gitea-repo.git", SourceEvent: "event1",
+	})
+
+	srv := newGitProxyTestServer(t, config.Config{GiteaURL: backend.URL}, st, publicRepo(101))
+
+	// Anonymous LFS batch on a public mapped repo routes to the mapped
+	// owner/repo, not the npub coordinate Gitea has never heard of.
+	req := httptest.NewRequest(http.MethodPost, "/npub1owner/repo%20one.git/info/lfs/objects/batch",
+		strings.NewReader(`{"operation":"download"}`))
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	seen := <-backendRequests
+	if seen.path != "/nip05-org/gitea-repo.git/info/lfs/objects/batch" {
+		t.Fatalf("LFS batch not rewritten to mapped repo: %q", seen.path)
+	}
+
+	// An LFS object GET routes too.
+	req = httptest.NewRequest(http.MethodGet, "/npub1owner/repo%20one.git/info/lfs/objects/abc123", nil)
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("LFS object GET status = %d", w.Code)
+	}
+	seen = <-backendRequests
+	if seen.path != "/nip05-org/gitea-repo.git/info/lfs/objects/abc123" {
+		t.Fatalf("LFS object path not rewritten: %q", seen.path)
+	}
+}
+
 func TestGitHTTPNpubProxyUnknownMappingReturns404(t *testing.T) {
 	backendHit := make(chan struct{}, 1)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

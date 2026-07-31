@@ -154,8 +154,8 @@ credentials directly, defeating scope enforcement — so the bridge refuses to
 start with `BRIDGE_TOKENS_ENABLED=true` unless full-proxy mode is on.
 
 **Scopes.** Tokens carry an explicit closed set of scopes. Currently enabled:
-`git:read`, `git:write`, `packages:read`, `packages:write`, `api:read`, and
-`api:write`. The
+`git:read`, `git:write`, `packages:read`, `packages:write`, `api:read`,
+`api:write`, `lfs:read`, and `lfs:write`. The
 `packages:*` scopes cover the `/api/packages/` registry family (npm, PyPI,
 Cargo, Maven, Composer, NuGet, generic, …) regardless of how the client
 presents the token — npm's `Bearer`, PyPI's Basic password, Cargo's raw
@@ -181,8 +181,17 @@ email management — refuse bridge credentials outright: a hidden PAT minting
 a durable Gitea credential would escape bridge scoping, expiry, and
 revocation entirely. Non-canonical path spellings (dot segments, encoded
 separators) also fail closed. Ordinary user credentials pass through these
-endpoints untouched. `lfs:*` is reserved for a later phase; a token used on
-a surface without an adapter fails with `403` rather than being forwarded.
+endpoints untouched. A token used on a surface without an adapter fails
+with `403` rather than being forwarded.
+
+**Git LFS** works with the same `npub:token` Basic credential git uses. The
+batch API's read-vs-write nature lives in its JSON body, so the bridge
+resolves the required scope from the bounded request (`download` →
+`lfs:read`, `upload` → `lfs:write`, anything else fails closed); object
+transfers stream both directions with the credential exchanged on headers
+only. Backend-origin transfer URLs in batch responses are rewritten to the
+public origin. Direct NIP-98 is refused on the LFS surface — a
+payload-bound signature cannot cover an object stream.
 
 **Direct NIP-98.** On adapter-supported surfaces, a per-request
 `Authorization: Nostr` proof is accepted instead of a bridge token for

@@ -29,8 +29,10 @@ has an adapter for, exchanging it for a hidden per-user Gitea PAT. Git, the
 `/api/packages/` registry family (npm Bearer, PyPI/Maven/Composer/generic
 Basic, Cargo raw token, NuGet `X-NuGet-ApiKey`), and Docker/OCI `/v2` (Basic
 bridge credentials at the token endpoint, scope-mapped from the requested
-docker access; the registry JWT passes through) have adapters; REST and LFS
-adapters follow. **Delayed-revocation caveat**: once Gitea issues a registry
+docker access; the registry JWT passes through), the REST API
+(`/api/v1`, method-mapped `api:*`, with admin and credential-management
+endpoints refused), and Git LFS (`lfs:*`, batch operation resolved from the
+request body, object streams, transfer-URL rewriting) all have adapters. **Delayed-revocation caveat**: once Gitea issues a registry
 JWT, revoking the originating bridge token cannot invalidate it — the JWT
 remains usable until its own expiry. Validate on the deployed image that the
 registry token lifetime is short (target ≤ ~5 minutes); that lifetime is the

@@ -466,18 +466,19 @@ func TestServeHTTPBridgeTokenOnUnsupportedSurfaceFailsClosed(t *testing.T) {
 	}
 	env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
 
-	// API/container/LFS adapters land in later phases; a bridge token must
-	// not be silently exchanged for the hidden PAT's full authority. The
-	// principal deliberately holds every enabled scope so the rejection can
-	// only come from the surface, not from a missing scope.
+	// Container object paths remain the one surface without a bridge-token
+	// adapter (only the /v2 token exchange is supported); a bridge token
+	// must not be silently exchanged for the hidden PAT's full authority.
+	// The principal deliberately holds every enabled scope so the rejection
+	// can only come from the surface, not from a missing scope.
 	tokens.principal.Scopes = []string{
 		auth.ScopeGitRead, auth.ScopeGitWrite,
 		auth.ScopePackagesRead, auth.ScopePackagesWrite,
+		auth.ScopeAPIRead, auth.ScopeAPIWrite,
+		auth.ScopeLFSRead, auth.ScopeLFSWrite,
 	}
 	for _, path := range []string{
-		"/api/v1/user",
 		"/v2/owner/image/blobs/uploads/",
-		"/owner/repo.git/info/lfs/objects/batch",
 	} {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
 		r.Header.Set("Authorization", "Bearer "+testBridgeToken)

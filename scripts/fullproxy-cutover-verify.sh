@@ -204,7 +204,7 @@ if [[ -n "${GITEA_USER:-}" && -n "${GITEA_PAT:-}" ]]; then
     note "GITEA_REPO_PATH unset; conventional git compatibility not checked"
   fi
 
-  # LFS batch is a passthrough surface in phase 1.
+  # LFS batch reachable with an ordinary credential.
   if [[ -n "${GITEA_REPO_PATH:-}" ]]; then
     code="$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
       -u "${GITEA_USER}:${GITEA_PAT}" \
@@ -217,6 +217,22 @@ if [[ -n "${GITEA_USER:-}" && -n "${GITEA_PAT:-}" ]]; then
       ok "LFS batch endpoint reachable with an ordinary credential (${code})"
     else
       bad "LFS batch returned ${code}"
+    fi
+
+    # With a bridge token, the batch operation resolves the required scope
+    # from the body: an lfs:read token may download; upload needs lfs:write.
+    if [[ -n "${BRIDGE_TOKEN:-}" ]]; then
+      code="$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${BRIDGE_TOKEN}" \
+        -X POST \
+        -H 'Content-Type: application/vnd.git-lfs+json' \
+        -d '{"operation":"download","transfers":["basic"],"objects":[]}' \
+        "${PUBLIC_URL}${GITEA_REPO_PATH}/info/lfs/objects/batch")"
+      if [[ "${code}" =~ ^(200|422)$ ]]; then
+        ok "LFS batch download accepted with a bridge token (${code})"
+      else
+        bad "LFS batch download with bridge token returned ${code}"
+      fi
     fi
   fi
 else

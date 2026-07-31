@@ -69,11 +69,28 @@ func (s *Server) isRelayRootRequest(r *http.Request) bool {
 // request to the shared streaming proxy, which decides credentials.
 func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request, npub, repoID, gitSubpath string) {
 	setGitHTTPCORS(w.Header())
+	isLFS := giteaproxy.IsLFSSubpath(gitSubpath)
+	if isLFS {
+		// LFS clients preflight PUT/DELETE carrying an Authorization header;
+		// advertise the full method/header set before the OPTIONS short-
+		// circuit so the preflight succeeds.
+		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
+	}
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+	if isLFS {
+		// LFS uses PUT (object upload) and DELETE (locks) beyond GET/POST.
+		switch r.Method {
+		case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodHead:
+		default:
+			w.Header().Set("Allow", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	} else if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST, OPTIONS")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -161,7 +178,10 @@ func parseNpubGitHTTPPath(r *http.Request) (npub string, repoID string, gitSubpa
 	} else {
 		encodedRepoID = repoAndGitPath[:marker]
 		gitSubpath = repoAndGitPath[marker+len(gitMarker):]
-		if !giteaproxy.IsGitSmartHTTPSubpath(gitSubpath) {
+		// git-lfs derives its endpoint from the clone URL, so a canonical
+		// npub clone requests .git/info/lfs/... as well as the three smart
+		// HTTP endpoints. Both are served through the mapped repository.
+		if !giteaproxy.IsGitSmartHTTPSubpath(gitSubpath) && !giteaproxy.IsLFSSubpath(gitSubpath) {
 			return "", "", "", false, nil
 		}
 	}
