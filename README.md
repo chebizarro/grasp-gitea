@@ -158,10 +158,21 @@ start with `BRIDGE_TOKENS_ENABLED=true` unless full-proxy mode is on.
 `packages:*` scopes cover the `/api/packages/` registry family (npm, PyPI,
 Cargo, Maven, Composer, NuGet, generic, …) regardless of how the client
 presents the token — npm's `Bearer`, PyPI's Basic password, Cargo's raw
-`Authorization` value, and token-in-username Basic all work. The Docker/OCI
-`/v2` surface, `api:*`, and `lfs:*` are reserved for later phases and are
-rejected until their adapters land. A token used on a surface without an
-adapter fails with `403` rather than being forwarded.
+`Authorization` value, NuGet's `X-NuGet-ApiKey`, and token-in-username Basic
+all work.
+
+Docker/OCI works through the standard token flow: `docker login` with the
+npub as username and a bridge token as password exchanges Basic credentials
+at the `/v2` token endpoint for Gitea's short-lived registry JWT. The
+bridge maps the docker-requested access to bridge scopes (`pull` →
+`packages:read`; `push`/`delete` → `packages:write`; unknown actions fail
+closed) and rewrites the challenge realm to the public origin. The JWT
+itself passes through untouched — its short lifetime is the revocation
+bound after a bridge token is revoked.
+
+`api:*` and `lfs:*` are reserved for later phases and are rejected until
+their adapters land. A token used on a surface without an adapter fails
+with `403` rather than being forwarded.
 
 Hidden PATs are provisioned with the matching Gitea scope union
 (`write:repository`, `write:package`). A PAT provisioned by an older

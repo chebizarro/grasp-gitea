@@ -620,6 +620,160 @@ func TestNuGetAPIKeyHeaderCarriesBridgeToken(t *testing.T) {
 	})
 }
 
+// TestDockerTokenExchangeTranslatesBridgeToken covers the docker login flow:
+// Basic npub:bridge-token on the /v2 token endpoint is exchanged for the
+// hidden PAT, gated by the docker-requested scope.
+func TestDockerTokenExchangeTranslatesBridgeToken(t *testing.T) {
+	pkgPrincipal := linkedPrincipal()
+	pkgPrincipal.Scopes = []string{auth.ScopePackagesRead, auth.ScopePackagesWrite}
+	tokens := &stubAuthenticator{
+		enabled: true, principal: pkgPrincipal,
+		patLogin: "npub1owner-login", patSecret: "hidden-pat",
+	}
+	env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+
+	for _, target := range []string{
+		"/v2/", // login probe
+		"/v2/token?service=container_registry&scope=repository:owner/img:pull,push",
+	} {
+		r := httptest.NewRequest(http.MethodGet, target, nil)
+		r.Header.Set("Authorization", basicHeader("npub1owner", testBridgeToken))
+		w := httptest.NewRecorder()
+		env.proxy.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status = %d: %s", target, w.Code, w.Body.String())
+		}
+		if got := env.seen.snapshot().authorization; got != basicHeader("npub1owner-login", "hidden-pat") {
+			t.Fatalf("%s downstream authorization = %q, want hidden PAT Basic", target, got)
+		}
+	}
+}
+
+// TestDockerTokenExchangeScopeEnforcement: push requires packages:write;
+// unknown docker actions fail closed even with every scope.
+func TestDockerTokenExchangeScopeEnforcement(t *testing.T) {
+	readOnly := linkedPrincipal()
+	readOnly.Scopes = []string{auth.ScopePackagesRead}
+	tokens := &stubAuthenticator{
+		enabled: true, principal: readOnly, patLogin: "login", patSecret: "hidden-pat",
+	}
+	env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+
+	r := httptest.NewRequest(http.MethodGet, "/v2/token?scope=repository:o/img:pull,push", nil)
+	r.Header.Set("Authorization", basicHeader("npub1owner", testBridgeToken))
+	w := httptest.NewRecorder()
+	env.proxy.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("push exchange with read-only token = %d, want 403", w.Code)
+	}
+
+	full := linkedPrincipal()
+	full.Scopes = []string{auth.ScopePackagesRead, auth.ScopePackagesWrite}
+	tokens.principal = full
+	r = httptest.NewRequest(http.MethodGet, "/v2/token?scope=repository:o/img:admin", nil)
+	r.Header.Set("Authorization", basicHeader("npub1owner", testBridgeToken))
+	w = httptest.NewRecorder()
+	env.proxy.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("unknown docker action = %d, want 403 (fail closed)", w.Code)
+	}
+	if env.seen.snapshot().hit {
+		t.Fatal("denied docker exchange reached Gitea")
+	}
+
+	// A manifest named "token" is not the exchange endpoint: a bridge token
+	// there hits the scopeless container surface and fails closed, never
+	// trading a read-only token for the hidden PAT on a write endpoint.
+	for _, method := range []string{http.MethodPut, http.MethodDelete} {
+		r = httptest.NewRequest(method, "/v2/o/img/manifests/token", strings.NewReader("m"))
+		r.Header.Set("Authorization", basicHeader("npub1owner", testBridgeToken))
+		w = httptest.NewRecorder()
+		env.proxy.ServeHTTP(w, r)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("%s manifests/token = %d, want 403", method, w.Code)
+		}
+		if env.seen.snapshot().hit {
+			t.Fatal("bridge token reached Gitea via manifests/token")
+		}
+	}
+}
+
+// TestRegistryJWTPassesThrough: after the exchange, docker presents Gitea's
+// registry token as Bearer; it has no bridge prefix and must pass through.
+func TestRegistryJWTPassesThrough(t *testing.T) {
+	env := newProxyEnv(t, Config{FullProxy: true}, &stubAuthenticator{enabled: true}, stubInspector{})
+
+	r := httptest.NewRequest(http.MethodGet, "/v2/owner/img/manifests/latest", nil)
+	r.Header.Set("Authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.registry.jwt")
+	w := httptest.NewRecorder()
+	env.proxy.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if got := env.seen.snapshot().authorization; got != "Bearer eyJhbGciOiJIUzI1NiJ9.registry.jwt" {
+		t.Fatalf("registry JWT altered: %q", got)
+	}
+}
+
+// TestBearerChallengeRealmRewrite: the docker token-endpoint discovery realm
+// must point at the public origin, and only an exact backend-origin realm is
+// rewritten.
+func TestBearerChallengeRealmRewrite(t *testing.T) {
+	seen := &observed{}
+	var challenge string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.mu.Lock()
+		seen.last = backendRequest{hit: true}
+		seen.mu.Unlock()
+		w.Header().Set("WWW-Authenticate", challenge)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(backend.Close)
+
+	p, err := New(Config{
+		GiteaURL:  backend.URL,
+		PublicURL: "https://git.example.com",
+		FullProxy: true,
+	}, nil, stubInspector{}, nil, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Backend-origin realm is rewritten, other attributes preserved.
+	challenge = `Bearer realm="` + backend.URL + `/v2/token",service="container_registry"`
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v2/", nil))
+	want := `Bearer realm="https://git.example.com/v2/token",service="container_registry"`
+	if got := w.Header().Get("WWW-Authenticate"); got != want {
+		t.Fatalf("challenge = %q, want %q", got, want)
+	}
+
+	// A foreign-origin realm must not be vouched for.
+	challenge = `Bearer realm="https://evil.example/v2/token",service="x"`
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v2/", nil))
+	if got := w.Header().Get("WWW-Authenticate"); got != challenge {
+		t.Fatalf("foreign realm altered: %q", got)
+	}
+
+	// A Basic challenge is left alone.
+	challenge = `Basic realm="Gitea"`
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v2/", nil))
+	if got := w.Header().Get("WWW-Authenticate"); got != challenge {
+		t.Fatalf("basic challenge altered: %q", got)
+	}
+
+	// Scheme and parameter names are case-insensitive per RFC 9110.
+	challenge = `bearer REALM="` + backend.URL + `/v2/token",service="x"`
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v2/", nil))
+	wantLower := `bearer REALM="https://git.example.com/v2/token",service="x"`
+	if got := w.Header().Get("WWW-Authenticate"); got != wantLower {
+		t.Fatalf("case-variant challenge = %q, want %q", got, wantLower)
+	}
+}
+
 // TestPackageWriteRequiresWriteScope ensures a read-only package token cannot
 // publish or delete.
 func TestPackageWriteRequiresWriteScope(t *testing.T) {

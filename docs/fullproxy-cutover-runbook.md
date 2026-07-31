@@ -25,10 +25,16 @@ client -> nginx -> grasp-bridge -> gitea      (everything)
 ```
 
 The bridge can then authenticate `npub + grasp_v1_ token` on any surface it
-has an adapter for, exchanging it for a hidden per-user Gitea PAT. Git and
-the `/api/packages/` registry family (npm Bearer, PyPI/Maven/Composer/generic
-Basic, Cargo raw token, NuGet `X-NuGet-ApiKey`) have adapters; Docker/OCI
-`/v2`, REST, and LFS adapters follow. Hidden PATs carry
+has an adapter for, exchanging it for a hidden per-user Gitea PAT. Git, the
+`/api/packages/` registry family (npm Bearer, PyPI/Maven/Composer/generic
+Basic, Cargo raw token, NuGet `X-NuGet-ApiKey`), and Docker/OCI `/v2` (Basic
+bridge credentials at the token endpoint, scope-mapped from the requested
+docker access; the registry JWT passes through) have adapters; REST and LFS
+adapters follow. **Delayed-revocation caveat**: once Gitea issues a registry
+JWT, revoking the originating bridge token cannot invalidate it — the JWT
+remains usable until its own expiry. Validate on the deployed image that the
+registry token lifetime is short (target ≤ ~5 minutes); that lifetime is the
+revocation bound for container access. Hidden PATs carry
 `write:package, write:repository`; credentials provisioned before package
 support are rotated automatically on next use.
 

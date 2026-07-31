@@ -68,7 +68,14 @@ func Classify(r *http.Request) Classification {
 	case isLFSPath(path):
 		return Classification{Surface: SurfaceLFS, Action: lfsAction(r)}
 	case strings.HasPrefix(path, "/v2/"), path == "/v2":
-		return Classification{Surface: SurfaceContainer, Action: containerAction(r)}
+		class := Classification{Surface: SurfaceContainer, Action: containerAction(r)}
+		if class.Action == ActionTokenExchange {
+			// The docker token exchange is the only container endpoint where a
+			// bridge token may appear (as Basic auth). Everything after it
+			// carries Gitea's short-lived registry JWT, which passes through.
+			class.Scope = dockerTokenScope(r)
+		}
+		return class
 	case strings.HasPrefix(path, "/api/packages/"):
 		return Classification{Surface: SurfacePackages, Action: methodAction(r), Scope: packagesScope(r)}
 	case strings.HasPrefix(path, "/api/v1/"):
@@ -101,10 +108,61 @@ func packagesScope(r *http.Request) string {
 
 func containerAction(r *http.Request) Action {
 	// Docker's login exchange trades Basic credentials for a registry token.
-	if strings.HasSuffix(r.URL.Path, "/token") || strings.HasSuffix(r.URL.Path, "/v2/") || r.URL.Path == "/v2" {
+	// Only the exact token endpoint and the version probe are the exchange:
+	// a suffix match would misclassify a manifest legitimately named "token"
+	// (e.g. PUT /v2/o/img/manifests/token) and let a read-only bridge token
+	// reach a write endpoint with the hidden PAT's full authority.
+	switch r.URL.Path {
+	case "/v2/token":
 		return ActionTokenExchange
+	case "/v2", "/v2/":
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			return ActionTokenExchange
+		}
 	}
 	return methodAction(r)
+}
+
+// dockerTokenScope maps the docker-requested access (the repeated `scope`
+// query parameter, `resource:name:action[,action...]`) to the bridge scope
+// the exchange requires. Pull-only needs packages:read; push or delete needs
+// packages:write. No requested scope (a bare `docker login` probe) is an
+// authentication check and needs packages:read. Any malformed scope or
+// unknown action returns "" so the exchange fails closed rather than
+// guessing at authority.
+func dockerTokenScope(r *http.Request) string {
+	requested := r.URL.Query()["scope"]
+	if len(requested) == 0 {
+		return auth.ScopePackagesRead
+	}
+	write := false
+	for _, s := range requested {
+		// Strictly resource:name:actions with non-empty components and a
+		// recognized resource type. Anything looser risks the bridge and
+		// Gitea interpreting the same scope differently.
+		parts := strings.SplitN(s, ":", 3)
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			return ""
+		}
+		switch parts[0] {
+		case "repository", "registry":
+		default:
+			return ""
+		}
+		for _, action := range strings.Split(parts[2], ",") {
+			switch action {
+			case "pull":
+			case "push", "delete", "*":
+				write = true
+			default:
+				return ""
+			}
+		}
+	}
+	if write {
+		return auth.ScopePackagesWrite
+	}
+	return auth.ScopePackagesRead
 }
 
 func isLFSPath(path string) bool {

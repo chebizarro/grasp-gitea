@@ -485,7 +485,71 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	}
 
 	p.rewriteBackendOrigin(resp)
+	p.rewriteBearerChallengeRealm(resp)
 	return nil
+}
+
+// rewriteBearerChallengeRealm rewrites the realm URL in a Bearer challenge
+// (docker's token-endpoint discovery) from the private Gitea origin to the
+// public origin. Only a realm whose scheme and host exactly equal the
+// configured upstream is rewritten: anything else is either already public
+// or a value the bridge must not vouch for.
+func (p *Proxy) rewriteBearerChallengeRealm(resp *http.Response) {
+	if p.publicURL == "" {
+		return
+	}
+	values := resp.Header.Values("WWW-Authenticate")
+	if len(values) == 0 {
+		return
+	}
+	rewritten := make([]string, 0, len(values))
+	changed := false
+	for _, challenge := range values {
+		if out, ok := p.rewriteOneBearerRealm(challenge); ok {
+			rewritten = append(rewritten, out)
+			changed = true
+		} else {
+			rewritten = append(rewritten, challenge)
+		}
+	}
+	if !changed {
+		return
+	}
+	resp.Header.Del("WWW-Authenticate")
+	for _, v := range rewritten {
+		resp.Header.Add("WWW-Authenticate", v)
+	}
+}
+
+// rewriteOneBearerRealm rewrites a single challenge value. Scheme and
+// parameter names are matched case-insensitively per RFC 9110.
+func (p *Proxy) rewriteOneBearerRealm(challenge string) (string, bool) {
+	if len(challenge) < len("bearer ") || !strings.EqualFold(challenge[:len("bearer ")], "bearer ") {
+		return "", false
+	}
+	lower := strings.ToLower(challenge)
+	const marker = `realm="`
+	start := strings.Index(lower, marker)
+	if start < 0 {
+		return "", false
+	}
+	valueStart := start + len(marker)
+	end := strings.Index(challenge[valueStart:], `"`)
+	if end < 0 {
+		return "", false
+	}
+	realm := challenge[valueStart : valueStart+end]
+	parsed, err := url.Parse(realm)
+	if err != nil || !parsed.IsAbs() {
+		return "", false
+	}
+	if !strings.EqualFold(parsed.Scheme, p.target.Scheme) ||
+		!strings.EqualFold(parsed.Host, p.target.Host) {
+		return "", false
+	}
+	parsed.Scheme = p.publicScheme
+	parsed.Host = p.publicHost
+	return challenge[:valueStart] + parsed.String() + challenge[valueStart+end:], true
 }
 
 // rewriteBackendOrigin replaces the private Gitea origin with the public
