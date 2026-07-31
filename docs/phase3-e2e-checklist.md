@@ -12,8 +12,14 @@
 
 ## 2) Reverse proxy
 
-- Copy `deploy/nginx/gitea-vhost.conf.example`, replace `YOUR_DOMAIN` with your domain.
-- Reload nginx.
+> **Pick the right file.** `deploy/nginx/gitea-vhost.conf.example` is now the
+> **full-proxy** config, in which the bridge fronts all of Gitea and which
+> requires `GITEA_FULL_PROXY_ENABLED=true` (see
+> [`fullproxy-cutover-runbook.md`](fullproxy-cutover-runbook.md)). For this
+> checklist's topology, use `deploy/nginx/gitea-vhost.legacy.conf.example`.
+
+- Copy `deploy/nginx/gitea-vhost.legacy.conf.example`, replace `YOUR_DOMAIN` with your domain.
+- Run `nginx -t`, then reload nginx.
 - Verify:
   - `curl -I https://<your-domain>` returns `200` or `302` from gitea.
 
