@@ -44,15 +44,18 @@ status_of()  { curl -sS -o /dev/null -w '%{http_code}' "$@"; }
 PAT_NAME="z88-validate-$$"
 PAT_NAME2="z88-validate-byname-$$"
 USER_PAT=""
+SCRATCH_FILE="$(mktemp)"
+printf 'z88' >"${SCRATCH_FILE}"
 
 cleanup() {
   # Best-effort: remove anything this run created.
   if [[ -n "${USER_PAT}" ]]; then
+    curl -sS -u "${TEST_USER}:${USER_PAT}" -X DELETE \
+      "${GITEA_URL}/api/packages/${PKG_OWNER}/generic/z88-scratch/1.0.0" >/dev/null 2>&1
     admin_curl -X DELETE "${GITEA_URL}/api/v1/users/${TEST_USER}/tokens/${PAT_NAME}" >/dev/null 2>&1
   fi
   admin_curl -X DELETE "${GITEA_URL}/api/v1/users/${TEST_USER}/tokens/${PAT_NAME2}" >/dev/null 2>&1
-  curl -sS -u "${TEST_USER}:${USER_PAT}" -X DELETE \
-    "${GITEA_URL}/api/packages/${PKG_OWNER}/generic/z88-scratch/1.0.0" >/dev/null 2>&1
+  rm -f "${SCRATCH_FILE}"
 }
 trap cleanup EXIT
 
@@ -161,7 +164,8 @@ fi
 
 hdr "6. Package routes accept Basic user:PAT (the bridge's injected shape)"
 if [[ -n "${USER_PAT}" ]]; then
-  code="$(status_of -u "${TEST_USER}:${USER_PAT}" -X PUT --data-binary 'z88' \
+  code="$(status_of -u "${TEST_USER}:${USER_PAT}" -X PUT \
+    -F "package=@${SCRATCH_FILE};filename=z88.txt" \
     "${GITEA_URL}/api/packages/${PKG_OWNER}/generic/z88-scratch/1.0.0/z88.txt")"
   if [[ "${code}" == "201" ]]; then
     ok "generic upload with Basic PAT → 201"
@@ -221,17 +225,17 @@ if [[ -n "${realm}" && -n "${USER_PAT}" ]]; then
     payload="$(cut -d. -f2 <<<"${reg_token}" | tr '_-' '/+' )"
     pad=$(( (4 - ${#payload} % 4) % 4 )); payload="${payload}$(printf '=%.0s' $(seq 1 ${pad}) 2>/dev/null)"
     decoded="$(base64 -d <<<"${payload}" 2>/dev/null || base64 -D <<<"${payload}" 2>/dev/null)"
-    iat="$(jq -r '.iat // empty' <<<"${decoded}")"
+    issued="$(jq -r '.iat // .nbf // empty' <<<"${decoded}")"
     exp="$(jq -r '.exp // empty' <<<"${decoded}")"
-    if [[ -n "${iat}" && -n "${exp}" ]]; then
-      lifetime=$(( exp - iat ))
+    if [[ -n "${issued}" && -n "${exp}" ]]; then
+      lifetime=$(( exp - issued ))
       if (( lifetime <= 600 )); then
         ok "registry JWT lifetime = ${lifetime}s (revocation bound; <= 600s)"
       else
         bad "registry JWT lifetime = ${lifetime}s — exceeds the intended ~5min revocation bound; document or reduce before enabling tokens for docker"
       fi
     else
-      note "could not decode JWT exp/iat; inspect manually: ${tok_resp:0:120}..."
+      note "could not decode JWT exp/(iat or nbf); inspect manually: ${tok_resp:0:120}..."
     fi
   else
     bad "token endpoint did not return a token: ${tok_resp:0:200}"

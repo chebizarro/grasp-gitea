@@ -38,6 +38,13 @@ revocation bound for container access. Hidden PATs carry
 `write:package, write:repository`; credentials provisioned before package
 support are rotated automatically on next use.
 
+Gitea 1.26.2 issues these package/registry JWTs with a hard-coded 24-hour
+lifetime (`services/packages/auth.go`) and exposes no `app.ini` setting to
+shorten it. A deployment on that release may perform the full-proxy cutover
+with `BRIDGE_TOKENS_ENABLED=false`, but must not enable bridge tokens for
+container traffic unless it explicitly accepts a 24-hour revocation bound or
+moves to a Gitea build/release with a suitably bounded token lifetime.
+
 ## Prerequisites
 
 1. **Gitea must be unreachable from outside the private network.** Remove any

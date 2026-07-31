@@ -208,7 +208,9 @@ if [[ -n "${GITEA_USER:-}" && -n "${GITEA_PAT:-}" ]]; then
   if [[ -n "${GITEA_REPO_PATH:-}" ]]; then
     code="$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
       -u "${GITEA_USER}:${GITEA_PAT}" \
-      -X POST -H 'Content-Type: application/vnd.git-lfs+json' \
+      -X POST \
+      -H 'Content-Type: application/vnd.git-lfs+json' \
+      -H 'Accept: application/vnd.git-lfs+json' \
       -d '{"operation":"download","transfers":["basic"],"objects":[]}' \
       "${PUBLIC_URL}${GITEA_REPO_PATH}/info/lfs/objects/batch")"
     if [[ "${code}" =~ ^(200|422)$ ]]; then
@@ -222,7 +224,7 @@ else
 fi
 
 echo "== 9. Relay WebSocket still upgrades at the root =="
-ws_headers="$("${CURL[@]}" -o /dev/null -D - \
+ws_headers="$("${CURL[@]}" --http1.1 -o /dev/null -D - \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
   "${PUBLIC_URL}/" 2>/dev/null)"
