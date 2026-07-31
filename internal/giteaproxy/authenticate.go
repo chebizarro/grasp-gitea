@@ -12,10 +12,11 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/auth"
 )
 
-// internalHeaders are bridge-internal headers a public client must never be
+// InternalHeaders are bridge-internal headers a public client must never be
 // able to set. nginx clears them at the edge; the proxy clears them again so
-// a misconfigured or bypassed edge cannot forge an identity.
-var internalHeaders = []string{
+// a misconfigured or bypassed edge cannot forge an identity. It is exported
+// so the deployment-config tests can assert nginx clears exactly this set.
+var InternalHeaders = []string{
 	"X-Grasp-Auth-User",
 	"X-Grasp-Auth-Redirect",
 	"X-Grasp-Session-Proxy",
@@ -179,7 +180,7 @@ func decodeBasic(encoded string) (username, password string, ok bool) {
 
 // stripInternalHeaders removes bridge-internal headers from a request.
 func stripInternalHeaders(h http.Header) {
-	for _, name := range internalHeaders {
+	for _, name := range InternalHeaders {
 		h.Del(name)
 	}
 }

@@ -587,7 +587,7 @@ func TestInternalHeadersAreStrippedFromClientRequests(t *testing.T) {
 	env := newProxyEnv(t, Config{FullProxy: true}, nil, stubInspector{})
 
 	r := httptest.NewRequest(http.MethodGet, "/explore/repos", nil)
-	for _, header := range internalHeaders {
+	for _, header := range InternalHeaders {
 		r.Header.Set(header, "forged")
 	}
 	w := httptest.NewRecorder()
@@ -659,6 +659,47 @@ func TestBackendOriginRewriteRequiresExactHostMatch(t *testing.T) {
 
 	if got := w.Header().Get("Location"); got != lookalike {
 		t.Fatalf("Location = %q, want it left alone (only the exact backend origin is rewritten)", got)
+	}
+}
+
+// TestForwardedForPreservesClientChain pins behaviour the cutover depends on:
+// nginx sets X-Forwarded-For to the real client, and the proxy must append
+// itself rather than replace it, or Gitea's audit log and any IP-based
+// controls would only ever see the bridge.
+func TestForwardedForPreservesClientChain(t *testing.T) {
+	var gotXFF string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotXFF = r.Header.Get("X-Forwarded-For")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	p, err := New(Config{
+		GiteaURL: backend.URL, PublicURL: "https://git.example.com", FullProxy: true,
+	}, nil, stubInspector{}, nil, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	front := httptest.NewServer(p)
+	defer front.Close()
+
+	req, err := http.NewRequest(http.MethodGet, front.URL+"/explore", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	// As nginx would set it for a real client.
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if !strings.HasPrefix(gotXFF, "203.0.113.7") {
+		t.Fatalf("X-Forwarded-For = %q, want the client chain preserved with the bridge appended", gotXFF)
+	}
+	if gotXFF == "203.0.113.7" {
+		t.Fatalf("X-Forwarded-For = %q, want the bridge hop appended too", gotXFF)
 	}
 }
 

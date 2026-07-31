@@ -29,6 +29,7 @@ type Server struct {
 	mirrorCallbackToken string
 	webhookHandler      http.Handler // Gitea webhook handler for NIP-34 events
 	routeRegistrars     []func(*http.ServeMux)
+	readinessProbes     []ReadinessProbe
 	giteaProxy          *giteaproxy.Proxy
 	rootRelayHandler    http.Handler
 	signerAuthorizer    SignerAuthorizer
@@ -107,6 +108,7 @@ func (s *Server) AddRouteRegistrar(register func(*http.ServeMux)) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", method(http.MethodGet, s.health))
+	mux.HandleFunc("/ready", method(http.MethodGet, s.ready))
 	mux.HandleFunc("/metrics", method(http.MethodGet, s.requireAuth(s.metrics)))
 	mux.HandleFunc("/mappings", method(http.MethodGet, s.requireAuth(s.mappings)))
 	mux.HandleFunc("/outbound-events", method(http.MethodGet, s.requireAuth(s.outboundEvents)))

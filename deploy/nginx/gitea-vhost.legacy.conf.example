@@ -1,0 +1,221 @@
+# PRE-CUTOVER / ROLLBACK configuration: nginx proxies ordinary Gitea traffic
+# directly to Gitea, and only GRASP-specific paths reach the bridge.
+#
+# This is the rollback target for the full-proxy cutover. Restoring it returns
+# the deployment to a known-good state if the bridge misbehaves.
+#
+# WHEN ROLLING BACK, ALSO SET ON THE BRIDGE:
+#   GITEA_FULL_PROXY_ENABLED=false
+#   BRIDGE_TOKENS_ENABLED=false
+#
+# Bridge tokens MUST be disabled here. In this topology conventional git,
+# package, and API requests bypass the bridge entirely, so token scopes are
+# not enforced on those surfaces. Once the bridge restarts with the token
+# service off, existing bridge tokens stop working (the proxy recognizes the
+# grasp_v1_ prefix and rejects it locally). Token rows and hidden PATs are
+# not deleted: hidden PATs stay valid inside Gitea until the retirement sweep
+# or an operator removes them.
+#
+# Replace YOUR_DOMAIN and certificate paths. Gitea and the bridge must remain
+# reachable only on this trusted container/private network.
+#
+# These map/zone directives belong in nginx's http {} context (conf.d is
+# normally included there).
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+map "$http_upgrade:$http_accept" $grasp_root_is_relay {
+    default                         0;
+    ~*^websocket:                   1;
+    ~*application/nostr\+json      1;
+}
+map $request_uri $grasp_repo_quota_key {
+    default "";
+    ~^(/npub1.+\.git)/git-receive-pack$ $1;
+}
+limit_req_zone $binary_remote_addr zone=grasp_push_ip:10m rate=30r/m;
+limit_req_zone $grasp_repo_quota_key zone=grasp_push_repo:10m rate=60r/m;
+limit_conn_zone $binary_remote_addr zone=grasp_push_connections:10m;
+
+upstream gitea_backend {
+    server gitea:3000;
+    keepalive 16;
+}
+upstream grasp_bridge_backend {
+    server grasp-bridge:8090;
+    keepalive 16;
+}
+upstream grasp_relay_backend {
+    server grasp-bridge:3334;
+    keepalive 16;
+}
+
+server {
+    listen 80;
+    server_name YOUR_DOMAIN;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name YOUR_DOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem;
+
+    # Defense in depth for all request bodies. Public receive-pack is further
+    # constrained by the pre-receive object/decompressed-size quotas.
+    client_max_body_size 256m;
+
+    # A browser visits this one-time URL. The internal subrequest consumes the
+    # audience- and cookie-bound token; only this request receives the trusted
+    # Gitea reverse-proxy-auth username.
+    location = /auth/session/handoff {
+        access_log off;
+        set $grasp_handoff_token $arg_token;
+        auth_request /_grasp_session_handoff_consume;
+        auth_request_set $grasp_auth_user $upstream_http_x_grasp_auth_user;
+        auth_request_set $grasp_auth_redirect $upstream_http_x_grasp_auth_redirect;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Grasp-Auth-User $grasp_auth_user;
+        proxy_set_header X-WEBAUTH-USER "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_next_upstream off;
+        proxy_no_cache 1;
+        proxy_cache_bypass 1;
+        proxy_pass http://gitea_backend$grasp_auth_redirect;
+
+        add_header Cache-Control "no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Set-Cookie "__Host-grasp-handoff-bind=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict" always;
+    }
+
+    location = /_grasp_session_handoff_consume {
+        internal;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header Cookie $http_cookie;
+        proxy_set_header X-Grasp-Internal-Handoff "1";
+        proxy_set_header X-Grasp-Handoff-Token $grasp_handoff_token;
+        proxy_set_header X-Grasp-Handoff-Audience "$scheme://$host";
+        proxy_pass http://grasp_bridge_backend/auth/session/handoff/consume;
+    }
+
+    # The legacy status response reflects its unvalidated redirect_uri, so the
+    # canonical edge disables it. The safe replacement omits redirects and its
+    # bearer-shaped query token from access logs.
+    location = /auth/nip46/status { return 404; }
+    location = /auth/session/nip46/status {
+        access_log off;
+        proxy_pass http://grasp_bridge_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Grasp-Auth-User "";
+    }
+
+    # Bridge APIs and authentication callbacks share the canonical origin.
+    # Strip internal authentication headers supplied by any public client.
+    location ~ ^/(auth/|webhook/gitea$|repository-state/|signer/|outbound-events$|health$|ready$|metrics$|mappings$|provision$) {
+        proxy_pass http://grasp_bridge_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header X-Grasp-Auth-User "";
+        proxy_set_header X-Grasp-Internal-Handoff "";
+        proxy_set_header X-Grasp-Handoff-Token "";
+        proxy_set_header X-Grasp-Handoff-Audience "";
+        proxy_request_buffering off;
+    }
+
+    # Public pushes receive independent per-IP and per-repository rate limits.
+    location ~ ^/npub1.+\.git/git-receive-pack$ {
+        limit_req zone=grasp_push_ip burst=10 nodelay;
+        limit_req zone=grasp_push_repo burst=20 nodelay;
+        limit_conn grasp_push_connections 2;
+        client_max_body_size 256m;
+
+        proxy_pass http://grasp_bridge_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Grasp-Auth-User "";
+        proxy_request_buffering off;
+        proxy_buffering off;
+    }
+
+    # Bare canonical npub repository URLs and all smart-HTTP subpaths go to the
+    # bridge, which resolves the NIP-34 coordinate before proxying to Gitea.
+    location ~ ^/npub1.+\.git(?:/.*)?$ {
+        proxy_pass http://grasp_bridge_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Grasp-Auth-User "";
+        proxy_request_buffering off;
+        proxy_buffering off;
+    }
+
+    # At exactly "/", WebSocket upgrades and NIP-11 requests reach the relay;
+    # ordinary browser requests reach Gitea.
+    location = / {
+        error_page 418 = @grasp_relay_root;
+        if ($grasp_root_is_relay) { return 418; }
+
+        proxy_pass http://gitea_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Grasp-Auth-User "";
+        proxy_set_header X-WEBAUTH-USER "";
+        proxy_set_header X-Forwarded-User "";
+    }
+
+    location @grasp_relay_root {
+        proxy_pass http://grasp_relay_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 75s;
+        proxy_send_timeout 75s;
+    }
+
+    # Normal Gitea UI/API traffic never receives a client-supplied reverse-auth
+    # identity. Gitea must not be published directly outside this proxy.
+    location / {
+        proxy_pass http://gitea_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Grasp-Auth-User "";
+        proxy_set_header X-WEBAUTH-USER "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header X-Grasp-Internal-Handoff "";
+        proxy_set_header X-Grasp-Handoff-Token "";
+        proxy_set_header X-Grasp-Handoff-Audience "";
+    }
+}

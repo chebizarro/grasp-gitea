@@ -1,19 +1,46 @@
-# Canonical single-host nginx example for GRASP + Gitea.
-# Replace YOUR_DOMAIN and certificate paths. Gitea and the bridge must remain
-# reachable only on this trusted container/private network.
+# Canonical single-host nginx example for GRASP + Gitea, in FULL-PROXY mode.
 #
+# Every public request reaches grasp-bridge, which is the only component that
+# talks to Gitea. That is what lets a Nostr identity authenticate to any Gitea
+# surface: the bridge translates `npub + grasp_v1_ token` into a hidden
+# per-user Gitea PAT before forwarding. Requires GITEA_FULL_PROXY_ENABLED=true
+# on the bridge.
+#
+# CRITICAL: Gitea must NOT be reachable from outside the private container
+# network. Do not publish its port. If a client can reach Gitea directly, the
+# bridge's scope enforcement is trivially bypassed.
+#
+# Replace YOUR_DOMAIN, the certificate paths, and the edge secret placeholder.
+# YOUR_DOMAIN appears in redirects and the handoff audience deliberately:
+# those must never be derived from the client-supplied Host header.
+#
+# For the pre-cutover topology (nginx proxying ordinary traffic straight to
+# Gitea), see gitea-vhost.legacy.conf.example, which is also the rollback
+# target if the cutover misbehaves.
+#
+# EVERY location that forwards public traffic clears the complete set of
+# bridge-internal headers. That list is asserted against
+# giteaproxy.InternalHeaders by internal/api/nginx_routing_test.go, so the two
+# cannot drift. Only /auth/session/handoff may set a trusted identity.
+
 # These map/zone directives belong in nginx's http {} context (conf.d is
 # normally included there).
+#
+# An empty value makes nginx omit the Connection header entirely, which keeps
+# the upstream keepalive pool usable for ordinary requests. Sending
+# "Connection: close" on every non-WebSocket request would disable it.
 map $http_upgrade $connection_upgrade {
     default upgrade;
-    ''      close;
+    ''      "";
 }
 map "$http_upgrade:$http_accept" $grasp_root_is_relay {
     default                         0;
     ~*^websocket:                   1;
     ~*application/nostr\+json      1;
 }
-map $request_uri $grasp_repo_quota_key {
+# Keyed on $uri (path only). $request_uri includes the query string, so any
+# appended query would empty the key and skip the per-repository limit.
+map $uri $grasp_repo_quota_key {
     default "";
     ~^(/npub1.+\.git)/git-receive-pack$ $1;
 }
@@ -21,23 +48,33 @@ limit_req_zone $binary_remote_addr zone=grasp_push_ip:10m rate=30r/m;
 limit_req_zone $grasp_repo_quota_key zone=grasp_push_repo:10m rate=60r/m;
 limit_conn_zone $binary_remote_addr zone=grasp_push_connections:10m;
 
-upstream gitea_backend {
-    server gitea:3000;
-    keepalive 16;
-}
+# The bridge is the only public application upstream.
 upstream grasp_bridge_backend {
     server grasp-bridge:8090;
-    keepalive 16;
+    keepalive 32;
 }
 upstream grasp_relay_backend {
     server grasp-bridge:3334;
     keepalive 16;
 }
 
+# Reject any hostname the operator did not configure. Without this, an
+# arbitrary Host header would flow into proxy headers and application URLs.
+server {
+    listen 80 default_server;
+    listen 443 ssl default_server;
+    server_name _;
+    ssl_certificate /etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem;
+    return 444;
+}
+
 server {
     listen 80;
     server_name YOUR_DOMAIN;
-    return 301 https://$host$request_uri;
+    # Redirect to the configured canonical hostname, never $host, which is
+    # client-controlled and would allow an open redirect.
+    return 301 https://YOUR_DOMAIN$request_uri;
 }
 
 server {
@@ -47,13 +84,17 @@ server {
     ssl_certificate /etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem;
 
-    # Defense in depth for all request bodies. Public receive-pack is further
-    # constrained by the pre-receive object/decompressed-size quotas.
+    # Package registries and LFS push large artifacts. Per-surface locations
+    # below raise this further; the pre-receive hook still enforces its own
+    # object/decompressed-size quotas for git.
     client_max_body_size 256m;
 
+    # --- Session handoff ----------------------------------------------------
+    #
     # A browser visits this one-time URL. The internal subrequest consumes the
-    # audience- and cookie-bound token; only this request receives the trusted
-    # Gitea reverse-proxy-auth username.
+    # audience- and cookie-bound token; only this request carries the trusted
+    # reverse-proxy identity onward. Post-cutover the continuation goes to the
+    # bridge (not Gitea), authenticated by the edge shared secret.
     location = /auth/session/handoff {
         access_log off;
         set $grasp_handoff_token $arg_token;
@@ -66,13 +107,27 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+
+        # The ONLY location that sets these. The bridge verifies the secret in
+        # constant time before honouring the identity.
+        proxy_set_header X-Grasp-Session-Proxy "1";
         proxy_set_header X-Grasp-Auth-User $grasp_auth_user;
+        proxy_set_header X-Grasp-Edge-Secret "REPLACE_WITH_GRASP_EDGE_SHARED_SECRET";
+
+        # Every other internal header is still cleared.
+        proxy_set_header X-Grasp-Auth-Redirect "";
+        proxy_set_header X-Grasp-Internal-Handoff "";
+        proxy_set_header X-Grasp-Handoff-Token "";
+        proxy_set_header X-Grasp-Handoff-Audience "";
         proxy_set_header X-WEBAUTH-USER "";
         proxy_set_header X-Forwarded-User "";
+        proxy_set_header Proxy-Authorization "";
+
         proxy_next_upstream off;
         proxy_no_cache 1;
         proxy_cache_bypass 1;
-        proxy_pass http://gitea_backend$grasp_auth_redirect;
+        proxy_pass http://grasp_bridge_backend$grasp_auth_redirect;
 
         add_header Cache-Control "no-store" always;
         add_header Referrer-Policy "no-referrer" always;
@@ -84,9 +139,20 @@ server {
         proxy_pass_request_body off;
         proxy_set_header Content-Length "";
         proxy_set_header Cookie $http_cookie;
+        proxy_set_header Connection "";
+
         proxy_set_header X-Grasp-Internal-Handoff "1";
         proxy_set_header X-Grasp-Handoff-Token $grasp_handoff_token;
-        proxy_set_header X-Grasp-Handoff-Audience "$scheme://$host";
+        # Built from the canonical origin, never client-supplied Host.
+        proxy_set_header X-Grasp-Handoff-Audience "https://YOUR_DOMAIN";
+
+        proxy_set_header X-Grasp-Auth-User "";
+        proxy_set_header X-Grasp-Auth-Redirect "";
+        proxy_set_header X-Grasp-Session-Proxy "";
+        proxy_set_header X-Grasp-Edge-Secret "";
+        proxy_set_header X-WEBAUTH-USER "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header Proxy-Authorization "";
         proxy_pass http://grasp_bridge_backend/auth/session/handoff/consume;
     }
 
@@ -102,12 +168,44 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
         proxy_set_header X-Grasp-Auth-User "";
+        proxy_set_header X-Grasp-Auth-Redirect "";
+        proxy_set_header X-Grasp-Session-Proxy "";
+        proxy_set_header X-Grasp-Internal-Handoff "";
+        proxy_set_header X-Grasp-Handoff-Token "";
+        proxy_set_header X-Grasp-Handoff-Audience "";
+        proxy_set_header X-Grasp-Edge-Secret "";
+        proxy_set_header X-WEBAUTH-USER "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header Proxy-Authorization "";
+    }
+
+    # Token minting and management. The NIP-98 proof is in the Authorization
+    # header, so keep these out of the access log.
+    location ~ ^/auth/tokens?(/|$) {
+        access_log off;
+        proxy_pass http://grasp_bridge_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_set_header X-Grasp-Auth-User "";
+        proxy_set_header X-Grasp-Auth-Redirect "";
+        proxy_set_header X-Grasp-Session-Proxy "";
+        proxy_set_header X-Grasp-Internal-Handoff "";
+        proxy_set_header X-Grasp-Handoff-Token "";
+        proxy_set_header X-Grasp-Handoff-Audience "";
+        proxy_set_header X-Grasp-Edge-Secret "";
+        proxy_set_header X-WEBAUTH-USER "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header Proxy-Authorization "";
     }
 
     # Bridge APIs and authentication callbacks share the canonical origin.
-    # Strip internal authentication headers supplied by any public client.
-    location ~ ^/(auth/|webhook/gitea$|repository-state/|signer/|outbound-events$|health$|metrics$|mappings$|provision$) {
+    location ~ ^/(auth/|webhook/gitea$|repository-state/|signer/|outbound-events$|health$|ready$|metrics$|mappings$|provision$) {
         proxy_pass http://grasp_bridge_backend;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -117,13 +215,25 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_set_header X-Grasp-Auth-User "";
+        proxy_set_header X-Grasp-Auth-Redirect "";
+        proxy_set_header X-Grasp-Session-Proxy "";
         proxy_set_header X-Grasp-Internal-Handoff "";
         proxy_set_header X-Grasp-Handoff-Token "";
         proxy_set_header X-Grasp-Handoff-Audience "";
+        proxy_set_header X-Grasp-Edge-Secret "";
+        proxy_set_header X-WEBAUTH-USER "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header Proxy-Authorization "";
         proxy_request_buffering off;
     }
 
-    # Public pushes receive independent per-IP and per-repository rate limits.
+    # --- Streaming surfaces -------------------------------------------------
+    #
+    # Git packs, package artifacts, container blobs, and LFS objects are
+    # streams. Buffering them would break interactive pack negotiation and
+    # exhaust disk on large uploads.
+
+    # Public GRASP pushes keep independent per-IP and per-repository limits.
     location ~ ^/npub1.+\.git/git-receive-pack$ {
         limit_req zone=grasp_push_ip burst=10 nodelay;
         limit_req zone=grasp_push_repo burst=20 nodelay;
@@ -136,40 +246,82 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
         proxy_set_header X-Grasp-Auth-User "";
+        proxy_set_header X-Grasp-Auth-Redirect "";
+        proxy_set_header X-Grasp-Session-Proxy "";
+        proxy_set_header X-Grasp-Internal-Handoff "";
+        proxy_set_header X-Grasp-Handoff-Token "";
+        proxy_set_header X-Grasp-Handoff-Audience "";
+        proxy_set_header X-Grasp-Edge-Secret "";
+        proxy_set_header X-WEBAUTH-USER "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header Proxy-Authorization "";
         proxy_request_buffering off;
         proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+        proxy_next_upstream off;
     }
 
-    # Bare canonical npub repository URLs and all smart-HTTP subpaths go to the
-    # bridge, which resolves the NIP-34 coordinate before proxying to Gitea.
-    location ~ ^/npub1.+\.git(?:/.*)?$ {
+    # Canonical npub repositories, conventional git smart HTTP, LFS, package
+    # registries, and the container registry.
+    location ~ ^(/npub1.+\.git(?:/.*)?|.*\.git/(?:info/refs|git-upload-pack|git-receive-pack|info/lfs/.*)|/api/packages/.*|/v2/.*)$ {
+        # Container and package uploads can be very large; bound by storage
+        # policy rather than an arbitrary edge limit.
+        client_max_body_size 0;
+
         proxy_pass http://grasp_bridge_backend;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
         proxy_set_header X-Grasp-Auth-User "";
+        proxy_set_header X-Grasp-Auth-Redirect "";
+        proxy_set_header X-Grasp-Session-Proxy "";
+        proxy_set_header X-Grasp-Internal-Handoff "";
+        proxy_set_header X-Grasp-Handoff-Token "";
+        proxy_set_header X-Grasp-Handoff-Audience "";
+        proxy_set_header X-Grasp-Edge-Secret "";
+        proxy_set_header X-WEBAUTH-USER "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header Proxy-Authorization "";
         proxy_request_buffering off;
         proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+        # Never retry after any request body bytes have been sent.
+        proxy_next_upstream off;
     }
 
+    # --- Service root -------------------------------------------------------
+    #
     # At exactly "/", WebSocket upgrades and NIP-11 requests reach the relay;
-    # ordinary browser requests reach Gitea.
+    # ordinary browser requests reach the bridge, which forwards them to the
+    # Gitea UI.
     location = / {
         error_page 418 = @grasp_relay_root;
         if ($grasp_root_is_relay) { return 418; }
 
-        proxy_pass http://gitea_backend;
+        proxy_pass http://grasp_bridge_backend;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
         proxy_set_header X-Grasp-Auth-User "";
+        proxy_set_header X-Grasp-Auth-Redirect "";
+        proxy_set_header X-Grasp-Session-Proxy "";
+        proxy_set_header X-Grasp-Internal-Handoff "";
+        proxy_set_header X-Grasp-Handoff-Token "";
+        proxy_set_header X-Grasp-Handoff-Audience "";
+        proxy_set_header X-Grasp-Edge-Secret "";
         proxy_set_header X-WEBAUTH-USER "";
         proxy_set_header X-Forwarded-User "";
+        proxy_set_header Proxy-Authorization "";
     }
 
     location @grasp_relay_root {
@@ -181,24 +333,37 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
-        proxy_read_timeout 75s;
-        proxy_send_timeout 75s;
+        # Relay WebSockets are long-lived and mostly idle. This must exceed
+        # the client's ping interval or connections drop mid-subscription.
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
     }
 
-    # Normal Gitea UI/API traffic never receives a client-supplied reverse-auth
-    # identity. Gitea must not be published directly outside this proxy.
+    # --- Everything else ----------------------------------------------------
+    #
+    # Gitea UI, REST API, static assets, and any surface not matched above.
+    # All of it goes through the bridge; nginx never contacts Gitea directly.
     location / {
-        proxy_pass http://gitea_backend;
+        proxy_pass http://grasp_bridge_backend;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        # Gitea serves EventSource/WebSocket endpoints under this location.
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 10m;
         proxy_set_header X-Grasp-Auth-User "";
-        proxy_set_header X-WEBAUTH-USER "";
-        proxy_set_header X-Forwarded-User "";
+        proxy_set_header X-Grasp-Auth-Redirect "";
+        proxy_set_header X-Grasp-Session-Proxy "";
         proxy_set_header X-Grasp-Internal-Handoff "";
         proxy_set_header X-Grasp-Handoff-Token "";
         proxy_set_header X-Grasp-Handoff-Audience "";
+        proxy_set_header X-Grasp-Edge-Secret "";
+        proxy_set_header X-WEBAUTH-USER "";
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header Proxy-Authorization "";
+        proxy_request_buffering off;
     }
 }

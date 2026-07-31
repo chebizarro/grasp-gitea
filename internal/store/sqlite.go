@@ -547,6 +547,11 @@ func ensureSQLiteColumn(db *sql.DB, table, column, definition string) error {
 	return err
 }
 
+// Ping verifies the database is reachable, for readiness probing.
+func (s *SQLiteStore) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }

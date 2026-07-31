@@ -117,10 +117,10 @@ type Config struct {
 	EdgeSharedSecret string
 	// FullProxyEnabled routes ALL unmatched HTTP traffic through the bridge to
 	// Gitea (full reverse proxy mode) instead of only canonical npub paths.
-	FullProxyEnabled bool
-	TokenTTLDefault  time.Duration
-	TokenTTLMin      time.Duration
-	TokenTTLMax      time.Duration
+	FullProxyEnabled   bool
+	TokenTTLDefault    time.Duration
+	TokenTTLMin        time.Duration
+	TokenTTLMax        time.Duration
 	AuthAuditRetention time.Duration
 	// ShutdownGrace bounds graceful HTTP shutdown; long enough for active
 	// streaming git/package uploads to complete.

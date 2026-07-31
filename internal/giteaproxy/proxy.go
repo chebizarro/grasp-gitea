@@ -387,9 +387,17 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 	pl, _ := pr.In.Context().Value(planKey{}).(*plan)
 
 	pr.SetURL(p.target)
-	// Give Gitea the canonical external identity rather than a client-
-	// controlled Host header, which would otherwise poison generated URLs,
-	// cookies, and redirects.
+
+	// ReverseProxy strips X-Forwarded-* from Out before Rewrite runs, so the
+	// chain nginx built is already gone. Restore it when the immediate peer is
+	// a trusted private address (our own edge); otherwise Gitea's audit log
+	// and any IP-based control would only ever see the bridge. A non-private
+	// peer is untrusted because it could forge the chain.
+	if prior := pr.In.Header.Get("X-Forwarded-For"); prior != "" && trustedPeer(pr.In.RemoteAddr) {
+		pr.Out.Header.Set("X-Forwarded-For", prior)
+	}
+	// Appends this hop to whatever chain survived above, and gives Gitea the
+	// canonical external identity rather than a client-controlled Host.
 	pr.SetXForwarded()
 	if p.publicHost != "" {
 		pr.Out.Host = p.publicHost
@@ -435,6 +443,22 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 	default:
 		// Ordinary Gitea credentials (or none) pass through unchanged.
 	}
+}
+
+// trustedPeer reports whether the immediate TCP peer may be believed about
+// the forwarding chain. In the documented topology the bridge is reachable
+// only from nginx on the private container network, so loopback and private
+// ranges are the edge; anything else is a client that could forge headers.
+func trustedPeer(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
 func (p *Proxy) modifyResponse(resp *http.Response) error {

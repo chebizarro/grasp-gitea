@@ -525,7 +525,7 @@ func (s *SQLiteStore) SetPATCredentialState(ctx context.Context, giteaUserID, ge
 
 // MarkPATCredentialRetired records completed Gitea-side deletion of a PAT.
 // Completion is denoted by state='retiring' with a non-empty retired_at;
-// rows still awaiting deletion have state='retiring' and retired_at=''.
+// rows still awaiting deletion have state='retiring' and retired_at=”.
 func (s *SQLiteStore) MarkPATCredentialRetired(ctx context.Context, giteaUserID, generation int64, now time.Time) error {
 	return s.setPATRetirement(ctx, giteaUserID, generation, now, "")
 }

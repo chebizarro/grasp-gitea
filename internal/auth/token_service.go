@@ -31,14 +31,14 @@ import (
 // surfaces a token may reach; Gitea's own ACLs remain authoritative below
 // that. There is no implicit write-includes-read rule.
 const (
-	ScopeGitRead      = "git:read"
-	ScopeGitWrite     = "git:write"
+	ScopeGitRead       = "git:read"
+	ScopeGitWrite      = "git:write"
 	ScopePackagesRead  = "packages:read"
 	ScopePackagesWrite = "packages:write"
-	ScopeAPIRead      = "api:read"
-	ScopeAPIWrite     = "api:write"
-	ScopeLFSRead      = "lfs:read"
-	ScopeLFSWrite     = "lfs:write"
+	ScopeAPIRead       = "api:read"
+	ScopeAPIWrite      = "api:write"
+	ScopeLFSRead       = "lfs:read"
+	ScopeLFSWrite      = "lfs:write"
 )
 
 const (
@@ -158,7 +158,6 @@ func NewTokenService(cfg config.Config, st *store.SQLiteStore, identity *Identit
 func (t *TokenService) Enabled() bool {
 	return t != nil
 }
-
 
 // MintRequest is the mint/rotate input.
 type MintRequest struct {

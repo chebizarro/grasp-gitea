@@ -347,6 +347,9 @@ func main() {
 	}
 	apiServer.SetGiteaProxy(giteaProxy)
 	if cfg.FullProxyEnabled {
+		// The bridge is now the only path to Gitea, so its readiness must
+		// include upstream reachability.
+		apiServer.AddReadinessProbe(giteaProxy.UpstreamProbe())
 		logger.Info("full Gitea reverse proxy enabled; all unmatched traffic is proxied to Gitea")
 	}
 

@@ -1,0 +1,72 @@
+# Full-proxy overlay: apply ONLY during the cutover described in
+# docs/fullproxy-cutover-runbook.md.
+#
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f deploy/docker-compose.hardening.yml \
+#     -f deploy/docker-compose.fullproxy.yml \
+#     up -d
+#
+# This is a separate file because it requires two secret files that ordinary
+# deployments do not have. Compose fails to start if a declared secret file is
+# missing, so keeping them here means the base hardening overlay still works
+# before the cutover.
+#
+# Create the secrets first:
+#   mkdir -p ./secrets
+#   echo "current:$(openssl rand -base64 32)" > ./secrets/grasp-credential-keys
+#   openssl rand -base64 32 > ./secrets/grasp-edge-shared-secret
+#   chmod 600 ./secrets/grasp-credential-keys ./secrets/grasp-edge-shared-secret
+#
+# BACK UP grasp-credential-keys. Losing every key in the ring makes stored
+# hidden PATs undecryptable; they must then be deleted from Gitea and
+# re-provisioned.
+#
+# PREREQUISITE THIS FILE CANNOT ENFORCE: Gitea must have no published ports.
+# Compose merges `ports` additively, so an overlay cannot remove a publication
+# declared by the base file. Remove it there, and verify with:
+#
+#   docker compose config | grep -A5 'gitea:' | grep -i published
+#
+# If Gitea is reachable from outside the private network, bridge scope
+# enforcement is bypassable and this cutover is unsafe.
+
+services:
+  grasp-bridge:
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        export ADMIN_API_TOKEN="$$(cat /run/secrets/grasp-admin-api-token)"
+        export GRASP_CREDENTIAL_KEYS="$$(cat /run/secrets/grasp-credential-keys)"
+        export GRASP_EDGE_SHARED_SECRET="$$(cat /run/secrets/grasp-edge-shared-secret)"
+        exec grasp-bridge
+    environment:
+      # Step 1 of the cutover: proxy on, tokens off. Flip BRIDGE_TOKENS_ENABLED
+      # to true only after the nginx switch is verified.
+      GITEA_FULL_PROXY_ENABLED: ${GITEA_FULL_PROXY_ENABLED:-true}
+      BRIDGE_TOKENS_ENABLED: ${BRIDGE_TOKENS_ENABLED:-false}
+      GITEA_ADMIN_USER: ${GITEA_ADMIN_USER:?set GITEA_ADMIN_USER to the login owning GITEA_ADMIN_TOKEN}
+      # Must outlast in-flight pushes and package uploads.
+      SHUTDOWN_GRACE: ${SHUTDOWN_GRACE:-5m}
+    # The bridge now carries every Gitea connection.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # Slightly longer than SHUTDOWN_GRACE so the process finishes draining
+    # before Docker sends SIGKILL.
+    stop_grace_period: 6m
+    secrets:
+      - grasp-admin-api-token
+      - grasp-credential-keys
+      - grasp-edge-shared-secret
+
+secrets:
+  # AES-256-GCM key ring protecting hidden Gitea PATs at rest, newest first:
+  #   current:<base64 32 bytes>[,previous:<base64 32 bytes>]
+  grasp-credential-keys:
+    file: ${GRASP_CREDENTIAL_KEYS_FILE:-./secrets/grasp-credential-keys}
+  # Authenticates the nginx session-handoff continuation. Authorizes arbitrary
+  # X-Grasp-Auth-User impersonation, so it must be high entropy.
+  grasp-edge-shared-secret:
+    file: ${GRASP_EDGE_SECRET_FILE:-./secrets/grasp-edge-shared-secret}
