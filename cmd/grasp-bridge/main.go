@@ -307,6 +307,18 @@ func main() {
 			nip55Handler.RegisterRoutes(mux)
 		})
 		logger.Info("Nostr auth routes enabled", "bridge_public_url", cfg.BridgePublicURL)
+
+		if cfg.BridgeTokensEnabled {
+			tokenSvc, err := auth.NewTokenService(cfg, st, identitySvc, giteaClient, logger)
+			if err != nil {
+				logger.Error("failed to initialize bridge token service", "error", err)
+				os.Exit(1)
+			}
+			tokenHandler := auth.NewTokenHandler(authSvc, tokenSvc, logger)
+			apiServer.AddRouteRegistrar(tokenHandler.RegisterRoutes)
+			go tokenSvc.RunMaintenance(ctx)
+			logger.Info("bridge token service enabled", "scopes", tokenSvc.EnabledScopes())
+		}
 	}
 
 	// Wire webhook handler for NIP-34 events (PRs, issues, patches, labels)

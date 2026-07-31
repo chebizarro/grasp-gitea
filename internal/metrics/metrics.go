@@ -30,6 +30,13 @@ var outboxDeadLettered atomic.Int64
 var bridgeSignedFallback atomic.Int64
 var unlinkedActorSkipped atomic.Int64
 var actorEventsBackfilled atomic.Int64
+var bridgeTokensMinted atomic.Int64
+var bridgeTokensRevoked atomic.Int64
+var bridgeTokensRotated atomic.Int64
+var bridgeTokenAuthFailures atomic.Int64
+var patCredentialsProvisioned atomic.Int64
+var patProvisionFailures atomic.Int64
+var patCredentialsRetired atomic.Int64
 
 func IncAnnouncementReceived() {
 	announcementEventsReceived.Add(1)
@@ -146,6 +153,34 @@ func IncActorEventsBackfilled() {
 	actorEventsBackfilled.Add(1)
 }
 
+func IncBridgeTokensMinted() {
+	bridgeTokensMinted.Add(1)
+}
+
+func IncBridgeTokensRevoked() {
+	bridgeTokensRevoked.Add(1)
+}
+
+func IncBridgeTokensRotated() {
+	bridgeTokensRotated.Add(1)
+}
+
+func IncBridgeTokenAuthFailures() {
+	bridgeTokenAuthFailures.Add(1)
+}
+
+func IncPATCredentialsProvisioned() {
+	patCredentialsProvisioned.Add(1)
+}
+
+func IncPATProvisionFailures() {
+	patProvisionFailures.Add(1)
+}
+
+func IncPATCredentialsRetired() {
+	patCredentialsRetired.Add(1)
+}
+
 func Snapshot() map[string]int64 {
 	return map[string]int64{
 		"announcement_events_received":    announcementEventsReceived.Load(),
@@ -176,5 +211,12 @@ func Snapshot() map[string]int64 {
 		"bridge_signed_fallback":          bridgeSignedFallback.Load(),
 		"unlinked_actor_skipped":          unlinkedActorSkipped.Load(),
 		"actor_events_backfilled":         actorEventsBackfilled.Load(),
+		"bridge_tokens_minted":            bridgeTokensMinted.Load(),
+		"bridge_tokens_revoked":           bridgeTokensRevoked.Load(),
+		"bridge_tokens_rotated":           bridgeTokensRotated.Load(),
+		"bridge_token_auth_failures":      bridgeTokenAuthFailures.Load(),
+		"pat_credentials_provisioned":     patCredentialsProvisioned.Load(),
+		"pat_provision_failures":          patProvisionFailures.Load(),
+		"pat_credentials_retired":         patCredentialsRetired.Load(),
 	}
 }

@@ -136,6 +136,14 @@ func (c *Client) CreateUserAccessToken(ctx context.Context, username, tokenName 
 	if token.Token == "" {
 		return AccessToken{}, fmt.Errorf("gitea returned no token plaintext for %q", username)
 	}
+	// Without a usable id, deletion would target /tokens/0; without the exact
+	// requested name, the record could not be reconciled by name either.
+	if token.ID <= 0 {
+		return AccessToken{}, fmt.Errorf("gitea returned no usable token id for %q", username)
+	}
+	if token.Name != tokenName {
+		return AccessToken{}, fmt.Errorf("gitea returned token name %q, want %q", token.Name, tokenName)
+	}
 	return token, nil
 }
 

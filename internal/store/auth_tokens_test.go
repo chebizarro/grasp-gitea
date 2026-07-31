@@ -57,6 +57,69 @@ func TestSchemaMigrationIdempotent(t *testing.T) {
 	_ = st2.Close()
 }
 
+// TestUpgradeFromPR1ASchemaAddsTokenIDColumn simulates upgrading a database
+// whose gitea_pat_credentials table predates gitea_token_id. CREATE TABLE IF
+// NOT EXISTS cannot add the column, so an explicit migration must.
+func TestUpgradeFromPR1ASchemaAddsTokenIDColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "upgrade.db")
+
+	legacy, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	// Exact PR 1A definition: no gitea_token_id.
+	if _, err := legacy.Exec(`CREATE TABLE gitea_pat_credentials (
+		gitea_user_id INTEGER NOT NULL,
+		generation INTEGER NOT NULL,
+		gitea_user TEXT NOT NULL,
+		pat_name TEXT NOT NULL UNIQUE,
+		pat_ciphertext BLOB NOT NULL,
+		key_id TEXT NOT NULL,
+		gitea_scopes TEXT NOT NULL,
+		state TEXT NOT NULL CHECK(state IN ('provisioning', 'active', 'retiring', 'orphaned', 'error')),
+		created_at TEXT NOT NULL,
+		activated_at TEXT NOT NULL DEFAULT '',
+		retired_at TEXT NOT NULL DEFAULT '',
+		delete_attempts INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY (gitea_user_id, generation)
+	)`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO gitea_pat_credentials
+		(gitea_user_id, generation, gitea_user, pat_name, pat_ciphertext, key_id, gitea_scopes, state, created_at)
+		VALUES(1, 1, 'legacy', 'grasp-bridge-1-1', X'0102', 'k1', '["write:repository"]', 'active', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("open upgraded store: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	cred, err := st.GetActivePATCredential(ctx, 1)
+	if err != nil {
+		t.Fatalf("read legacy credential after upgrade: %v", err)
+	}
+	if cred.PATName != "grasp-bridge-1-1" || cred.GiteaTokenID != 0 {
+		t.Fatalf("legacy credential = %+v", cred)
+	}
+
+	// New provisioning must work against the upgraded table.
+	gen, _, err := st.ReservePATCredential(ctx, 2, "fresh", "grasp-bridge", []string{"write:repository"}, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("reserve after upgrade: %v", err)
+	}
+	if err := st.FinalizePATCredential(ctx, 2, gen, 77, []byte{9}, "k1"); err != nil {
+		t.Fatalf("finalize after upgrade: %v", err)
+	}
+}
+
 func TestBridgeTokenInsertGetAndState(t *testing.T) {
 	st := openAuthTokenTestStore(t)
 	ctx := context.Background()
@@ -408,6 +471,157 @@ func TestReservePATCredentialConcurrentGenerations(t *testing.T) {
 			t.Fatalf("generation %d assigned twice", gens[i])
 		}
 		seen[gens[i]] = true
+	}
+}
+
+func TestTouchBridgeTokenUsageIsConditional(t *testing.T) {
+	st := openAuthTokenTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	tok := testBridgeToken("tok", "pk", 1, now, time.Hour)
+	if err := st.InsertBridgeToken(ctx, tok, 0); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	cutoff := now.Add(-5 * time.Minute)
+	if err := st.TouchBridgeTokenUsage(ctx, "tok", now, cutoff); err != nil {
+		t.Fatalf("first touch: %v", err)
+	}
+	got, err := st.GetBridgeTokenByHash(ctx, tok.TokenHash)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !got.LastUsedAt.Equal(now) {
+		t.Fatalf("LastUsedAt = %v, want %v", got.LastUsedAt, now)
+	}
+
+	// A racing request with a stale view must not move the timestamp back:
+	// last_used_at is already newer than the cutoff.
+	later := now.Add(time.Minute)
+	if err := st.TouchBridgeTokenUsage(ctx, "tok", later, cutoff); err != nil {
+		t.Fatalf("second touch: %v", err)
+	}
+	got, err = st.GetBridgeTokenByHash(ctx, tok.TokenHash)
+	if err != nil {
+		t.Fatalf("get after second touch: %v", err)
+	}
+	if !got.LastUsedAt.Equal(now) {
+		t.Fatalf("LastUsedAt = %v, want unchanged %v (write throttle must live in SQL)", got.LastUsedAt, now)
+	}
+
+	// Once the window has passed, the write lands.
+	if err := st.TouchBridgeTokenUsage(ctx, "tok", later, now); err != nil {
+		t.Fatalf("third touch: %v", err)
+	}
+	got, err = st.GetBridgeTokenByHash(ctx, tok.TokenHash)
+	if err != nil {
+		t.Fatalf("get after third touch: %v", err)
+	}
+	if !got.LastUsedAt.Equal(later) {
+		t.Fatalf("LastUsedAt = %v, want %v", got.LastUsedAt, later)
+	}
+}
+
+func TestResealPATCredentialCompareAndSwap(t *testing.T) {
+	st := openAuthTokenTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	gen, _, err := st.ReservePATCredential(ctx, 3, "u3", "pat", []string{"write:repository"}, now)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	original := []byte{1, 2, 3}
+	if err := st.FinalizePATCredential(ctx, 3, gen, 5, original, "old"); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if err := st.ActivatePATCredential(ctx, 3, gen, now); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	if err := st.ResealPATCredential(ctx, 3, gen, original, []byte{4, 5, 6}, "new"); err != nil {
+		t.Fatalf("reseal: %v", err)
+	}
+	cred, err := st.GetActivePATCredential(ctx, 3)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if cred.KeyID != "new" || string(cred.Ciphertext) != string([]byte{4, 5, 6}) {
+		t.Fatalf("cred = %+v", cred)
+	}
+
+	// A stale reseal (expecting the old ciphertext) must not clobber.
+	if err := st.ResealPATCredential(ctx, 3, gen, original, []byte{7}, "stale"); err != nil {
+		t.Fatalf("stale reseal: %v", err)
+	}
+	cred, err = st.GetActivePATCredential(ctx, 3)
+	if err != nil {
+		t.Fatalf("get after stale: %v", err)
+	}
+	if cred.KeyID != "new" {
+		t.Fatalf("stale reseal clobbered row: %+v", cred)
+	}
+}
+
+func TestListGiteaUsersWithoutActiveTokens(t *testing.T) {
+	st := openAuthTokenTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	for _, userID := range []int64{1, 2, 3} {
+		gen, _, err := st.ReservePATCredential(ctx, userID, fmt.Sprintf("u%d", userID), "pat", []string{"write:repository"}, now)
+		if err != nil {
+			t.Fatalf("reserve %d: %v", userID, err)
+		}
+		if err := st.FinalizePATCredential(ctx, userID, gen, userID, []byte{byte(userID)}, "k"); err != nil {
+			t.Fatalf("finalize %d: %v", userID, err)
+		}
+		if err := st.ActivatePATCredential(ctx, userID, gen, now); err != nil {
+			t.Fatalf("activate %d: %v", userID, err)
+		}
+	}
+
+	// user 1: active token. user 2: revoked long ago (with a far-future
+	// expiry, proving revocation ends usability). user 3: expired long ago.
+	if err := st.InsertBridgeToken(ctx, testBridgeToken("live", "pk1", 1, now, time.Hour), 0); err != nil {
+		t.Fatalf("insert live: %v", err)
+	}
+	old := now.Add(-48 * time.Hour)
+	if err := st.InsertBridgeToken(ctx, testBridgeToken("revoked", "pk2", 2, old, 30*24*time.Hour), 0); err != nil {
+		t.Fatalf("insert revoked: %v", err)
+	}
+	if err := st.RevokeBridgeToken(ctx, "pk2", "revoked", old.Add(time.Hour)); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if err := st.InsertBridgeToken(ctx, testBridgeToken("expired", "pk3", 3, old, time.Hour), 0); err != nil {
+		t.Fatalf("insert expired: %v", err)
+	}
+
+	idle, err := st.ListGiteaUsersWithoutActiveTokens(ctx, now, 100)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if _, present := idle[1]; present {
+		t.Fatal("user with an active token queued for retirement")
+	}
+	if len(idle) != 2 {
+		t.Fatalf("idle = %+v, want users 2 and 3", idle)
+	}
+	for _, userID := range []int64{2, 3} {
+		since, ok := idle[userID]
+		if !ok || since.IsZero() || now.Sub(since) < 20*time.Hour {
+			t.Fatalf("user %d retirement basis = %v", userID, since)
+		}
+	}
+
+	n, err := st.RetireActivePATCredential(ctx, 2)
+	if err != nil || n != 1 {
+		t.Fatalf("retire = %d err=%v", n, err)
+	}
+	pending, err := st.ListPATCredentialsPendingDeletion(ctx, 10)
+	if err != nil || len(pending) != 1 || pending[0].GiteaUserID != 2 {
+		t.Fatalf("pending = %+v err=%v", pending, err)
 	}
 }
 

@@ -271,13 +271,92 @@ func (s *SQLiteStore) CountActiveBridgeTokensForGiteaUser(ctx context.Context, g
 	return n, err
 }
 
-// TouchBridgeTokenUsage records last_used_at. Callers throttle invocation (at
-// most once per usage window) so hot paths avoid a write per request.
-func (s *SQLiteStore) TouchBridgeTokenUsage(ctx context.Context, id string, now time.Time) error {
+// TouchBridgeTokenUsage records last_used_at only when the previous value is
+// older than cutoff. The condition lives in SQL so concurrent proxy requests
+// that all observe the same stale value still produce a single write.
+func (s *SQLiteStore) TouchBridgeTokenUsage(ctx context.Context, id string, now, cutoff time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE bridge_tokens SET last_used_at = ? WHERE id = ?
-	`, now.UTC().Format(time.RFC3339), id)
+		UPDATE bridge_tokens SET last_used_at = ?
+		WHERE id = ? AND (last_used_at = '' OR last_used_at <= ?)
+	`, now.UTC().Format(time.RFC3339), id, cutoff.UTC().Format(time.RFC3339))
 	return err
+}
+
+// ResealPATCredential swaps a PAT's ciphertext to a new key, but only if the
+// row still holds the ciphertext the caller decrypted (compare-and-swap), so
+// a concurrent rotation is never clobbered.
+func (s *SQLiteStore) ResealPATCredential(ctx context.Context, giteaUserID, generation int64, expectedCiphertext, ciphertext []byte, keyID string) error {
+	if len(ciphertext) == 0 || keyID == "" {
+		return fmt.Errorf("pat reseal requires ciphertext and key id")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE gitea_pat_credentials SET pat_ciphertext = ?, key_id = ?
+		WHERE gitea_user_id = ? AND generation = ? AND pat_ciphertext = ?
+	`, ciphertext, keyID, giteaUserID, generation, expectedCiphertext)
+	return err
+}
+
+// ListGiteaUsersWithoutActiveTokens returns Gitea user ids that hold an active
+// PAT but no unexpired, unrevoked bridge token, mapped to the most recent
+// instant any of their tokens was still usable. Retirement grace is measured
+// from that instant. A token ceases to be usable when it is revoked or when
+// it expires, whichever happens first — a revoked token's later expires_at is
+// not a usable moment.
+func (s *SQLiteStore) ListGiteaUsersWithoutActiveTokens(ctx context.Context, now time.Time, limit int) (map[int64]time.Time, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	nowStr := now.UTC().Format(time.RFC3339)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT c.gitea_user_id, COALESCE(MAX(
+			CASE WHEN t.revoked_at != '' AND t.revoked_at < t.expires_at
+			     THEN t.revoked_at ELSE t.expires_at END), '')
+		FROM gitea_pat_credentials c
+		LEFT JOIN bridge_tokens t ON t.gitea_user_id = c.gitea_user_id
+		WHERE c.state = ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM bridge_tokens a
+			WHERE a.gitea_user_id = c.gitea_user_id AND a.revoked_at = '' AND a.expires_at > ?
+		  )
+		GROUP BY c.gitea_user_id
+		LIMIT ?
+	`, PATStateActive, nowStr, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[int64]time.Time{}
+	for rows.Next() {
+		var userID int64
+		var lastUsable string
+		if err := rows.Scan(&userID, &lastUsable); err != nil {
+			return nil, err
+		}
+		var since time.Time
+		if lastUsable != "" {
+			parsed, err := time.Parse(time.RFC3339, lastUsable)
+			if err != nil {
+				return nil, fmt.Errorf("parse token retirement basis for user %d: %w", userID, err)
+			}
+			since = parsed
+		}
+		out[userID] = since
+	}
+	return out, rows.Err()
+}
+
+// RetireActivePATCredential moves a user's active PAT into the pending
+// deletion queue (state retiring, retired_at unset).
+func (s *SQLiteStore) RetireActivePATCredential(ctx context.Context, giteaUserID int64) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE gitea_pat_credentials SET state = ?, retired_at = ''
+		WHERE gitea_user_id = ? AND state = ?
+	`, PATStateRetiring, giteaUserID, PATStateActive)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // ReservePATCredential atomically assigns the next generation for a Gitea

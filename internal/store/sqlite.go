@@ -477,6 +477,14 @@ func Open(path string) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate purgatory ordering: %w", err)
 	}
+
+	// Migration: hidden-PAT rows created before Gitea's numeric token id was
+	// tracked. CREATE TABLE IF NOT EXISTS cannot add it to an existing table,
+	// and without it PAT finalization and every PAT scan fail.
+	if err := ensureSQLiteColumn(db, "gitea_pat_credentials", "gitea_token_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate gitea pat token id: %w", err)
+	}
 	if _, err := db.Exec(`UPDATE mappings SET announcement_created_at = CAST(json_extract(announcement_event_json, '$.created_at') AS INTEGER) WHERE announcement_created_at = 0 AND announcement_event_json != '' AND json_valid(announcement_event_json)`); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("backfill announcement ordering: %w", err)
