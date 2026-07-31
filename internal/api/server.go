@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
+	"github.com/sharegap/grasp-gitea/internal/giteaproxy"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
@@ -28,9 +29,7 @@ type Server struct {
 	mirrorCallbackToken string
 	webhookHandler      http.Handler // Gitea webhook handler for NIP-34 events
 	routeRegistrars     []func(*http.ServeMux)
-	giteaURL            string
-	gitBackendUser      string
-	gitBackendPassword  string
+	giteaProxy          *giteaproxy.Proxy
 	rootRelayHandler    http.Handler
 	signerAuthorizer    SignerAuthorizer
 }
@@ -41,16 +40,43 @@ type SignerAuthorizer interface {
 }
 
 func New(cfg config.Config, provisionerSvc *provisioner.Service, publisherSvc *publisher.Service, st *store.SQLiteStore, logger *slog.Logger) *Server {
-	return &Server{
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	s := &Server{
 		provisioner:         provisionerSvc,
 		publisher:           publisherSvc,
 		store:               st,
 		logger:              logger,
 		apiToken:            cfg.AdminAPIToken,
 		mirrorCallbackToken: cfg.MirrorCallbackToken,
-		giteaURL:            cfg.GiteaURL,
-		gitBackendUser:      cfg.GitBackendUser,
-		gitBackendPassword:  cfg.GitBackendPassword,
+	}
+	// A proxy without a token authenticator or repository inspector still
+	// serves anonymous public traffic; main injects the fully wired one.
+	// An unset GiteaURL simply means this Server does not proxy git.
+	if cfg.GiteaURL != "" {
+		proxy, err := giteaproxy.New(giteaproxy.Config{
+			GiteaURL:           cfg.GiteaURL,
+			PublicURL:          cfg.BridgePublicURL,
+			EdgeSharedSecret:   cfg.EdgeSharedSecret,
+			GitBackendUser:     cfg.GitBackendUser,
+			GitBackendPassword: cfg.GitBackendPassword,
+			FullProxy:          cfg.FullProxyEnabled,
+		}, nil, nil, st, logger)
+		if err != nil {
+			logger.Error("gitea proxy unavailable; git smart-HTTP will fail", "gitea_url", cfg.GiteaURL, "error", err)
+		} else {
+			s.giteaProxy = proxy
+		}
+	}
+	return s
+}
+
+// SetGiteaProxy installs the fully wired streaming proxy (token
+// authentication and live repository visibility).
+func (s *Server) SetGiteaProxy(p *giteaproxy.Proxy) {
+	if p != nil {
+		s.giteaProxy = p
 	}
 }
 
@@ -99,7 +125,7 @@ func (s *Server) Handler() http.Handler {
 		register(mux)
 	}
 
-	mux.HandleFunc("/", s.gitHTTPNpubProxy)
+	mux.HandleFunc("/", s.rootHandler)
 
 	return mux
 }

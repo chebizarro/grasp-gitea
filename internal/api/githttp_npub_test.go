@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
+	"github.com/sharegap/grasp-gitea/internal/gitea"
+	"github.com/sharegap/grasp-gitea/internal/giteaproxy"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -19,6 +21,46 @@ type observedGitBackendRequest struct {
 	path     string
 	rawQuery string
 }
+
+// stubRepoInspector models Gitea's live repository visibility, which the
+// proxy consults before serving anonymous mapped-npub traffic.
+type stubRepoInspector struct {
+	id      int64
+	private bool
+	err     error
+}
+
+func (s stubRepoInspector) GetRepo(_ context.Context, org, repo string) (gitea.Repository, error) {
+	if s.err != nil {
+		return gitea.Repository{}, s.err
+	}
+	return gitea.Repository{ID: s.id, Owner: org, Name: repo, Private: s.private}, nil
+}
+
+// newGitProxyTestServer builds a Server whose proxy sees the supplied
+// repository visibility. Passing a nil inspector exercises the fail-closed
+// path where visibility cannot be determined.
+func newGitProxyTestServer(t *testing.T, cfg config.Config, st *store.SQLiteStore, inspector giteaproxy.RepositoryInspector) *Server {
+	t.Helper()
+	srv := New(cfg, nil, nil, st, testLogger())
+	proxy, err := giteaproxy.New(giteaproxy.Config{
+		GiteaURL:           cfg.GiteaURL,
+		PublicURL:          cfg.BridgePublicURL,
+		EdgeSharedSecret:   cfg.EdgeSharedSecret,
+		GitBackendUser:     cfg.GitBackendUser,
+		GitBackendPassword: cfg.GitBackendPassword,
+		FullProxy:          cfg.FullProxyEnabled,
+	}, nil, inspector, nil, testLogger())
+	if err != nil {
+		t.Fatalf("build proxy: %v", err)
+	}
+	srv.SetGiteaProxy(proxy)
+	return srv
+}
+
+// publicRepo describes a public repository whose live Gitea id matches the
+// seeded mapping, which the proxy verifies before serving.
+func publicRepo(id int64) stubRepoInspector { return stubRepoInspector{id: id} }
 
 func TestGitHTTPNpubProxyRewritesToMappedGiteaRepo(t *testing.T) {
 	ctx := context.Background()
@@ -41,7 +83,7 @@ func TestGitHTTPNpubProxyRewritesToMappedGiteaRepo(t *testing.T) {
 		SourceEvent: "event1",
 	})
 
-	srv := New(config.Config{GiteaURL: backend.URL}, nil, nil, st, testLogger())
+	srv := newGitProxyTestServer(t, config.Config{GiteaURL: backend.URL}, st, publicRepo(101))
 	req := httptest.NewRequest(http.MethodGet, "/npub1owner/repo%20one.git/info/refs?service=git-upload-pack", nil)
 	w := httptest.NewRecorder()
 
@@ -75,7 +117,7 @@ func TestGitHTTPNpubProxyUnknownMappingReturns404(t *testing.T) {
 	defer backend.Close()
 
 	st := openGitHTTPProxyTestStore(t)
-	srv := New(config.Config{GiteaURL: backend.URL}, nil, nil, st, testLogger())
+	srv := newGitProxyTestServer(t, config.Config{GiteaURL: backend.URL}, st, publicRepo(1))
 	req := httptest.NewRequest(http.MethodGet, "/npub1missing/unknown.git/info/refs?service=git-upload-pack", nil)
 	w := httptest.NewRecorder()
 
@@ -94,7 +136,7 @@ func TestGitHTTPNpubProxyUnknownMappingReturns404(t *testing.T) {
 
 func TestGitHTTPNpubProxyOptionsReturns204WithCORS(t *testing.T) {
 	st := openGitHTTPProxyTestStore(t)
-	srv := New(config.Config{GiteaURL: "http://gitea.invalid"}, nil, nil, st, testLogger())
+	srv := newGitProxyTestServer(t, config.Config{GiteaURL: "http://gitea.invalid"}, st, publicRepo(1))
 	req := httptest.NewRequest(http.MethodOptions, "/npub1owner/repo.git/info/refs?service=git-upload-pack", nil)
 	w := httptest.NewRecorder()
 
@@ -127,7 +169,7 @@ func TestGitHTTPNpubProxyDecodesPercentEncodedIdentifier(t *testing.T) {
 		SourceEvent: "event2",
 	})
 
-	srv := New(config.Config{GiteaURL: backend.URL}, nil, nil, st, testLogger())
+	srv := newGitProxyTestServer(t, config.Config{GiteaURL: backend.URL}, st, publicRepo(102))
 	req := httptest.NewRequest(http.MethodPost, "/npub1owner/repo%2Fwith%20space.git/git-upload-pack", nil)
 	w := httptest.NewRecorder()
 
@@ -202,11 +244,11 @@ func TestGitHTTPNpubProxyStripsCallerCredentialsAndInjectsServiceIdentity(t *tes
 		CloneURL: backend.URL + "/org/repo.git", SourceEvent: "event1",
 	})
 
-	srv := New(config.Config{
+	srv := newGitProxyTestServer(t, config.Config{
 		GiteaURL:           backend.URL,
 		GitBackendUser:     "grasp-bridge",
 		GitBackendPassword: "service-secret",
-	}, nil, nil, st, testLogger())
+	}, st, publicRepo(1))
 
 	req := httptest.NewRequest(http.MethodGet, "/npub1owner/repo.git/info/refs?service=git-upload-pack", nil)
 	req.Header.Set("Authorization", "Basic Y2FsbGVyOnNlY3JldA==")
@@ -248,12 +290,15 @@ func TestGitHTTPNpubProxyForwardsNoCredentialsWhenUnconfigured(t *testing.T) {
 		CloneURL: backend.URL + "/org/repo.git", SourceEvent: "event1",
 	})
 
-	srv := New(config.Config{GiteaURL: backend.URL}, nil, nil, st, testLogger())
+	srv := newGitProxyTestServer(t, config.Config{GiteaURL: backend.URL}, st, publicRepo(1))
 	req := httptest.NewRequest(http.MethodGet, "/npub1owner/repo.git/info/refs?service=git-upload-pack", nil)
 	req.Header.Set("Authorization", "Basic Y2FsbGVyOnNlY3JldA==")
 	w := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w, req)
 
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
 	if got := <-backendAuth; got != "" {
 		t.Fatalf("expected no credentials forwarded to backend, got %q", got)
 	}
@@ -275,7 +320,7 @@ func TestGitHTTPNpubProxyNeverSurfacesGiteaBasicChallenge(t *testing.T) {
 		CloneURL: backend.URL + "/org/repo.git", SourceEvent: "event1",
 	})
 
-	srv := New(config.Config{GiteaURL: backend.URL}, nil, nil, st, testLogger())
+	srv := newGitProxyTestServer(t, config.Config{GiteaURL: backend.URL}, st, publicRepo(1))
 	req := httptest.NewRequest(http.MethodGet, "/npub1owner/repo.git/info/refs?service=git-receive-pack", nil)
 	w := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w, req)

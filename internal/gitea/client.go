@@ -47,6 +47,16 @@ type Repository struct {
 	SSHURL   string `json:"ssh_url"`
 	HTMLURL  string `json:"html_url"`
 	Private  bool   `json:"private"`
+	// Internal marks a non-private repository owned by a private
+	// organization. Gitea computes it as !IsPrivate && owner is private, so
+	// Private alone does not imply the repository is publicly readable.
+	Internal bool `json:"internal"`
+}
+
+// PubliclyReadable reports whether unauthenticated users may read the
+// repository. Anonymous GRASP access requires this to be true.
+func (r Repository) PubliclyReadable() bool {
+	return !r.Private && !r.Internal
 }
 
 // AccessToken is a Gitea personal access token. Token carries the plaintext
@@ -505,6 +515,7 @@ func parseRepo(resp []byte) (Repository, error) {
 		SSHURL   string `json:"ssh_url"`
 		HTMLURL  string `json:"html_url"`
 		Private  bool   `json:"private"`
+		Internal bool   `json:"internal"`
 		Owner    struct {
 			UserName string `json:"username"`
 		} `json:"owner"`
@@ -520,6 +531,7 @@ func parseRepo(resp []byte) (Repository, error) {
 		SSHURL:   raw.SSHURL,
 		HTMLURL:  raw.HTMLURL,
 		Private:  raw.Private,
+		Internal: raw.Internal,
 	}, nil
 }
 

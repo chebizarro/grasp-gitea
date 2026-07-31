@@ -39,6 +39,9 @@ func b64Key(seed byte) string {
 	return base64.StdEncoding.EncodeToString(key)
 }
 
+// testEdgeSecret is a 32-byte-equivalent secret satisfying the strength rule.
+var testEdgeSecret = strings.Repeat("e", minEdgeSecretLength)
+
 func TestParseCredentialKeysRing(t *testing.T) {
 	keys, err := parseCredentialKeys("current:" + b64Key(1) + ", older:" + b64Key(2))
 	if err != nil {
@@ -94,6 +97,11 @@ func TestBridgeTokensConfigValidation(t *testing.T) {
 	}
 
 	t.Setenv("GITEA_FULL_PROXY_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "GRASP_EDGE_SHARED_SECRET") {
+		t.Fatalf("full proxy with browser auth and no edge secret accepted: %v", err)
+	}
+
+	t.Setenv("GRASP_EDGE_SHARED_SECRET", testEdgeSecret)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("valid bridge-token config rejected: %v", err)
@@ -116,7 +124,14 @@ func TestFullProxyRequiresEdgeSecretInProduction(t *testing.T) {
 		t.Fatalf("production full proxy without edge secret accepted: %v", err)
 	}
 
+	// A short, guessable secret is rejected: it authorizes arbitrary
+	// X-Grasp-Auth-User impersonation.
 	t.Setenv("GRASP_EDGE_SHARED_SECRET", "edge-secret")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "at least") {
+		t.Fatalf("weak edge secret accepted: %v", err)
+	}
+
+	t.Setenv("GRASP_EDGE_SHARED_SECRET", testEdgeSecret)
 	if _, err := Load(); err != nil {
 		t.Fatalf("valid production full-proxy config rejected: %v", err)
 	}

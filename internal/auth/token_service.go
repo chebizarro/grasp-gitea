@@ -159,6 +159,7 @@ func (t *TokenService) Enabled() bool {
 	return t != nil
 }
 
+
 // MintRequest is the mint/rotate input.
 type MintRequest struct {
 	Name       string   `json:"name"`
@@ -240,7 +241,16 @@ func (t *TokenService) Mint(ctx context.Context, pubkey, eventID string, req Min
 	if err := t.verifyIdentityLink(ctx, identity); err != nil {
 		return MintResult{}, err
 	}
-	if err := t.ensureActivePAT(ctx, identity.GiteaUserID, identity.GiteaUser); err != nil {
+
+	// Hold the user's lifecycle lock across PAT provisioning AND token
+	// insertion. Without it, the retirement sweep could delete the PAT between
+	// the two steps, leaving a token that authenticates but has no downstream
+	// credential.
+	lock := t.userLock(identity.GiteaUserID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if err := t.ensureActivePATLocked(ctx, identity.GiteaUserID, identity.GiteaUser); err != nil {
 		return MintResult{}, err
 	}
 
@@ -594,17 +604,21 @@ func (t *TokenService) quarantineIdentity(ctx context.Context, identity Resolved
 	})
 }
 
-// ensureActivePAT guarantees one active encrypted Gitea PAT for the user,
-// following reserve -> create -> encrypt -> finalize -> activate. A PAT
+// userLock returns the striped lifecycle lock for a Gitea user. It serializes
+// PAT provisioning, token insertion, and PAT retirement against each other.
+func (t *TokenService) userLock(giteaUserID int64) *sync.Mutex {
+	return &t.userLocks[uint64(giteaUserID)%uint64(len(t.userLocks))]
+}
+
+// ensureActivePATLocked guarantees one active encrypted Gitea PAT for the
+// user, following reserve -> create -> encrypt -> finalize -> activate. A PAT
 // created in Gitea but not durably persisted is deleted immediately; if that
 // deletion also fails the row is marked error for operator reconciliation.
 // Once creation may have happened, persistence and rollback run on a detached
 // context so a disconnecting client cannot strand a live Gitea PAT.
-func (t *TokenService) ensureActivePAT(ctx context.Context, giteaUserID int64, giteaUser string) error {
-	lock := &t.userLocks[uint64(giteaUserID)%uint64(len(t.userLocks))]
-	lock.Lock()
-	defer lock.Unlock()
-
+//
+// The caller must hold the user's lifecycle lock.
+func (t *TokenService) ensureActivePATLocked(ctx context.Context, giteaUserID int64, giteaUser string) error {
 	if _, err := t.store.GetActivePATCredential(ctx, giteaUserID); err == nil {
 		return nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -693,6 +707,32 @@ func (t *TokenService) ensureActivePAT(ctx context.Context, giteaUserID int64, g
 	return nil
 }
 
+// retireUserPAT retires one user's idle PAT under their lifecycle lock, and
+// re-checks inside the lock that no token became active in the meantime.
+func (t *TokenService) retireUserPAT(ctx context.Context, giteaUserID int64, now time.Time) {
+	lock := t.userLock(giteaUserID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	active, err := t.store.CountActiveBridgeTokensForGiteaUser(ctx, giteaUserID, now)
+	if err != nil {
+		t.logger.Warn("PAT retirement re-check failed", "gitea_user_id", giteaUserID, "error", err)
+		return
+	}
+	if active > 0 {
+		// A token was minted between the scan and this lock.
+		return
+	}
+	n, err := t.store.RetireActivePATCredential(ctx, giteaUserID)
+	if err != nil {
+		t.logger.Warn("PAT retirement failed", "gitea_user_id", giteaUserID, "error", err)
+		return
+	}
+	if n > 0 {
+		t.logger.Info("queued idle hidden PAT for deletion", "gitea_user_id", giteaUserID)
+	}
+}
+
 // reconcileAmbiguousPAT deletes a possibly-created PAT by its reserved unique
 // name. A 404 means Gitea never committed it, which is equally fine.
 func (t *TokenService) reconcileAmbiguousPAT(ctx context.Context, giteaUser, patName string) {
@@ -718,14 +758,7 @@ func (t *TokenService) retireIdlePATs(ctx context.Context) {
 			if lastUsable.IsZero() || now.Sub(lastUsable) < patRetirementGrace {
 				continue
 			}
-			n, err := t.store.RetireActivePATCredential(ctx, giteaUserID)
-			if err != nil {
-				t.logger.Warn("PAT retirement failed", "gitea_user_id", giteaUserID, "error", err)
-				continue
-			}
-			if n > 0 {
-				t.logger.Info("queued idle hidden PAT for deletion", "gitea_user_id", giteaUserID)
-			}
+			t.retireUserPAT(ctx, giteaUserID, now)
 		}
 	}
 

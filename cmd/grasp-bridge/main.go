@@ -21,6 +21,7 @@ import (
 	cashuwallet "github.com/sharegap/grasp-gitea/internal/cashu"
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
+	"github.com/sharegap/grasp-gitea/internal/giteaproxy"
 	"github.com/sharegap/grasp-gitea/internal/hiveci"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
 	"github.com/sharegap/grasp-gitea/internal/loom"
@@ -281,6 +282,7 @@ func main() {
 	}
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
+	var bridgeTokenSvc *auth.TokenService
 	if relayRootHandler != nil {
 		// GRASP-01: serve the Nostr relay (WebSocket) and NIP-11 negotiation
 		// at the canonical service root on the public listener.
@@ -317,8 +319,35 @@ func main() {
 			tokenHandler := auth.NewTokenHandler(authSvc, tokenSvc, logger)
 			apiServer.AddRouteRegistrar(tokenHandler.RegisterRoutes)
 			go tokenSvc.RunMaintenance(ctx)
+			bridgeTokenSvc = tokenSvc
 			logger.Info("bridge token service enabled", "scopes", tokenSvc.EnabledScopes())
 		}
+	}
+
+	// The streaming proxy is the sole path to Gitea. It authenticates bridge
+	// tokens, injects hidden per-user PATs, and checks live repository
+	// visibility before serving anonymous mapped-npub traffic.
+	// Assign through the interface variable: a typed nil *TokenService would
+	// box into a non-nil interface and defeat the proxy's disabled check.
+	var proxyAuthenticator giteaproxy.Authenticator
+	if bridgeTokenSvc != nil {
+		proxyAuthenticator = bridgeTokenSvc
+	}
+	giteaProxy, err := giteaproxy.New(giteaproxy.Config{
+		GiteaURL:           cfg.GiteaURL,
+		PublicURL:          cfg.BridgePublicURL,
+		EdgeSharedSecret:   cfg.EdgeSharedSecret,
+		GitBackendUser:     cfg.GitBackendUser,
+		GitBackendPassword: cfg.GitBackendPassword,
+		FullProxy:          cfg.FullProxyEnabled,
+	}, proxyAuthenticator, giteaClient, st, logger)
+	if err != nil {
+		logger.Error("failed to initialize Gitea proxy", "error", err)
+		os.Exit(1)
+	}
+	apiServer.SetGiteaProxy(giteaProxy)
+	if cfg.FullProxyEnabled {
+		logger.Info("full Gitea reverse proxy enabled; all unmatched traffic is proxied to Gitea")
 	}
 
 	// Wire webhook handler for NIP-34 events (PRs, issues, patches, labels)

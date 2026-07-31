@@ -133,6 +133,10 @@ type CredentialKey struct {
 	Key []byte
 }
 
+// minEdgeSecretLength is the shortest accepted GRASP_EDGE_SHARED_SECRET. It
+// corresponds to 32 random bytes in base64/hex form.
+const minEdgeSecretLength = 43
+
 func Load() (Config, error) {
 	cfg := Config{
 		GiteaURL:                envOrDefault("GITEA_URL", "http://gitea:3000"),
@@ -318,6 +322,14 @@ func Load() (Config, error) {
 		if !cfg.FullProxyEnabled {
 			return Config{}, fmt.Errorf("GITEA_FULL_PROXY_ENABLED=true is required when BRIDGE_TOKENS_ENABLED=true; minting tokens without downstream Gitea isolation would allow scope bypass")
 		}
+	}
+	// The edge secret authorizes arbitrary X-Grasp-Auth-User impersonation, so
+	// a guessable value is equivalent to an authentication bypass.
+	if cfg.EdgeSharedSecret != "" && len(cfg.EdgeSharedSecret) < minEdgeSecretLength {
+		return Config{}, fmt.Errorf("GRASP_EDGE_SHARED_SECRET must be at least %d characters of high-entropy random data", minEdgeSecretLength)
+	}
+	if cfg.FullProxyEnabled && cfg.AuthEnabled && cfg.EdgeSharedSecret == "" {
+		return Config{}, fmt.Errorf("GRASP_EDGE_SHARED_SECRET is required when GITEA_FULL_PROXY_ENABLED=true and AUTH_ENABLED=true; browser session handoff cannot be authenticated without it")
 	}
 	if cfg.Production() && cfg.FullProxyEnabled && cfg.EdgeSharedSecret == "" {
 		return Config{}, fmt.Errorf("GRASP_EDGE_SHARED_SECRET is required in production when GITEA_FULL_PROXY_ENABLED=true")

@@ -1,0 +1,601 @@
+// Copyright 2026 Sharegap contributors. All rights reserved.
+// Use of this source code is governed by a BSD-style license.
+
+package giteaproxy
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/sharegap/grasp-gitea/internal/auth"
+	"github.com/sharegap/grasp-gitea/internal/gitea"
+	"github.com/sharegap/grasp-gitea/internal/store"
+)
+
+// Authenticator resolves bridge tokens and their hidden downstream
+// credentials. *auth.TokenService satisfies it.
+type Authenticator interface {
+	Enabled() bool
+	Authenticate(ctx context.Context, token string) (auth.TokenPrincipal, error)
+	DownstreamPAT(ctx context.Context, giteaUserID int64) (login string, pat string, err error)
+}
+
+// RepositoryInspector reports current repository metadata. *gitea.Client
+// satisfies it. Visibility is read live: a cached value could expose a
+// repository in the window after it is made private.
+type RepositoryInspector interface {
+	GetRepo(ctx context.Context, org string, repo string) (gitea.Repository, error)
+}
+
+// Auditor records authorization outcomes. *store.SQLiteStore satisfies it.
+type Auditor interface {
+	InsertAuthAuditEvent(ctx context.Context, ev store.AuthAuditEvent) error
+}
+
+// Config configures the proxy.
+type Config struct {
+	// GiteaURL is the fixed upstream origin. It is parsed once at startup and
+	// is never derived from request headers, redirects, or query values.
+	GiteaURL string
+	// PublicURL is the canonical public origin used to rewrite backend-origin
+	// URLs in responses.
+	PublicURL string
+	// EdgeSharedSecret authenticates nginx-supplied session-handoff headers.
+	EdgeSharedSecret string
+	// GitBackendUser/Password is the narrow service identity used for
+	// anonymous access to public mapped npub repositories.
+	GitBackendUser     string
+	GitBackendPassword string
+	// FullProxy enables the generic Gitea fallback for unmatched paths.
+	FullProxy bool
+}
+
+// Proxy is the single streaming reverse proxy toward Gitea.
+type Proxy struct {
+	target *url.URL
+	// publicURL/publicScheme/publicHost describe the canonical external
+	// origin used for forwarded headers and response-origin rewriting.
+	publicURL    string
+	publicScheme string
+	publicHost   string
+	edgeSecret   string
+
+	serviceUser     string
+	servicePassword string
+	fullProxy       bool
+
+	proxy   *httputil.ReverseProxy
+	tokens  Authenticator
+	repos   RepositoryInspector
+	auditor Auditor
+	logger  *slog.Logger
+}
+
+// disabledAuthenticator stands in when bridge tokens are not configured.
+type disabledAuthenticator struct{}
+
+func (disabledAuthenticator) Enabled() bool { return false }
+
+func (disabledAuthenticator) Authenticate(context.Context, string) (auth.TokenPrincipal, error) {
+	return auth.TokenPrincipal{}, auth.ErrTokenUnauthorized
+}
+
+func (disabledAuthenticator) DownstreamPAT(context.Context, int64) (string, string, error) {
+	return "", "", auth.ErrTokenUnauthorized
+}
+
+// planKey carries the per-request decision into the shared proxy without
+// mutating shared state.
+type planKey struct{}
+
+// plan is the per-request routing and credential decision.
+type plan struct {
+	// backendPath, when non-empty, replaces the outgoing path.
+	backendPath string
+	cred        credential
+	class       Classification
+	principal   *auth.TokenPrincipal
+	// downstreamUser/PAT is the hidden credential to inject, if any.
+	downstreamUser string
+	downstreamPAT  string
+	// npubSurface marks the public GRASP path: strip caller credentials,
+	// add CORS, and never surface a Gitea auth challenge.
+	npubSurface bool
+	// injectedHidden records that the bridge supplied the credential, so a
+	// downstream 401 is a bridge fault rather than a caller fault.
+	injectedHidden bool
+}
+
+// New builds the proxy. The upstream origin is validated here so a malformed
+// GiteaURL fails at startup rather than per request.
+func New(cfg Config, tokens Authenticator, repos RepositoryInspector, auditor Auditor, logger *slog.Logger) (*Proxy, error) {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	target, err := url.Parse(strings.TrimRight(cfg.GiteaURL, "/"))
+	if err != nil {
+		return nil, fmt.Errorf("parse gitea url: %w", err)
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return nil, fmt.Errorf("gitea url must be http or https, got %q", target.Scheme)
+	}
+	if target.Host == "" {
+		return nil, fmt.Errorf("gitea url must include a host")
+	}
+
+	if tokens == nil {
+		// A disabled authenticator rejects every bridge credential rather
+		// than panicking or silently allowing one through.
+		tokens = disabledAuthenticator{}
+	}
+
+	publicURL := strings.TrimRight(cfg.PublicURL, "/")
+	var publicScheme, publicHost string
+	if publicURL != "" {
+		public, err := url.Parse(publicURL)
+		if err != nil || !public.IsAbs() || public.Host == "" {
+			return nil, fmt.Errorf("public url must be an absolute URL with a host, got %q", cfg.PublicURL)
+		}
+		publicScheme, publicHost = public.Scheme, public.Host
+	}
+
+	p := &Proxy{
+		target:          target,
+		publicURL:       publicURL,
+		publicScheme:    publicScheme,
+		publicHost:      publicHost,
+		edgeSecret:      cfg.EdgeSharedSecret,
+		serviceUser:     cfg.GitBackendUser,
+		servicePassword: cfg.GitBackendPassword,
+		fullProxy:       cfg.FullProxy,
+		tokens:          tokens,
+		repos:           repos,
+		auditor:         auditor,
+		logger:          logger.With("component", "giteaproxy"),
+	}
+
+	p.proxy = &httputil.ReverseProxy{
+		Rewrite:        p.rewrite,
+		ModifyResponse: p.modifyResponse,
+		ErrorHandler:   p.handleProxyError,
+		// Immediate flushing: git pack negotiation and registry uploads are
+		// interactive streams that must not sit in a buffer.
+		FlushInterval: -1,
+		Transport:     newTransport(),
+	}
+	return p, nil
+}
+
+// newTransport builds the streaming transport. It deliberately omits any
+// whole-request timeout: git clones and blob uploads legitimately run for
+// minutes. Environment proxies are disabled so the upstream can never be
+// redirected by ambient configuration.
+func newTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: nil,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+	}
+}
+
+// FullProxyEnabled reports whether unmatched paths are proxied to Gitea.
+func (p *Proxy) FullProxyEnabled() bool {
+	return p != nil && p.fullProxy
+}
+
+// ServeHTTP proxies an ordinary Gitea request: UI, REST, packages, LFS, and
+// conventional /<owner>/<repo>.git Git paths.
+func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	class := Classify(r)
+	cred := p.extractCredential(r)
+
+	pl := plan{cred: cred, class: class}
+
+	switch cred.kind {
+	case credentialBridgeMalformed:
+		// Prefixed but unusable: never fall through to Gitea or anonymous.
+		p.rejectUnauthorized(w, r, class, "malformed bridge credential")
+		return
+
+	case credentialUnsupported:
+		p.rejectUnauthorized(w, r, class, "unsupported authorization")
+		return
+
+	case credentialBridgeToken:
+		if !p.tokens.Enabled() {
+			p.rejectUnauthorized(w, r, class, "bridge tokens are not enabled")
+			return
+		}
+		if !class.BridgeTokensSupported() {
+			// A valid token on a surface whose adapter has not landed must
+			// fail loudly rather than leak the hidden PAT's full authority.
+			p.rejectForbidden(w, r, class,
+				fmt.Sprintf("bridge tokens are not supported on the %s surface yet", class.Surface))
+			return
+		}
+		principal, err := p.tokens.Authenticate(r.Context(), cred.token)
+		if err != nil {
+			p.rejectUnauthorized(w, r, class, "invalid bridge token")
+			return
+		}
+		if cred.username != "" && !principal.PermitsUsername(cred.username) {
+			// Never authenticate by password alone: the presented username
+			// must identify the token's subject.
+			p.rejectUnauthorized(w, r, class, "username does not match token subject")
+			return
+		}
+		if !principal.HasScope(class.Scope) {
+			p.rejectForbidden(w, r, class, "token is missing scope "+class.Scope)
+			return
+		}
+		login, pat, err := p.tokens.DownstreamPAT(r.Context(), principal.GiteaUserID)
+		if err != nil {
+			p.logger.Error("downstream credential unavailable",
+				"gitea_user_id", principal.GiteaUserID, "error", err)
+			p.audit(r, class, "credential_fault", principal.TokenID, principal.Pubkey)
+			http.Error(w, "downstream credential unavailable", http.StatusBadGateway)
+			return
+		}
+		pl.principal = &principal
+		pl.downstreamUser, pl.downstreamPAT = login, pat
+		pl.injectedHidden = true
+		p.audit(r, class, "allowed", principal.TokenID, principal.Pubkey)
+	}
+
+	p.proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), planKey{}, &pl)))
+}
+
+// MappedRepo identifies the Gitea repository behind a canonical npub
+// coordinate. ExpectedID pins the mapping to the exact repository that was
+// provisioned, so a deleted-and-recreated repository at the same path is
+// never served under the original NIP-34 coordinate.
+type MappedRepo struct {
+	Owner      string
+	Name       string
+	ExpectedID int64
+}
+
+// ServeMappedGit proxies a canonical npub git path to its mapped Gitea
+// repository. A valid bridge token grants the caller's own access; otherwise
+// the request is anonymous and only permitted while the repository is
+// publicly readable. Either way the live repository identity is verified, so
+// the bridge never pushes into a repository that is not the mapped one.
+func (p *Proxy) ServeMappedGit(w http.ResponseWriter, r *http.Request, mapped MappedRepo, gitSubpath string) {
+	owner, repoName := mapped.Owner, mapped.Name
+	class := Classify(r)
+	if class.Surface != SurfaceGit {
+		// The caller already validated the subpath shape; anything else here
+		// is not a git request.
+		setGitHTTPCORS(w.Header())
+		http.Error(w, "unsupported git request", http.StatusBadRequest)
+		return
+	}
+
+	backendPath := "/" + owner + "/" + repoName + ".git/" + gitSubpath
+	pl := plan{backendPath: backendPath, class: class, npubSurface: true}
+	cred := p.extractCredential(r)
+	pl.cred = cred
+
+	// The mapped repository must still be the one that was provisioned. A
+	// recreated repository at the same owner/name lacks the GRASP pre-receive
+	// hook, so serving it would bypass Nostr authority enforcement entirely.
+	repo, err := p.lookupMappedRepo(r.Context(), owner, repoName, mapped.ExpectedID)
+	if err != nil {
+		setGitHTTPCORS(w.Header())
+		p.logger.Error("mapped repository verification failed",
+			"owner", owner, "repo", repoName, "expected_id", mapped.ExpectedID, "error", err)
+		p.audit(r, class, "denied_mapping", "", "")
+		http.Error(w, "git backend unavailable", http.StatusBadGateway)
+		return
+	}
+
+	switch cred.kind {
+	case credentialBridgeMalformed, credentialUnsupported:
+		setGitHTTPCORS(w.Header())
+		p.rejectUnauthorized(w, r, class, "unusable credential")
+		return
+
+	case credentialBridgeToken:
+		if !p.tokens.Enabled() {
+			setGitHTTPCORS(w.Header())
+			p.rejectUnauthorized(w, r, class, "bridge tokens are not enabled")
+			return
+		}
+		principal, err := p.tokens.Authenticate(r.Context(), cred.token)
+		if err != nil {
+			setGitHTTPCORS(w.Header())
+			p.rejectUnauthorized(w, r, class, "invalid bridge token")
+			return
+		}
+		if cred.username != "" && !principal.PermitsUsername(cred.username) {
+			setGitHTTPCORS(w.Header())
+			p.rejectUnauthorized(w, r, class, "username does not match token subject")
+			return
+		}
+		if !principal.HasScope(class.Scope) {
+			setGitHTTPCORS(w.Header())
+			p.rejectForbidden(w, r, class, "token is missing scope "+class.Scope)
+			return
+		}
+		login, pat, err := p.tokens.DownstreamPAT(r.Context(), principal.GiteaUserID)
+		if err != nil {
+			setGitHTTPCORS(w.Header())
+			p.logger.Error("downstream credential unavailable",
+				"gitea_user_id", principal.GiteaUserID, "error", err)
+			http.Error(w, "downstream credential unavailable", http.StatusBadGateway)
+			return
+		}
+		pl.principal = &principal
+		pl.downstreamUser, pl.downstreamPAT = login, pat
+		pl.injectedHidden = true
+		p.audit(r, class, "allowed", principal.TokenID, principal.Pubkey)
+
+	default:
+		// Anonymous (or ordinary-credential, which this surface strips):
+		// permitted only while the mapped repository is publicly readable.
+		// Internal repositories (public repo, private owner org) are not.
+		if !repo.PubliclyReadable() {
+			setGitHTTPCORS(w.Header())
+			p.audit(r, class, "denied_private", "", "")
+			p.writeGitAuthRequired(w)
+			return
+		}
+		pl.injectedHidden = p.serviceUser != "" || p.servicePassword != ""
+	}
+
+	p.proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), planKey{}, &pl)))
+}
+
+// lookupMappedRepo reads the live repository and verifies it is the exact one
+// the mapping was provisioned against. Visibility is read fresh on every
+// request: a cached value could serve a repository in the window after it is
+// made private.
+func (p *Proxy) lookupMappedRepo(ctx context.Context, owner, repoName string, expectedID int64) (gitea.Repository, error) {
+	if p.repos == nil {
+		return gitea.Repository{}, fmt.Errorf("repository inspector is not configured")
+	}
+	repo, err := p.repos.GetRepo(ctx, owner, repoName)
+	if err != nil {
+		return gitea.Repository{}, err
+	}
+	if expectedID != 0 && repo.ID != expectedID {
+		return gitea.Repository{}, fmt.Errorf(
+			"mapped repository id changed: found %d, expected %d", repo.ID, expectedID)
+	}
+	return repo, nil
+}
+
+func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
+	pl, _ := pr.In.Context().Value(planKey{}).(*plan)
+
+	pr.SetURL(p.target)
+	// Give Gitea the canonical external identity rather than a client-
+	// controlled Host header, which would otherwise poison generated URLs,
+	// cookies, and redirects.
+	pr.SetXForwarded()
+	if p.publicHost != "" {
+		pr.Out.Host = p.publicHost
+		pr.Out.Header.Set("X-Forwarded-Host", p.publicHost)
+		pr.Out.Header.Set("X-Forwarded-Proto", p.publicScheme)
+	} else {
+		pr.Out.Host = p.target.Host
+	}
+	if pl != nil && pl.backendPath != "" {
+		pr.Out.URL.Path = singleJoiningSlash(p.target.Path, pl.backendPath)
+		pr.Out.URL.RawPath = ""
+		pr.Out.URL.RawQuery = joinRawQuery(p.target.RawQuery, pr.In.URL.RawQuery)
+	}
+
+	// Defense in depth: no client-supplied internal header ever reaches Gitea.
+	stripInternalHeaders(pr.Out.Header)
+
+	if pl == nil {
+		stripCallerCredentials(pr.Out.Header)
+		return
+	}
+
+	switch {
+	case pl.npubSurface && pl.downstreamPAT == "":
+		// Public GRASP surface, anonymous: forward no caller credentials and
+		// authenticate as the narrow service identity.
+		stripCallerCredentials(pr.Out.Header)
+		if p.serviceUser != "" || p.servicePassword != "" {
+			pr.Out.SetBasicAuth(p.serviceUser, p.servicePassword)
+		}
+
+	case pl.downstreamPAT != "":
+		// Replace the caller credential with the hidden PAT; never leave both.
+		stripCallerCredentials(pr.Out.Header)
+		pr.Out.SetBasicAuth(pl.downstreamUser, pl.downstreamPAT)
+
+	case pl.cred.kind == credentialSessionProxy:
+		// Trusted browser session continuation: Gitea's reverse-proxy auth
+		// header is the only identity, and it is set by the bridge alone.
+		stripCallerCredentials(pr.Out.Header)
+		pr.Out.Header.Set("X-Grasp-Auth-User", pl.cred.sessionUser)
+
+	default:
+		// Ordinary Gitea credentials (or none) pass through unchanged.
+	}
+}
+
+func (p *Proxy) modifyResponse(resp *http.Response) error {
+	pl, _ := resp.Request.Context().Value(planKey{}).(*plan)
+
+	if pl != nil && pl.npubSurface {
+		setGitHTTPCORS(resp.Header)
+		sanitizeGitBackendResponse(resp)
+		// Mapped responses can still carry backend-origin redirects, which
+		// would leak the private Gitea address to public clients.
+		p.rewriteBackendOrigin(resp)
+		return nil
+	}
+
+	if pl != nil && pl.injectedHidden &&
+		(resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusProxyAuthRequired) {
+		// The bridge supplied this credential, so a challenge is a bridge
+		// fault. Never relay it: the caller cannot act on it, and it would
+		// invite them to retry with Gitea credentials.
+		p.logger.Error("downstream rejected bridge-injected credential",
+			"path", resp.Request.URL.Path, "status", resp.StatusCode)
+		replaceWithPlainText(resp, http.StatusBadGateway, "downstream credential rejected\n")
+		return nil
+	}
+
+	p.rewriteBackendOrigin(resp)
+	return nil
+}
+
+// rewriteBackendOrigin replaces the private Gitea origin with the public
+// origin in redirect targets. The URL is parsed and its scheme/host compared
+// exactly: a prefix match would also rewrite hostile look-alikes such as
+// http://gitea:3000.evil.example/.
+func (p *Proxy) rewriteBackendOrigin(resp *http.Response) {
+	if p.publicURL == "" {
+		return
+	}
+	for _, header := range []string{"Location", "Content-Location"} {
+		value := resp.Header.Get(header)
+		if value == "" {
+			continue
+		}
+		parsed, err := url.Parse(value)
+		if err != nil || !parsed.IsAbs() {
+			continue
+		}
+		if !strings.EqualFold(parsed.Scheme, p.target.Scheme) ||
+			!strings.EqualFold(parsed.Host, p.target.Host) {
+			continue
+		}
+		parsed.Scheme = p.publicScheme
+		parsed.Host = p.publicHost
+		resp.Header.Set(header, parsed.String())
+	}
+}
+
+func (p *Proxy) handleProxyError(w http.ResponseWriter, r *http.Request, err error) {
+	pl, _ := r.Context().Value(planKey{}).(*plan)
+	if pl != nil && pl.npubSurface {
+		setGitHTTPCORS(w.Header())
+	}
+	if r.Context().Err() != nil {
+		// Client went away mid-stream; nothing useful to report.
+		p.logger.Debug("proxy request cancelled", "path", r.URL.Path)
+		return
+	}
+	p.logger.Error("gitea proxy failed", "path", r.URL.Path, "error", err)
+	http.Error(w, "git backend unavailable", http.StatusBadGateway)
+}
+
+// writeGitAuthRequired asks a git client for credentials. Git only retries
+// with a helper-supplied credential after a 401 carrying a Basic challenge.
+func (p *Proxy) writeGitAuthRequired(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="GRASP"`)
+	http.Error(w, "authentication required", http.StatusUnauthorized)
+}
+
+func (p *Proxy) rejectUnauthorized(w http.ResponseWriter, r *http.Request, class Classification, reason string) {
+	p.logger.Info("proxy rejected credential", "path", r.URL.Path, "surface", class.Surface, "reason", reason)
+	p.audit(r, class, "denied_unauthorized", "", "")
+	w.Header().Set("WWW-Authenticate", `Basic realm="GRASP"`)
+	http.Error(w, reason, http.StatusUnauthorized)
+}
+
+func (p *Proxy) rejectForbidden(w http.ResponseWriter, r *http.Request, class Classification, reason string) {
+	p.logger.Info("proxy denied scope", "path", r.URL.Path, "surface", class.Surface, "reason", reason)
+	p.audit(r, class, "denied_scope", "", "")
+	http.Error(w, reason, http.StatusForbidden)
+}
+
+// audit records an authorization outcome. It never stores credentials, and a
+// failure to audit must not fail the request.
+func (p *Proxy) audit(r *http.Request, class Classification, outcome, tokenID, pubkey string) {
+	if p.auditor == nil {
+		return
+	}
+	err := p.auditor.InsertAuthAuditEvent(r.Context(), store.AuthAuditEvent{
+		EventType: "proxy_request",
+		Pubkey:    pubkey,
+		TokenID:   tokenID,
+		Surface:   string(class.Surface),
+		Action:    string(class.Action),
+		Outcome:   outcome,
+	})
+	if err != nil {
+		p.logger.Warn("proxy audit insert failed", "error", err)
+	}
+}
+
+// sanitizeGitBackendResponse guarantees the public GRASP surface never emits a
+// Gitea authentication challenge or session state.
+func sanitizeGitBackendResponse(resp *http.Response) {
+	resp.Header.Del("WWW-Authenticate")
+	resp.Header.Del("Proxy-Authenticate")
+	resp.Header.Del("Set-Cookie")
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusProxyAuthRequired {
+		replaceWithPlainText(resp, http.StatusBadGateway, "git backend unavailable\n")
+	}
+}
+
+func replaceWithPlainText(resp *http.Response, status int, body string) {
+	if resp.Body != nil {
+		resp.Body.Close()
+	}
+	resp.StatusCode = status
+	resp.Status = http.StatusText(status)
+	resp.Body = io.NopCloser(strings.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	resp.Header.Set("Content-Type", "text/plain; charset=utf-8")
+	resp.Header.Del("WWW-Authenticate")
+	resp.Header.Del("Proxy-Authenticate")
+}
+
+func setGitHTTPCORS(h http.Header) {
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Allow-Methods", "GET, POST")
+	h.Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	default:
+		return a + b
+	}
+}
+
+func joinRawQuery(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + "&" + b
+	}
+}

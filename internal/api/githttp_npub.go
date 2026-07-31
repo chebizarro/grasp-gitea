@@ -5,12 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
-	"strconv"
 	"strings"
+
+	"github.com/sharegap/grasp-gitea/internal/giteaproxy"
 )
 
 const (
@@ -19,16 +18,11 @@ const (
 	gitHTTPCORSAllowHeaders = "Content-Type"
 )
 
-// gitHTTPNpubProxy serves the GRASP-01 git smart-HTTP npub path:
-// /<npub>/<percent-encoded-repo-id>.git/{info/refs,git-upload-pack,git-receive-pack}.
-// The bridge stores repositories under their Gitea owner/org name, so this
-// handler resolves (npub, repo-id) through the mapping store and reverse-proxies
-// the smart-HTTP request to /<owner>/<repo>.git/<git-smart-http-subpath>.
-func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request) {
-	// GRASP-01: the service root is the relay endpoint — WebSocket upgrades
-	// and NIP-11 (Accept: application/nostr+json) negotiate there, while
-	// /<npub>/<identifier>.git paths remain the git surface.
-	if s.rootRelayHandler != nil && r.URL.Path == "/" {
+// rootHandler is the catch-all. It dispatches, in order: the GRASP-01 relay
+// at the service root, canonical npub git paths, and — in full-proxy mode —
+// every remaining Gitea request.
+func (s *Server) rootHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" && s.rootRelayHandler != nil && s.isRelayRootRequest(r) {
 		s.rootRelayHandler.ServeHTTP(w, r)
 		return
 	}
@@ -39,11 +33,41 @@ func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad git smart-http path", http.StatusBadRequest)
 		return
 	}
-	if !ok {
-		http.NotFound(w, r)
+	if ok {
+		s.gitHTTPNpubProxy(w, r, npub, repoID, gitSubpath)
 		return
 	}
 
+	// Full-proxy mode: the bridge fronts all of Gitea.
+	if s.giteaProxy != nil && s.giteaProxy.FullProxyEnabled() {
+		s.giteaProxy.ServeHTTP(w, r)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+// isRelayRootRequest reports whether a request to "/" is relay traffic.
+//
+// While nginx still routes ordinary Gitea traffic directly, everything the
+// bridge sees at "/" is relay traffic. Once the bridge fronts all of Gitea,
+// browsers reach "/" too, so the relay is selected only by an actual
+// WebSocket upgrade or NIP-11 content negotiation.
+func (s *Server) isRelayRootRequest(r *http.Request) bool {
+	if s.giteaProxy == nil || !s.giteaProxy.FullProxyEnabled() {
+		return true
+	}
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "application/nostr+json")
+}
+
+// gitHTTPNpubProxy serves the GRASP-01 git smart-HTTP npub path:
+// /<npub>/<percent-encoded-repo-id>.git/{info/refs,git-upload-pack,git-receive-pack}.
+// The bridge stores repositories under their Gitea owner/org name, so this
+// handler resolves (npub, repo-id) through the mapping store and hands the
+// request to the shared streaming proxy, which decides credentials.
+func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request, npub, repoID, gitSubpath string) {
 	setGitHTTPCORS(w.Header())
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
@@ -60,6 +84,15 @@ func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mapping, err := s.store.GetMapping(r.Context(), npub, repoID)
+	if err == nil && !mapping.HookInstalled {
+		// Provisioning did not finish, so grasp-pre-receive is not installed.
+		// Serving it would let a push bypass Nostr authority enforcement.
+		if s.logger != nil {
+			s.logger.Warn("refusing git smart-http for repository without the GRASP hook",
+				"npub", npub, "repo_id", repoID)
+		}
+		err = sql.ErrNoRows
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		if gitSubpath == "" {
 			s.serveRepoLandingPage(w, r, npub, repoID, false)
@@ -76,53 +109,23 @@ func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, err := url.Parse(strings.TrimRight(s.giteaURL, "/"))
-	if err != nil || target.Scheme == "" || target.Host == "" {
-		if s.logger != nil {
-			s.logger.Error("invalid Gitea URL for git smart-http proxy", "gitea_url", s.giteaURL, "error", err)
-		}
-		http.Error(w, "git backend unavailable", http.StatusBadGateway)
-		return
-	}
-
 	if gitSubpath == "" {
 		s.serveRepoLandingPage(w, r, npub, repoID, true)
 		return
 	}
 
-	backendPath := "/" + mapping.Owner + "/" + mapping.RepoName + ".git/" + gitSubpath
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(target)
-			pr.Out.Host = pr.In.Host
-			pr.Out.URL.Path = singleJoiningSlash(target.Path, backendPath)
-			pr.Out.URL.RawPath = ""
-			pr.Out.URL.RawQuery = joinRawQuery(target.RawQuery, pr.In.URL.RawQuery)
-			// GRASP-01: the public interface is unauthenticated and caller
-			// credentials must never reach Gitea. Push authorization comes from
-			// signed repository-state events enforced by the pre-receive hook,
-			// so the bridge authenticates to Gitea with its own scoped service
-			// identity, injected only after the npub/identifier mapping resolved.
-			stripCallerCredentials(pr.Out.Header)
-			if s.gitBackendUser != "" || s.gitBackendPassword != "" {
-				pr.Out.SetBasicAuth(s.gitBackendUser, s.gitBackendPassword)
-			}
-		},
-		ModifyResponse: func(resp *http.Response) error {
-			setGitHTTPCORS(resp.Header)
-			sanitizeGitBackendResponse(resp)
-			return nil
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			setGitHTTPCORS(w.Header())
-			if s.logger != nil {
-				s.logger.Error("git smart-http proxy failed", "npub", npub, "repo_id", repoID, "error", err)
-			}
-			http.Error(w, "git backend unavailable", http.StatusBadGateway)
-		},
-		FlushInterval: -1,
+	if s.giteaProxy == nil {
+		if s.logger != nil {
+			s.logger.Error("git smart-http proxy is not configured")
+		}
+		http.Error(w, "git backend unavailable", http.StatusBadGateway)
+		return
 	}
-	proxy.ServeHTTP(w, r)
+	s.giteaProxy.ServeMappedGit(w, r, giteaproxy.MappedRepo{
+		Owner:      mapping.Owner,
+		Name:       mapping.RepoName,
+		ExpectedID: mapping.GiteaRepoID,
+	}, gitSubpath)
 }
 
 func parseNpubGitHTTPPath(r *http.Request) (npub string, repoID string, gitSubpath string, ok bool, err error) {
@@ -158,7 +161,7 @@ func parseNpubGitHTTPPath(r *http.Request) (npub string, repoID string, gitSubpa
 	} else {
 		encodedRepoID = repoAndGitPath[:marker]
 		gitSubpath = repoAndGitPath[marker+len(gitMarker):]
-		if !isGitSmartHTTPSubpath(gitSubpath) {
+		if !giteaproxy.IsGitSmartHTTPSubpath(gitSubpath) {
 			return "", "", "", false, nil
 		}
 	}
@@ -211,74 +214,8 @@ func (s *Server) serveRepoLandingPage(w http.ResponseWriter, r *http.Request, np
 		template.HTMLEscapeString(naddr))
 }
 
-func isGitSmartHTTPSubpath(subpath string) bool {
-	switch subpath {
-	case "info/refs", "git-upload-pack", "git-receive-pack":
-		return true
-	default:
-		return false
-	}
-}
-
-// stripCallerCredentials removes any caller-supplied authentication material
-// before the request is forwarded to Gitea. GRASP-01 git smart-HTTP is public;
-// forwarding these headers would let Gitea authenticate (or challenge) the
-// caller, which must never happen on this path.
-func stripCallerCredentials(h http.Header) {
-	h.Del("Authorization")
-	h.Del("Proxy-Authorization")
-	h.Del("Cookie")
-}
-
-// sanitizeGitBackendResponse guarantees the public GRASP surface never emits a
-// Gitea authentication challenge or session state. A backend 401/407 means the
-// bridge's own service identity is missing or misconfigured, which is an
-// operator error — report it as a backend failure, not an auth challenge.
-func sanitizeGitBackendResponse(resp *http.Response) {
-	resp.Header.Del("WWW-Authenticate")
-	resp.Header.Del("Proxy-Authenticate")
-	resp.Header.Del("Set-Cookie")
-
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusProxyAuthRequired {
-		body := "git backend unavailable\n"
-		if resp.Body != nil {
-			resp.Body.Close()
-		}
-		resp.StatusCode = http.StatusBadGateway
-		resp.Status = http.StatusText(http.StatusBadGateway)
-		resp.Body = io.NopCloser(strings.NewReader(body))
-		resp.ContentLength = int64(len(body))
-		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-		resp.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	}
-}
-
 func setGitHTTPCORS(h http.Header) {
 	h.Set("Access-Control-Allow-Origin", gitHTTPCORSAllowOrigin)
 	h.Set("Access-Control-Allow-Methods", gitHTTPCORSAllowMethods)
 	h.Set("Access-Control-Allow-Headers", gitHTTPCORSAllowHeaders)
-}
-
-func singleJoiningSlash(a, b string) string {
-	aslash := strings.HasSuffix(a, "/")
-	bslash := strings.HasPrefix(b, "/")
-	switch {
-	case aslash && bslash:
-		return a + b[1:]
-	case !aslash && !bslash:
-		return a + "/" + b
-	default:
-		return a + b
-	}
-}
-
-func joinRawQuery(a, b string) string {
-	switch {
-	case a == "":
-		return b
-	case b == "":
-		return a
-	default:
-		return a + "&" + b
-	}
 }
