@@ -55,8 +55,20 @@ support are rotated automatically on next use.
    Then confirm from a host **outside** the deployment network that the port
    is closed. Checking from inside proves nothing.
 
-2. **Validate the deployed Gitea image** (issue `phase1-z88`). Confirm against
-   the exact image you run:
+2. **Validate the deployed Gitea image** (issue `phase1-z88`). Run
+   `scripts/z88-gitea-validate.sh` from a host that reaches Gitea directly —
+   it automates every HTTP-probeable check below and prints the manual
+   remainder:
+
+   ```bash
+   GITEA_URL=http://127.0.0.1:3000 \
+   GITEA_ADMIN_USER=<admin> GITEA_ADMIN_PAT=<admin pat> \
+   TEST_USER=<non-admin login> TEST_PRIVATE_REPO=<owner/name> \
+   PUBLIC_URL=https://git.example.com \
+   bash scripts/z88-gitea-validate.sh
+   ```
+
+   Confirm against the exact image you run:
    - `POST /api/v1/users/{username}/tokens` works with **Basic** auth using
      the admin login + admin PAT. The `Authorization: token` header does not
      work: Gitea gates this route behind `reqBasicOrRevProxyAuth`.
