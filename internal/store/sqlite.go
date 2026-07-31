@@ -279,6 +279,28 @@ func Open(path string) (*SQLiteStore, error) {
 			last_login_at TEXT NOT NULL DEFAULT '',
 			UNIQUE (gitea_user_id)
 		);`,
+		// profile_sync_state records the last kind:0 event applied to a linked
+		// user's Gitea profile, for replaceable-event dedup (newest wins).
+		`CREATE TABLE IF NOT EXISTS profile_sync_state (
+			pubkey TEXT PRIMARY KEY,
+			gitea_user_id INTEGER NOT NULL DEFAULT 0,
+			event_created_at INTEGER NOT NULL DEFAULT 0,
+			event_id TEXT NOT NULL DEFAULT '',
+			synced_at TEXT NOT NULL DEFAULT ''
+		);`,
+		// profile_sync_pat_cleanup durably tracks ephemeral write:user PATs
+		// minted to set a user's avatar, so a crash never strands a live PAT.
+		`CREATE TABLE IF NOT EXISTS profile_sync_pat_cleanup (
+			pat_name TEXT PRIMARY KEY,
+			gitea_user_id INTEGER NOT NULL UNIQUE,
+			gitea_user TEXT NOT NULL,
+			gitea_token_id INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL,
+			delete_attempts INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT ''
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_profile_sync_pat_cleanup_fair ON profile_sync_pat_cleanup(delete_attempts, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_profile_sync_pat_cleanup_user ON profile_sync_pat_cleanup(gitea_user_id);`,
 		`CREATE TABLE IF NOT EXISTS nip46_sessions (
 			session_token TEXT PRIMARY KEY,
 			bunker_pubkey TEXT NOT NULL,

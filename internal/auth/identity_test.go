@@ -186,6 +186,30 @@ func TestResolveOrCreateExistingLink(t *testing.T) {
 	}
 }
 
+// recordingNotifier records enqueued pubkeys.
+type recordingNotifier struct{ pubkeys []string }
+
+func (r *recordingNotifier) Enqueue(pubkey string) { r.pubkeys = append(r.pubkeys, pubkey) }
+
+func TestResolveOrCreateNotifiesProfileSync(t *testing.T) {
+	resolver := &stubOrgResolver{names: map[string]string{testPubkey: "alice"}}
+	svc, _, _ := newTestIdentityService(t, resolver)
+	notifier := &recordingNotifier{}
+	svc.SetProfileSyncNotifier(notifier)
+	ctx := context.Background()
+
+	// Both create and resolve-existing notify.
+	if _, err := svc.ResolveOrCreate(ctx, testPubkey, nil); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := svc.ResolveOrCreate(ctx, testPubkey, nil); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(notifier.pubkeys) != 2 || notifier.pubkeys[0] != testPubkey || notifier.pubkeys[1] != testPubkey {
+		t.Fatalf("notifications = %v, want two for %s", notifier.pubkeys, testPubkey)
+	}
+}
+
 func TestResolveOrCreateHexFallback(t *testing.T) {
 	// No NIP-05 mapping — should use hex fallback.
 	resolver := &stubOrgResolver{names: map[string]string{}}

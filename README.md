@@ -247,6 +247,28 @@ matching (an https credential is never disclosed over http):
 See [`docs/fullproxy-cutover-runbook.md`](docs/fullproxy-cutover-runbook.md)
 to enable this, and [`docs/UPGRADING.md`](docs/UPGRADING.md) for what changes.
 
+## Nostr profile sync (kind:0 → Gitea)
+
+With `PROFILE_SYNC_ENABLED=true`, the bridge keeps each linked user's Gitea
+profile in sync with their Nostr kind:0 (NIP-01/NIP-24) metadata. It fetches
+every linked pubkey's latest verified kind:0 on a periodic sweep (and
+immediately when an identity resolves via login), deduplicates by the event's
+`created_at`, and applies bounded changes:
+
+- `display_name`/`name` → Gitea full name (≤100 runes, control-stripped)
+- `about` → description (≤255 runes, newlines kept)
+- `website` → website (absolute `http(s)` only; `javascript:` and
+  userinfo URLs dropped)
+- `picture` → custom avatar (SSRF-safe HTTPS fetch, ≤2 MiB, sniffed
+  PNG/JPEG/GIF/WebP); an empty picture clears the avatar
+
+Avatars can't be set through Gitea's admin API, so the bridge mints a
+short-lived `write:user` PAT for the user, verifies it authenticates as the
+pinned account, sets the avatar, and deletes the PAT immediately — with a
+durable cleanup queue so a crash never strands a live credential. The feature
+is independent of bridge tokens but requires `GITEA_ADMIN_USER`, and is
+**single-node only** for now (no cross-node coordination yet).
+
 ## User-signed NIP-34 model
 
 - Repository announcements (`kind:30617`) remain owner-signed and are cached/rebroadcast verbatim.

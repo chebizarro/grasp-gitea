@@ -41,6 +41,9 @@ var patCredentialsReencrypted atomic.Int64
 var patCredentialsReconciled atomic.Int64
 var patReconcileFailures atomic.Int64
 var patStuckProvisioning atomic.Int64
+var profileSynced atomic.Int64
+var profileSyncPATCleanupFailures atomic.Int64
+var profileSyncRelayFailures atomic.Int64
 
 func IncAnnouncementReceived() {
 	announcementEventsReceived.Add(1)
@@ -201,46 +204,60 @@ func IncPATReconcileFailures() { patReconcileFailures.Add(1) }
 // past the recovery threshold at the last sweep — a gauge operators alert on.
 func SetPATStuckProvisioning(n int64) { patStuckProvisioning.Store(n) }
 
+// IncProfileSynced counts kind:0 profiles applied to a Gitea user.
+func IncProfileSynced() { profileSynced.Add(1) }
+
+// IncProfileSyncPATCleanupFailures counts ephemeral avatar PATs whose
+// delete-after-use failed and was queued for reconciliation.
+func IncProfileSyncPATCleanupFailures() { profileSyncPATCleanupFailures.Add(1) }
+
+// IncProfileSyncRelayFailure counts profile fetches where every relay was
+// unreachable, so a relay outage stays observable.
+func IncProfileSyncRelayFailure() { profileSyncRelayFailures.Add(1) }
+
 func Snapshot() map[string]int64 {
 	return map[string]int64{
-		"announcement_events_received":    announcementEventsReceived.Load(),
-		"announcement_events_rejected":    announcementEventsRejected.Load(),
-		"announcement_events_provisioned": announcementEventsProvisioned.Load(),
-		"manual_provision_requests":       manualProvisionRequests.Load(),
-		"manual_provision_failures":       manualProvisionFailures.Load(),
-		"auth_challenges_issued":          authChallengesIssued.Load(),
-		"auth_verify_success":             authVerifySuccess.Load(),
-		"auth_verify_failure":             authVerifyFailure.Load(),
-		"auth_replay_rejected":            authReplayRejected.Load(),
-		"auth_user_provisioned":           authUserProvisioned.Load(),
-		"nip46_sessions_initiated":        nip46SessionsInitiated.Load(),
-		"nip46_sessions_completed":        nip46SessionsCompleted.Load(),
-		"nip46_sessions_failed":           nip46SessionsFailed.Load(),
-		"nip55_challenges_issued":         nip55ChallengesIssued.Load(),
-		"nip55_verify_success":            nip55VerifySuccess.Load(),
-		"nip55_verify_failure":            nip55VerifyFailure.Load(),
-		"ci_workflow_runs_published":      ciWorkflowRunsPublished.Load(),
-		"ci_workflow_runs_failed":         ciWorkflowRunsFailed.Load(),
-		"webhook_events_received":         webhookEventsReceived.Load(),
-		"webhook_events_published":        webhookEventsPublished.Load(),
-		"webhook_events_failed":           webhookEventsFailed.Load(),
-		"outbox_queue_depth":              outboxQueueDepth.Load(),
-		"outbox_published":                outboxPublished.Load(),
-		"outbox_retried":                  outboxRetried.Load(),
-		"outbox_dead_lettered":            outboxDeadLettered.Load(),
-		"bridge_signed_fallback":          bridgeSignedFallback.Load(),
-		"unlinked_actor_skipped":          unlinkedActorSkipped.Load(),
-		"actor_events_backfilled":         actorEventsBackfilled.Load(),
-		"bridge_tokens_minted":            bridgeTokensMinted.Load(),
-		"bridge_tokens_revoked":           bridgeTokensRevoked.Load(),
-		"bridge_tokens_rotated":           bridgeTokensRotated.Load(),
-		"bridge_token_auth_failures":      bridgeTokenAuthFailures.Load(),
-		"pat_credentials_provisioned":     patCredentialsProvisioned.Load(),
-		"pat_provision_failures":          patProvisionFailures.Load(),
-		"pat_credentials_retired":         patCredentialsRetired.Load(),
-		"pat_credentials_reencrypted":     patCredentialsReencrypted.Load(),
-		"pat_credentials_reconciled":      patCredentialsReconciled.Load(),
-		"pat_reconcile_failures":          patReconcileFailures.Load(),
-		"pat_stuck_provisioning":          patStuckProvisioning.Load(),
+		"announcement_events_received":      announcementEventsReceived.Load(),
+		"announcement_events_rejected":      announcementEventsRejected.Load(),
+		"announcement_events_provisioned":   announcementEventsProvisioned.Load(),
+		"manual_provision_requests":         manualProvisionRequests.Load(),
+		"manual_provision_failures":         manualProvisionFailures.Load(),
+		"auth_challenges_issued":            authChallengesIssued.Load(),
+		"auth_verify_success":               authVerifySuccess.Load(),
+		"auth_verify_failure":               authVerifyFailure.Load(),
+		"auth_replay_rejected":              authReplayRejected.Load(),
+		"auth_user_provisioned":             authUserProvisioned.Load(),
+		"nip46_sessions_initiated":          nip46SessionsInitiated.Load(),
+		"nip46_sessions_completed":          nip46SessionsCompleted.Load(),
+		"nip46_sessions_failed":             nip46SessionsFailed.Load(),
+		"nip55_challenges_issued":           nip55ChallengesIssued.Load(),
+		"nip55_verify_success":              nip55VerifySuccess.Load(),
+		"nip55_verify_failure":              nip55VerifyFailure.Load(),
+		"ci_workflow_runs_published":        ciWorkflowRunsPublished.Load(),
+		"ci_workflow_runs_failed":           ciWorkflowRunsFailed.Load(),
+		"webhook_events_received":           webhookEventsReceived.Load(),
+		"webhook_events_published":          webhookEventsPublished.Load(),
+		"webhook_events_failed":             webhookEventsFailed.Load(),
+		"outbox_queue_depth":                outboxQueueDepth.Load(),
+		"outbox_published":                  outboxPublished.Load(),
+		"outbox_retried":                    outboxRetried.Load(),
+		"outbox_dead_lettered":              outboxDeadLettered.Load(),
+		"bridge_signed_fallback":            bridgeSignedFallback.Load(),
+		"unlinked_actor_skipped":            unlinkedActorSkipped.Load(),
+		"actor_events_backfilled":           actorEventsBackfilled.Load(),
+		"bridge_tokens_minted":              bridgeTokensMinted.Load(),
+		"bridge_tokens_revoked":             bridgeTokensRevoked.Load(),
+		"bridge_tokens_rotated":             bridgeTokensRotated.Load(),
+		"bridge_token_auth_failures":        bridgeTokenAuthFailures.Load(),
+		"pat_credentials_provisioned":       patCredentialsProvisioned.Load(),
+		"pat_provision_failures":            patProvisionFailures.Load(),
+		"pat_credentials_retired":           patCredentialsRetired.Load(),
+		"pat_credentials_reencrypted":       patCredentialsReencrypted.Load(),
+		"pat_credentials_reconciled":        patCredentialsReconciled.Load(),
+		"pat_reconcile_failures":            patReconcileFailures.Load(),
+		"pat_stuck_provisioning":            patStuckProvisioning.Load(),
+		"profile_synced":                    profileSynced.Load(),
+		"profile_sync_pat_cleanup_failures": profileSyncPATCleanupFailures.Load(),
+		"profile_sync_relay_failures":       profileSyncRelayFailures.Load(),
 	}
 }

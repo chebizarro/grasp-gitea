@@ -6,6 +6,7 @@ package nostrprofile
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,6 +14,18 @@ import (
 
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 )
+
+// ErrProfileNotFound means no valid kind:0 event was found for the pubkey on
+// any relay. It is distinct from a relay connection/subscription failure.
+var ErrProfileNotFound = errors.New("no kind:0 profile found")
+
+// Snapshot is a parsed kind:0 profile plus the event metadata a caller needs
+// to deduplicate (replaceable-event semantics: newest created_at wins).
+type Snapshot struct {
+	Profile   Profile
+	EventID   string
+	CreatedAt int64
+}
 
 // Profile holds the fields from a Nostr kind:0 metadata event that are
 // relevant for Gitea profile sync.
@@ -30,37 +43,64 @@ func (p Profile) IsEmpty() bool {
 	return p.DisplayName == "" && p.Picture == "" && p.About == "" && p.Website == ""
 }
 
-// Fetch fetches the most recent kind:0 event for pubkey from any of the
-// provided relay URLs and returns a parsed Profile. Returns nil if no event
-// is found within the timeout.
+// Fetch returns the parsed Profile only, for callers that do not need event
+// metadata. It delegates to FetchLatest and maps ErrProfileNotFound to a nil
+// profile for backward compatibility.
 func Fetch(ctx context.Context, pubkey string, relayURLs []string) (*Profile, error) {
-	if len(relayURLs) == 0 {
-		return nil, fmt.Errorf("no relay URLs provided")
+	snap, err := FetchLatest(ctx, pubkey, relayURLs)
+	if errors.Is(err, ErrProfileNotFound) {
+		return nil, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	p := snap.Profile
+	return &p, nil
+}
 
+// FetchLatest queries every relay and returns the highest-created_at verified
+// kind:0 event, with its id and timestamp. Event id breaks a created_at tie
+// deterministically. Returns ErrProfileNotFound when no relay yielded a valid
+// profile but at least one was reachable; a wrapped transport error when
+// every relay failed to connect.
+func FetchLatest(ctx context.Context, pubkey string, relayURLs []string) (Snapshot, error) {
+	if len(relayURLs) == 0 {
+		return Snapshot{}, fmt.Errorf("no relay URLs provided")
+	}
 	pk, err := nostr.PubKeyFromHex(pubkey)
 	if err != nil {
-		return nil, fmt.Errorf("parse pubkey: %w", err)
+		return Snapshot{}, fmt.Errorf("parse pubkey: %w", err)
 	}
 
-	// Try each relay in order, return on first successful fetch.
+	var best *Snapshot
 	var lastErr error
+	reachable := false
 	for _, relayURL := range relayURLs {
-		p, err := fetchFromRelay(ctx, pk, relayURL)
+		snap, err := fetchSnapshotFromRelay(ctx, pk, relayURL)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		return p, nil
+		reachable = true
+		if snap == nil {
+			continue // reachable, but no profile stored here
+		}
+		if best == nil || snap.CreatedAt > best.CreatedAt ||
+			(snap.CreatedAt == best.CreatedAt && snap.EventID > best.EventID) {
+			best = snap
+		}
 	}
 
-	if lastErr != nil {
-		return nil, fmt.Errorf("fetch kind:0 from all relays: %w", lastErr)
+	if best != nil {
+		return *best, nil
 	}
-	return nil, nil
+	if reachable {
+		return Snapshot{}, ErrProfileNotFound
+	}
+	return Snapshot{}, fmt.Errorf("fetch kind:0 from all relays: %w", lastErr)
 }
 
-func fetchFromRelay(ctx context.Context, pk nostr.PubKey, relayURL string) (*Profile, error) {
+func fetchSnapshotFromRelay(ctx context.Context, pk nostr.PubKey, relayURL string) (*Snapshot, error) {
 	fetchCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
@@ -93,9 +133,13 @@ func fetchFromRelay(ctx context.Context, pk nostr.PubKey, relayURL string) (*Pro
 		if err := nostrverify.ValidateEventIDAndSignature(&ev); err != nil {
 			return nil, fmt.Errorf("relay %s returned invalid kind-0 event: %w", relayURL, err)
 		}
-		return parse(ev.Content)
+		p, err := parse(ev.Content)
+		if err != nil {
+			return nil, err
+		}
+		return &Snapshot{Profile: *p, EventID: ev.ID.Hex(), CreatedAt: int64(ev.CreatedAt)}, nil
 	case <-sub.EndOfStoredEvents:
-		return nil, nil // no kind:0 stored on this relay
+		return nil, nil // reachable, no kind:0 stored here
 	case <-fetchCtx.Done():
 		return nil, fmt.Errorf("timeout waiting for kind:0 from %s", relayURL)
 	}

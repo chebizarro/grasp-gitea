@@ -28,6 +28,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/outbox"
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
+	"github.com/sharegap/grasp-gitea/internal/profilesync"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/reflector"
@@ -293,9 +294,31 @@ func main() {
 		apiServer.SetSignerAuthorizer(signerSvc)
 	}
 
+	// Profile sync runs independently of interactive auth: it keeps already
+	// linked users' Gitea profiles current from their kind:0. Constructed
+	// here so the auth block can attach it as an identity notifier.
+	var profileSyncSvc *profilesync.Service
+	profileSyncDone := make(chan struct{})
+	if cfg.ProfileSyncEnabled {
+		profileSyncSvc = profilesync.New(profilesync.Config{
+			Interval: cfg.ProfileSyncInterval,
+			Workers:  cfg.ProfileSyncWorkers,
+		}, st, giteaClient, relayURLs, logger)
+		go func() {
+			defer close(profileSyncDone)
+			profileSyncSvc.Run(ctx)
+		}()
+		logger.Info("Nostr kind:0 profile sync enabled", "interval", cfg.ProfileSyncInterval.String(), "workers", cfg.ProfileSyncWorkers)
+	} else {
+		close(profileSyncDone)
+	}
+
 	if cfg.AuthEnabled {
 		authSvc := auth.NewService(cfg, st, logger)
 		identitySvc := auth.NewIdentityService(st, giteaClient, nip05Resolver, logger)
+		if profileSyncSvc != nil {
+			identitySvc.SetProfileSyncNotifier(profileSyncSvc)
+		}
 		nip07Handler := auth.NewNIP07Handler(authSvc, identitySvc, relayURLs, logger)
 		nip46Handler := auth.NewNIP46Handler(st, identitySvc, relayURLs, cfg.BridgePublicURL, signerSvc, logger)
 		nip46Handler.SetTrustedProxyCIDRs(cfg.NIP46TrustedProxyCIDRs)
@@ -498,6 +521,11 @@ func main() {
 	case <-proactiveSyncDone:
 	case <-shutdownCtx.Done():
 		logger.Warn("proactive sync scheduler did not stop before shutdown timeout")
+	}
+	select {
+	case <-profileSyncDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("profile sync service did not stop before shutdown timeout")
 	}
 	select {
 	case <-refsNostrReaperDone:

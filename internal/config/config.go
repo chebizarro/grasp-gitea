@@ -125,6 +125,12 @@ type Config struct {
 	// ShutdownGrace bounds graceful HTTP shutdown; long enough for active
 	// streaming git/package uploads to complete.
 	ShutdownGrace time.Duration
+
+	// ProfileSyncEnabled turns on live kind:0 -> Gitea user profile sync
+	// (display name, bio, website, avatar). Independent of bridge tokens.
+	ProfileSyncEnabled  bool
+	ProfileSyncInterval time.Duration
+	ProfileSyncWorkers  int
 }
 
 // CredentialKey is one entry of the credential-encryption key ring.
@@ -160,6 +166,9 @@ func Load() (Config, error) {
 		ChallengeTTL:            durationEnv("CHALLENGE_TTL", 5*time.Minute),
 		NIP46TrustedProxyCIDRs:  csvEnv("NIP46_TRUSTED_PROXY_CIDRS"),
 		ProactiveSyncInterval:   normalizeProactiveSyncInterval(durationEnv("PROACTIVE_SYNC_INTERVAL", time.Hour)),
+		ProfileSyncEnabled:      boolEnv("PROFILE_SYNC_ENABLED", false),
+		ProfileSyncInterval:     durationEnv("PROFILE_SYNC_INTERVAL", 10*time.Minute),
+		ProfileSyncWorkers:      intEnv("PROFILE_SYNC_WORKERS", 4),
 		SignerMasterKey:         nil,
 		SignetBunkerURL:         strings.TrimSpace(os.Getenv("SIGNET_BUNKER_URL")),
 		BridgeNsec:              strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
@@ -340,6 +349,20 @@ func Load() (Config, error) {
 	}
 	if cfg.Production() && (cfg.SignetBunkerURL != "" || cfg.AuthEnabled) && !cfg.SignerEnabled() {
 		return Config{}, fmt.Errorf("SIGNER_MASTER_KEY is required for production durable signing")
+	}
+
+	if cfg.ProfileSyncEnabled {
+		// Profile sync mints admin PATs and edits users via the admin API,
+		// which Gitea gates behind Basic admin auth.
+		if cfg.GiteaAdminUser == "" {
+			return Config{}, fmt.Errorf("GITEA_ADMIN_USER is required when PROFILE_SYNC_ENABLED=true")
+		}
+		if cfg.ProfileSyncInterval < time.Minute || cfg.ProfileSyncInterval > 24*time.Hour {
+			return Config{}, fmt.Errorf("PROFILE_SYNC_INTERVAL must be between 1m and 24h, got %s", cfg.ProfileSyncInterval)
+		}
+		if cfg.ProfileSyncWorkers < 1 || cfg.ProfileSyncWorkers > 32 {
+			return Config{}, fmt.Errorf("PROFILE_SYNC_WORKERS must be between 1 and 32, got %d", cfg.ProfileSyncWorkers)
+		}
 	}
 
 	return cfg, nil

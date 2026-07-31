@@ -170,20 +170,28 @@ func (t *guardedTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 
 func (g *guard) validateURL(ctx context.Context, u *url.URL) error {
 	if u == nil {
-		return fmt.Errorf("nil URL")
+		return fmt.Errorf("%w: nil URL", ErrPolicy)
 	}
 	if !strings.EqualFold(u.Scheme, "https") {
-		return fmt.Errorf("scheme %q is not allowed; HTTPS is required", u.Scheme)
+		return fmt.Errorf("%w: scheme %q is not allowed; HTTPS is required", ErrPolicy, u.Scheme)
 	}
 	if u.Hostname() == "" {
-		return fmt.Errorf("URL host is required")
+		return fmt.Errorf("%w: URL host is required", ErrPolicy)
 	}
 	if u.User != nil {
-		return fmt.Errorf("URL credentials are not allowed")
+		return fmt.Errorf("%w: URL credentials are not allowed", ErrPolicy)
 	}
-	_, err := g.resolvePublicIPs(ctx, u.Hostname())
-	return err
+	if _, err := g.resolvePublicIPs(ctx, u.Hostname()); err != nil {
+		return fmt.Errorf("%w: %v", ErrPolicy, err)
+	}
+	return nil
 }
+
+// ErrPolicy marks a URL/host rejected by safefetch policy (non-HTTPS,
+// private/reserved/loopback address, credentials in URL, IP zone). Callers
+// use errors.Is to distinguish a permanent policy rejection from a transient
+// network failure, rather than matching error text.
+var ErrPolicy = errors.New("safefetch policy rejection")
 
 func (g *guard) resolvePublicIPs(ctx context.Context, host string) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {

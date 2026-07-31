@@ -27,6 +27,27 @@ type IdentityService struct {
 	giteaClient *gitea.Client
 	orgResolver OrgNameResolver
 	logger      *slog.Logger
+	profileSync ProfileSyncNotifier
+}
+
+// ProfileSyncNotifier is notified (best-effort, non-blocking) when an
+// identity is resolved or created, so the profile-sync service can refresh
+// that user's Gitea profile from their kind:0. *profilesync.Service
+// satisfies it.
+type ProfileSyncNotifier interface {
+	Enqueue(pubkey string)
+}
+
+// SetProfileSyncNotifier attaches a profile-sync notifier. Notification never
+// affects identity resolution success.
+func (s *IdentityService) SetProfileSyncNotifier(n ProfileSyncNotifier) {
+	s.profileSync = n
+}
+
+func (s *IdentityService) notifyProfileSync(pubkey string) {
+	if s.profileSync != nil {
+		s.profileSync.Enqueue(pubkey)
+	}
 }
 
 // OrgNameResolver resolves a pubkey to a human-readable org/user name.
@@ -80,6 +101,7 @@ func (s *IdentityService) ResolveOrCreate(ctx context.Context, pubkey string, re
 			s.logger.Warn("failed to update last_login_at", "pubkey", pubkey, "error", loginErr)
 		}
 		s.logger.Info("returning login resolved to existing user", "pubkey", pubkey, "gitea_user", existing.GiteaUser)
+		s.notifyProfileSync(pubkey)
 		return ResolvedIdentity{
 			Pubkey:      pubkey,
 			Npub:        npub,
@@ -137,6 +159,7 @@ func (s *IdentityService) ResolveOrCreate(ctx context.Context, pubkey string, re
 	metrics.IncAuthUserProvisioned()
 	s.logger.Info("auto-created Gitea user for Nostr identity",
 		"pubkey", pubkey, "gitea_user", user.Login, "gitea_user_id", user.ID)
+	s.notifyProfileSync(pubkey)
 
 	return ResolvedIdentity{
 		Pubkey:      pubkey,
