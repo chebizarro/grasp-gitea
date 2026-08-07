@@ -99,7 +99,7 @@ func (s *Service) CIEnabled() bool {
 // ---------------------------------------------------------------------------
 
 // HandleStateEventCI inspects an incoming kind:30618 repository state
-// event, detects changed branches, checks for CI workflow files, and
+// event, detects changed branches and release tags, checks for CI workflow files, and
 // publishes a canonical ContextVM ci/workflow-run request for each qualifying
 // change.
 //
@@ -141,7 +141,7 @@ func (s *Service) HandleStateEventCI(ctx context.Context, ev *nostr.Event, sourc
 	repoPath := filepath.Join(s.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
 
 	// Snapshot current local refs to detect what changed.
-	_, localBranches, _, localErr := snapshotRefs(ctx, repoPath)
+	_, localBranches, localTags, localErr := snapshotRefs(ctx, repoPath)
 	if localErr != nil {
 		s.logger.Debug("CI: cannot snapshot local refs, skipping",
 			"repo", repoID, "error", localErr)
@@ -202,6 +202,36 @@ func (s *Service) HandleStateEventCI(ctx context.Context, ev *nostr.Event, sourc
 		}
 	}
 
+	for tag, newSHA := range state.Tags {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if localTags[tag] == newSHA {
+			continue
+		}
+		workflows, wfErr := detectWorkflows(ctx, repoPath, newSHA)
+		if wfErr != nil {
+			s.logger.Debug("CI: workflow detection error", "repo", repoID, "tag", tag, "error", wfErr)
+			continue
+		}
+		for _, wf := range workflows {
+			wfEv, buildErr := s.buildWorkflowRunEventForRef(
+				mapping.Pubkey, repoID, newSHA, "refs/tags/"+tag, wf, sourceRelay, "nip34-tag", mapping.CloneURL)
+			if buildErr != nil {
+				s.logger.Warn("failed to build release workflow run event", "repo", repoID, "tag", tag, "workflow", wf, "error", buildErr)
+				continue
+			}
+			if pubErr := s.publishToRelays(ctx, wfEv); pubErr != nil {
+				metrics.IncCIWorkflowRunsFailed()
+				s.logger.Warn("failed to publish release workflow run event", "repo", repoID, "tag", tag, "workflow", wf, "error", pubErr)
+				continue
+			}
+			published++
+			metrics.IncCIWorkflowRunsPublished()
+			s.logger.Info("published release CI workflow run event", "repo", repoID, "tag", tag, "workflow", wf, "commit", newSHA, "event_id", wfEv.ID)
+		}
+	}
+
 	if published == 0 {
 		s.logger.Debug("no CI workflow runs triggered", "repo", repoID)
 	}
@@ -233,7 +263,7 @@ func (s *Service) HandleWebhookPushCI(ctx context.Context, giteaRepoID int64, re
 	if !s.CIEnabled() {
 		return nil
 	}
-	if !strings.HasPrefix(ref, "refs/heads/") {
+	if !strings.HasPrefix(ref, "refs/heads/") && !strings.HasPrefix(ref, "refs/tags/") {
 		return nil
 	}
 	if after == "" || after == before || strings.Trim(after, "0") == "" {
@@ -251,37 +281,41 @@ func (s *Service) HandleWebhookPushCI(ctx context.Context, giteaRepoID int64, re
 		return nil
 	}
 
-	branch := strings.TrimPrefix(ref, "refs/heads/")
+	refName := strings.TrimPrefix(strings.TrimPrefix(ref, "refs/heads/"), "refs/tags/")
+	triggeredBy := "push"
+	if strings.HasPrefix(ref, "refs/tags/") {
+		triggeredBy = "webhook-tag"
+	}
 	repoPath := filepath.Join(s.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
 	workflows, wfErr := detectWorkflows(ctx, repoPath, after)
 	if wfErr != nil {
 		s.logger.Debug("CI: workflow detection error on webhook push",
-			"repo", mapping.RepoID, "branch", branch, "error", wfErr)
+			"repo", mapping.RepoID, "ref", ref, "error", wfErr)
 		return nil
 	}
 	if len(workflows) == 0 {
-		s.logger.Debug("no CI workflow runs triggered on webhook push", "repo", mapping.RepoID, "branch", branch)
+		s.logger.Debug("no CI workflow runs triggered on webhook push", "repo", mapping.RepoID, "ref", ref)
 		return nil
 	}
 
 	for _, wf := range workflows {
-		wfEv, buildErr := s.buildWorkflowRunEvent(mapping.Pubkey, mapping.RepoID, after, branch, wf, sourceRelay)
+		wfEv, buildErr := s.buildWorkflowRunEventForRef(mapping.Pubkey, mapping.RepoID, after, ref, wf, sourceRelay, triggeredBy, mapping.CloneURL)
 		if buildErr != nil {
 			s.logger.Warn("failed to build workflow run event from webhook push",
-				"repo", mapping.RepoID, "branch", branch,
+				"repo", mapping.RepoID, "ref", ref,
 				"workflow", wf, "error", buildErr)
 			continue
 		}
 		if pubErr := s.publishToRelays(ctx, wfEv); pubErr != nil {
 			metrics.IncCIWorkflowRunsFailed()
 			s.logger.Warn("failed to publish workflow run event from webhook push",
-				"repo", mapping.RepoID, "branch", branch,
+				"repo", mapping.RepoID, "ref", ref, "name", refName,
 				"workflow", wf, "error", pubErr)
 			continue
 		}
 		metrics.IncCIWorkflowRunsPublished()
 		s.logger.Info("published CI workflow run event",
-			"repo", mapping.RepoID, "branch", branch,
+			"repo", mapping.RepoID, "ref", ref, "name", refName,
 			"workflow", wf, "commit", after,
 			"event_id", wfEv.ID)
 	}
@@ -360,12 +394,17 @@ func listWorkflowFiles(ctx context.Context, repoPath, commitSHA, dir string) ([]
 // and signs it with the bridge key. The repository coordinate remains on the
 // event so routers can select a worker without decoding the JSON-RPC payload.
 func (s *Service) buildWorkflowRunEvent(ownerPubkey, repoID, commitSHA, branch, workflow, relayHint string) (*nostr.Event, error) {
+	return s.buildWorkflowRunEventForRef(ownerPubkey, repoID, commitSHA, "refs/heads/"+branch, workflow, relayHint, "push", "")
+}
+
+func (s *Service) buildWorkflowRunEventForRef(ownerPubkey, repoID, commitSHA, ref, workflow, relayHint, triggeredBy, repository string) (*nostr.Event, error) {
 	method, ok := cascadia.ContextVMMethods["ci/workflow-run"]
 	if !ok {
 		return nil, fmt.Errorf("generated binding missing ci/workflow-run")
 	}
+	refName := strings.TrimPrefix(strings.TrimPrefix(ref, "refs/heads/"), "refs/tags/")
 	payload := cascadia.HiveCiWorkflowV1Payload{
-		Workflow: workflow, Commit: commitSHA, Branch: branch, TriggeredBy: "push",
+		Workflow: workflow, Commit: commitSHA, Branch: refName, TriggeredBy: triggeredBy,
 	}
 	if err := payload.Validate(); err != nil {
 		return nil, fmt.Errorf("validate %s payload: %w", method.Schema, err)
@@ -395,10 +434,21 @@ func (s *Service) buildWorkflowRunEvent(ownerPubkey, repoID, commitSHA, branch, 
 		Tags: nostr.Tags{
 			{"a", aTag},
 			{"p", ownerPubkey},
+			{"commit", commitSHA},
+			{"branch", refName},
+			{"ref", ref},
+			{"workflow", workflow},
+			{"triggered-by", triggeredBy},
 			{"publisher", s.bridgePubKey},
 			{"relay", relayHint},
 		},
 		Content: string(content),
+	}
+	if strings.HasPrefix(ref, "refs/tags/") {
+		ev.Tags = append(ev.Tags, nostr.Tag{"tag", refName}, nostr.Tag{"release", "true"})
+	}
+	if strings.TrimSpace(repository) != "" {
+		ev.Tags = append(ev.Tags, nostr.Tag{"repo", strings.TrimSpace(repository)})
 	}
 
 	if err := s.signOutbound(context.Background(), ev); err != nil {

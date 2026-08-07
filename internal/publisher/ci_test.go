@@ -114,6 +114,35 @@ func TestBuildWorkflowRunEvent(t *testing.T) {
 	}
 }
 
+func TestBuildWorkflowRunEventForReleaseTag(t *testing.T) {
+	privKey := nostr.Generate().Hex()
+	pubKey, _ := derivePubHex(privKey)
+	svc := &Service{bridgePrivKey: privKey, bridgePubKey: pubKey}
+
+	ev, err := svc.buildWorkflowRunEventForRef(
+		"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+		"bahia",
+		"deadbeef1234567890abcdef1234567890abcdef12",
+		"refs/tags/v0.2.0-rc.1",
+		".github/workflows/release.yml",
+		"wss://relay.example.com",
+		"nip34-tag",
+		"https://git.example/cascadia/bahia.git",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTag(t, ev, "branch", "v0.2.0-rc.1")
+	assertTag(t, ev, "ref", "refs/tags/v0.2.0-rc.1")
+	assertTag(t, ev, "tag", "v0.2.0-rc.1")
+	assertTag(t, ev, "release", "true")
+	assertTag(t, ev, "triggered-by", "nip34-tag")
+	assertTag(t, ev, "repo", "https://git.example/cascadia/bahia.git")
+	if !ev.VerifySignature() {
+		t.Fatal("release workflow-run signature invalid")
+	}
+}
+
 func TestBuildWorkflowRunEventDifferentBranch(t *testing.T) {
 	privKey := nostr.Generate().Hex()
 	pubKey, _ := derivePubHex(privKey)
