@@ -264,6 +264,27 @@ func TestWorkflowDirsContainsExpectedPaths(t *testing.T) {
 	}
 }
 
+func TestWorkflowAcceptsTag(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{"matching tag", "on:\n  push:\n    tags: ['v*']\n", true},
+		{"branch only", "on:\n  push:\n    branches: [master]\n", false},
+		{"manual only", "on:\n  workflow_dispatch:\n", false},
+		{"unrestricted push", "on: push\n", true},
+		{"excluded tag", "on:\n  push:\n    tags: ['v*', '!v0.*']\n", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := workflowAcceptsTag([]byte(tt.yaml), "v0.1.0-canary.1"); got != tt.want {
+				t.Fatalf("workflowAcceptsTag() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Dedup cache tests
 // ---------------------------------------------------------------------------

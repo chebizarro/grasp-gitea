@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip19"
 	"fiatjaf.com/nostr/nip34"
@@ -209,7 +211,7 @@ func (s *Service) HandleStateEventCI(ctx context.Context, ev *nostr.Event, sourc
 		if localTags[tag] == newSHA {
 			continue
 		}
-		workflows, wfErr := detectWorkflows(ctx, repoPath, newSHA)
+		workflows, wfErr := detectTagWorkflows(ctx, repoPath, newSHA, tag)
 		if wfErr != nil {
 			s.logger.Debug("CI: workflow detection error", "repo", repoID, "tag", tag, "error", wfErr)
 			continue
@@ -352,6 +354,100 @@ func detectWorkflows(ctx context.Context, repoPath string, commitSHA string) ([]
 		workflows = append(workflows, found...)
 	}
 	return workflows, nil
+}
+
+// detectTagWorkflows returns only workflows whose GitHub-compatible trigger
+// accepts the released tag. Merely existing under a workflow directory is not
+// enough: branch-only CI must not fan out when a NIP-34 tag is published.
+func detectTagWorkflows(ctx context.Context, repoPath, commitSHA, tag string) ([]string, error) {
+	workflows, err := detectWorkflows(ctx, repoPath, commitSHA)
+	if err != nil {
+		return nil, err
+	}
+	var selected []string
+	for _, workflow := range workflows {
+		out, showErr := exec.CommandContext(ctx, "git", "--git-dir", repoPath,
+			"show", commitSHA+":"+workflow).Output()
+		if showErr != nil {
+			continue
+		}
+		if workflowAcceptsTag(out, tag) {
+			selected = append(selected, workflow)
+		}
+	}
+	return selected, nil
+}
+
+func workflowAcceptsTag(data []byte, tag string) bool {
+	var document yaml.Node
+	if yaml.Unmarshal(data, &document) != nil || len(document.Content) == 0 {
+		return false
+	}
+	on := mappingValue(document.Content[0], "on")
+	if on == nil {
+		return false
+	}
+	switch on.Kind {
+	case yaml.ScalarNode:
+		return on.Value == "push"
+	case yaml.SequenceNode:
+		for _, trigger := range on.Content {
+			if trigger.Value == "push" {
+				return true
+			}
+		}
+		return false
+	case yaml.MappingNode:
+		push := mappingValue(on, "push")
+		if push == nil {
+			return false
+		}
+		if push.Kind == yaml.ScalarNode && (push.Tag == "!!null" || push.Value == "") {
+			return true
+		}
+		if push.Kind != yaml.MappingNode {
+			return true
+		}
+		tags := mappingValue(push, "tags")
+		if tags == nil {
+			// GitHub does not run tag refs when a push trigger restricts branches.
+			return mappingValue(push, "branches") == nil && mappingValue(push, "branches-ignore") == nil
+		}
+		return yamlPatternsMatch(tags, tag)
+	default:
+		return false
+	}
+}
+
+func mappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func yamlPatternsMatch(node *yaml.Node, value string) bool {
+	patterns := node.Content
+	if node.Kind == yaml.ScalarNode {
+		patterns = []*yaml.Node{node}
+	}
+	matched := false
+	for _, patternNode := range patterns {
+		pattern := patternNode.Value
+		negated := strings.HasPrefix(pattern, "!")
+		pattern = strings.TrimPrefix(pattern, "!")
+		ok, err := path.Match(pattern, value)
+		if err != nil || !ok {
+			continue
+		}
+		matched = !negated
+	}
+	return matched
 }
 
 // listWorkflowFiles returns .yml/.yaml file paths under a single
