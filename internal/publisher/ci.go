@@ -486,9 +486,10 @@ func listWorkflowFiles(ctx context.Context, repoPath, commitSHA, dir string) ([]
 // Event construction
 // ---------------------------------------------------------------------------
 
-// buildWorkflowRunEvent creates a canonical ContextVM ci/workflow-run request
-// and signs it with the bridge key. The repository coordinate remains on the
-// event so routers can select a worker without decoding the JSON-RPC payload.
+// buildWorkflowRunEvent creates the legacy Hive CI workflow-run event consumed
+// by Bahia's authenticated HiveCI bridge and signs it with the bridge key. The
+// JSON-RPC-shaped content remains additive metadata; routing uses the signed
+// kind-5401 tags and does not require decoding the content.
 func (s *Service) buildWorkflowRunEvent(ownerPubkey, repoID, commitSHA, branch, workflow, relayHint string) (*nostr.Event, error) {
 	return s.buildWorkflowRunEventForRef(ownerPubkey, repoID, commitSHA, "refs/heads/"+branch, workflow, relayHint, "push", "")
 }
@@ -526,7 +527,7 @@ func (s *Service) buildWorkflowRunEventForRef(ownerPubkey, repoID, commitSHA, re
 	ev := &nostr.Event{
 		PubKey:    s.bridgePubKeyBytes,
 		CreatedAt: nostr.Now(),
-		Kind:      nostr.Kind(method.Kind),
+		Kind:      relay.KindHiveWorkflowRun,
 		Tags: nostr.Tags{
 			{"a", aTag},
 			{"p", ownerPubkey},

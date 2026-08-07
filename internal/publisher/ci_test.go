@@ -73,8 +73,8 @@ func TestBuildWorkflowRunEvent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if int(ev.Kind) != cascadia.ContextVMMethods["ci/workflow-run"].Kind {
-		t.Errorf("expected canonical ContextVM kind, got %d", ev.Kind)
+	if ev.Kind != relay.KindHiveWorkflowRun {
+		t.Errorf("expected Hive CI workflow-run kind, got %d", ev.Kind)
 	}
 	if ev.PubKey.Hex() != pubKey {
 		t.Errorf("expected pubkey %s, got %s", pubKey, ev.PubKey)
