@@ -13,6 +13,7 @@ import (
 	cascadia "git.sharegap.net/cascadia/cascadia-go"
 
 	"github.com/sharegap/grasp-gitea/internal/relay"
+	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
 func TestIsRepoCIAllowed(t *testing.T) {
@@ -163,6 +164,16 @@ func TestBuildWorkflowRunEventDifferentBranch(t *testing.T) {
 	}
 	if request.Method != "ci/workflow-run" || request.Params.Branch != "develop" || request.Params.Workflow != ".github/workflows/test.yml" {
 		t.Errorf("unexpected request: %+v", request)
+	}
+}
+
+func TestPreferredCloneURLUsesCanonicalAnnouncement(t *testing.T) {
+	mapping := store.Mapping{
+		AnnouncedCloneURL: "https://grasp.example/npub1owner/repo.git",
+		CloneURL:          "https://git.internal/owner/repo.git",
+	}
+	if got := preferredCloneURL(mapping); got != mapping.AnnouncedCloneURL {
+		t.Fatalf("preferredCloneURL() = %q, want %q", got, mapping.AnnouncedCloneURL)
 	}
 }
 

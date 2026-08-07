@@ -218,7 +218,7 @@ func (s *Service) HandleStateEventCI(ctx context.Context, ev *nostr.Event, sourc
 		}
 		for _, wf := range workflows {
 			wfEv, buildErr := s.buildWorkflowRunEventForRef(
-				mapping.Pubkey, repoID, newSHA, "refs/tags/"+tag, wf, sourceRelay, "nip34-tag", mapping.CloneURL)
+				mapping.Pubkey, repoID, newSHA, "refs/tags/"+tag, wf, sourceRelay, "nip34-tag", preferredCloneURL(mapping))
 			if buildErr != nil {
 				s.logger.Warn("failed to build release workflow run event", "repo", repoID, "tag", tag, "workflow", wf, "error", buildErr)
 				continue
@@ -301,7 +301,7 @@ func (s *Service) HandleWebhookPushCI(ctx context.Context, giteaRepoID int64, re
 	}
 
 	for _, wf := range workflows {
-		wfEv, buildErr := s.buildWorkflowRunEventForRef(mapping.Pubkey, mapping.RepoID, after, ref, wf, sourceRelay, triggeredBy, mapping.CloneURL)
+		wfEv, buildErr := s.buildWorkflowRunEventForRef(mapping.Pubkey, mapping.RepoID, after, ref, wf, sourceRelay, triggeredBy, preferredCloneURL(mapping))
 		if buildErr != nil {
 			s.logger.Warn("failed to build workflow run event from webhook push",
 				"repo", mapping.RepoID, "ref", ref,
@@ -565,6 +565,13 @@ func evTagValue(tags nostr.Tags, key string) string {
 		return ""
 	}
 	return v[1]
+}
+
+func preferredCloneURL(mapping store.Mapping) string {
+	if cloneURL := strings.TrimSpace(mapping.AnnouncedCloneURL); cloneURL != "" {
+		return cloneURL
+	}
+	return strings.TrimSpace(mapping.CloneURL)
 }
 
 func (s *Service) resolveStateEventMapping(ctx context.Context, ev *nostr.Event, repoID string) (store.Mapping, error) {
