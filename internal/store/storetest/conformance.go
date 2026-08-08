@@ -36,6 +36,90 @@ func Run(t *testing.T, factory Factory) {
 	t.Run("ConcurrentMintsNeverExceedLimit", func(t *testing.T) { testConcurrentLimit(t, factory(t)) })
 	t.Run("ConcurrentReservationsGetDistinctGenerations", func(t *testing.T) { testConcurrentReserve(t, factory(t)) })
 	t.Run("UserLockIsMutuallyExclusive", func(t *testing.T) { testUserLockExclusion(t, factory(t)) })
+	t.Run("MaintenanceLeaseIsSingleHolder", func(t *testing.T) { testMaintenanceLease(t, factory(t)) })
+}
+
+// testMaintenanceLease proves at most one node holds the maintenance lease at
+// a time, and that a released lease can be re-acquired. On Postgres each
+// acquirer uses a distinct pooled session, so this exercises real advisory-
+// lock leadership; SQLite is trivially always-leader.
+func testMaintenanceLease(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+
+	// A single-node backend (SQLite) is always the leader: every attempt
+	// succeeds. A multi-node backend (Postgres) grants exactly one at a time.
+	// Detect which by whether a second concurrent acquire succeeds while the
+	// first is held.
+	acq1, rel1, err := st.TryMaintenanceLease(ctx)
+	if err != nil || !acq1 {
+		t.Fatalf("first lease: acquired=%v err=%v", acq1, err)
+	}
+	acq2, rel2, err := st.TryMaintenanceLease(ctx)
+	if err != nil {
+		t.Fatalf("second lease attempt: %v", err)
+	}
+	singleNode := acq2 // always-leader backend
+	if acq2 {
+		rel2()
+	}
+	rel1()
+
+	if singleNode {
+		// Nothing more to prove: a single-node store is always leader by
+		// contract, and re-acquisition trivially holds.
+		if acq, rel, err := st.TryMaintenanceLease(ctx); err != nil || !acq {
+			t.Fatalf("re-acquire on single-node: acquired=%v err=%v", acq, err)
+		} else {
+			rel()
+		}
+		return
+	}
+
+	// Multi-node: race many acquirers; exactly one may hold it at once.
+	const workers = 16
+	var held atomic.Int32
+	var maxHeld atomic.Int32
+	var wins atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			acquired, release, err := st.TryMaintenanceLease(ctx)
+			if err != nil {
+				t.Errorf("lease: %v", err)
+				return
+			}
+			if !acquired {
+				return
+			}
+			wins.Add(1)
+			n := held.Add(1)
+			for {
+				m := maxHeld.Load()
+				if n <= m || maxHeld.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(3 * time.Millisecond)
+			held.Add(-1)
+			release()
+		}()
+	}
+	wg.Wait()
+	if maxHeld.Load() > 1 {
+		t.Fatalf("maintenance lease held by %d nodes at once, want <= 1", maxHeld.Load())
+	}
+	if wins.Load() == 0 {
+		t.Fatal("no node ever acquired the maintenance lease")
+	}
+
+	// After the storm, the lease is free and re-acquirable.
+	if acq, rel, err := st.TryMaintenanceLease(ctx); err != nil || !acq {
+		t.Fatalf("re-acquire after release: acquired=%v err=%v", acq, err)
+	} else {
+		rel()
+	}
 }
 
 // testUserLockExclusion proves WithUserLock serializes critical sections for

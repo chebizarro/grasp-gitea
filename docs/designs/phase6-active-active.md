@@ -66,16 +66,105 @@ this first as its own PR**; it has value even single-node (test doubles).
   touches the store for token auth + DownstreamPAT, so pool pressure is
   auth-rate, not transfer-rate.
 
-### Maintenance leadership
+### Maintenance leadership (step 4 — designed here)
 
-The maintenance loop (`RunMaintenance`) runs destructive sweeps. Options:
+**Problem.** `TokenService.maintain()` runs once per tick and performs five
+global sweeps: idle-PAT retirement, proactive re-encryption, terminal/
+stuck-provisioning reconciliation, expired-replay-claim cleanup, and audit
+retention. Two of them (retire, stuck-provisioning) already serialize per
+user through `WithUserLock` (step 3), so they are *correct* multi-node — but
+all five are wasteful when every replica runs them every tick: duplicate
+Gitea `DELETE` calls, duplicate CAS reseals, N× the DB churn. Terminal
+reconciliation in particular fires a Gitea API call per error/orphaned row;
+running it on 3 nodes triples that load for zero benefit.
 
-- **A. Advisory-lock leader:** each node tries `pg_try_advisory_lock(MAINT)`
-  once per tick; only the holder sweeps. Simple, no extra infra.
-- **B. Idempotent everywhere:** make every sweep safe to run concurrently
-  (they mostly are — Gitea deletes are 404-idempotent; the stuck-provisioning
-  path already re-reads under a lock). Preferred long-term, but the
-  advisory-lock leader is the safer first cut.
+Leadership is therefore an **efficiency** guarantee, not a **correctness**
+one. Every sweep must remain idempotent regardless (they are: Gitea deletes
+treat 404 as success, reseal is CAS, cleanup deletes are set-based). This is
+deliberate — it means a leadership handoff mid-sweep can never corrupt state,
+only waste a little work.
+
+**Chosen design: per-tick advisory-lease leader.**
+
+Add to the store contract:
+
+```go
+// TryMaintenanceLease attempts to become the maintenance leader for one
+// sweep. acquired=false means another node holds it right now (skip this
+// tick). release() frees it; always call it when acquired.
+TryMaintenanceLease(ctx context.Context) (acquired bool, release func(), err error)
+```
+
+- **Postgres:** `pg_try_advisory_lock(MAINT_KEY)` on a dedicated pooled
+  connection. Non-blocking: a follower gets `acquired=false` instantly and
+  skips the sweep. `release()` runs `pg_advisory_unlock` and closes the
+  connection. If the leader **crashes**, its session ends and Postgres frees
+  the lock automatically — the next tick, some node acquires it. At most one
+  holder per key across the whole cluster, by construction.
+- **SQLite:** single-node, so it is always the leader — `(true, noop, nil)`.
+
+`RunMaintenance` wraps the whole `maintain()` pass:
+
+```go
+for {
+    if acquired, release, err := t.store.TryMaintenanceLease(ctx); err != nil {
+        t.logger.Warn("maintenance lease error; skipping tick", "error", err)
+    } else if acquired {
+        t.maintain(ctx)
+        release()
+    } else {
+        t.logger.Debug("not maintenance leader this tick; skipping")
+    }
+    select { case <-ctx.Done(): return; case <-ticker.C: }
+}
+```
+
+**Why per-tick, not a held lease with heartbeat.** The lock is acquired at
+the start of a tick and released at its end — held only for the duration of
+one `maintain()` pass, not continuously. Rationale:
+
+- A continuously-held lease means a *wedged* (not crashed) leader — alive
+  but stuck — blocks all maintenance indefinitely and needs liveness
+  detection (heartbeat + takeover timeout) to recover. Per-tick acquisition
+  makes the worst case a single skipped tick.
+- Leadership may flap between nodes tick-to-tick. That is fine: maintenance
+  is stateless, and the interval (default 1h) dwarfs a sweep's duration, so
+  in practice one node holds it for the whole sweep and releases well
+  before the next tick.
+- No new tables, no heartbeat rows, no clock assumptions. The Postgres
+  session *is* the liveness signal.
+
+**Failure modes.**
+
+| Event | Behavior |
+|---|---|
+| Follower tick | `acquired=false`, sweep skipped, no-op |
+| Leader crash mid-sweep | Session ends → Postgres frees lock → next tick re-elects; partial sweep is idempotent, resumes next tick |
+| DB unreachable at lease time | `err != nil` → skip tick, log, stay follower, retry next tick (never crash) |
+| Two nodes race the lease | `pg_try_advisory_lock` grants exactly one; the loser skips |
+| Long sweep overruns the interval | Leader still holds the lock; followers keep skipping; no overlap |
+
+**What this does NOT need:** a heartbeat table, a lease-expiry timestamp, or
+clock synchronization — all of which a token-bucket or timestamp-lease design
+would require. The advisory lock's session lifetime is the entire mechanism.
+
+**Rejected alternatives.**
+
+- *Idempotent-everywhere, no leader (original option B):* correct, but leaves
+  the N× Gitea API load unaddressed — the whole point of leadership here.
+  Kept as the safety net *under* leadership, not instead of it.
+- *Held lease + heartbeat:* needed only if a sweep must not restart on
+  handoff. Ours are idempotent, so the added liveness machinery buys nothing.
+- *External coordinator (etcd/Consul/k8s lease):* real infra dependency for a
+  problem one `pg_try_advisory_lock` solves, given we already require the
+  shared Postgres.
+
+**Testable now (implemented alongside this sketch):** `TryMaintenanceLease`
+on both backends + a conformance check (`MaintenanceLeaseIsSingleHolder`:
+of N racing acquirers exactly one succeeds; after release another can take
+it). The `RunMaintenance` wrapper is wired but inert single-node (SQLite is
+always leader). Multi-node exercise waits for the two-replica deploy
+(step 5).
 
 ### Session handoff / NIP-46 bindings
 

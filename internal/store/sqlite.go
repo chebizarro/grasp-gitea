@@ -225,6 +225,11 @@ func (s *SQLiteStore) WithUserLock(ctx context.Context, giteaUserID int64, fn fu
 	return fn(ctx)
 }
 
+// TryMaintenanceLease: a single-node store is always the maintenance leader.
+func (s *SQLiteStore) TryMaintenanceLease(ctx context.Context) (bool, func(), error) {
+	return true, func() {}, nil
+}
+
 func Open(path string) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {

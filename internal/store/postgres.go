@@ -249,6 +249,36 @@ func (s *PostgresStore) WithUserLock(ctx context.Context, giteaUserID int64, fn 
 	return fn(ctx)
 }
 
+// maintenanceLeaseKey is the fixed advisory-lock key for the single-leader
+// maintenance role. Arbitrary but stable; must not collide with the
+// per-user PAT lock keyspace (those are hashtextextended of 'pat_user:<id>').
+const maintenanceLeaseKey = int64(0x6772_6173_705f_6d74) // "grasp_mt"
+
+// TryMaintenanceLease attempts pg_try_advisory_lock on a dedicated pooled
+// connection. Non-blocking: a follower returns acquired=false at once. If the
+// leader's process dies, its session ends and Postgres frees the lock, so the
+// next tick re-elects. release() unlocks and returns the connection.
+func (s *PostgresStore) TryMaintenanceLease(ctx context.Context) (bool, func(), error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, nil, fmt.Errorf("acquire lease connection: %w", err)
+	}
+	var got bool
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, maintenanceLeaseKey).Scan(&got); err != nil {
+		conn.Close()
+		return false, nil, fmt.Errorf("try maintenance lease: %w", err)
+	}
+	if !got {
+		conn.Close()
+		return false, nil, nil
+	}
+	release := func() {
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, maintenanceLeaseKey)
+		conn.Close()
+	}
+	return true, release, nil
+}
+
 // --- NIP-98 replay ledger ---
 
 // ClaimNIP98Event is single-use across every node sharing this store: the

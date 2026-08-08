@@ -35,6 +35,14 @@ type AuthStore interface {
 	// must not hold a database transaction while fn runs.
 	WithUserLock(ctx context.Context, giteaUserID int64, fn func(ctx context.Context) error) error
 
+	// TryMaintenanceLease attempts to become the maintenance leader for a
+	// single sweep. acquired=false means another node holds it right now, so
+	// the caller should skip this tick (leadership is an efficiency
+	// guarantee: sweeps stay idempotent, so skipping only avoids redundant
+	// work). Always call release() when acquired is true. A single-node
+	// backend is always the leader.
+	TryMaintenanceLease(ctx context.Context) (acquired bool, release func(), err error)
+
 	// NIP-98 replay ledger.
 	ClaimNIP98Event(ctx context.Context, eventID, pubkey, method string, targetHash []byte, now, expiresAt time.Time) (bool, error)
 	CleanupExpiredReplayClaims(ctx context.Context, now time.Time) (int64, error)

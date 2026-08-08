@@ -557,7 +557,20 @@ func (t *TokenService) RunMaintenance(ctx context.Context) {
 	ticker := time.NewTicker(tokenMaintenanceInterval)
 	defer ticker.Stop()
 	for {
-		t.maintain(ctx)
+		// Only the maintenance leader runs the sweeps: on a multi-node
+		// backend every node would otherwise duplicate the Gitea deletes and
+		// DB churn. Single-node backends are always the leader. Sweeps stay
+		// idempotent, so a skipped or handed-off tick is never a correctness
+		// problem — only work avoided.
+		acquired, release, err := t.store.TryMaintenanceLease(ctx)
+		if err != nil {
+			t.logger.Warn("maintenance lease error; skipping tick", "error", err)
+		} else if acquired {
+			t.maintain(ctx)
+			release()
+		} else {
+			t.logger.Debug("not maintenance leader this tick; skipping sweeps")
+		}
 		select {
 		case <-ctx.Done():
 			return
