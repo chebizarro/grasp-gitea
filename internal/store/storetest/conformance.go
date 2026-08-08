@@ -13,6 +13,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +32,119 @@ func Run(t *testing.T, factory Factory) {
 	t.Run("ResealIsCompareAndSwap", func(t *testing.T) { testResealCAS(t, factory(t)) })
 	t.Run("NotFoundIsErrNoRows", func(t *testing.T) { testNotFound(t, factory(t)) })
 	t.Run("TokenRevocationIsSubjectScoped", func(t *testing.T) { testRevokeScoped(t, factory(t)) })
+	t.Run("ConcurrentReplayClaimsOneWinner", func(t *testing.T) { testConcurrentReplay(t, factory(t)) })
+	t.Run("ConcurrentMintsNeverExceedLimit", func(t *testing.T) { testConcurrentLimit(t, factory(t)) })
+	t.Run("ConcurrentReservationsGetDistinctGenerations", func(t *testing.T) { testConcurrentReserve(t, factory(t)) })
+}
+
+// testConcurrentReplay hammers the same event id from many goroutines:
+// exactly one claim may win. This is THE cross-node NIP-98 guarantee.
+func testConcurrentReplay(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	hash := sha256.Sum256([]byte("t"))
+
+	const attempts = 24
+	wins := make(chan bool, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, err := st.ClaimNIP98Event(ctx, "race-ev", "pk", "POST", hash[:], now, now.Add(5*time.Minute))
+			if err != nil {
+				t.Errorf("claim: %v", err)
+				return
+			}
+			wins <- ok
+		}()
+	}
+	wg.Wait()
+	close(wins)
+	won := 0
+	for ok := range wins {
+		if ok {
+			won++
+		}
+	}
+	if won != 1 {
+		t.Fatalf("%d concurrent claims won for one event id, want exactly 1", won)
+	}
+}
+
+// testConcurrentLimit races many mints against a limit of 3: the number of
+// active tokens must never exceed the limit, no matter the interleaving.
+func testConcurrentLimit(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	expires := time.Now().Add(time.Hour)
+
+	const attempts = 24
+	const limit = 3
+	var wg sync.WaitGroup
+	var inserted atomic.Int64
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			err := st.InsertBridgeToken(ctx, token(fmt.Sprintf("race-tok-%02d", i), "race-pk", 50, expires), limit)
+			switch {
+			case err == nil:
+				inserted.Add(1)
+			case errors.Is(err, store.ErrBridgeTokenLimit):
+			default:
+				t.Errorf("insert: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	tokens, err := st.ListBridgeTokens(ctx, "race-pk", 100, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(tokens) > limit {
+		t.Fatalf("%d tokens inserted under a limit of %d — the conditional insert is not atomic on this backend", len(tokens), limit)
+	}
+	if inserted.Load() != int64(len(tokens)) {
+		t.Fatalf("insert successes %d != stored rows %d", inserted.Load(), len(tokens))
+	}
+}
+
+// testConcurrentReserve races PAT reservations for one user: every
+// reservation must receive a distinct generation (unique names feed the
+// ambiguous-creation reconciliation).
+func testConcurrentReserve(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	const attempts = 12
+	gens := make(chan int64, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gen, _, err := st.ReservePATCredential(ctx, 60, "u60", "grasp-bridge", []string{"write:repository"}, now)
+			if err != nil {
+				// A serialization conflict surfacing as an error is acceptable
+				// (the caller retries); a duplicate generation is not.
+				return
+			}
+			gens <- gen
+		}()
+	}
+	wg.Wait()
+	close(gens)
+	seen := map[int64]bool{}
+	for gen := range gens {
+		if seen[gen] {
+			t.Fatalf("generation %d handed to two concurrent reservations", gen)
+		}
+		seen[gen] = true
+	}
+	if len(seen) == 0 {
+		t.Fatal("no reservation succeeded")
+	}
 }
 
 func testReplaySingleUse(t *testing.T, st store.AuthStore) {

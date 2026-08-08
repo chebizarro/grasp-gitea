@@ -1,17 +1,18 @@
 module github.com/sharegap/grasp-gitea
 
-go 1.25
+go 1.25.0
 
 require (
 	fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026
 	git.sharegap.net/cascadia/cascadia-go v1.0.3-0.20260720153145-c371769cdba8
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4
 	github.com/elnosh/gonuts v0.4.2
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/zalando/go-keyring v0.2.8
-	golang.org/x/crypto v0.39.0
+	golang.org/x/crypto v0.41.0
 	golang.org/x/sys v0.35.0
-	golang.org/x/term v0.32.0
+	golang.org/x/term v0.34.0
 )
 
 require (
@@ -48,7 +49,9 @@ require (
 	github.com/go-errors/errors v1.5.1 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
-	github.com/jackc/pgx/v5 v5.5.4 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jessevdk/go-flags v1.4.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/jrick/logrotate v1.1.2 // indirect
@@ -90,10 +93,10 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	go.etcd.io/bbolt v1.4.2 // indirect
 	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394 // indirect
-	golang.org/x/mod v0.25.0 // indirect
-	golang.org/x/net v0.41.0 // indirect
-	golang.org/x/sync v0.15.0 // indirect
-	golang.org/x/text v0.26.0 // indirect
-	golang.org/x/tools v0.33.0 // indirect
+	golang.org/x/mod v0.27.0 // indirect
+	golang.org/x/net v0.43.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
+	golang.org/x/text v0.29.0 // indirect
+	golang.org/x/tools v0.36.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

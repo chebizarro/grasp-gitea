@@ -95,8 +95,18 @@ backend swap covers.
    TokenService, NIP46Handler) now holds the interface, never
    *SQLiteStore. Reusable conformance suite in internal/store/storetest
    — a Postgres backend runs storetest.Run unchanged.
-2. Postgres backend implementing the interface + the same conformance suite
-   run against a Postgres testcontainer.
+2. ✅ **SHIPPED** — `store.PostgresStore` (internal/store/postgres.go)
+   implements AuthStore with byte-identical representation (RFC3339 TEXT
+   timestamps, JSON scope arrays, BYTEA secrets) so comparisons behave the
+   same on both backends. Conformance runs against a real Postgres when
+   `GRASP_TEST_POSTGRES_DSN` is set (docker: postgres:16-alpine on :5433,
+   per-test schemas via connection-scoped search_path). The suite now
+   includes concurrency checks — and they immediately caught the READ
+   COMMITTED token-limit race SQLite's single-writer hides (7 tokens
+   under a limit of 3): fixed with a pg_advisory_xact_lock keyed on the
+   pubkey inside InsertBridgeToken. Concurrent replay claims (one winner)
+   and concurrent PAT reservations (distinct generations, PK-enforced,
+   error=retry) verified on both backends.
 3. DB advisory locks replacing `userLock`; replay-claim ON CONFLICT.
 4. Advisory-lock maintenance leadership.
 5. Deploy two replicas behind the existing nginx; run the `phase1-fww`
