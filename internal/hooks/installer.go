@@ -19,6 +19,7 @@ var uploadPackCapabilities = [][2]string{
 	{"uploadpack.allowFilter", "true"},
 	{"uploadpack.allowTipSHA1InWant", "true"},
 	{"uploadpack.allowReachableSHA1InWant", "true"},
+	{"uploadpack.allowAnySHA1InWant", "true"},
 }
 
 // safeShellValue matches values that are safe to embed in single-quoted

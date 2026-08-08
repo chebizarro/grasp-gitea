@@ -97,7 +97,7 @@ func TestInstallConfiguresUploadPackCapabilities(t *testing.T) {
 		t.Fatalf("install: %v", err)
 	}
 
-	for _, key := range []string{"uploadpack.allowFilter", "uploadpack.allowTipSHA1InWant", "uploadpack.allowReachableSHA1InWant"} {
+	for _, key := range []string{"uploadpack.allowFilter", "uploadpack.allowTipSHA1InWant", "uploadpack.allowReachableSHA1InWant", "uploadpack.allowAnySHA1InWant"} {
 		out, err := exec.Command("git", "config", "--file", filepath.Join(repoDir, "config"), "--get", key).Output()
 		if err != nil {
 			t.Fatalf("read %s: %v", key, err)
