@@ -15,7 +15,12 @@ import (
 const (
 	gitHTTPCORSAllowOrigin  = "*"
 	gitHTTPCORSAllowMethods = "GET, POST"
-	gitHTTPCORSAllowHeaders = "Content-Type"
+	// Git-Protocol lets browser clients opt in to git wire protocol v2
+	// ("Git-Protocol: version=2"). Without it in the preflight allow-list a
+	// browser would strip the header and every client would silently fall
+	// back to protocol v0. Clients that never send it (git-natural-api)
+	// keep the byte-identical v0 advertisement.
+	gitHTTPCORSAllowHeaders = "Content-Type, Git-Protocol"
 )
 
 // rootHandler is the catch-all. It dispatches, in order: the GRASP-01 relay

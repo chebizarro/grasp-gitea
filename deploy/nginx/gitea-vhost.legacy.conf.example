@@ -153,6 +153,10 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        # Git wire protocol v2 opt-in: pass the client's Git-Protocol header
+        # through explicitly so "Git-Protocol: version=2" reaches git
+        # http-backend (GIT_PROTOCOL). Clients that omit it keep protocol v0.
+        proxy_set_header Git-Protocol $http_git_protocol;
         proxy_set_header X-Grasp-Auth-User "";
         proxy_request_buffering off;
         proxy_buffering off;
@@ -167,6 +171,10 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        # Git wire protocol v2 opt-in: pass the client's Git-Protocol header
+        # through explicitly so "Git-Protocol: version=2" reaches git
+        # http-backend (GIT_PROTOCOL). Clients that omit it keep protocol v0.
+        proxy_set_header Git-Protocol $http_git_protocol;
         proxy_set_header X-Grasp-Auth-User "";
         proxy_request_buffering off;
         proxy_buffering off;

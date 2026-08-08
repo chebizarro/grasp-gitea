@@ -260,8 +260,8 @@ func assertGitHTTPCORS(t *testing.T, h http.Header) {
 	if got := h.Get("Access-Control-Allow-Methods"); got != "GET, POST" {
 		t.Fatalf("expected Access-Control-Allow-Methods GET, POST, got %q", got)
 	}
-	if got := h.Get("Access-Control-Allow-Headers"); got != "Content-Type" {
-		t.Fatalf("expected Access-Control-Allow-Headers Content-Type, got %q", got)
+	if got := h.Get("Access-Control-Allow-Headers"); got != "Content-Type, Git-Protocol" {
+		t.Fatalf("expected Access-Control-Allow-Headers \"Content-Type, Git-Protocol\", got %q", got)
 	}
 }
 

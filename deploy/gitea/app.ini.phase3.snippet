@@ -21,6 +21,15 @@ receive.maxInputSize = 268435456
 ; GRASP-01 git advertisement: advertise partial clone filtering and SHA-1-in-want support.
 uploadpack.allowFilter = true
 uploadpack.allowAnySHA1InWant = true
+
+; Git wire protocol v2 is negotiated per request: clients opt in with the
+; "Git-Protocol: version=2" HTTP header (the nginx vhost forwards it, and
+; git http-backend maps it to GIT_PROTOCOL for upload-pack). Any server git
+; >= 2.18 honors it with no extra configuration; clients that omit the
+; header keep receiving the protocol v0 advertisement unchanged. No
+; protocol.version setting is required here -- setting it would only change
+; the version this host's *outgoing* git clients (mirrors, migrations)
+; request, not what is served.
 ; For strict literal GRASP-01 compliance, operators may also set these per served repo:
 ;   git -C /path/to/repo.git config uploadpack.allowTipSHA1InWant true
 ;   git -C /path/to/repo.git config uploadpack.allowReachableSHA1InWant true
