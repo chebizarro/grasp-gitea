@@ -224,6 +224,31 @@ func (s *PostgresStore) ensureSchema() error {
 
 func ts(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
+// WithUserLock runs fn while holding an exclusive per-Gitea-user advisory
+// lock honored across every node sharing this store. A dedicated pooled
+// connection pins the lock's session for the duration; the lock never wraps
+// a database transaction, because fn legitimately performs external work
+// (Gitea HTTP calls) that must not hold a transaction open.
+func (s *PostgresStore) WithUserLock(ctx context.Context, giteaUserID int64, fn func(ctx context.Context) error) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire lock connection: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx,
+		`SELECT pg_advisory_lock(hashtextextended('pat_user:' || $1, 0))`, fmt.Sprintf("%d", giteaUserID)); err != nil {
+		return fmt.Errorf("acquire user lock: %w", err)
+	}
+	defer func() {
+		// Unlock on the SAME session. If the connection died, the session
+		// lock is released by the server automatically.
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx),
+			`SELECT pg_advisory_unlock(hashtextextended('pat_user:' || $1, 0))`, fmt.Sprintf("%d", giteaUserID))
+	}()
+	return fn(ctx)
+}
+
 // --- NIP-98 replay ledger ---
 
 // ClaimNIP98Event is single-use across every node sharing this store: the

@@ -35,6 +35,57 @@ func Run(t *testing.T, factory Factory) {
 	t.Run("ConcurrentReplayClaimsOneWinner", func(t *testing.T) { testConcurrentReplay(t, factory(t)) })
 	t.Run("ConcurrentMintsNeverExceedLimit", func(t *testing.T) { testConcurrentLimit(t, factory(t)) })
 	t.Run("ConcurrentReservationsGetDistinctGenerations", func(t *testing.T) { testConcurrentReserve(t, factory(t)) })
+	t.Run("UserLockIsMutuallyExclusive", func(t *testing.T) { testUserLockExclusion(t, factory(t)) })
+}
+
+// testUserLockExclusion proves WithUserLock serializes critical sections for
+// one user: a plain (unsynchronized) read-modify-write under the lock must
+// behave as if serial. On Postgres each goroutine holds a distinct pooled
+// session, so this exercises real advisory-lock exclusion, not a Go mutex.
+func testUserLockExclusion(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	const workers = 16
+
+	var counter int // deliberately unsynchronized; the lock is the protection
+	var inside atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := st.WithUserLock(ctx, 42, func(context.Context) error {
+				if inside.Add(1) != 1 {
+					t.Error("two critical sections for the same user overlapped")
+				}
+				v := counter
+				time.Sleep(2 * time.Millisecond)
+				counter = v + 1
+				inside.Add(-1)
+				return nil
+			})
+			if err != nil {
+				t.Errorf("lock: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if counter != workers {
+		t.Fatalf("counter = %d, want %d (lost updates => exclusion broken)", counter, workers)
+	}
+
+	// A different user's lock must not deadlock against user 42's.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = st.WithUserLock(ctx, 42, func(ctx context.Context) error {
+			return st.WithUserLock(ctx, 43, func(context.Context) error { return nil })
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("nested locks for distinct users deadlocked")
+	}
 }
 
 // testConcurrentReplay hammers the same event id from many goroutines:

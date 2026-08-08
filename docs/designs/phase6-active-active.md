@@ -107,7 +107,21 @@ backend swap covers.
    pubkey inside InsertBridgeToken. Concurrent replay claims (one winner)
    and concurrent PAT reservations (distinct generations, PK-enforced,
    error=retry) verified on both backends.
-3. DB advisory locks replacing `userLock`; replay-claim ON CONFLICT.
+3. ✅ **SHIPPED** — `AuthStore.WithUserLock(ctx, giteaUserID, fn)` is now
+   part of the store contract: SQLite implements it as the in-process
+   striped mutex (single-node, unchanged semantics), Postgres as a
+   session-scoped `pg_advisory_lock` on a dedicated pooled connection
+   (never wrapping a transaction — fn performs Gitea HTTP calls). The
+   TokenService's node-local `userLock` is GONE: mint, scope upgrade,
+   EnsureHiddenPAT, retirement, and stuck-provisioning recovery all
+   serialize through the store, so exclusion follows the backend.
+   Replay ON CONFLICT landed with step 2. Conformance:
+   UserLockIsMutuallyExclusive (16 racing critical sections, overlap
+   detector, lost-update check; distinct users don't block).
+   NOT yet wired: main.go still opens SQLite only — identity links are
+   read by publisher/signer/webhook/profilesync/proxy, so switching
+   auth alone to Postgres would split-brain identity data. DSN wiring
+   belongs with the consumer convergence in step 5.
 4. Advisory-lock maintenance leadership.
 5. Deploy two replicas behind the existing nginx; run the `phase1-fww`
    load/chaos suite (needs real infra — that issue owns it).

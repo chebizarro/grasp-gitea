@@ -28,6 +28,13 @@ import (
 //     rows affected.
 //   - "Not found" is sql.ErrNoRows (or a wrapper satisfying errors.Is).
 type AuthStore interface {
+	// WithUserLock runs fn while holding an exclusive lock for one Gitea
+	// user, honored ACROSS EVERY NODE sharing the store. It serializes the
+	// PAT lifecycle (provision, scope upgrade, retirement, reconciliation)
+	// against itself; fn may perform external calls, so implementations
+	// must not hold a database transaction while fn runs.
+	WithUserLock(ctx context.Context, giteaUserID int64, fn func(ctx context.Context) error) error
+
 	// NIP-98 replay ledger.
 	ClaimNIP98Event(ctx context.Context, eventID, pubkey, method string, targetHash []byte, now, expiresAt time.Time) (bool, error)
 	CleanupExpiredReplayClaims(ctx context.Context, now time.Time) (int64, error)

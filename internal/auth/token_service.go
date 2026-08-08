@@ -15,7 +15,6 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"fiatjaf.com/nostr"
@@ -187,9 +186,6 @@ type TokenService struct {
 
 	enabledScopes map[string]struct{}
 
-	// userLocks serializes PAT ensure per Gitea user in this process.
-	userLocks [64]sync.Mutex
-
 	now func() time.Time
 }
 
@@ -316,23 +312,24 @@ func (t *TokenService) Mint(ctx context.Context, pubkey, eventID string, req Min
 		return MintResult{}, err
 	}
 
-	// Hold the user's lifecycle lock across PAT provisioning AND token
-	// insertion. Without it, the retirement sweep could delete the PAT between
-	// the two steps, leaving a token that authenticates but has no downstream
-	// credential.
-	lock := t.userLock(identity.GiteaUserID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	if err := t.ensureActivePATLocked(ctx, identity.GiteaUserID, identity.GiteaUser, requiredGiteaScopes(scopes)); err != nil {
-		return MintResult{}, err
-	}
-
-	record, plaintext, err := t.newTokenRecord(identity.Pubkey, identity.GiteaUserID, name, scopes, ttl, eventID)
+	// Hold the user's lifecycle lock (cross-node via the store) across PAT
+	// provisioning AND token insertion. Without it, the retirement sweep
+	// could delete the PAT between the two steps, leaving a token that
+	// authenticates but has no downstream credential.
+	var record store.BridgeToken
+	var plaintext string
+	err = t.store.WithUserLock(ctx, identity.GiteaUserID, func(ctx context.Context) error {
+		if err := t.ensureActivePATLocked(ctx, identity.GiteaUserID, identity.GiteaUser, requiredGiteaScopes(scopes)); err != nil {
+			return err
+		}
+		var err error
+		record, plaintext, err = t.newTokenRecord(identity.Pubkey, identity.GiteaUserID, name, scopes, ttl, eventID)
+		if err != nil {
+			return err
+		}
+		return t.store.InsertBridgeToken(ctx, record, MaxActiveBridgeTokens)
+	})
 	if err != nil {
-		return MintResult{}, err
-	}
-	if err := t.store.InsertBridgeToken(ctx, record, MaxActiveBridgeTokens); err != nil {
 		return MintResult{}, err
 	}
 
@@ -442,18 +439,19 @@ func (t *TokenService) DownstreamPAT(ctx context.Context, giteaUserID int64, bri
 // user's lifecycle lock; a concurrent upgrade simply finds the fresh
 // credential already active and returns it.
 func (t *TokenService) upgradePATScopes(ctx context.Context, giteaUserID int64, giteaUser string, required []string) (store.GiteaPATCredential, error) {
-	lock := t.userLock(giteaUserID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	if err := t.ensureActivePATLocked(ctx, giteaUserID, giteaUser, required); err != nil {
-		return store.GiteaPATCredential{}, err
-	}
-	cred, err := t.store.GetActivePATCredential(ctx, giteaUserID)
-	if err != nil {
-		return store.GiteaPATCredential{}, fmt.Errorf("%w: reload after scope upgrade: %v", ErrPATProvisioning, err)
-	}
-	return cred, nil
+	var cred store.GiteaPATCredential
+	err := t.store.WithUserLock(ctx, giteaUserID, func(ctx context.Context) error {
+		if err := t.ensureActivePATLocked(ctx, giteaUserID, giteaUser, required); err != nil {
+			return err
+		}
+		var err error
+		cred, err = t.store.GetActivePATCredential(ctx, giteaUserID)
+		if err != nil {
+			return fmt.Errorf("%w: reload after scope upgrade: %v", ErrPATProvisioning, err)
+		}
+		return nil
+	})
+	return cred, err
 }
 
 // scopesCover reports whether stored Gitea scopes cover a required set.
@@ -743,16 +741,9 @@ func (t *TokenService) EnsureHiddenPAT(ctx context.Context, identity ResolvedIde
 	if err := t.verifyIdentityLink(ctx, identity); err != nil {
 		return err
 	}
-	lock := t.userLock(identity.GiteaUserID)
-	lock.Lock()
-	defer lock.Unlock()
-	return t.ensureActivePATLocked(ctx, identity.GiteaUserID, identity.GiteaUser, requiredGiteaScopes(bridgeScopes))
-}
-
-// userLock returns the striped lifecycle lock for a Gitea user. It serializes
-// PAT provisioning, token insertion, and PAT retirement against each other.
-func (t *TokenService) userLock(giteaUserID int64) *sync.Mutex {
-	return &t.userLocks[uint64(giteaUserID)%uint64(len(t.userLocks))]
+	return t.store.WithUserLock(ctx, identity.GiteaUserID, func(ctx context.Context) error {
+		return t.ensureActivePATLocked(ctx, identity.GiteaUserID, identity.GiteaUser, requiredGiteaScopes(bridgeScopes))
+	})
 }
 
 // ensureActivePATLocked guarantees one active encrypted Gitea PAT for the
@@ -870,10 +861,15 @@ func (t *TokenService) ensureActivePATLocked(ctx context.Context, giteaUserID in
 // retireUserPAT retires one user's idle PAT under their lifecycle lock, and
 // re-checks inside the lock that no token became active in the meantime.
 func (t *TokenService) retireUserPAT(ctx context.Context, giteaUserID int64, now time.Time) {
-	lock := t.userLock(giteaUserID)
-	lock.Lock()
-	defer lock.Unlock()
+	if err := t.store.WithUserLock(ctx, giteaUserID, func(ctx context.Context) error {
+		t.retireUserPATLocked(ctx, giteaUserID, now)
+		return nil
+	}); err != nil {
+		t.logger.Warn("PAT retirement lock failed", "gitea_user_id", giteaUserID, "error", err)
+	}
+}
 
+func (t *TokenService) retireUserPATLocked(ctx context.Context, giteaUserID int64, now time.Time) {
 	active, err := t.store.CountActiveBridgeTokensForGiteaUser(ctx, giteaUserID, now)
 	if err != nil {
 		t.logger.Warn("PAT retirement re-check failed", "gitea_user_id", giteaUserID, "error", err)
@@ -1023,33 +1019,35 @@ func (t *TokenService) reconcilePATCredentials(ctx context.Context, now time.Tim
 	}
 	metrics.SetPATStuckProvisioning(int64(len(stuck)))
 	for _, cred := range stuck {
-		lock := t.userLock(cred.GiteaUserID)
-		lock.Lock()
-		// Re-read under the lock: a concurrent mint may have just finalized
-		// this exact generation.
-		if current, err := t.store.GetActivePATCredential(ctx, cred.GiteaUserID); err == nil && current.Generation == cred.Generation {
-			lock.Unlock()
-			continue
+		cred := cred
+		err := t.store.WithUserLock(ctx, cred.GiteaUserID, func(ctx context.Context) error {
+			// Re-read under the lock: a concurrent mint may have just
+			// finalized this exact generation.
+			if current, err := t.store.GetActivePATCredential(ctx, cred.GiteaUserID); err == nil && current.Generation == cred.Generation {
+				return nil
+			}
+			t.logger.Warn("recovering hidden PAT stranded in provisioning",
+				"gitea_user_id", cred.GiteaUserID, "generation", cred.Generation, "pat_name", cred.PATName)
+			ref := cred.PATName
+			if cred.GiteaTokenID > 0 {
+				ref = fmt.Sprintf("%d", cred.GiteaTokenID)
+			}
+			if err := t.gitea.DeleteUserAccessToken(ctx, cred.GiteaUser, ref); err != nil && !gitea.IsNotFound(err) {
+				metrics.IncPATReconcileFailures()
+				t.logger.Warn("could not delete stranded provisioning PAT; will retry",
+					"gitea_user_id", cred.GiteaUserID, "error", err)
+				return nil
+			}
+			if err := t.store.DeletePATCredential(ctx, cred.GiteaUserID, cred.Generation); err != nil {
+				t.logger.Warn("could not clear stranded provisioning row", "error", err)
+			} else {
+				metrics.IncPATCredentialsReconciled()
+			}
+			return nil
+		})
+		if err != nil {
+			t.logger.Warn("stuck-provisioning lock failed", "gitea_user_id", cred.GiteaUserID, "error", err)
 		}
-		t.logger.Warn("recovering hidden PAT stranded in provisioning",
-			"gitea_user_id", cred.GiteaUserID, "generation", cred.Generation, "pat_name", cred.PATName)
-		ref := cred.PATName
-		if cred.GiteaTokenID > 0 {
-			ref = fmt.Sprintf("%d", cred.GiteaTokenID)
-		}
-		if err := t.gitea.DeleteUserAccessToken(ctx, cred.GiteaUser, ref); err != nil && !gitea.IsNotFound(err) {
-			metrics.IncPATReconcileFailures()
-			lock.Unlock()
-			t.logger.Warn("could not delete stranded provisioning PAT; will retry",
-				"gitea_user_id", cred.GiteaUserID, "error", err)
-			continue
-		}
-		if err := t.store.DeletePATCredential(ctx, cred.GiteaUserID, cred.Generation); err != nil {
-			t.logger.Warn("could not clear stranded provisioning row", "error", err)
-		} else {
-			metrics.IncPATCredentialsReconciled()
-		}
-		lock.Unlock()
 	}
 }
 

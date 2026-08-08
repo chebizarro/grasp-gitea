@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -209,6 +210,19 @@ const DefaultEchoGuardWindow = 5 * time.Minute
 
 type SQLiteStore struct {
 	db *sql.DB
+	// userLocks implements WithUserLock for the single-node backend: an
+	// in-process striped mutex. Cross-node exclusion is the Postgres
+	// backend's job (advisory locks).
+	userLocks [64]sync.Mutex
+}
+
+// WithUserLock runs fn while holding an exclusive per-Gitea-user lock.
+// SQLite is single-node, so an in-process mutex is the whole guarantee.
+func (s *SQLiteStore) WithUserLock(ctx context.Context, giteaUserID int64, fn func(ctx context.Context) error) error {
+	lock := &s.userLocks[uint64(giteaUserID)%uint64(len(s.userLocks))]
+	lock.Lock()
+	defer lock.Unlock()
+	return fn(ctx)
 }
 
 func Open(path string) (*SQLiteStore, error) {
