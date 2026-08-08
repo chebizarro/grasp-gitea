@@ -87,8 +87,14 @@ backend swap covers.
 
 ## Sequencing (proposed sub-PRs under phase1-09c)
 
-1. `Store` interface extraction + SQLite conformance test suite (single-node,
-   no behavior change).
+1. ✅ **SHIPPED** — `store.AuthStore` interface (internal/store/interface.go)
+   covering the 40+ methods the auth layer calls, with the distributed
+   contract documented on the interface (cross-node single-use replay
+   claims, atomic token limit, create-before-retire activation, CAS
+   reseal, sql.ErrNoRows). internal/auth (Service, IdentityService,
+   TokenService, NIP46Handler) now holds the interface, never
+   *SQLiteStore. Reusable conformance suite in internal/store/storetest
+   — a Postgres backend runs storetest.Run unchanged.
 2. Postgres backend implementing the interface + the same conformance suite
    run against a Postgres testcontainer.
 3. DB advisory locks replacing `userLock`; replay-claim ON CONFLICT.

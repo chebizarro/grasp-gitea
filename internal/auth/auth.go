@@ -41,7 +41,7 @@ type ChallengeResponse struct {
 
 // Service manages auth challenge lifecycle and NIP-98 verification.
 type Service struct {
-	store        *store.SQLiteStore
+	store        store.AuthStore
 	publicURL    string
 	challengeTTL time.Duration
 	logger       *slog.Logger
@@ -53,7 +53,7 @@ type Service struct {
 }
 
 // NewService creates a new auth service. Returns nil if auth is disabled in config.
-func NewService(cfg config.Config, st *store.SQLiteStore, logger *slog.Logger) *Service {
+func NewService(cfg config.Config, st store.AuthStore, logger *slog.Logger) *Service {
 	if !cfg.AuthEnabled {
 		return nil
 	}

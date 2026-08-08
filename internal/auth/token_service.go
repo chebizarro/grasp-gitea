@@ -173,7 +173,7 @@ var (
 // hidden per-user Gitea PAT provisioning, edge authentication, listing,
 // revocation, and rotation.
 type TokenService struct {
-	store     *store.SQLiteStore
+	store     store.AuthStore
 	identity  *IdentityService
 	gitea     *gitea.Client
 	cipher    *CredentialCipher
@@ -195,7 +195,7 @@ type TokenService struct {
 
 // NewTokenService builds the token service. It returns (nil, nil) when bridge
 // tokens are disabled; a nil *TokenService is safe to query via Enabled.
-func NewTokenService(cfg config.Config, st *store.SQLiteStore, identity *IdentityService, gc *gitea.Client, logger *slog.Logger) (*TokenService, error) {
+func NewTokenService(cfg config.Config, st store.AuthStore, identity *IdentityService, gc *gitea.Client, logger *slog.Logger) (*TokenService, error) {
 	if !cfg.BridgeTokensEnabled {
 		return nil, nil
 	}

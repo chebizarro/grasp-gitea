@@ -1,0 +1,197 @@
+// Copyright 2026 Sharegap contributors. All rights reserved.
+// Use of this source code is governed by a BSD-style license.
+
+// Package storetest is the AuthStore conformance suite. Every backend
+// (SQLite today, a shared transactional store for active-active next) must
+// pass it unchanged: it encodes the distributed-correctness contract the
+// auth layer depends on, not implementation details.
+package storetest
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/sharegap/grasp-gitea/internal/store"
+)
+
+// Factory returns a fresh, empty AuthStore for one test.
+type Factory func(t *testing.T) store.AuthStore
+
+// Run executes the conformance suite against a backend.
+func Run(t *testing.T, factory Factory) {
+	t.Run("NIP98ReplayClaimIsSingleUse", func(t *testing.T) { testReplaySingleUse(t, factory(t)) })
+	t.Run("BridgeTokenActiveLimitIsAtomic", func(t *testing.T) { testTokenLimit(t, factory(t)) })
+	t.Run("PATActivationRetiresPreviousGeneration", func(t *testing.T) { testCreateBeforeRetire(t, factory(t)) })
+	t.Run("ResealIsCompareAndSwap", func(t *testing.T) { testResealCAS(t, factory(t)) })
+	t.Run("NotFoundIsErrNoRows", func(t *testing.T) { testNotFound(t, factory(t)) })
+	t.Run("TokenRevocationIsSubjectScoped", func(t *testing.T) { testRevokeScoped(t, factory(t)) })
+}
+
+func testReplaySingleUse(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	hash := sha256.Sum256([]byte("target"))
+
+	ok, err := st.ClaimNIP98Event(ctx, "ev1", "pk", "POST", hash[:], now, now.Add(5*time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("first claim: ok=%v err=%v", ok, err)
+	}
+	// The SAME event id must never be claimable twice — this is the
+	// cross-node single-use guarantee (unique-constraint semantics).
+	ok, err = st.ClaimNIP98Event(ctx, "ev1", "pk", "POST", hash[:], now, now.Add(5*time.Minute))
+	if err != nil || ok {
+		t.Fatalf("replay claim: ok=%v err=%v, want refused without error", ok, err)
+	}
+	// A different event id claims fine.
+	if ok, err := st.ClaimNIP98Event(ctx, "ev2", "pk", "POST", hash[:], now, now.Add(5*time.Minute)); err != nil || !ok {
+		t.Fatalf("second event: ok=%v err=%v", ok, err)
+	}
+	// Cleanup removes expired claims, freeing storage but never un-claiming
+	// a live one.
+	if _, err := st.CleanupExpiredReplayClaims(ctx, now.Add(10*time.Minute)); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+}
+
+func token(id, pubkey string, userID int64, expires time.Time) store.BridgeToken {
+	h := sha256.Sum256([]byte(id))
+	return store.BridgeToken{
+		ID: id, TokenHash: h[:], TokenSuffix: id[len(id)-4:],
+		Pubkey: pubkey, GiteaUserID: userID, Name: "n-" + id,
+		Scopes: []string{"git:read"}, IssuedAt: time.Now().UTC(), ExpiresAt: expires,
+	}
+}
+
+func testTokenLimit(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	expires := time.Now().Add(time.Hour)
+
+	for i := 0; i < 3; i++ {
+		if err := st.InsertBridgeToken(ctx, token(fmt.Sprintf("tok-%d", i), "pk1", 1, expires), 3); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	// The limit is enforced in the insert itself, atomically.
+	if err := st.InsertBridgeToken(ctx, token("tok-over", "pk1", 1, expires), 3); !errors.Is(err, store.ErrBridgeTokenLimit) {
+		t.Fatalf("over-limit insert error = %v, want ErrBridgeTokenLimit", err)
+	}
+	// Another subject is unaffected.
+	if err := st.InsertBridgeToken(ctx, token("tok-b", "pk2", 2, expires), 3); err != nil {
+		t.Fatalf("other subject: %v", err)
+	}
+	// Revoking frees a slot.
+	if err := st.RevokeBridgeToken(ctx, "pk1", "tok-0", time.Now().UTC()); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if err := st.InsertBridgeToken(ctx, token("tok-3", "pk1", 1, expires), 3); err != nil {
+		t.Fatalf("insert after revoke: %v", err)
+	}
+}
+
+func testCreateBeforeRetire(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	provision := func() int64 {
+		gen, _, err := st.ReservePATCredential(ctx, 7, "u7", "grasp-bridge", []string{"write:repository"}, now)
+		if err != nil {
+			t.Fatalf("reserve: %v", err)
+		}
+		if err := st.FinalizePATCredential(ctx, 7, gen, 9000+gen, []byte{1, 2, byte(gen)}, "key"); err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+		if err := st.ActivatePATCredential(ctx, 7, gen, now); err != nil {
+			t.Fatalf("activate gen %d: %v", gen, err)
+		}
+		return gen
+	}
+
+	gen1 := provision()
+	cred, err := st.GetActivePATCredential(ctx, 7)
+	if err != nil || cred.Generation != gen1 {
+		t.Fatalf("active after first: %+v err=%v", cred, err)
+	}
+
+	// Activating a second generation atomically demotes the first: exactly
+	// one active credential per user, at every instant.
+	gen2 := provision()
+	cred, err = st.GetActivePATCredential(ctx, 7)
+	if err != nil || cred.Generation != gen2 {
+		t.Fatalf("active after second: %+v err=%v", cred, err)
+	}
+	pending, err := st.ListPATCredentialsPendingDeletion(ctx, 10)
+	if err != nil || len(pending) != 1 || pending[0].Generation != gen1 {
+		t.Fatalf("pending = %+v err=%v, want demoted gen %d", pending, err, gen1)
+	}
+
+	// Activation without finalization must be refused: an active row always
+	// carries usable ciphertext.
+	gen3, _, err := st.ReservePATCredential(ctx, 7, "u7", "grasp-bridge", []string{"write:repository"}, now)
+	if err != nil {
+		t.Fatalf("reserve gen3: %v", err)
+	}
+	if err := st.ActivatePATCredential(ctx, 7, gen3, now); err == nil {
+		t.Fatal("unfinalized generation activated")
+	}
+}
+
+func testResealCAS(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	gen, _, err := st.ReservePATCredential(ctx, 8, "u8", "grasp-bridge", []string{"write:repository"}, now)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	original := []byte{9, 9, 9}
+	if err := st.FinalizePATCredential(ctx, 8, gen, 1, original, "k1"); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if err := st.ActivatePATCredential(ctx, 8, gen, now); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	if n, err := st.ResealPATCredential(ctx, 8, gen, original, []byte{1}, "k2"); err != nil || n != 1 {
+		t.Fatalf("reseal: n=%d err=%v", n, err)
+	}
+	// A stale expectation must not clobber, and must report 0 rows.
+	if n, err := st.ResealPATCredential(ctx, 8, gen, original, []byte{2}, "k3"); err != nil || n != 0 {
+		t.Fatalf("stale reseal: n=%d err=%v", n, err)
+	}
+	cred, _ := st.GetActivePATCredential(ctx, 8)
+	if cred.KeyID != "k2" {
+		t.Fatalf("key after CAS = %q, want k2", cred.KeyID)
+	}
+}
+
+func testNotFound(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	if _, err := st.GetActivePATCredential(ctx, 999); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing PAT error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := st.GetIdentityLinkByPubkey(ctx, "missing"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing link error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := st.GetBridgeTokenByHash(ctx, []byte{1}); !errors.Is(err, store.ErrBridgeTokenNotFound) {
+		t.Fatalf("missing token error = %v, want ErrBridgeTokenNotFound", err)
+	}
+}
+
+func testRevokeScoped(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	expires := time.Now().Add(time.Hour)
+	if err := st.InsertBridgeToken(ctx, token("tok-x", "owner", 1, expires), 5); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// A different pubkey cannot revoke someone else's token.
+	if err := st.RevokeBridgeToken(ctx, "attacker", "tok-x", time.Now().UTC()); !errors.Is(err, store.ErrBridgeTokenNotFound) {
+		t.Fatalf("foreign revoke error = %v, want ErrBridgeTokenNotFound", err)
+	}
+	if err := st.RevokeBridgeToken(ctx, "owner", "tok-x", time.Now().UTC()); err != nil {
+		t.Fatalf("owner revoke: %v", err)
+	}
+}

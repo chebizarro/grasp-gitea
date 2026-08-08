@@ -23,7 +23,7 @@ import (
 // IdentityService resolves a verified Nostr pubkey to a Gitea user,
 // creating the user and persisting the identity link if needed.
 type IdentityService struct {
-	store       *store.SQLiteStore
+	store       store.AuthStore
 	giteaClient *gitea.Client
 	orgResolver OrgNameResolver
 	logger      *slog.Logger
@@ -58,7 +58,7 @@ type OrgNameResolver interface {
 
 // NewIdentityService creates a new identity resolution service.
 func NewIdentityService(
-	st *store.SQLiteStore,
+	st store.AuthStore,
 	gc *gitea.Client,
 	orgResolver OrgNameResolver,
 	logger *slog.Logger,

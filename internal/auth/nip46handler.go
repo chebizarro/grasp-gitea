@@ -39,7 +39,7 @@ const (
 // NIP46Handler provides HTTP endpoints for the NIP-46 remote signer
 // (bunker) login flow: session init and status polling.
 type NIP46Handler struct {
-	store           *store.SQLiteStore
+	store           store.AuthStore
 	identityService *IdentityService
 	relayURLs       []string
 	publicURL       string
@@ -76,7 +76,7 @@ type ActorEventBackfiller interface {
 
 // NewNIP46Handler creates a new handler for NIP-46 auth endpoints.
 func NewNIP46Handler(
-	st *store.SQLiteStore,
+	st store.AuthStore,
 	identitySvc *IdentityService,
 	relayURLs []string,
 	publicURL string,
