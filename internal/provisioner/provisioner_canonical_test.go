@@ -19,6 +19,9 @@ func TestFindCloneForServiceCanonicalNpubURL(t *testing.T) {
 	if !ok || got != "https://grasp.sharegap.net/npub1owner/repo%20one.git" {
 		t.Fatalf("expected canonical clone URL match, got %q ok=%v", got, ok)
 	}
+	if !cloneMatchesRepoID(got, repoID) {
+		t.Fatalf("expected percent-encoded canonical clone URL %q to match repo id %q", got, repoID)
+	}
 
 	// NIP-34 permits multiple clone URLs in one tag. The service URL need not
 	// be the first value.
@@ -34,10 +37,11 @@ func TestFindCloneForServiceCanonicalNpubURL(t *testing.T) {
 		t.Fatalf("expected canonical clone URL in multi-value tag, got %q ok=%v", got, ok)
 	}
 
-	// Gitea /org/repo.git URL alone is NOT canonical when a grasp origin is set.
-	giteaOnly := nostr.Tags{{"clone", "https://git.sharegap.net/some-org/repo-one.git"}}
-	if _, ok := findCloneForService(giteaOnly, graspURL, "https://grasp.sharegap.net", npub, repoID); ok {
-		t.Fatalf("expected org-form Gitea URL to be rejected as canonical")
+	// Gitea /org/repo.git URL alone is NOT canonical when a grasp origin is set,
+	// even when it matches the separately configured legacy clone prefix.
+	giteaOnly := nostr.Tags{{"clone", "https://git.sharegap.net/some-org/repo%20one.git"}}
+	if _, ok := findCloneForService(giteaOnly, graspURL, "https://git.sharegap.net", npub, repoID); ok {
+		t.Fatal("expected legacy Gitea clone URL to be rejected when canonical service origin is configured")
 	}
 
 	// Legacy prefix fallback still works when no grasp origin configured.

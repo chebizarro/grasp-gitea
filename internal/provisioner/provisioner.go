@@ -143,47 +143,14 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 
 	cloneURL, ok := findCloneForService(ev.Tags, s.cfg.GraspPublicURL, s.cfg.ClonePrefix, npub, repoID)
 	if !ok {
-		if !s.cfg.ArchiveMode {
-			metrics.IncAnnouncementRejected()
-			return fmt.Errorf("announcement %s does not list this service in clone tags", ev.ID)
-		}
-		exists, err := s.store.MappingExists(ctx, npub, repoID)
-		if err != nil {
-			metrics.IncAnnouncementRejected()
-			return fmt.Errorf("check existing mapping: %w", err)
-		}
-		if exists {
-			mapping, lookupErr := s.store.GetMapping(ctx, npub, repoID)
-			if lookupErr != nil || mapping.Pubkey != ev.PubKey.Hex() || mapping.Owner == "" || mapping.GiteaRepoID <= 0 {
-				metrics.IncAnnouncementRejected()
-				return fmt.Errorf("refuse archive without a valid ownership link for %s/%s", npub, repoID)
-			}
-			linkedOwner, linked, linkErr := s.linkedOwner(ctx, npub, ev.PubKey.Hex())
-			if linkErr != nil || !linked || !strings.EqualFold(linkedOwner, mapping.Owner) {
-				metrics.IncAnnouncementRejected()
-				return fmt.Errorf("refuse archive with ambiguous ownership link for %s/%s", npub, repoID)
-			}
-			repo, repoErr := s.gitea.GetRepo(ctx, mapping.Owner, repoID)
-			if repoErr != nil || repo.ID != mapping.GiteaRepoID || !strings.EqualFold(repo.Owner, mapping.Owner) || repo.Name != mapping.RepoName {
-				metrics.IncAnnouncementRejected()
-				return fmt.Errorf("refuse archive: Gitea repository does not match mapping for %s/%s", npub, repoID)
-			}
-			orgName := mapping.Owner
-			if err := s.gitea.ArchiveRepo(ctx, orgName, repoID); err != nil {
-				metrics.IncAnnouncementRejected()
-				return fmt.Errorf("archive repo %s/%s after clone tag removal: %w", orgName, repoID, err)
-			}
-			_ = s.store.MarkEventProcessed(ctx, ev.ID.Hex(), ev.PubKey.Hex(), int(ev.Kind))
-			s.logger.Info("archived repository due to clone tag removal", "npub", npub, "org", orgName, "repo_id", repoID, "event", ev.ID.Hex())
-			return nil
-		}
-		return nil
+		metrics.IncAnnouncementRejected()
+		return fmt.Errorf("announcement %s does not list this service in clone tags", ev.ID)
 	}
 	if !cloneMatchesRepoID(cloneURL, repoID) {
 		metrics.IncAnnouncementRejected()
 		return fmt.Errorf("announcement %s clone URL does not match repo id %s", ev.ID, repoID)
 	}
-	if !s.cfg.ArchiveMode && !hasRelayForService(ev.Tags, s.serviceRelayURL()) {
+	if !hasRelayForService(ev.Tags, s.serviceRelayURL()) {
 		metrics.IncAnnouncementRejected()
 		return fmt.Errorf("announcement %s does not list this service in relays tags", ev.ID)
 	}
@@ -513,6 +480,7 @@ func findCloneForService(tags nostr.Tags, graspPublicURL string, clonePrefix str
 				}
 			}
 		}
+		return "", false
 	}
 	return findCloneForPrefix(tags, clonePrefix)
 }
@@ -563,5 +531,9 @@ func normalizeRelayURL(relayURL string) string {
 
 func cloneMatchesRepoID(cloneURL string, repoID string) bool {
 	cloneURL = strings.TrimRight(cloneURL, "/")
-	return strings.HasSuffix(cloneURL, "/"+repoID+".git")
+	decoded, err := url.PathUnescape(cloneURL)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(decoded, "/"+repoID+".git")
 }

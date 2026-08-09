@@ -25,7 +25,7 @@ func (f fakeHostedRepoChecker) MappingExists(_ context.Context, npub string, rep
 	return ok, nil
 }
 
-func TestEmbeddedRelayPolicyAcceptsIssueReferencingHostedRepo(t *testing.T) {
+func TestEmbeddedRelayPolicyAcceptsCollaborationKindsReferencingHostedRepo(t *testing.T) {
 	pubkey, err := derivePubHex(embeddedRelayTestSecretKey)
 	if err != nil {
 		t.Fatalf("derive pubkey: %v", err)
@@ -35,15 +35,30 @@ func TestEmbeddedRelayPolicyAcceptsIssueReferencingHostedRepo(t *testing.T) {
 		t.Fatalf("owner pubkey: %v", err)
 	}
 	npub := nip19.EncodeNpub(pk)
-
 	policy := makeEmbeddedRelayRejectPolicy(fakeHostedRepoChecker{npub + "\x00" + "repo1": {}}, nil)
-	ev := &nostr.Event{
-		Kind: relay.KindIssue,
-		Tags: nostr.Tags{{"a", "30617:" + pubkey + ":repo1"}},
+
+	kinds := []nostr.Kind{
+		relay.KindPatch,
+		relay.KindPROpen,
+		relay.KindPRUpdate,
+		relay.KindIssue,
+		relay.KindStatusOpen,
+		relay.KindStatusApplied,
+		relay.KindStatusClosed,
+		relay.KindStatusDraft,
+		relay.KindNIP22Comment,
 	}
-	reject, msg := policy(context.Background(), ev)
-	if reject {
-		t.Fatalf("expected issue referencing hosted repo to be accepted, rejected with %q", msg)
+	for _, kind := range kinds {
+		t.Run(kind.String(), func(t *testing.T) {
+			ev := &nostr.Event{
+				Kind: kind,
+				Tags: nostr.Tags{{"a", "30617:" + pubkey + ":repo1"}},
+			}
+			reject, msg := policy(context.Background(), ev)
+			if reject {
+				t.Fatalf("expected kind %d referencing hosted repo to be accepted, rejected with %q", kind, msg)
+			}
+		})
 	}
 }
 

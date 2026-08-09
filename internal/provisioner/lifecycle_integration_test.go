@@ -289,22 +289,33 @@ func TestAnnouncementRejectsMissingServiceRelay(t *testing.T) {
 	}
 }
 
-func TestAnnouncementArchiveModeSkipsServiceRelayRequirement(t *testing.T) {
-	svc, st, _, _ := newTestService(t)
+func TestAnnouncementArchiveModeStillRequiresServiceRelay(t *testing.T) {
+	svc, st, state, _ := newTestService(t)
 	svc.cfg.ArchiveMode = true
 	ctx := context.Background()
 
-	ev := makeSignedAnnouncementEventWithRelays(t, "archive-relay-skip", "https://git.example.com/whatever/archive-relay-skip.git", nil)
-	if err := svc.HandleAnnouncementEvent(ctx, ev, "ws://relay"); err != nil {
-		t.Fatalf("archive mode should skip relays-tag rejection: %v", err)
+	ev := makeSignedAnnouncementEventWithRelays(t, "archive-relay-strict", "https://git.example.com/whatever/archive-relay-strict.git", nil)
+	err := svc.HandleAnnouncementEvent(ctx, ev, "ws://relay")
+	if err == nil {
+		t.Fatal("expected archive mode announcement without the service relay to be rejected")
+	}
+	if !strings.Contains(err.Error(), "relays tags") {
+		t.Fatalf("expected relays tag error, got: %v", err)
 	}
 
-	mappings, err := st.ListMappings(ctx)
-	if err != nil {
-		t.Fatal(err)
+	mappings, mapErr := st.ListMappings(ctx)
+	if mapErr != nil {
+		t.Fatal(mapErr)
 	}
-	if len(mappings) != 1 {
-		t.Fatalf("expected mapping to be provisioned in archive mode, got %d", len(mappings))
+	if len(mappings) != 0 {
+		t.Fatalf("expected no mapping for rejected archive-mode announcement, got %d", len(mappings))
+	}
+
+	state.mu.Lock()
+	repoCount := len(state.repos)
+	state.mu.Unlock()
+	if repoCount != 0 {
+		t.Fatalf("expected no repository for rejected archive-mode announcement, got %d", repoCount)
 	}
 }
 
@@ -343,42 +354,39 @@ func TestDuplicateEventIsIgnored(t *testing.T) {
 	}
 }
 
-func TestAnnouncementArchivesRemovedClone(t *testing.T) {
+func TestAnnouncementArchiveModeRejectsRemovedServiceClone(t *testing.T) {
 	svc, st, state, _ := newTestService(t)
 	svc.cfg.ArchiveMode = true
 	ctx := context.Background()
 
-	// First: provision with matching clone URL.
+	// First: provision with both required service tags.
 	ev1 := makeSignedAnnouncementEvent(t, "archiveme", "https://git.example.com/whatever/archiveme.git")
 	if err := svc.HandleAnnouncementEvent(ctx, ev1, "ws://relay"); err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify repo exists and is not archived.
 	mappings, _ := st.ListMappings(ctx)
 	if len(mappings) != 1 {
 		t.Fatalf("expected 1 mapping, got %d", len(mappings))
 	}
 	orgName := mappings[0].Owner
+
+	// A later announcement without the service clone is not accepted, even in
+	// archive mode; strict repository admission must always require both tags.
+	ev2 := makeSignedAnnouncementEvent(t, "archiveme", "")
+	err := svc.HandleAnnouncementEvent(ctx, ev2, "ws://relay")
+	if err == nil {
+		t.Fatal("expected archive mode announcement without the service clone to be rejected")
+	}
+	if !strings.Contains(err.Error(), "clone tags") {
+		t.Fatalf("expected clone tag error, got: %v", err)
+	}
+
 	state.mu.Lock()
 	repo := state.repos[orgName+"/archiveme"]
+	state.mu.Unlock()
 	if repo.Archived {
-		t.Error("repo should not be archived yet")
-	}
-	state.mu.Unlock()
-
-	// Second: new announcement for the same (npub, repo_id) WITHOUT clone URL.
-	ev2 := makeSignedAnnouncementEvent(t, "archiveme", "")
-	if err := svc.HandleAnnouncementEvent(ctx, ev2, "ws://relay"); err != nil {
-		t.Fatal(err)
-	}
-
-	// Verify repo is now archived in mock Gitea.
-	state.mu.Lock()
-	repo = state.repos[orgName+"/archiveme"]
-	state.mu.Unlock()
-	if !repo.Archived {
-		t.Error("expected repo to be archived after clone tag removal")
+		t.Error("rejected announcement must not archive the repository")
 	}
 }
 
