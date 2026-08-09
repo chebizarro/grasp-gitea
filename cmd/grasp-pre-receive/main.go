@@ -23,7 +23,6 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/nostrstate"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
-	"github.com/sharegap/grasp-gitea/internal/relay"
 )
 
 type pushUpdate struct {
@@ -160,9 +159,9 @@ func decodedPubkeyHex(value any) (string, bool) {
 type nostrRefChecker func(eventID string, tipSHA string) error
 
 // newRelayNostrRefChecker enforces GRASP-01 differing-tip rejection before the
-// git update commits: if the relay already holds the PR/PR-update event named
-// by the ref and that event lists a different tip commit, the push is
-// rejected during pre-receive rather than being noticed later by a webhook.
+// git update commits: if the relay already holds the event named by the ref
+// and that event lists a different tip commit, the push is rejected during
+// pre-receive rather than being noticed later by a webhook.
 // Valid IDs with no relay event are accepted. Relay unreachability fails
 // closed, matching the state-check path.
 func newRelayNostrRefChecker(parent context.Context, relayURL string) nostrRefChecker {
@@ -195,11 +194,7 @@ func (f relayEventFetcher) FetchEvent(ctx context.Context, id string) (*nostr.Ev
 		return nil, fmt.Errorf("connect relay: %w", err)
 	}
 	defer r.Close()
-	for ev := range r.QueryEvents(nostr.Filter{
-		IDs:   []nostr.ID{eid},
-		Kinds: []nostr.Kind{relay.KindPROpen, relay.KindPRUpdate},
-		Limit: 1,
-	}) {
+	for ev := range r.QueryEvents(nostrRefEventFilter(eid)) {
 		e := ev
 		if e.ID.Hex() != id || nostrverify.ValidateEventIDAndSignature(&e) != nil {
 			return nil, fmt.Errorf("relay returned invalid event")
@@ -207,6 +202,17 @@ func (f relayEventFetcher) FetchEvent(ctx context.Context, id string) (*nostr.Ev
 		return &e, nil
 	}
 	return nil, nil
+}
+
+// nostrRefEventFilter deliberately does not constrain event kind. GRASP-01
+// requires conflict rejection whenever the event named by refs/nostr/<id>
+// exists and lists a different tip; PR-kind filtering applies only to the
+// later retention decision.
+func nostrRefEventFilter(eventID nostr.ID) nostr.Filter {
+	return nostr.Filter{
+		IDs:   []nostr.ID{eventID},
+		Limit: 1,
+	}
 }
 
 func collectPushUpdates(r io.Reader) ([]pushUpdate, error) {

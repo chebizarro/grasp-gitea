@@ -155,6 +155,17 @@ func TestAtomicMixedPushWithAdditionsUpdatesAndDeletions(t *testing.T) {
 	}
 }
 
+func TestNostrRefRelayLookupIsKindAgnostic(t *testing.T) {
+	eventID := nostr.MustIDFromHex(strings.Repeat("ab", 32))
+	filter := nostrRefEventFilter(eventID)
+	if len(filter.IDs) != 1 || filter.IDs[0] != eventID {
+		t.Fatalf("unexpected event filter IDs: %#v", filter.IDs)
+	}
+	if len(filter.Kinds) != 0 {
+		t.Fatalf("refs/nostr conflict lookup must not restrict event kinds: %#v", filter.Kinds)
+	}
+}
+
 func TestNostrRefConflictRejectedDuringPreReceive(t *testing.T) {
 	eventID := strings.Repeat("ab", 32)
 	otherID := strings.Repeat("cd", 32)

@@ -119,10 +119,10 @@ func TestReaperKeepsExpiredRefWithMatchingPR(t *testing.T) {
 	}
 }
 
-func TestFetchEventForTipRejectsDifferingTip(t *testing.T) {
+func TestFetchEventForTipRejectsDifferingTipForPatchEvent(t *testing.T) {
 	ev := &nostr.Event{
 		ID:   nostr.MustIDFromHex(testEventID),
-		Kind: relay.KindPROpen,
+		Kind: relay.KindPatch,
 		Tags: nostr.Tags{{"c", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
 	}
 	_, err := FetchEventForTip(context.Background(), fakeFetcher{ev: ev}, testEventID, testTipSHA)
