@@ -3,7 +3,7 @@ ARG BUILD_TAGS=""
 RUN apk add --no-cache build-base git ca-certificates
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN --mount=type=secret,id=gitauth,target=/root/.netrc go mod download
+RUN go mod download
 COPY . .
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -tags "${BUILD_TAGS}" -o /out/grasp-bridge ./cmd/grasp-bridge
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/grasp-pre-receive ./cmd/grasp-pre-receive
