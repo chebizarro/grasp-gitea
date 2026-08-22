@@ -278,7 +278,8 @@ func main() {
 			localPubkey = serverSigner.PublicKey()
 		}
 		loomActionIngestor, err = hiveci.NewLoomActionIngestor(hiveci.LoomActionConfig{
-			Enabled: true, LocalPubkey: localPubkey, RepositoriesDir: cfg.GiteaRepositoriesDir, Policies: policies,
+			Enabled: true, LocalPubkey: localPubkey, RepositoriesDir: cfg.GiteaRepositoriesDir,
+			MaxEventAge: cfg.LoomActions.MaxAge, FutureSkew: cfg.LoomActions.FutureSkew, Policies: policies,
 		}, st, hiveRunner, logger)
 		if err != nil {
 			logger.Error("failed to configure Loom action ingress", "error", err)

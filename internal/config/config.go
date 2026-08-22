@@ -174,8 +174,10 @@ type LoomActionPolicy struct {
 }
 
 type LoomActionsConfig struct {
-	Enabled  bool
-	Policies []LoomActionPolicy
+	Enabled    bool
+	MaxAge     time.Duration
+	FutureSkew time.Duration
+	Policies   []LoomActionPolicy
 }
 
 // CredentialKey is one entry of the credential-encryption key ring.
@@ -267,6 +269,8 @@ func Load() (Config, error) {
 		}
 	}
 	cfg.LoomActions.Enabled = boolEnv("LOOM_ACTIONS_ENABLED", false)
+	cfg.LoomActions.MaxAge = boundedDurationEnv("LOOM_ACTION_MAX_AGE", 15*time.Minute, time.Minute, 24*time.Hour)
+	cfg.LoomActions.FutureSkew = boundedDurationEnv("LOOM_ACTION_FUTURE_SKEW", 5*time.Minute, time.Second, time.Hour)
 	if raw := strings.TrimSpace(os.Getenv("LOOM_ACTION_POLICIES_JSON")); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.LoomActions.Policies); err != nil {
 			return Config{}, fmt.Errorf("LOOM_ACTION_POLICIES_JSON must be a JSON array: %w", err)

@@ -27,6 +27,15 @@ import (
 
 const TriggerSourceLoomActions = "loom-actions"
 
+const (
+	defaultLoomActionMaxAge     = 15 * time.Minute
+	defaultLoomActionFutureSkew = 5 * time.Minute
+	minLoomActionMaxAge         = time.Minute
+	maxLoomActionMaxAge         = 24 * time.Hour
+	minLoomActionFutureSkew     = time.Second
+	maxLoomActionFutureSkew     = time.Hour
+)
+
 var loomWorkflowMethod = cascadia.ContextVMMethods["ci/workflow-run"]
 
 // LoomActionPolicy authorizes signed Hive-CI action events for one canonical
@@ -45,6 +54,8 @@ type LoomActionConfig struct {
 	Enabled         bool
 	LocalPubkey     string
 	RepositoriesDir string
+	MaxEventAge     time.Duration
+	FutureSkew      time.Duration
 	Policies        []LoomActionPolicy
 }
 
@@ -52,11 +63,13 @@ type loomActionStore interface {
 	GetProvisionedMappingByRepoAddr(context.Context, string, string) (store.Mapping, error)
 	GetAcceptedRepositoryState(context.Context, string) (store.AcceptedRepositoryState, error)
 	GetTriggerEnvelope(context.Context, string) (store.TriggerEnvelope, error)
+	GetTriggerEnvelopeByIdentity(context.Context, string, string) (store.TriggerEnvelope, error)
 	ClaimTriggerEnvelope(context.Context, store.TriggerEnvelope) (store.TriggerEnvelope, bool, error)
 	GetLoomJobByTriggerEnvelope(context.Context, string, string) (store.LoomJob, error)
 }
 
 type loomActionRunner interface {
+	Enabled() bool
 	RunTriggerEnvelope(context.Context, string, string) error
 }
 
@@ -66,10 +79,13 @@ type LoomActionIngestor struct {
 	enabled         bool
 	localPubkey     string
 	repositoriesDir string
+	maxEventAge     time.Duration
+	futureSkew      time.Duration
 	policies        map[string]LoomActionPolicy
 	store           loomActionStore
 	runner          loomActionRunner
 	logger          *slog.Logger
+	now             func() time.Time
 }
 
 func NewLoomActionIngestor(cfg LoomActionConfig, st loomActionStore, runner loomActionRunner, logger *slog.Logger) (*LoomActionIngestor, error) {
@@ -79,13 +95,25 @@ func NewLoomActionIngestor(cfg LoomActionConfig, st loomActionStore, runner loom
 	ingestor := &LoomActionIngestor{
 		enabled: cfg.Enabled, localPubkey: strings.ToLower(strings.TrimSpace(cfg.LocalPubkey)),
 		repositoriesDir: strings.TrimSpace(cfg.RepositoriesDir), policies: make(map[string]LoomActionPolicy),
-		store: st, runner: runner, logger: logger.With("component", "hiveci.loom_actions"),
+		store: st, runner: runner, logger: logger.With("component", "hiveci.loom_actions"), now: time.Now,
 	}
 	if !cfg.Enabled {
 		return ingestor, nil
 	}
-	if ingestor.repositoriesDir == "" || st == nil || runner == nil {
+	if ingestor.repositoriesDir == "" || st == nil || runner == nil || !runner.Enabled() {
 		return nil, fmt.Errorf("complete Loom action ingress configuration is required")
+	}
+	ingestor.maxEventAge = cfg.MaxEventAge
+	if ingestor.maxEventAge == 0 {
+		ingestor.maxEventAge = defaultLoomActionMaxAge
+	}
+	ingestor.futureSkew = cfg.FutureSkew
+	if ingestor.futureSkew == 0 {
+		ingestor.futureSkew = defaultLoomActionFutureSkew
+	}
+	if ingestor.maxEventAge < minLoomActionMaxAge || ingestor.maxEventAge > maxLoomActionMaxAge ||
+		ingestor.futureSkew < minLoomActionFutureSkew || ingestor.futureSkew > maxLoomActionFutureSkew {
+		return nil, fmt.Errorf("Loom action timing configuration is outside safe bounds")
 	}
 	if ingestor.localPubkey != "" {
 		if _, err := nostr.PubKeyFromHex(ingestor.localPubkey); err != nil {
@@ -134,6 +162,23 @@ func (h *LoomActionIngestor) HandleEvent(ctx context.Context, ev *nostr.Event, s
 	if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
 		return true, loomActionReject("invalid Loom action signature")
 	}
+	// Freshness gates only a first-seen action. Once the exact signed identity is
+	// durably claimed, later relay redelivery must remain able to resume a
+	// transiently failed runner handoff without opening historical new actions.
+	_, existingErr := h.store.GetTriggerEnvelopeByIdentity(ctx, TriggerSourceLoomActions, ev.ID.Hex())
+	if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+		return true, existingErr
+	}
+	if errors.Is(existingErr, sql.ErrNoRows) {
+		now := h.now().UTC()
+		createdAt := time.Unix(int64(ev.CreatedAt), 0).UTC()
+		if createdAt.Before(now.Add(-h.maxEventAge)) {
+			return true, loomActionReject("Loom action is older than the configured maximum age")
+		}
+		if createdAt.After(now.Add(h.futureSkew)) {
+			return true, loomActionReject("Loom action timestamp is implausibly far in the future")
+		}
+	}
 	envelope, resumeEnvelopeID, err := h.validate(ctx, ev, action)
 	if err != nil {
 		return true, err
@@ -145,19 +190,28 @@ func (h *LoomActionIngestor) HandleEvent(ctx context.Context, ev *nostr.Event, s
 	if resumeEnvelopeID == "" {
 		resumeEnvelopeID = stored.IdempotencyKey
 	}
-	runContext := context.WithoutCancel(ctx)
-	go func() {
-		if action == "retry" {
-			job, err := h.store.GetLoomJobByTriggerEnvelope(runContext, resumeEnvelopeID, stored.WorkflowPath)
-			if err != nil || job.WorkflowRunID != envelopeRetryRunID(stored) || store.LoomJobTerminal(job) {
-				h.logger.Warn("Loom retry no longer has nonterminal workflow-run lineage", "event", ev.ID.Hex(), "error", err)
-				return
+	if action == "retry" {
+		job, err := h.store.GetLoomJobByTriggerEnvelope(ctx, resumeEnvelopeID, stored.WorkflowPath)
+		if err != nil {
+			h.logger.Warn("Loom retry no longer has nonterminal workflow-run lineage", "event", ev.ID.Hex(), "error", err)
+			if errors.Is(err, sql.ErrNoRows) {
+				return true, loomActionReject("retry no longer has nonterminal workflow-run lineage")
 			}
+			return true, err
 		}
-		if err := h.runner.RunTriggerEnvelope(runContext, resumeEnvelopeID, sourceRelay); err != nil {
-			h.logger.Error("Loom action orchestration failed", "event", ev.ID.Hex(), "action", action, "error", err)
+		if job.WorkflowRunID != envelopeRetryRunID(stored) || store.LoomJobTerminal(job) {
+			h.logger.Warn("Loom retry no longer has nonterminal workflow-run lineage", "event", ev.ID.Hex())
+			return true, loomActionReject("retry no longer has nonterminal workflow-run lineage")
 		}
-	}()
+	}
+	// Complete the durable runner handoff before returning to the subscriber.
+	// Relay redelivery can then resume the exact stored envelope after transient
+	// failures. Retry deliberately resumes the same nonterminal logical run; it
+	// never creates a second workflow run for a published trigger.
+	if err := h.runner.RunTriggerEnvelope(ctx, resumeEnvelopeID, sourceRelay); err != nil {
+		h.logger.Error("Loom action orchestration failed", "event", ev.ID.Hex(), "action", action, "error", err)
+		return true, err
+	}
 	return true, nil
 }
 
@@ -237,6 +291,10 @@ func (h *LoomActionIngestor) validate(ctx context.Context, ev *nostr.Event, acti
 		if original.Source != TriggerSourceLoomActions || original.Action != "workflow_dispatch" ||
 			!loomActionMatchesEnvelope(claims, original) || original.PolicyVersion != policy.Version {
 			return store.TriggerEnvelope{}, "", loomActionReject("retry evidence conflicts with the original trigger")
+		}
+		if (claims.prEventID != "" || claims.statusEventID != "") &&
+			(claims.prEventID != original.PREventID || claims.statusEventID != original.StatusEventID) {
+			return store.TriggerEnvelope{}, "", loomActionReject("retry PR/status lineage conflicts with the original trigger")
 		}
 		job, err := h.store.GetLoomJobByTriggerEnvelope(ctx, original.IdempotencyKey, claims.workflow)
 		if errors.Is(err, sql.ErrNoRows) {

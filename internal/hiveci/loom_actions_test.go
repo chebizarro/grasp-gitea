@@ -169,6 +169,34 @@ func TestLoomActionRejectsUnauthorizedActorAndMissingLineage(t *testing.T) {
 	})
 }
 
+func TestLoomActionRejectsStaleAndFutureEvents(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		when time.Time
+	}{
+		{name: "zero", when: time.Unix(0, 0)},
+		{name: "stale", when: time.Now().Add(-defaultLoomActionMaxAge - time.Minute)},
+		{name: "future", when: time.Now().Add(defaultLoomActionFutureSkew + time.Minute)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newLoomActionFixture(t, false)
+			ev := fx.lineageDispatch(t)
+			ev.CreatedAt = nostr.Timestamp(tc.when.Unix())
+			resignMergeEvent(t, ev, fx.actorPriv)
+			handled, err := fx.handler.HandleEvent(fx.merge.ctx, ev, "")
+			if !handled || !isNonRetryable(err) {
+				t.Fatalf("timestamp rejection = %v, %v", handled, err)
+			}
+			if calls := fx.runner.snapshot(); len(calls) != 0 {
+				t.Fatalf("timestamp-rejected action ran trigger: %v", calls)
+			}
+			if _, err := fx.store.GetTriggerEnvelopeByIdentity(fx.merge.ctx, TriggerSourceLoomActions, ev.ID.Hex()); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("timestamp-rejected action persisted: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoomActionDirectPolicyDenyAndAllow(t *testing.T) {
 	denied := newLoomActionFixture(t, false)
 	if handled, err := denied.handler.HandleEvent(denied.merge.ctx, denied.directDispatch(t), ""); !handled || !isNonRetryable(err) {
@@ -279,6 +307,84 @@ func TestLoomActionRetryResumesSameNonterminalRunAndRejectsTerminal(t *testing.T
 	}
 }
 
+func TestLoomActionRetryPRStatusLineageMustMatchOriginal(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		tags    func(store.TriggerEnvelope) nostr.Tags
+		allowed bool
+	}{
+		{name: "matching", allowed: true, tags: func(original store.TriggerEnvelope) nostr.Tags {
+			return nostr.Tags{{"pr-event", original.PREventID}, {"status-event", original.StatusEventID}}
+		}},
+		{name: "conflicting", tags: func(original store.TriggerEnvelope) nostr.Tags {
+			return nostr.Tags{{"pr-event", strings.Repeat("a", 64)}, {"status-event", original.StatusEventID}}
+		}},
+		{name: "partial", tags: func(original store.TriggerEnvelope) nostr.Tags {
+			return nostr.Tags{{"pr-event", original.PREventID}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newLoomActionFixture(t, false)
+			dispatch := fx.lineageDispatch(t)
+			if _, err := fx.handler.HandleEvent(fx.merge.ctx, dispatch, ""); err != nil {
+				t.Fatal(err)
+			}
+			fx.runner.wait(t, 1)
+			original, err := fx.store.GetTriggerEnvelopeByIdentity(fx.merge.ctx, TriggerSourceLoomActions, dispatch.ID.Hex())
+			if err != nil {
+				t.Fatal(err)
+			}
+			runID := strings.Repeat("8", 64)
+			fx.store.jobs[original.IdempotencyKey+"\x00"+fx.workflow] = store.LoomJob{WorkflowRunID: runID, Status: store.LoomStatusPending}
+			retry := fx.retry(t, original, runID)
+			retry.Tags = append(retry.Tags, tc.tags(original)...)
+			resignMergeEvent(t, retry, fx.actorPriv)
+			handled, err := fx.handler.HandleEvent(fx.merge.ctx, retry, "")
+			if tc.allowed {
+				if !handled || err != nil {
+					t.Fatalf("matching retry lineage = %v, %v", handled, err)
+				}
+				if calls := fx.runner.snapshot(); len(calls) != 2 {
+					t.Fatalf("matching retry did not resume trigger: %v", calls)
+				}
+				return
+			}
+			if !handled || !isNonRetryable(err) || !strings.Contains(err.Error(), "PR/status lineage") {
+				t.Fatalf("invalid retry lineage = %v, %v", handled, err)
+			}
+			if calls := fx.runner.snapshot(); len(calls) != 1 {
+				t.Fatalf("invalid retry ran trigger: %v", calls)
+			}
+		})
+	}
+}
+
+func TestLoomActionRunnerFailureIsRetryableAndReplayResumes(t *testing.T) {
+	fx := newLoomActionFixture(t, false)
+	ev := fx.lineageDispatch(t)
+	now := time.Now().UTC()
+	fx.handler.now = func() time.Time { return now }
+	fx.runner.error = errors.New("temporary runner failure")
+	handled, err := fx.handler.HandleEvent(fx.merge.ctx, ev, "wss://loom.test")
+	if !handled || err == nil || isNonRetryable(err) {
+		t.Fatalf("temporary runner failure = %v, %v", handled, err)
+	}
+	if _, lookupErr := fx.store.GetTriggerEnvelopeByIdentity(fx.merge.ctx, TriggerSourceLoomActions, ev.ID.Hex()); lookupErr != nil {
+		t.Fatalf("runner failure did not retain envelope: %v", lookupErr)
+	}
+	fx.runner.error = nil
+	// Freshness prevents new historical actions, but an already claimed exact
+	// identity must remain recoverable after a longer transient outage.
+	now = now.Add(defaultLoomActionMaxAge + time.Minute)
+	if handled, err = fx.handler.HandleEvent(fx.merge.ctx, ev, "wss://loom.test"); !handled || err != nil {
+		t.Fatalf("runner replay = %v, %v", handled, err)
+	}
+	calls := fx.runner.snapshot()
+	if len(calls) != 2 || calls[0] != calls[1] {
+		t.Fatalf("runner replay ids=%v", calls)
+	}
+}
+
 func TestLoomActionIgnoresLocalWorkflowRunSelfEchoAndRawCommands(t *testing.T) {
 	fx := newLoomActionFixture(t, false)
 	local, err := NewLoomActionIngestor(LoomActionConfig{
@@ -316,6 +422,28 @@ func TestLoomActionUsesCanonicalLegacyWorkflowBinding(t *testing.T) {
 	if loomWorkflowMethod.Kind != cascadia.KindContextVMIntent || loomWorkflowMethod.Domain != "ci" ||
 		loomWorkflowMethod.Op != "workflow-run" || loomWorkflowMethod.Schema == "" {
 		t.Fatalf("unexpected canonical workflow binding: %#v", loomWorkflowMethod)
+	}
+}
+
+func TestLoomActionIngressRequiresEnabledRunner(t *testing.T) {
+	fx := newLoomActionFixture(t, false)
+	_, err := NewLoomActionIngestor(LoomActionConfig{
+		Enabled: true, RepositoriesDir: fx.merge.repositoriesDir, Policies: []LoomActionPolicy{fx.policy},
+	}, fx.store, &githubRunnerCapture{disabled: true}, nil)
+	if err == nil {
+		t.Fatal("disabled runner accepted for Loom action ingress")
+	}
+}
+
+func TestLoomActionIngressRejectsUnsafeTimingConfiguration(t *testing.T) {
+	fx := newLoomActionFixture(t, false)
+	for _, tc := range []LoomActionConfig{
+		{Enabled: true, RepositoriesDir: fx.merge.repositoriesDir, MaxEventAge: -time.Second, Policies: []LoomActionPolicy{fx.policy}},
+		{Enabled: true, RepositoriesDir: fx.merge.repositoriesDir, FutureSkew: 2 * time.Hour, Policies: []LoomActionPolicy{fx.policy}},
+	} {
+		if _, err := NewLoomActionIngestor(tc, fx.store, fx.runner, nil); err == nil {
+			t.Fatalf("unsafe timing configuration accepted: %#v", tc)
+		}
 	}
 }
 

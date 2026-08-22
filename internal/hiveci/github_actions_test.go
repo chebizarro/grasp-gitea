@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,11 +24,14 @@ import (
 )
 
 type githubRunnerCapture struct {
-	mu    sync.Mutex
-	ids   []string
-	error error
-	calls chan struct{}
+	mu       sync.Mutex
+	ids      []string
+	error    error
+	calls    chan struct{}
+	disabled bool
 }
+
+func (r *githubRunnerCapture) Enabled() bool { return r != nil && !r.disabled }
 
 func (r *githubRunnerCapture) RunTriggerEnvelope(_ context.Context, id, _ string) error {
 	r.mu.Lock()
@@ -266,6 +270,28 @@ func TestGitHubActionDuplicateConflictIsTerminal(t *testing.T) {
 	}
 }
 
+func TestGitHubActionRunnerFailureIsRetryableAndReplayResumes(t *testing.T) {
+	fx := newGitHubActionFixture(t)
+	body, _ := json.Marshal(fx.manualPayload())
+	fx.runner.error = errors.New("temporary runner failure")
+	failed := fx.request(t, "workflow_dispatch", "runner-retry", body, fx.secret)
+	if failed.Code != http.StatusInternalServerError {
+		t.Fatalf("failure status=%d body=%s", failed.Code, failed.Body.String())
+	}
+	if _, err := fx.merge.store.GetTriggerEnvelopeByIdentity(fx.merge.ctx, TriggerSourceGitHubActions, "runner-retry"); err != nil {
+		t.Fatalf("runner failure did not retain envelope: %v", err)
+	}
+	fx.runner.error = nil
+	replay := fx.request(t, "workflow_dispatch", "runner-retry", body, fx.secret)
+	if replay.Code != http.StatusOK || !strings.Contains(replay.Body.String(), `"replay":true`) {
+		t.Fatalf("replay status=%d body=%s", replay.Code, replay.Body.String())
+	}
+	ids := fx.runner.snapshot()
+	if len(ids) != 2 || ids[0] != ids[1] {
+		t.Fatalf("runner replay ids=%v", ids)
+	}
+}
+
 func TestGitHubActionRequiresValidHMACAndHeaders(t *testing.T) {
 	fx := newGitHubActionFixture(t)
 	body, _ := json.Marshal(fx.manualPayload())
@@ -302,6 +328,20 @@ func TestGitHubActionPolicyRejectsInvalidCoordinate(t *testing.T) {
 	}, fx.store, &githubRunnerCapture{}, nil)
 	if err == nil {
 		t.Fatal("invalid canonical repository coordinate accepted")
+	}
+}
+
+func TestGitHubActionIngressRequiresEnabledRunner(t *testing.T) {
+	fx := newMergeFixture(t, true)
+	_, err := NewGitHubActionHandler(GitHubActionConfig{
+		Secret: "secret", RepositoriesDir: fx.repositoriesDir,
+		Policies: []GitHubActionPolicy{{Repository: "upstream/project", RepositoryID: 1,
+			RepoAddress: fx.repoAddress(), Actors: []string{"bot"}, ActorIDs: []int64{2},
+			Events: []string{"workflow_dispatch"}, ProtectedBranches: []string{"main"},
+			Workflows: []string{".github/workflows/deploy.yml"}, Version: "v1"}},
+	}, fx.store, &githubRunnerCapture{disabled: true}, nil)
+	if err == nil {
+		t.Fatal("disabled runner accepted for GitHub action ingress")
 	}
 }
 

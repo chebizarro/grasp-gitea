@@ -308,6 +308,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.HiveCIActPath != "/usr/bin/act" {
 		t.Errorf("default HiveCIActPath: got %q", cfg.HiveCIActPath)
 	}
+	if cfg.LoomActions.MaxAge != 15*time.Minute || cfg.LoomActions.FutureSkew != 5*time.Minute {
+		t.Errorf("default Loom action timing: max_age=%v future_skew=%v", cfg.LoomActions.MaxAge, cfg.LoomActions.FutureSkew)
+	}
 	if cfg.SignerEnabled() {
 		t.Error("signer should be disabled by default")
 	}
@@ -334,6 +337,7 @@ func TestLoadLoomActionIngressConfig(t *testing.T) {
 	setEnvs(t, map[string]string{
 		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com", "RELAY_URLS": "wss://relay",
 		"LOOM_ENABLED": "true", "LOOM_ACTIONS_ENABLED": "true", "HIVE_CI_ENABLED": "true", "CI_TRIGGER_REPOS": "*",
+		"LOOM_ACTION_MAX_AGE": "30m", "LOOM_ACTION_FUTURE_SKEW": "2m",
 		"LOOM_ACTION_POLICIES_JSON": `[{"repo_address":"30617:owner:repo","actors":["` + actor + `"],"branches":["main"],"workflows":[".gitea/workflows/deploy.yml"],"allow_direct_dispatch":true,"version":"v1"}]`,
 	})
 	cfg, err := Load()
@@ -341,7 +345,8 @@ func TestLoadLoomActionIngressConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !cfg.LoomActions.Enabled || len(cfg.LoomActions.Policies) != 1 ||
-		!cfg.LoomActions.Policies[0].AllowDirectDispatch || cfg.LoomActions.Policies[0].Actors[0] != actor {
+		!cfg.LoomActions.Policies[0].AllowDirectDispatch || cfg.LoomActions.Policies[0].Actors[0] != actor ||
+		cfg.LoomActions.MaxAge != 30*time.Minute || cfg.LoomActions.FutureSkew != 2*time.Minute {
 		t.Fatalf("unexpected Loom action config: %#v", cfg.LoomActions)
 	}
 }

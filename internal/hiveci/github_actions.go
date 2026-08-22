@@ -59,6 +59,7 @@ type githubActionStore interface {
 }
 
 type githubActionRunner interface {
+	Enabled() bool
 	RunTriggerEnvelope(context.Context, string, string) error
 }
 
@@ -83,7 +84,7 @@ func NewGitHubActionHandler(cfg GitHubActionConfig, st githubActionStore, runner
 		policies: make(map[string]GitHubActionPolicy), store: st, runner: runner,
 		logger: logger.With("component", "hiveci.github_actions"),
 	}
-	if len(h.secret) == 0 || h.repositoriesDir == "" || st == nil || runner == nil {
+	if len(h.secret) == 0 || h.repositoriesDir == "" || st == nil || runner == nil || !runner.Enabled() {
 		return nil, fmt.Errorf("complete GitHub action ingress configuration is required")
 	}
 	for _, policy := range cfg.Policies {
@@ -150,15 +151,18 @@ func (h *GitHubActionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		githubActionError(w, status, message)
 		return
 	}
-	// The envelope is durable before acknowledgement. Detach execution from
-	// GitHub's short webhook request lifetime; Runner's durable per-workflow
-	// claim makes concurrent redeliveries and restarts execution-idempotent.
-	runContext := context.WithoutCancel(r.Context())
-	go func() {
-		if err := h.runner.RunTriggerEnvelope(runContext, stored.IdempotencyKey, "github:"+eventType); err != nil {
-			h.logger.Error("GitHub action orchestration failed", "event", eventType, "delivery", deliveryID, "error", err)
+	// Complete the initial durable per-workflow handoff before acknowledging.
+	// A transient failure returns 5xx so GitHub redelivery resumes the exact
+	// stored envelope instead of leaving an acknowledged claim stranded.
+	if err := h.runner.RunTriggerEnvelope(r.Context(), stored.IdempotencyKey, "github:"+eventType); err != nil {
+		h.logger.Error("GitHub action orchestration failed", "event", eventType, "delivery", deliveryID, "error", err)
+		status, message := githubActionStatus(err), err.Error()
+		if status >= 500 {
+			message = "GitHub action orchestration unavailable"
 		}
-	}()
+		githubActionError(w, status, message)
+		return
+	}
 	status := http.StatusOK
 	if claimed {
 		status = http.StatusAccepted
