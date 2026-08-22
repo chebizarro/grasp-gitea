@@ -76,6 +76,11 @@ type Config struct {
 	HiveCIActPath       string
 	HiveCIRunTimeout    time.Duration
 	HiveCIMaxConcurrent int
+	// HiveCIDispatchPolicies authorize canonical Drydock review attestations
+	// per repository. Reviewers must also retain current NIP-34 authority.
+	HiveCIDispatchPolicies []HiveCIDispatchPolicy
+	HiveCIReviewMaxAge     time.Duration
+	HiveCIReviewFutureSkew time.Duration
 
 	// GitHub action ingestion is an independent, default-off signed webhook
 	// boundary. Policies map an upstream GitHub repository to exactly one
@@ -99,6 +104,7 @@ type Config struct {
 	LoomLogMaxBytes         int64
 	LoomJobTTL              time.Duration
 	LoomMaxJobs             int
+	LoomWorkerAdMaxAge      time.Duration
 	LoomFutureSkew          time.Duration
 	LoomResultGrace         time.Duration
 	CIProtocol              string
@@ -180,6 +186,14 @@ type LoomActionsConfig struct {
 	Policies   []LoomActionPolicy
 }
 
+// HiveCIDispatchPolicy is the operator-owned review trust policy for one
+// canonical NIP-34 repository coordinate.
+type HiveCIDispatchPolicy struct {
+	RepoAddress string   `json:"repo_address"`
+	Reviewers   []string `json:"reviewers"`
+	Version     string   `json:"version"`
+}
+
 // CredentialKey is one entry of the credential-encryption key ring.
 type CredentialKey struct {
 	ID  string
@@ -232,6 +246,8 @@ func Load() (Config, error) {
 		HiveCIActPath:           envOrDefault("HIVE_CI_ACT_PATH", "/usr/bin/act"),
 		HiveCIRunTimeout:        boundedDurationEnv("HIVE_CI_RUN_TIMEOUT", 15*time.Minute, time.Second, time.Hour),
 		HiveCIMaxConcurrent:     boundedIntEnv("HIVE_CI_MAX_CONCURRENT", 2, 1, 16),
+		HiveCIReviewMaxAge:      boundedDurationEnv("HIVE_CI_REVIEW_MAX_AGE", 24*time.Hour, time.Minute, 30*24*time.Hour),
+		HiveCIReviewFutureSkew:  boundedDurationEnv("HIVE_CI_REVIEW_FUTURE_SKEW", 5*time.Minute, time.Second, time.Hour),
 		LoomEnabled:             boolEnv("LOOM_ENABLED", false),
 		LoomDispatchMode:        strings.ToLower(envOrDefault("LOOM_DISPATCH_MODE", "local")),
 		LoomWorkerPubkeys:       csvEnv("LOOM_WORKER_PUBKEYS"),
@@ -247,6 +263,7 @@ func Load() (Config, error) {
 		LoomLogMaxBytes:         int64(boundedIntEnv("LOOM_LOG_MAX_BYTES", 1<<20, 1024, 10<<20)),
 		LoomJobTTL:              boundedDurationEnv("LOOM_JOB_TTL", 7*24*time.Hour, time.Hour, 30*24*time.Hour),
 		LoomMaxJobs:             boundedIntEnv("LOOM_MAX_JOBS", 4096, 1, 100000),
+		LoomWorkerAdMaxAge:      boundedDurationEnv("LOOM_WORKER_AD_MAX_AGE", 15*time.Minute, time.Second, 24*time.Hour),
 		LoomFutureSkew:          boundedDurationEnv("LOOM_FUTURE_SKEW", 5*time.Minute, time.Second, time.Hour),
 		LoomResultGrace:         boundedDurationEnv("LOOM_RESULT_GRACE", 30*time.Second, time.Second, 10*time.Minute),
 		CIProtocol:              strings.ToLower(envOrDefault("CI_PROTOCOL", "canonical")),
@@ -274,6 +291,11 @@ func Load() (Config, error) {
 	if raw := strings.TrimSpace(os.Getenv("LOOM_ACTION_POLICIES_JSON")); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.LoomActions.Policies); err != nil {
 			return Config{}, fmt.Errorf("LOOM_ACTION_POLICIES_JSON must be a JSON array: %w", err)
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("HIVE_CI_DISPATCH_POLICIES_JSON")); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &cfg.HiveCIDispatchPolicies); err != nil {
+			return Config{}, fmt.Errorf("HIVE_CI_DISPATCH_POLICIES_JSON must be a JSON array: %w", err)
 		}
 	}
 

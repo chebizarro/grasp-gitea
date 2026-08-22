@@ -34,6 +34,29 @@ func (s testDispatchSigner) NIP44Encrypt(_ context.Context, target nostr.PubKey,
 	return nip44.Encrypt(plaintext, key)
 }
 
+type testDispatchRevalidator struct {
+	requestErr error
+	retryErr   error
+	requests   int
+	retries    int
+}
+
+func (v *testDispatchRevalidator) ValidateDispatchRequest(context.Context, DispatchRequest) error {
+	v.requests++
+	return v.requestErr
+}
+
+func (v *testDispatchRevalidator) RevalidateDispatch(context.Context, store.LoomJob) error {
+	v.retries++
+	return v.retryErr
+}
+
+func allowTestDispatch(d *Dispatcher) *testDispatchRevalidator {
+	v := &testDispatchRevalidator{}
+	d.SetDispatchRevalidator(v)
+	return v
+}
+
 func signedWorkerAd(t *testing.T, worker nostr.SecretKey, created time.Time, software string, price string) *nostr.Event {
 	t.Helper()
 	ev := &nostr.Event{
@@ -102,6 +125,29 @@ func TestWorkerPoolAllowlistCanonicalLatestAndPaymentGate(t *testing.T) {
 	}
 }
 
+func TestWorkerPoolRevalidatesExactFreshAdvertisement(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	worker := nostr.Generate()
+	pool := NewWorkerPool(WorkerPoolConfig{Allowlist: []string{worker.Public().Hex()}, AdTTL: time.Minute, FutureSkew: time.Second})
+	first := signedWorkerAd(t, worker, now, "act", "0")
+	if err := pool.HandleEvent(first, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := pool.Revalidate(worker.Public().Hex(), first.ID.Hex(), now, 15*time.Minute, false, ""); !ok {
+		t.Fatal("fresh exact advertisement failed revalidation")
+	}
+	replacement := signedWorkerAd(t, worker, now.Add(time.Second), "act", "0")
+	if err := pool.HandleEvent(replacement, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := pool.Revalidate(worker.Public().Hex(), first.ID.Hex(), now.Add(time.Second), 15*time.Minute, false, ""); ok {
+		t.Fatal("replaced advertisement remained valid")
+	}
+	if _, ok := pool.Revalidate(worker.Public().Hex(), replacement.ID.Hex(), now.Add(2*time.Minute), 15*time.Minute, false, ""); ok {
+		t.Fatal("stale advertisement remained valid")
+	}
+}
+
 func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "loom.db"))
@@ -120,6 +166,7 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 		Enabled: true, MaxDuration: 15 * time.Minute, RelayURLs: []string{"wss://relay.invalid"},
 		JobTTL: time.Hour, MaxJobs: 20,
 	}, pool, st, testDispatchSigner{operator}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	allowTestDispatch(d)
 	var published []nostr.Event
 	d.publish = func(_ context.Context, ev *nostr.Event) error {
 		// The attempt and both exact signed payloads must already exist.
@@ -162,7 +209,12 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 		tagValue(run.Tags, "pr-event") != req.PREventID || tagValue(run.Tags, "status-event") != req.StatusEventID ||
 		tagValue(run.Tags, "source-commit") != req.SourceCommit ||
 		tagValue(run.Tags, "source-tree") != req.SourceTree || tagValue(run.Tags, "patch-digest") != req.PatchDigest ||
-		tagValue(run.Tags, "repo-address") != req.RepoAddress || tagValue(run.Tags, "policy") != req.PolicyVersion {
+		tagValue(run.Tags, "repo-address") != req.RepoAddress || tagValue(run.Tags, "policy") != req.PolicyVersion ||
+		tagValue(run.Tags, "pr") != req.PREventID || tagValue(run.Tags, "review") != req.ReviewEventID ||
+		tagValue(run.Tags, "audit") != req.AuditEventID || tagValue(run.Tags, "reviewer") != req.ReviewerPubkey ||
+		tagValue(run.Tags, "tree") != req.CommitTree || tagValue(run.Tags, "workflow-digest") != req.WorkflowDigest ||
+		tagValue(run.Tags, "requester") != req.Actor || tagValue(run.Tags, "idempotency") != req.TriggerEnvelopeID ||
+		tagValue(run.Tags, "worker-ad") == "" || tagValue(run.Tags, "policy-digest") != req.ReviewPolicySHA256 {
 		t.Fatalf("invalid kind-5401 tags: %#v", run.Tags)
 	}
 	secretTag := request.Tags.Find("secret")
@@ -178,7 +230,8 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.WorkflowRunEvent == "" || job.JobRequestEvent == "" || job.DispatchState != "published" {
+	if job.WorkflowRunEvent == "" || job.JobRequestEvent == "" || job.DispatchState != "published" ||
+		job.WorkerAdID != tagValue(run.Tags, "worker-ad") {
 		t.Fatalf("durable dispatch = %#v", job)
 	}
 	secret := tagValue(published[1].Tags, "secret")
@@ -221,11 +274,20 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 	if err != nil || !store.LoomJobTerminal(correlated) {
 		t.Fatalf("terminal trigger lookup = %#v, %v", correlated, err)
 	}
-	if handled, err := d.Dispatch(ctx, req); err != nil || !handled {
-		t.Fatalf("terminal exact replay = %v, %v", handled, err)
+	if handled, err := d.Dispatch(ctx, req); !handled || !errors.Is(err, store.ErrTriggerConflict) {
+		t.Fatalf("terminal exact replay = %v, %v, want non-retryable conflict", handled, err)
 	}
 	if len(published) != 2 {
 		t.Fatal("terminal exact replay published or created another run")
+	}
+	if _, err := st.SweepLoomJobs(ctx, time.Now().UTC().Add(2*time.Hour), time.Hour, 20); err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := d.Dispatch(ctx, req); !handled || !errors.Is(err, store.ErrTriggerConflict) {
+		t.Fatalf("post-sweep replay = %v, %v, want durable conflict", handled, err)
+	}
+	if len(published) != 2 {
+		t.Fatal("post-sweep replay reached publication")
 	}
 	conflict := req
 	conflict.EvidenceJSON = `{"kind":1631,"conflict":true}`
@@ -292,6 +354,7 @@ func TestDispatcherRetryReusesExactEventIDs(t *testing.T) {
 	}
 	d := NewDispatcher(DispatcherConfig{Enabled: true, MaxDuration: 15 * time.Minute,
 		RelayURLs: []string{"wss://relay.invalid"}}, pool, st, testDispatchSigner{operator}, nil)
+	allowTestDispatch(d)
 	var firstIDs []nostr.ID
 	d.publish = func(_ context.Context, ev *nostr.Event) error {
 		firstIDs = append(firstIDs, ev.ID)
@@ -354,6 +417,7 @@ func TestDispatcherCashuSpendIsExactAndNeverRepeated(t *testing.T) {
 	d := NewDispatcher(DispatcherConfig{Enabled: true, PaymentMode: "cashu", MintURL: "https://mint.invalid",
 		MaxDuration: 15 * time.Minute, MaxPayment: 2000, RelayURLs: []string{"wss://relay.invalid"}},
 		pool, st, testDispatchSigner{operator}, nil, wallet)
+	allowTestDispatch(d)
 	var firstIDs []nostr.ID
 	d.publish = func(_ context.Context, ev *nostr.Event) error {
 		firstIDs = append(firstIDs, ev.ID)
@@ -412,6 +476,7 @@ func TestDispatcherCancelsSupersededSameRef(t *testing.T) {
 	}
 	d := NewDispatcher(DispatcherConfig{Enabled: true, MaxDuration: 15 * time.Minute,
 		RelayURLs: []string{"wss://relay.invalid"}}, pool, st, testDispatchSigner{operator}, nil)
+	allowTestDispatch(d)
 	var published []nostr.Event
 	d.publish = func(_ context.Context, ev *nostr.Event) error { published = append(published, *ev); return nil }
 	first := testDispatchRequest(operator.Public().Hex())
@@ -425,7 +490,13 @@ func TestDispatcherCancelsSupersededSameRef(t *testing.T) {
 	}
 	second := first
 	second.SourceEventID = stringsOf('d', 64)
+	second.TriggerEnvelopeID = stringsOf('7', 64)
+	second.TriggerID = second.SourceEventID
+	second.StatusEventID = second.SourceEventID
 	second.CommitSHA = stringsOf('e', 40)
+	second.SourceCommit = stringsOf('e', 40)
+	second.SourceTree = stringsOf('a', 40)
+	second.PatchDigest = stringsOf('b', 64)
 	if handled, err := d.Dispatch(ctx, second); err != nil || !handled {
 		t.Fatal(handled, err)
 	}
@@ -452,20 +523,26 @@ func TestDispatcherAmbiguousCashuReservationFailsClosed(t *testing.T) {
 	}
 	defer st.Close()
 	worker, operator := nostr.Generate(), nostr.Generate()
+	now := time.Now().UTC().Truncate(time.Second)
+	ad := signedWorkerAd(t, worker, now, "act", "2")
 	req := testDispatchRequest(operator.Public().Hex())
 	key, _ := dispatchKey(req)
 	if _, claimed, err := st.ReserveLoomCashuSpend(ctx, store.LoomCashuSpend{
-		DispatchKey: key, WorkerPub: worker.Public().Hex(), WorkerAdID: stringsOf('a', 64), MintURL: "https://mint.invalid",
+		DispatchKey: key, WorkerPub: worker.Public().Hex(), WorkerAdID: ad.ID.Hex(), MintURL: "https://mint.invalid",
 		Amount: 1800, PricePerSecond: 2, DurationSeconds: 900,
-	}, time.Now().UTC()); err != nil || !claimed {
+	}, now); err != nil || !claimed {
 		t.Fatalf("reserve crash window = %v, %v", claimed, err)
 	}
 	pool := NewWorkerPool(WorkerPoolConfig{Allowlist: []string{worker.Public().Hex()}})
+	if err := pool.HandleEvent(ad, now); err != nil {
+		t.Fatal(err)
+	}
 	wallet := &countingCashuWallet{}
 	d := NewDispatcher(DispatcherConfig{Enabled: true, PaymentMode: "cashu", MintURL: "https://mint.invalid",
 		MaxDuration: 15 * time.Minute, MaxPayment: 2000, RelayURLs: []string{"wss://relay.invalid"}},
 		pool, st, testDispatchSigner{operator}, nil, wallet)
-	if handled, err := d.Dispatch(ctx, req); handled || err == nil || !strings.Contains(err.Error(), "refusing a second payment") {
+	allowTestDispatch(d)
+	if handled, err := d.Dispatch(ctx, req); !handled || err == nil || !strings.Contains(err.Error(), "refusing a second payment") {
 		t.Fatalf("ambiguous dispatch = %v, %v", handled, err)
 	}
 	if wallet.createCalls != 0 {
@@ -475,13 +552,22 @@ func TestDispatcherAmbiguousCashuReservationFailsClosed(t *testing.T) {
 
 func TestEphemeralPublisherIsolatedAcrossWorkers(t *testing.T) {
 	operator, firstWorker, secondWorker := nostr.Generate(), nostr.Generate(), nostr.Generate()
-	d := &Dispatcher{signer: testDispatchSigner{operator}}
+	now := time.Now().UTC().Truncate(time.Second)
+	pool := NewWorkerPool(WorkerPoolConfig{Allowlist: []string{firstWorker.Public().Hex(), secondWorker.Public().Hex()}, AdTTL: time.Hour})
+	firstAd, secondAd := signedWorkerAd(t, firstWorker, now, "act", "0"), signedWorkerAd(t, secondWorker, now, "act", "0")
+	if err := pool.HandleEvent(firstAd, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.HandleEvent(secondAd, now); err != nil {
+		t.Fatal(err)
+	}
+	d := &Dispatcher{signer: testDispatchSigner{operator}, pool: pool, maxDuration: 15 * time.Minute}
 	req := testDispatchRequest(operator.Public().Hex())
-	first, err := d.buildAttempt(context.Background(), req, "first", firstWorker.Public().Hex(), "", time.Now().UTC())
+	first, err := d.buildAttempt(context.Background(), req, "first", WorkerAd{Event: *firstAd}, "", now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := d.buildAttempt(context.Background(), req, "second", secondWorker.Public().Hex(), "", time.Now().UTC())
+	second, err := d.buildAttempt(context.Background(), req, "second", WorkerAd{Event: *secondAd}, "", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,6 +583,15 @@ func testDispatchRequest(owner string) DispatchRequest {
 		CloneURL:  "https://git.example/alice/repo.git",
 		CommitSHA: stringsOf('b', 40), WorkflowPath: ".github/workflows/ci.yml",
 		Branch: "main", Trigger: "push", TriggeredBy: owner,
+		TriggerEnvelopeID: stringsOf('6', 64), TriggerSource: store.TriggerSourceNIP34MergeStatus,
+		TriggerID: stringsOf('a', 64), Actor: owner, EvidenceJSON: `{"kind":1631}`,
+		PREventID: stringsOf('1', 64), StatusEventID: stringsOf('a', 64),
+		SourceCommit: stringsOf('5', 40), SourceTree: stringsOf('3', 40), PatchDigest: stringsOf('4', 64),
+		RepoAddress: "30617:" + owner + ":repo", PolicyVersion: "hiveci.nip34-merge-status.v1",
+		ReviewEventID: stringsOf('d', 64), AuditEventID: stringsOf('e', 64), ReviewerPubkey: owner,
+		ReviewRootEventID: stringsOf('f', 64), ReviewBaseCommit: stringsOf('7', 40),
+		ReviewPolicyVersion: "review-policy-v1", ReviewPolicySHA256: stringsOf('8', 64),
+		CommitTree: stringsOf('9', 40), WorkflowDigest: stringsOf('c', 64),
 	}
 }
 

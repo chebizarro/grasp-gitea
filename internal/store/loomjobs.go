@@ -32,6 +32,7 @@ type LoomJob struct {
 	JobRequestID         string
 	PublisherPub         string
 	WorkerPub            string
+	WorkerAdID           string
 	Owner                string
 	RepoName             string
 	RepoID               string
@@ -113,6 +114,7 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 			job_request_id TEXT NOT NULL DEFAULT '',
 			publisher_pub TEXT NOT NULL DEFAULT '',
 			worker_pub TEXT NOT NULL DEFAULT '',
+			worker_ad_id TEXT NOT NULL DEFAULT '',
 			owner TEXT NOT NULL,
 			repo_name TEXT NOT NULL,
 			repo_id TEXT NOT NULL,
@@ -158,6 +160,13 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 			workflow_path TEXT NOT NULL,
 			dispatch_key TEXT NOT NULL UNIQUE,
 			workflow_run_id TEXT NOT NULL UNIQUE,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY(trigger_envelope_id, workflow_path)
+		)`,
+		`CREATE TABLE IF NOT EXISTS loom_dispatch_claims (
+			trigger_envelope_id TEXT NOT NULL,
+			workflow_path TEXT NOT NULL,
+			dispatch_key TEXT NOT NULL UNIQUE,
 			created_at INTEGER NOT NULL,
 			PRIMARY KEY(trigger_envelope_id, workflow_path)
 		)`,
@@ -219,14 +228,14 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 		"cancelled_by":             "TEXT NOT NULL DEFAULT ''",
 		"worker_ad_id":             "TEXT NOT NULL DEFAULT ''",
 	} {
-		table := "loom_jobs"
-		if column == "worker_ad_id" {
-			table = "loom_cashu_spends"
-		}
-		if err := ensureSQLiteColumn(s.db, table, column, definition); err != nil &&
+		if err := ensureSQLiteColumn(s.db, "loom_jobs", column, definition); err != nil &&
 			!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 			return fmt.Errorf("migrate Loom %s: %w", column, err)
 		}
+	}
+	if err := ensureSQLiteColumn(s.db, "loom_cashu_spends", "worker_ad_id", "TEXT NOT NULL DEFAULT ''"); err != nil &&
+		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return fmt.Errorf("migrate Loom Cashu worker_ad_id: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_loom_jobs_dispatch
 		ON loom_jobs(dispatch_key) WHERE dispatch_key != ''`); err != nil {
@@ -245,6 +254,42 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 		return fmt.Errorf("initialize Loom supersession index: %w", err)
 	}
 	return nil
+}
+
+// ClaimLoomDispatchReservation atomically consumes the immutable
+// trigger/workflow identity before payment or signing. A process crash after
+// this claim deliberately leaves a fail-closed tombstone rather than allowing
+// another process to mint a second paid/signed attempt.
+func (s *SQLiteStore) ClaimLoomDispatchReservation(ctx context.Context, envelopeID, workflowPath,
+	dispatchKey string, now time.Time) (bool, error) {
+	envelopeID, workflowPath, dispatchKey = strings.TrimSpace(envelopeID), strings.TrimSpace(workflowPath), strings.TrimSpace(dispatchKey)
+	if envelopeID == "" || workflowPath == "" || dispatchKey == "" {
+		return false, fmt.Errorf("complete Loom dispatch reservation is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return false, err
+	}
+	res, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO loom_dispatch_claims(
+		trigger_envelope_id, workflow_path, dispatch_key, created_at
+	) VALUES(?, ?, ?, ?)`, envelopeID, workflowPath, dispatchKey, now.Unix())
+	if err != nil {
+		return false, err
+	}
+	if inserted, _ := res.RowsAffected(); inserted > 0 {
+		return true, nil
+	}
+	var storedKey string
+	if err := s.db.QueryRowContext(ctx, `SELECT dispatch_key FROM loom_dispatch_claims
+		WHERE trigger_envelope_id = ? AND workflow_path = ?`, envelopeID, workflowPath).Scan(&storedKey); err != nil {
+		return false, &TriggerConflictError{Source: "loom-reservation", TriggerID: envelopeID + "/" + workflowPath}
+	}
+	if storedKey != dispatchKey {
+		return false, &TriggerConflictError{Source: "loom-reservation", TriggerID: envelopeID + "/" + workflowPath}
+	}
+	return false, nil
 }
 
 // SaveLoomJob persists an immutable attempt and bounds the table by TTL and row cap.
@@ -269,11 +314,11 @@ func (s *SQLiteStore) SaveLoomJob(ctx context.Context, job LoomJob, now time.Tim
 	defer tx.Rollback()
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO loom_jobs(
-			workflow_run_id, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
+			workflow_run_id, job_request_id, publisher_pub, worker_pub, worker_ad_id, owner, repo_name, repo_id,
 			commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, delivery_state,
 			created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-	`, job.WorkflowRunID, job.JobRequestID, job.PublisherPub, job.WorkerPub, job.Owner, job.RepoName,
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+	`, job.WorkflowRunID, job.JobRequestID, job.PublisherPub, job.WorkerPub, job.WorkerAdID, job.Owner, job.RepoName,
 		job.RepoID, job.CommitSHA, job.WorkflowPath, job.Branch, job.WorkflowRunEvent, job.JobRequestEvent,
 		LoomStatusPending, job.CreatedAt.UTC().Unix(), now.Unix())
 	if err != nil {
@@ -345,11 +390,11 @@ func (s *SQLiteStore) ClaimLoomJobStatus(ctx context.Context, job LoomJob, updat
 
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO loom_jobs(
-			workflow_run_id, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
+			workflow_run_id, job_request_id, publisher_pub, worker_pub, worker_ad_id, owner, repo_name, repo_id,
 			commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, terminal_source,
 			last_protocol_event_id, delivery_state, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-	`, job.WorkflowRunID, job.JobRequestID, job.PublisherPub, job.WorkerPub, job.Owner, job.RepoName,
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+	`, job.WorkflowRunID, job.JobRequestID, job.PublisherPub, job.WorkerPub, job.WorkerAdID, job.Owner, job.RepoName,
 		job.RepoID, job.CommitSHA, job.WorkflowPath, job.Branch, job.WorkflowRunEvent, job.JobRequestEvent,
 		update.State, "", update.ProtocolEventID, job.CreatedAt.UTC().Unix(), now.Unix())
 	if err != nil {
@@ -393,7 +438,7 @@ func (s *SQLiteStore) ClaimLoomOutbound(ctx context.Context, job LoomJob, update
 	if err := validateLoomJob(job); err != nil {
 		return LoomJob{}, false, err
 	}
-	if job.DispatchKey == "" || job.JobRequestID == "" || job.PublisherPub == "" || job.WorkerPub == "" ||
+	if job.DispatchKey == "" || job.JobRequestID == "" || job.PublisherPub == "" || job.WorkerPub == "" || job.WorkerAdID == "" ||
 		job.WorkflowRunEvent == "" || job.JobRequestEvent == "" {
 		return LoomJob{}, false, fmt.Errorf("complete outbound Loom dispatch is required")
 	}
@@ -433,11 +478,11 @@ func (s *SQLiteStore) ClaimLoomOutbound(ctx context.Context, job LoomJob, update
 	}
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO loom_jobs(
-			workflow_run_id, dispatch_key, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
+			workflow_run_id, dispatch_key, job_request_id, publisher_pub, worker_pub, worker_ad_id, owner, repo_name, repo_id,
 			commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, terminal_source,
 			last_protocol_event_id, delivery_state, dispatch_state, dispatch_next_attempt_at, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', 'pending', ?, ?, ?)
-	`, job.WorkflowRunID, job.DispatchKey, job.JobRequestID, job.PublisherPub, job.WorkerPub,
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', 'pending', ?, ?, ?)
+	`, job.WorkflowRunID, job.DispatchKey, job.JobRequestID, job.PublisherPub, job.WorkerPub, job.WorkerAdID,
 		job.Owner, job.RepoName, job.RepoID, job.CommitSHA, job.WorkflowPath, job.Branch,
 		job.WorkflowRunEvent, job.JobRequestEvent, update.State, update.ProtocolEventID,
 		now.Unix(), job.CreatedAt.UTC().Unix(), now.Unix())
@@ -698,6 +743,9 @@ func (s *SQLiteStore) GetLoomJobByTriggerEnvelope(ctx context.Context, envelopeI
 	}
 	job, err := getLoomJobRow(s.db.QueryRowContext(ctx, loomJobSelectSQL()+
 		" WHERE workflow_run_id = ?", workflowRunID))
+	if err == sql.ErrNoRows {
+		return LoomJob{}, &TriggerConflictError{Source: "loom-swept", TriggerID: envelopeID + "/" + workflowPath}
+	}
 	if err != nil {
 		return LoomJob{}, err
 	}
@@ -720,7 +768,7 @@ func (s *SQLiteStore) ListDueLoomDispatches(ctx context.Context, now time.Time, 
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, loomJobSelectSQL()+
-		" WHERE dispatch_state != '' AND dispatch_state != 'published' AND dispatch_next_attempt_at <= ?"+
+		" WHERE dispatch_state != '' AND dispatch_state != 'published' AND status = 'pending' AND dispatch_next_attempt_at <= ?"+
 		" ORDER BY dispatch_next_attempt_at, workflow_run_id LIMIT ?", now.Unix(), limit)
 	if err != nil {
 		return nil, err
@@ -1181,7 +1229,7 @@ func sweepLoomJobsTx(ctx context.Context, tx *sql.Tx, now time.Time, ttl time.Du
 }
 
 func loomJobSelectSQL() string {
-	return `SELECT dispatch_key, workflow_run_id, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
+	return `SELECT dispatch_key, workflow_run_id, job_request_id, publisher_pub, worker_pub, worker_ad_id, owner, repo_name, repo_id,
 		commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, terminal_source,
 		last_protocol_event_id, status_event_created_at, status_event_id, delivery_state,
 		dispatch_state, dispatch_attempts, dispatch_next_attempt_at, dispatch_last_error, published_at,
@@ -1194,7 +1242,7 @@ type loomScanner interface{ Scan(...any) error }
 func getLoomJobRow(row loomScanner) (LoomJob, error) {
 	var job LoomJob
 	var dispatchNext, published, cancelNext, created, updated int64
-	err := row.Scan(&job.DispatchKey, &job.WorkflowRunID, &job.JobRequestID, &job.PublisherPub, &job.WorkerPub,
+	err := row.Scan(&job.DispatchKey, &job.WorkflowRunID, &job.JobRequestID, &job.PublisherPub, &job.WorkerPub, &job.WorkerAdID,
 		&job.Owner, &job.RepoName, &job.RepoID, &job.CommitSHA, &job.WorkflowPath, &job.Branch,
 		&job.WorkflowRunEvent, &job.JobRequestEvent, &job.Status, &job.TerminalSource,
 		&job.LastProtocolEventID, &job.StatusEventCreatedAt, &job.StatusEventID,
@@ -1228,6 +1276,12 @@ func getLoomJobTx(ctx context.Context, tx *sql.Tx, column, value string) (LoomJo
 func claimLoomTriggerRunTx(ctx context.Context, tx *sql.Tx, requested, stored LoomJob, now time.Time) error {
 	if requested.TriggerEnvelopeID == "" {
 		return nil
+	}
+	var reservedKey string
+	if err := tx.QueryRowContext(ctx, `SELECT dispatch_key FROM loom_dispatch_claims
+		WHERE trigger_envelope_id = ? AND workflow_path = ?`, requested.TriggerEnvelopeID,
+		requested.WorkflowPath).Scan(&reservedKey); err != nil || reservedKey != requested.DispatchKey {
+		return &TriggerConflictError{Source: "loom-reservation", TriggerID: requested.TriggerEnvelopeID + "/" + requested.WorkflowPath}
 	}
 	res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO loom_trigger_runs(
 		trigger_envelope_id, workflow_path, dispatch_key, workflow_run_id, created_at
@@ -1308,6 +1362,7 @@ func normalizeLoomJob(job *LoomJob) {
 	job.JobRequestID = strings.TrimSpace(job.JobRequestID)
 	job.PublisherPub = strings.TrimSpace(job.PublisherPub)
 	job.WorkerPub = strings.TrimSpace(job.WorkerPub)
+	job.WorkerAdID = strings.TrimSpace(job.WorkerAdID)
 	job.Owner = strings.TrimSpace(job.Owner)
 	job.RepoName = strings.TrimSpace(job.RepoName)
 	job.RepoID = strings.TrimSpace(job.RepoID)
@@ -1326,7 +1381,7 @@ func validateLoomJob(job LoomJob) error {
 
 func sameLoomIdentity(a, b LoomJob) bool {
 	return a.DispatchKey == b.DispatchKey && a.WorkflowRunID == b.WorkflowRunID && a.JobRequestID == b.JobRequestID &&
-		a.PublisherPub == b.PublisherPub && a.WorkerPub == b.WorkerPub &&
+		a.PublisherPub == b.PublisherPub && a.WorkerPub == b.WorkerPub && a.WorkerAdID == b.WorkerAdID &&
 		a.Owner == b.Owner && a.RepoName == b.RepoName && a.RepoID == b.RepoID &&
 		a.CommitSHA == b.CommitSHA && a.WorkflowPath == b.WorkflowPath && a.Branch == b.Branch &&
 		a.WorkflowRunEvent == b.WorkflowRunEvent && a.JobRequestEvent == b.JobRequestEvent

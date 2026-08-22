@@ -119,6 +119,50 @@ func (p *WorkerPool) SelectForMint(now time.Time, jobBound time.Duration, mintUR
 	return p.selectWorker(now, jobBound, true, normalized)
 }
 
+// Revalidate requires the exact selected advertisement to remain the canonical
+// latest signed event for its author and to remain fresh/capable at the moment
+// of a side effect. A replacement ad, even from the same worker, invalidates
+// the selection so dispatch cannot silently inherit changed capabilities or
+// pricing.
+func (p *WorkerPool) Revalidate(workerPub, adID string, now time.Time, jobBound time.Duration,
+	paymentConfigured bool, mintURL string) (WorkerAd, bool) {
+	if p == nil {
+		return WorkerAd{}, false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	workerPub, adID = strings.TrimSpace(workerPub), strings.TrimSpace(adID)
+	if mintURL != "" {
+		var err error
+		mintURL, err = cashu.NormalizeMintURL(mintURL)
+		if err != nil {
+			return WorkerAd{}, false
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ev, ok := p.ads[workerPub]
+	if !ok || ev.ID.Hex() != adID {
+		return WorkerAd{}, false
+	}
+	created := time.Unix(int64(ev.CreatedAt), 0).UTC()
+	if created.Before(now.Add(-p.adTTL)) || created.After(now.Add(p.futureSkew)) ||
+		nostrverify.ValidateEventIDAndSignature(&ev) != nil {
+		return WorkerAd{}, false
+	}
+	ad, err := parseWorkerAd(ev)
+	if err != nil || !p.eligible(ad, jobBound, paymentConfigured) {
+		return WorkerAd{}, false
+	}
+	if mintURL != "" {
+		if price, supported := ad.Prices[mintURL]; !supported || price == 0 {
+			return WorkerAd{}, false
+		}
+	}
+	return ad, true
+}
+
 func (p *WorkerPool) selectWorker(now time.Time, jobBound time.Duration, paymentConfigured bool, mintURL string) (WorkerAd, bool) {
 	if p == nil {
 		return WorkerAd{}, false

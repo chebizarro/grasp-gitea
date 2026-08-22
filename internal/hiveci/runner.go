@@ -101,6 +101,7 @@ type Runner struct {
 	remote       RemoteDispatcher
 	dispatchMode string
 	authorizer   WorkflowAuthorizer
+	dispatchGate DispatchPolicyGate
 }
 
 type WorkflowAuthorizer interface {
@@ -110,6 +111,13 @@ type WorkflowAuthorizer interface {
 type RemoteDispatcher interface {
 	Enabled() bool
 	Dispatch(context.Context, loom.DispatchRequest) (bool, error)
+}
+
+// DispatchPolicyGate resolves the current signed review/audit/authority join
+// for one immutable trigger envelope. The concrete implementation is
+// DispatchPolicyResolver; the interface keeps runner tests focused.
+type DispatchPolicyGate interface {
+	Resolve(context.Context, store.TriggerEnvelope) (DispatchApproval, error)
 }
 
 type branchTip struct {
@@ -206,6 +214,140 @@ func (r *Runner) SetRemoteDispatcher(dispatcher RemoteDispatcher, mode string) {
 	if dispatcher != nil && dispatcher.Enabled() && mode != "local" && r.store != nil && r.repositoriesDir != "" {
 		r.enabled = true
 	}
+}
+
+// SetDispatchPolicyGate installs the fail-closed review gate for remote 5401
+// dispatch. Raw repository/PR events remain eligible only for local Tier-A
+// execution; every remote attempt requires a durable trigger envelope.
+func (r *Runner) SetDispatchPolicyGate(gate DispatchPolicyGate) {
+	if r != nil {
+		r.dispatchGate = gate
+	}
+}
+
+// ValidateDispatchRequest re-resolves current review authority and policy and
+// binds them to the exact local Git objects before the dispatcher performs any
+// reservation, payment, signing, or status side effect.
+func (r *Runner) ValidateDispatchRequest(ctx context.Context, req loom.DispatchRequest) error {
+	if r == nil || r.dispatchGate == nil {
+		return dispatchPolicyDenied("remote dispatch review gate is unavailable")
+	}
+	st, ok := r.store.(triggerEnvelopeStore)
+	if !ok {
+		return dispatchPolicyDenied("durable trigger-envelope store is unavailable")
+	}
+	envelope, err := st.GetTriggerEnvelope(ctx, req.TriggerEnvelopeID)
+	if err != nil {
+		return dispatchPolicyDenied("durable trigger envelope is unavailable: %v", err)
+	}
+	if req.SourceEventID != envelope.TriggerID || req.TriggerSource != envelope.Source ||
+		req.TriggerID != envelope.TriggerID || req.Actor != envelope.Actor || req.EvidenceJSON != envelope.EvidenceJSON ||
+		req.PREventID != envelope.PREventID || req.StatusEventID != envelope.StatusEventID ||
+		req.SourceCommit != envelope.SourceCommit || req.SourceTree != envelope.SourceTree ||
+		req.PatchDigest != envelope.PatchDigest || req.RepoAddress != envelope.RepoAddress ||
+		req.PolicyVersion != envelope.PolicyVersion || req.CommitSHA != envelope.AcceptedCommit ||
+		req.Branch != envelope.Branch || req.Trigger != envelope.Action || req.TriggeredBy != envelope.Actor ||
+		(envelope.WorkflowPath != "" && req.WorkflowPath != envelope.WorkflowPath) {
+		return dispatchPolicyDenied("dispatch request does not match its immutable trigger envelope")
+	}
+	ownerPub, repoID, ok := parseRepoAddr(envelope.RepoAddress)
+	if !ok || ownerPub != req.OwnerPubkey || repoID != req.RepoID {
+		return dispatchPolicyDenied("dispatch repository coordinate does not match its trigger")
+	}
+	mapping, err := st.GetProvisionedMappingByRepoAddr(ctx, ownerPub, repoID)
+	if err != nil {
+		return dispatchPolicyDenied("dispatch repository mapping is unavailable: %v", err)
+	}
+	if mapping.Owner != req.Owner || mapping.RepoName != req.RepoName ||
+		firstNonEmpty(mapping.AnnouncedCloneURL, mapping.CloneURL) != req.CloneURL {
+		return dispatchPolicyDenied("dispatch repository mapping changed")
+	}
+	approval, err := r.dispatchGate.Resolve(ctx, envelope)
+	if err != nil {
+		return err
+	}
+	if req.ReviewEventID != approval.ReviewEventID || req.AuditEventID != approval.AuditEventID ||
+		req.ReviewerPubkey != approval.ReviewerPubkey || req.ReviewRootEventID != approval.RootEventID ||
+		req.ReviewBaseCommit != approval.BaseCommit || req.ReviewPolicyVersion != approval.PolicyVersion ||
+		req.ReviewPolicySHA256 != approval.PolicySHA256 {
+		return dispatchPolicyDenied("dispatch request no longer matches current review policy")
+	}
+	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
+	tree, err := verifyDispatchGitLineage(ctx, repoPath, req.CommitSHA, envelope, approval)
+	if err != nil {
+		return err
+	}
+	if tree != strings.ToLower(req.CommitTree) {
+		return dispatchPolicyDenied("dispatch accepted tree changed")
+	}
+	digest, err := workflowBlobDigest(ctx, repoPath, req.CommitSHA, req.WorkflowPath)
+	if err != nil {
+		return dispatchPolicyDenied("dispatch workflow is unavailable: %v", err)
+	}
+	if digest != strings.ToLower(req.WorkflowDigest) {
+		return dispatchPolicyDenied("dispatch workflow digest changed")
+	}
+	return nil
+}
+
+// RevalidateDispatch reconstructs the authorization request from the immutable
+// signed 5401 plus the durable trigger envelope, then performs the same current
+// policy/Git checks used before signing. This is intentionally invoked on every
+// retry rather than trusting an earlier decision.
+func (r *Runner) RevalidateDispatch(ctx context.Context, job store.LoomJob) error {
+	var run nostr.Event
+	if err := json.Unmarshal([]byte(job.WorkflowRunEvent), &run); err != nil {
+		return dispatchPolicyDenied("persisted HiveCI workflow request is invalid")
+	}
+	if run.Kind != relay.KindHiveWorkflowRun || run.ID.Hex() != job.WorkflowRunID ||
+		nostrverify.ValidateEventIDAndSignature(&run) != nil {
+		return dispatchPolicyDenied("persisted HiveCI workflow signature is invalid")
+	}
+	envelopeID := tagValue(run.Tags, "trigger-envelope")
+	st, ok := r.store.(triggerEnvelopeStore)
+	if !ok {
+		return dispatchPolicyDenied("durable trigger-envelope store is unavailable")
+	}
+	envelope, err := st.GetTriggerEnvelope(ctx, envelopeID)
+	if err != nil {
+		return dispatchPolicyDenied("durable trigger envelope is unavailable: %v", err)
+	}
+	ownerPub, repoID, ok := parseRepoAddr(envelope.RepoAddress)
+	if !ok {
+		return dispatchPolicyDenied("persisted trigger repository is invalid")
+	}
+	mapping, err := st.GetProvisionedMappingByRepoAddr(ctx, ownerPub, repoID)
+	if err != nil {
+		return dispatchPolicyDenied("dispatch repository mapping is unavailable: %v", err)
+	}
+	evidenceDigest := sha256.Sum256([]byte(envelope.EvidenceJSON))
+	if tagValue(run.Tags, "evidence-digest") != hex.EncodeToString(evidenceDigest[:]) ||
+		tagValue(run.Tags, "a") != envelope.RepoAddress || tagValue(run.Tags, "worker-ad") != job.WorkerAdID ||
+		tagValue(run.Tags, "commit") != job.CommitSHA || tagValue(run.Tags, "workflow") != job.WorkflowPath ||
+		tagValue(run.Tags, "branch") != job.Branch {
+		return dispatchPolicyDenied("persisted HiveCI lineage does not match its durable dispatch")
+	}
+	req := loom.DispatchRequest{
+		SourceEventID: envelope.TriggerID, TriggerEnvelopeID: envelopeID, TriggerSource: tagValue(run.Tags, "trigger-source"),
+		TriggerID: tagValue(run.Tags, "trigger-id"), Actor: tagValue(run.Tags, "actor"), EvidenceJSON: envelope.EvidenceJSON,
+		PREventID: tagValue(run.Tags, "pr-event"), StatusEventID: tagValue(run.Tags, "status-event"),
+		SourceCommit: tagValue(run.Tags, "source-commit"), SourceTree: tagValue(run.Tags, "source-tree"),
+		PatchDigest: tagValue(run.Tags, "patch-digest"), RepoAddress: tagValue(run.Tags, "repo-address"),
+		PolicyVersion: tagValue(run.Tags, "policy"), ReviewEventID: tagValue(run.Tags, "review"),
+		AuditEventID: tagValue(run.Tags, "audit"), ReviewerPubkey: tagValue(run.Tags, "reviewer"),
+		ReviewRootEventID: tagValue(run.Tags, "review-root"), ReviewBaseCommit: tagValue(run.Tags, "review-base"),
+		ReviewPolicyVersion: tagValue(run.Tags, "review-policy"), ReviewPolicySHA256: tagValue(run.Tags, "policy-digest"),
+		CommitTree: tagValue(run.Tags, "tree"), WorkflowDigest: tagValue(run.Tags, "workflow-digest"),
+		OwnerPubkey: ownerPub, Owner: job.Owner, RepoName: job.RepoName, RepoID: repoID,
+		CloneURL: firstNonEmpty(mapping.AnnouncedCloneURL, mapping.CloneURL), CommitSHA: job.CommitSHA,
+		WorkflowPath: job.WorkflowPath, Branch: job.Branch, Trigger: tagValue(run.Tags, "trigger"),
+		TriggeredBy: tagValue(run.Tags, "triggered-by"),
+	}
+	if tagValue(run.Tags, "pr") != req.PREventID || tagValue(run.Tags, "requester") != req.Actor ||
+		tagValue(run.Tags, "idempotency") != envelopeID {
+		return dispatchPolicyDenied("persisted HiveCI correlation tags are inconsistent")
+	}
+	return r.ValidateDispatchRequest(ctx, req)
 }
 
 // Enabled reports whether the runner can execute checks and publish results.
@@ -333,6 +475,23 @@ func (r *Runner) runForSource(ctx context.Context, mapping store.Mapping, source
 		return &store.TriggerConflictError{Source: triggerEnvelope.Source, TriggerID: triggerEnvelope.TriggerID}
 	}
 	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
+	var approval DispatchApproval
+	acceptedTree := ""
+	remoteAuthorized := false
+	if r.remote != nil && r.remote.Enabled() && r.dispatchMode != "local" && triggerEnvelope != nil {
+		if r.dispatchGate == nil {
+			return dispatchPolicyDenied("remote dispatch review gate is unavailable")
+		}
+		resolved, err := r.dispatchGate.Resolve(ctx, *triggerEnvelope)
+		if err != nil {
+			return err
+		}
+		acceptedTree, err = verifyDispatchGitLineage(ctx, repoPath, commit, *triggerEnvelope, resolved)
+		if err != nil {
+			return err
+		}
+		approval, remoteAuthorized = resolved, true
+	}
 	workflows, err := detectWorkflows(ctx, repoPath, commit)
 	if err != nil {
 		return fmt.Errorf("detect HiveCI workflows for %s/%s@%s: %w", mapping.Owner, mapping.RepoName, commit, err)
@@ -354,13 +513,22 @@ func (r *Runner) runForSource(ctx context.Context, mapping store.Mapping, source
 		executionID = triggerEnvelope.IdempotencyKey
 	}
 	for _, workflow := range workflows {
-		if r.remote != nil && r.remote.Enabled() && r.dispatchMode != "local" {
+		if remoteAuthorized {
+			workflowDigest, err := workflowBlobDigest(ctx, repoPath, commit, workflow)
+			if err != nil {
+				return fmt.Errorf("digest HiveCI workflow %s@%s: %w", workflow, commit, err)
+			}
 			dispatchRequest := loom.DispatchRequest{
 				SourceEventID: sourceID, OwnerPubkey: mapping.Pubkey,
 				Owner: mapping.Owner, RepoName: mapping.RepoName, RepoID: mapping.RepoID,
 				CloneURL:  firstNonEmpty(mapping.AnnouncedCloneURL, mapping.CloneURL),
 				CommitSHA: commit, WorkflowPath: workflow,
 				Branch: branch, Trigger: trigger, TriggeredBy: actor,
+				CommitTree: acceptedTree, WorkflowDigest: workflowDigest,
+				ReviewEventID: approval.ReviewEventID, AuditEventID: approval.AuditEventID,
+				ReviewerPubkey: approval.ReviewerPubkey, ReviewRootEventID: approval.RootEventID,
+				ReviewBaseCommit: approval.BaseCommit, ReviewPolicyVersion: approval.PolicyVersion,
+				ReviewPolicySHA256: approval.PolicySHA256,
 			}
 			if triggerEnvelope != nil {
 				dispatchRequest.TriggerEnvelopeID = triggerEnvelope.IdempotencyKey
@@ -430,6 +598,48 @@ func (r *Runner) runForSource(ctx context.Context, mapping store.Mapping, source
 		r.logger.Info("HiveCI check run published", "repo", mapping.RepoID, "branch", branch, "workflow", workflow, "commit", commit, "result", record.Result)
 	}
 	return nil
+}
+
+func verifyDispatchGitLineage(ctx context.Context, repoPath, acceptedCommit string, envelope store.TriggerEnvelope,
+	approval DispatchApproval) (string, error) {
+	if approval.RepoAddress != envelope.RepoAddress || approval.PatchEventID != strings.ToLower(envelope.PREventID) ||
+		approval.SourceCommit != strings.ToLower(envelope.SourceCommit) || approval.SourceTree != strings.ToLower(envelope.SourceTree) ||
+		approval.DiffSHA256 != strings.ToLower(envelope.PatchDigest) || approval.PolicyVersion == "" ||
+		approval.PolicySHA256 == "" || approval.ReviewEventID == "" || approval.AuditEventID == "" {
+		return "", dispatchPolicyDenied("resolved approval does not match immutable trigger envelope")
+	}
+	sourceTree, err := gitOutput(ctx, repoPath, "rev-parse", "--verify", envelope.SourceCommit+"^{tree}")
+	if err != nil {
+		return "", fmt.Errorf("verify reviewed source tree: %w", err)
+	}
+	if !strings.EqualFold(sourceTree, envelope.SourceTree) {
+		return "", dispatchPolicyDenied("reviewed source tree no longer matches local Git object")
+	}
+	acceptedTree, err := gitOutput(ctx, repoPath, "rev-parse", "--verify", acceptedCommit+"^{tree}")
+	if err != nil {
+		return "", fmt.Errorf("verify accepted commit tree: %w", err)
+	}
+	if !validCommitSHA.MatchString(acceptedTree) {
+		return "", dispatchPolicyDenied("accepted commit tree is malformed")
+	}
+	return strings.ToLower(acceptedTree), nil
+}
+
+func workflowBlobDigest(ctx context.Context, repoPath, commit, workflow string) (string, error) {
+	object := commit + ":" + workflow
+	typeName, err := gitOutput(ctx, repoPath, "cat-file", "-t", object)
+	if err != nil {
+		return "", err
+	}
+	if typeName != "blob" {
+		return "", fmt.Errorf("workflow object is %q, want blob", typeName)
+	}
+	out, err := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "cat-file", "blob", object).Output()
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(out)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func selectTriggerWorkflows(workflows []string, requested, commit string) ([]string, error) {

@@ -7,7 +7,7 @@ const (
 	KindRepositoryState        = 30618
 	KindContextVMIntent        = cascadia.CAS_INTENT
 	KindCheckRunResult         = 30315
-	KindCASAudit               = 4903
+	KindCASAudit               = cascadia.CAS_AUDIT
 	KindPatch                  = 1617
 	KindPROpen                 = 1618
 	KindPRUpdate               = 1619
@@ -18,7 +18,7 @@ const (
 	KindStatusDraft            = 1633
 	KindNIP22Comment           = 1111
 	KindNIP32Label             = 1985
-	KindLoomWorkerAd           = 10100
+	KindLoomWorkerAd           = cascadia.CAS_WORKER_AD
 	KindLoomJobRequest         = 5100
 	KindLoomJobResult          = 5101
 	KindLoomJobCancel          = 5102

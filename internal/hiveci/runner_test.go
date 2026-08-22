@@ -166,13 +166,26 @@ type recordingRemoteDispatcher struct {
 	enabled  bool
 }
 
+type allowDispatchGate struct{}
+
+func (allowDispatchGate) Resolve(_ context.Context, envelope store.TriggerEnvelope) (DispatchApproval, error) {
+	return DispatchApproval{
+		ReviewEventID: strings.Repeat("d", 64), AuditEventID: strings.Repeat("e", 64),
+		ReviewerPubkey: strings.Repeat("f", 64), RepoAddress: envelope.RepoAddress,
+		RootEventID: strings.Repeat("a", 64), PatchEventID: strings.ToLower(envelope.PREventID),
+		BaseCommit: strings.Repeat("1", 40), SourceCommit: strings.ToLower(envelope.SourceCommit),
+		SourceTree: strings.ToLower(envelope.SourceTree), DiffSHA256: strings.ToLower(envelope.PatchDigest),
+		PolicyVersion: "review-policy-v1", PolicySHA256: strings.Repeat("2", 64),
+	}, nil
+}
+
 func (d *recordingRemoteDispatcher) Enabled() bool { return d.enabled }
 func (d *recordingRemoteDispatcher) Dispatch(_ context.Context, req loom.DispatchRequest) (bool, error) {
 	d.requests = append(d.requests, req)
 	return true, nil
 }
 
-func TestRunnerRemoteDispatchRequiresResolverAuthorization(t *testing.T) {
+func TestRunnerRawEventsNeverDispatchRemotely(t *testing.T) {
 	ctx := context.Background()
 	st, mapping, ownerPriv := newHiveTestStore(t)
 	repo := setupHiveRepo(t, mapping, ".github/workflows/ci.yml")
@@ -191,11 +204,8 @@ func TestRunnerRemoteDispatchRequiresResolverAuthorization(t *testing.T) {
 	if err := r.HandleEvent(ctx, authorized, ""); err != nil {
 		t.Fatal(err)
 	}
-	if len(remote.requests) != 1 {
-		t.Fatalf("authorized dispatches = %d, want 1", len(remote.requests))
-	}
-	if remote.requests[0].CloneURL != mapping.AnnouncedCloneURL {
-		t.Fatalf("remote clone URL = %q, want public %q", remote.requests[0].CloneURL, mapping.AnnouncedCloneURL)
+	if len(remote.requests) != 0 {
+		t.Fatalf("raw repository state dispatched %d remote workflows, want 0", len(remote.requests))
 	}
 
 	attacker := nostr.Generate()
@@ -205,7 +215,7 @@ func TestRunnerRemoteDispatchRequiresResolverAuthorization(t *testing.T) {
 	if err := r.HandleEvent(ctx, unauthorized, ""); err != nil {
 		t.Fatal(err)
 	}
-	if len(remote.requests) != 1 {
+	if len(remote.requests) != 0 {
 		t.Fatal("unauthorized author caused a remote dispatch")
 	}
 }

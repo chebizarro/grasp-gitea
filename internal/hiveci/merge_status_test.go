@@ -145,6 +145,7 @@ func TestMergeStatusAcceptsConfiguredBridgeAuthor(t *testing.T) {
 	bridge := newFakeSigner(t)
 	runner := New(Config{Enabled: false, TriggerRepos: []string{"*"}}, fx.store, bridge, nil,
 		fx.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	runner.SetDispatchPolicyGate(allowDispatchGate{})
 	runner.SetRemoteDispatcher(remote, "remote")
 	status := fx.statusEvent(t, bridge.priv, false, fx.acceptedCommit, fx.stateCreatedAt+1)
 	if err := runner.HandleEvent(fx.ctx, status, ""); err != nil {
@@ -483,6 +484,7 @@ func TestSyntheticCanonicalKind1631Fixture(t *testing.T) {
 func newMergeRunner(fx *mergeFixture, remote *mergeRemoteDispatcher) *Runner {
 	runner := New(Config{Enabled: false, TriggerRepos: []string{"*"}}, fx.store, nil, nil,
 		fx.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	runner.SetDispatchPolicyGate(allowDispatchGate{})
 	runner.SetRemoteDispatcher(remote, "remote")
 	return runner
 }
@@ -687,6 +689,7 @@ func TestRunTriggerEnvelopeSelectsExactWorkflow(t *testing.T) {
 		envelope := store.TriggerEnvelope{
 			Source: "github", TriggerID: "delivery-" + id,
 			Actor: "octocat", Action: "workflow_dispatch", WorkflowPath: workflow, EvidenceJSON: `{"authorized":true}`,
+			PREventID:    strings.Repeat("a", 64),
 			SourceCommit: fx.sourceCommit, SourceTree: sourceTree,
 			PatchDigest: strings.Repeat("c", 64), AcceptedCommit: fx.acceptedCommit,
 			RepoAddress: fx.repoAddress(), PolicyVersion: "github.v1", Branch: "main",
@@ -707,7 +710,9 @@ func TestRunTriggerEnvelopeSelectsExactWorkflow(t *testing.T) {
 	}
 	for _, req := range remote.unique {
 		if req.WorkflowPath != valid.WorkflowPath || req.TriggerID != valid.TriggerID ||
-			req.TriggerSource != valid.Source || req.Actor != valid.Actor {
+			req.TriggerSource != valid.Source || req.Actor != valid.Actor || req.ReviewEventID == "" ||
+			req.AuditEventID == "" || req.CommitTree == "" || len(req.WorkflowDigest) != 64 ||
+			req.ReviewPolicyVersion == "" || len(req.ReviewPolicySHA256) != 64 {
 			t.Fatalf("source-neutral dispatch = %#v", req)
 		}
 	}

@@ -138,6 +138,28 @@ func TestLoomJobsTTLEvictionAndRowCap(t *testing.T) {
 	}
 }
 
+func TestClaimLoomDispatchReservationIsDurableAndExclusive(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "reservation.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	claimed, err := st.ClaimLoomDispatchReservation(ctx, "envelope", "ci.yml", "dispatch-a", now)
+	if err != nil || !claimed {
+		t.Fatalf("first reservation = %v, %v", claimed, err)
+	}
+	claimed, err = st.ClaimLoomDispatchReservation(ctx, "envelope", "ci.yml", "dispatch-a", now)
+	if err != nil || claimed {
+		t.Fatalf("identical reservation replay = %v, %v", claimed, err)
+	}
+	if claimed, err = st.ClaimLoomDispatchReservation(ctx, "envelope", "ci.yml", "dispatch-b", now); claimed ||
+		!errors.Is(err, ErrTriggerConflict) {
+		t.Fatalf("conflicting reservation = %v, %v", claimed, err)
+	}
+}
+
 func TestClaimLoomJobStatusIsDurableAndExclusive(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "claim.db"))
 	if err != nil {

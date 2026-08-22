@@ -206,6 +206,22 @@ func main() {
 	} else if cfg.CIEnabled && cfg.CIProtocol == "canonical" {
 		logger.Info("canonical CI uses the Loom dispatcher; legacy CI_ENABLED publisher remains disabled")
 	}
+	dispatchPolicies := make([]hiveci.DispatchReviewPolicy, 0, len(cfg.HiveCIDispatchPolicies))
+	for _, policy := range cfg.HiveCIDispatchPolicies {
+		dispatchPolicies = append(dispatchPolicies, hiveci.DispatchReviewPolicy{
+			RepoAddress: policy.RepoAddress, Reviewers: policy.Reviewers, Version: policy.Version,
+		})
+	}
+	dispatchPolicyResolver, err := hiveci.NewDispatchPolicyResolver(hiveci.DispatchPolicyConfig{
+		Policies: dispatchPolicies, ApprovalMaxAge: cfg.HiveCIReviewMaxAge, FutureSkew: cfg.HiveCIReviewFutureSkew,
+	}, st)
+	if err != nil {
+		logger.Error("failed to configure HiveCI dispatch review policy", "error", err)
+		os.Exit(1)
+	}
+	if dispatchPolicyResolver.Enabled() {
+		logger.Info("HiveCI dispatch review evidence ingestion enabled", "policies", len(dispatchPolicies))
+	}
 	statusSink := loom.NewDurableStatusSink(st, giteaClient, cfg.LoomJobTTL, cfg.LoomMaxJobs, logger)
 	if cfg.LoomEnabled || cfg.HiveCIEnabled {
 		go statusSink.Run(ctx)
@@ -213,7 +229,7 @@ func main() {
 
 	workerPool := loom.NewWorkerPool(loom.WorkerPoolConfig{
 		Allowlist: cfg.LoomWorkerPubkeys, RequiredSoftware: []string{"act"},
-		FutureSkew: cfg.LoomFutureSkew,
+		AdTTL: cfg.LoomWorkerAdMaxAge, FutureSkew: cfg.LoomFutureSkew,
 	})
 	var dispatchSigner loom.DispatchSigner
 	if candidate, ok := serverSigner.(loom.DispatchSigner); ok {
@@ -252,8 +268,6 @@ func main() {
 		}
 		logger.Warn("preferred Loom dispatch unavailable; both mode will use local Hive-CI")
 	}
-	go loomDispatcher.Run(ctx)
-
 	hiveRunner := hiveci.New(hiveci.Config{
 		Enabled:       cfg.HiveCIEnabled,
 		ActPath:       cfg.HiveCIActPath,
@@ -263,7 +277,10 @@ func main() {
 	}, st, serverSigner, relayURLs, cfg.GiteaRepositoriesDir, logger)
 	hiveRunner.SetStatusSink(statusSink, cfg.LoomStatusContextPrefix)
 	hiveRunner.SetWorkflowAuthorizer(proactiveSyncSvc)
+	hiveRunner.SetDispatchPolicyGate(dispatchPolicyResolver)
 	hiveRunner.SetRemoteDispatcher(loomDispatcher, cfg.LoomDispatchMode)
+	loomDispatcher.SetDispatchRevalidator(hiveRunner)
+	go loomDispatcher.Run(ctx)
 	var loomActionIngestor *hiveci.LoomActionIngestor
 	if cfg.LoomActions.Enabled {
 		policies := make([]hiveci.LoomActionPolicy, 0, len(cfg.LoomActions.Policies))
@@ -471,6 +488,11 @@ func main() {
 	}
 
 	handler := func(ctx context.Context, ev *nostr.Event, sourceRelay string) error {
+		if handled, evidenceErr := dispatchPolicyResolver.HandleEvent(ctx, ev); evidenceErr != nil {
+			return evidenceErr
+		} else if handled {
+			logger.Debug("persisted HiveCI dispatch policy evidence", "event", ev.ID, "kind", ev.Kind)
+		}
 		err := provisionerSvc.HandleAnnouncementEvent(ctx, ev, sourceRelay)
 		if err != nil {
 			return err

@@ -48,6 +48,31 @@ func TestLoadMinimalValid(t *testing.T) {
 	if cfg.LoomActions.Enabled {
 		t.Fatal("Loom action ingress must default disabled")
 	}
+	if cfg.LoomWorkerAdMaxAge != 15*time.Minute {
+		t.Fatalf("default Loom worker advertisement max age = %v", cfg.LoomWorkerAdMaxAge)
+	}
+}
+
+func TestLoadHiveCIDispatchReviewPolicy(t *testing.T) {
+	reviewer := nostr.Generate().Public().Hex()
+	owner := nostr.Generate().Public().Hex()
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com", "RELAY_URLS": "wss://relay",
+		"HIVE_CI_REVIEW_MAX_AGE": "12h", "HIVE_CI_REVIEW_FUTURE_SKEW": "2m",
+		"HIVE_CI_DISPATCH_POLICIES_JSON": `[{"repo_address":"30617:` + owner + `:repo","reviewers":["` + reviewer + `"],"version":"review-v1"}]`,
+	})
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.HiveCIDispatchPolicies) != 1 || cfg.HiveCIDispatchPolicies[0].Reviewers[0] != reviewer ||
+		cfg.HiveCIReviewMaxAge != 12*time.Hour || cfg.HiveCIReviewFutureSkew != 2*time.Minute {
+		t.Fatalf("unexpected dispatch review config: %#v", cfg.HiveCIDispatchPolicies)
+	}
+	t.Setenv("HIVE_CI_DISPATCH_POLICIES_JSON", "not-json")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "JSON array") {
+		t.Fatalf("invalid dispatch review JSON accepted: %v", err)
+	}
 }
 
 func TestLoadGitHubActionIngressConfig(t *testing.T) {

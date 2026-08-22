@@ -28,29 +28,38 @@ var errNoLoomWorker = errors.New("no eligible Loom worker")
 // DispatchRequest is an already-authorized workflow trigger from the shared
 // Hive-CI detector. TriggeredBy is the Nostr signer authorized by Resolver.
 type DispatchRequest struct {
-	SourceEventID     string
-	TriggerEnvelopeID string
-	TriggerSource     string
-	TriggerID         string
-	Actor             string
-	EvidenceJSON      string
-	PREventID         string
-	StatusEventID     string
-	SourceCommit      string
-	SourceTree        string
-	PatchDigest       string
-	RepoAddress       string
-	PolicyVersion     string
-	OwnerPubkey       string
-	Owner             string
-	RepoName          string
-	RepoID            string
-	CloneURL          string
-	CommitSHA         string
-	WorkflowPath      string
-	Branch            string
-	Trigger           string
-	TriggeredBy       string
+	SourceEventID       string
+	TriggerEnvelopeID   string
+	TriggerSource       string
+	TriggerID           string
+	Actor               string
+	EvidenceJSON        string
+	PREventID           string
+	StatusEventID       string
+	SourceCommit        string
+	SourceTree          string
+	PatchDigest         string
+	RepoAddress         string
+	PolicyVersion       string
+	ReviewEventID       string
+	AuditEventID        string
+	ReviewerPubkey      string
+	ReviewRootEventID   string
+	ReviewBaseCommit    string
+	ReviewPolicyVersion string
+	ReviewPolicySHA256  string
+	CommitTree          string
+	WorkflowDigest      string
+	OwnerPubkey         string
+	Owner               string
+	RepoName            string
+	RepoID              string
+	CloneURL            string
+	CommitSHA           string
+	WorkflowPath        string
+	Branch              string
+	Trigger             string
+	TriggeredBy         string
 }
 
 // DispatchSigner signs as the bridge and performs NIP-44 as that same author.
@@ -61,9 +70,20 @@ type DispatchSigner interface {
 	NIP44Encrypt(context.Context, nostr.PubKey, string) (string, error)
 }
 
+// DispatchRevalidator is the fail-closed policy boundary around every durable
+// dispatch. The request check runs before reservation, payment, signing, or
+// status creation. The persisted check runs immediately before every outbox
+// publication, including crash/retry recovery.
+type DispatchRevalidator interface {
+	ValidateDispatchRequest(context.Context, DispatchRequest) error
+	RevalidateDispatch(context.Context, store.LoomJob) error
+}
+
 type DispatchStore interface {
+	GetLoomJobByWorkflowRunID(context.Context, string) (store.LoomJob, error)
 	GetLoomJobByDispatchKey(context.Context, string) (store.LoomJob, error)
 	GetLoomJobByTriggerEnvelope(context.Context, string, string) (store.LoomJob, error)
+	ClaimLoomDispatchReservation(context.Context, string, string, string, time.Time) (bool, error)
 	ClaimLoomOutbound(context.Context, store.LoomJob, store.LoomStatusUpdate, time.Time, time.Duration, int) (store.LoomJob, bool, error)
 	ListDueLoomDispatches(context.Context, time.Time, int) ([]store.LoomJob, error)
 	MarkLoomDispatchPublished(context.Context, string, time.Time) error
@@ -91,6 +111,9 @@ type DispatcherConfig struct {
 	RelayURLs          []string
 	JobTTL             time.Duration
 	MaxJobs            int
+	// Publish, when set, replaces relay publication. It is primarily a test and
+	// embedding seam; production leaves it nil and uses RelayURLs.
+	Publish func(context.Context, *nostr.Event) error
 }
 
 type Dispatcher struct {
@@ -109,6 +132,7 @@ type Dispatcher struct {
 	pool            *WorkerPool
 	store           DispatchStore
 	signer          DispatchSigner
+	revalidator     DispatchRevalidator
 	logger          *slog.Logger
 	publish         func(context.Context, *nostr.Event) error
 	wake            chan struct{}
@@ -147,6 +171,9 @@ func NewDispatcher(cfg DispatcherConfig, pool *WorkerPool, st DispatchStore, sig
 		pool: pool, store: st, signer: signer, logger: logger, wake: make(chan struct{}, 1),
 	}
 	d.publish = d.publishToRelays
+	if cfg.Publish != nil {
+		d.publish = cfg.Publish
+	}
 	if d.paymentMode == "cashu" && (d.wallet == nil || d.mintURL == "" || d.maxPayment == 0) {
 		d.enabled = false
 	}
@@ -154,6 +181,15 @@ func NewDispatcher(cfg DispatcherConfig, pool *WorkerPool, st DispatchStore, sig
 }
 
 func (d *Dispatcher) Enabled() bool { return d != nil && d.enabled }
+
+// SetDispatchRevalidator installs the current review/policy/Git-lineage gate.
+// Dispatch remains enabled for composition ordering, but no attempt can cross
+// the side-effect boundary until this dependency is installed.
+func (d *Dispatcher) SetDispatchRevalidator(revalidator DispatchRevalidator) {
+	if d != nil {
+		d.revalidator = revalidator
+	}
+}
 
 // Dispatch persists a single immutable attempt before publishing. The bool says
 // whether remote execution owns the workflow; once persisted it remains true
@@ -166,23 +202,37 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (bool, e
 	if err != nil {
 		return false, err
 	}
+	if d.revalidator == nil {
+		return false, fmt.Errorf("HiveCI dispatch policy revalidator is unavailable")
+	}
+	if err := d.revalidator.ValidateDispatchRequest(ctx, req); err != nil {
+		return false, err
+	}
 	if req.TriggerEnvelopeID != "" {
 		if existing, err := d.store.GetLoomJobByTriggerEnvelope(ctx, req.TriggerEnvelopeID, req.WorkflowPath); err == nil {
 			if existing.DispatchKey != key {
 				return true, &store.TriggerConflictError{Source: req.TriggerSource, TriggerID: req.TriggerID}
 			}
-			d.ensureSupersededCancellations(ctx, existing)
+			if store.LoomJobTerminal(existing) {
+				return true, &store.TriggerConflictError{Source: req.TriggerSource, TriggerID: req.TriggerID}
+			}
 			if existing.DispatchState == "published" {
+				d.ensureSupersededCancellations(ctx, existing)
 				return true, nil
 			}
 			return true, d.publishAttempt(ctx, existing)
+		} else if errors.Is(err, store.ErrTriggerConflict) {
+			return true, err
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return false, err
 		}
 	}
 	if existing, err := d.store.GetLoomJobByDispatchKey(ctx, key); err == nil {
-		d.ensureSupersededCancellations(ctx, existing)
+		if store.LoomJobTerminal(existing) {
+			return true, &store.TriggerConflictError{Source: req.TriggerSource, TriggerID: req.TriggerID}
+		}
 		if existing.DispatchState == "published" {
+			d.ensureSupersededCancellations(ctx, existing)
 			return true, nil
 		}
 		return true, d.publishAttempt(ctx, existing)
@@ -191,14 +241,22 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (bool, e
 	}
 
 	now := time.Now().UTC()
-	workerPub, paymentToken, err := d.preparePayment(ctx, key, now)
-	if errors.Is(err, errNoLoomWorker) {
+	workerAd, ok := d.selectWorker(now)
+	if !ok {
 		return false, nil
 	}
+	reserved, err := d.store.ClaimLoomDispatchReservation(ctx, req.TriggerEnvelopeID, req.WorkflowPath, key, now)
 	if err != nil {
 		return false, err
 	}
-	job, err := d.buildAttempt(ctx, req, key, workerPub, paymentToken, now)
+	if !reserved {
+		return true, &store.TriggerConflictError{Source: req.TriggerSource, TriggerID: req.TriggerID}
+	}
+	paymentToken, err := d.preparePayment(ctx, key, workerAd, now)
+	if err != nil {
+		return true, err
+	}
+	job, err := d.buildAttempt(ctx, req, key, workerAd, paymentToken, now)
 	if err != nil {
 		return false, err
 	}
@@ -216,7 +274,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (bool, e
 			return true, err
 		}
 	}
-	d.ensureSupersededCancellations(ctx, stored)
+	if store.LoomJobTerminal(stored) {
+		return true, &store.TriggerConflictError{Source: req.TriggerSource, TriggerID: req.TriggerID}
+	}
 	select {
 	case d.wake <- struct{}{}:
 	default:
@@ -224,63 +284,76 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (bool, e
 	return true, d.publishAttempt(ctx, stored)
 }
 
-func (d *Dispatcher) preparePayment(ctx context.Context, key string, now time.Time) (string, string, error) {
+func (d *Dispatcher) selectWorker(now time.Time) (WorkerAd, bool) {
 	if d.paymentMode != "cashu" {
-		worker, ok := d.pool.Select(now, d.maxDuration, d.paymentToken != "")
-		if !ok {
-			return "", "", errNoLoomWorker
+		return d.pool.Select(now, d.maxDuration, d.paymentToken != "")
+	}
+	return d.pool.SelectForMint(now, d.maxDuration, d.mintURL)
+}
+
+func (d *Dispatcher) preparePayment(ctx context.Context, key string, worker WorkerAd, now time.Time) (string, error) {
+	if d.paymentMode != "cashu" {
+		if _, ok := d.pool.Revalidate(worker.Event.PubKey.Hex(), worker.Event.ID.Hex(), now,
+			d.maxDuration, d.paymentToken != "", ""); !ok {
+			return "", errNoLoomWorker
 		}
-		return worker.Event.PubKey.Hex(), d.paymentToken, nil
+		return d.paymentToken, nil
 	}
 
 	if spend, err := d.store.GetLoomCashuSpend(ctx, key); err == nil {
 		if spend.State != "ready" || spend.Token == "" {
-			return "", "", fmt.Errorf("Cashu spend %s is reserved without a durable token; refusing a second payment", key)
+			return "", fmt.Errorf("Cashu spend %s is reserved without a durable token; refusing a second payment", key)
 		}
-		return spend.WorkerPub, spend.Token, nil
+		if spend.WorkerPub != worker.Event.PubKey.Hex() || spend.WorkerAdID != worker.Event.ID.Hex() {
+			return "", fmt.Errorf("Cashu spend %s worker advertisement changed", key)
+		}
+		return spend.Token, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		return "", "", err
+		return "", err
 	}
 
-	worker, ok := d.pool.SelectForMint(now, d.maxDuration, d.mintURL)
-	if !ok {
-		return "", "", errNoLoomWorker
-	}
 	price := worker.Prices[mustNormalizeMint(d.mintURL)]
 	amount, err := cashu.PaymentAmount(price, d.maxDuration)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	if amount > d.maxPayment {
-		return "", "", fmt.Errorf("Cashu payment %d exceeds configured per-job maximum %d", amount, d.maxPayment)
+		return "", fmt.Errorf("Cashu payment %d exceeds configured per-job maximum %d", amount, d.maxPayment)
 	}
 	spend, claimed, err := d.store.ReserveLoomCashuSpend(ctx, store.LoomCashuSpend{
 		DispatchKey: key, WorkerPub: worker.Event.PubKey.Hex(), WorkerAdID: worker.Event.ID.Hex(), MintURL: mustNormalizeMint(d.mintURL),
 		Amount: amount, PricePerSecond: price, DurationSeconds: int64(d.maxDuration / time.Second),
 	}, now)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	if !claimed {
 		if spend.State == "ready" && spend.Token != "" {
-			return spend.WorkerPub, spend.Token, nil
+			if spend.WorkerPub != worker.Event.PubKey.Hex() || spend.WorkerAdID != worker.Event.ID.Hex() {
+				return "", fmt.Errorf("Cashu spend %s worker advertisement changed", key)
+			}
+			return spend.Token, nil
 		}
-		return "", "", fmt.Errorf("Cashu spend %s is already reserved without a durable token; refusing a second payment", key)
+		return "", fmt.Errorf("Cashu spend %s is already reserved without a durable token; refusing a second payment", key)
+	}
+	if _, ok := d.pool.Revalidate(worker.Event.PubKey.Hex(), worker.Event.ID.Hex(), time.Now().UTC(),
+		d.maxDuration, true, d.mintURL); !ok {
+		return "", errNoLoomWorker
 	}
 	payment, err := d.wallet.CreatePayment(ctx, cashu.PaymentRequest{
 		Amount: amount, MintURL: spend.MintURL, WorkerPubkey: spend.WorkerPub,
 	})
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	if payment.Amount != amount {
-		return "", "", fmt.Errorf("Cashu wallet returned amount %d, want %d", payment.Amount, amount)
+		return "", fmt.Errorf("Cashu wallet returned amount %d, want %d", payment.Amount, amount)
 	}
 	ready, err := d.store.CompleteLoomCashuSpend(ctx, key, payment.QuoteID, payment.Token, time.Now().UTC())
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-	return ready.WorkerPub, ready.Token, nil
+	return ready.Token, nil
 }
 
 func mustNormalizeMint(raw string) string {
@@ -288,7 +361,16 @@ func mustNormalizeMint(raw string) string {
 	return value
 }
 
-func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key, workerPub, paymentToken string, now time.Time) (store.LoomJob, error) {
+func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key string, workerAd WorkerAd, paymentToken string, now time.Time) (store.LoomJob, error) {
+	workerPub, workerAdID := workerAd.Event.PubKey.Hex(), workerAd.Event.ID.Hex()
+	mintURL := ""
+	if d.paymentMode == "cashu" {
+		mintURL = d.mintURL
+	}
+	if _, ok := d.pool.Revalidate(workerPub, workerAdID, now, d.maxDuration,
+		d.paymentToken != "" || d.paymentMode == "cashu", mintURL); !ok {
+		return store.LoomJob{}, errNoLoomWorker
+	}
 	bridgePub, err := nostr.PubKeyFromHex(strings.TrimSpace(d.signer.PublicKey()))
 	if err != nil {
 		return store.LoomJob{}, fmt.Errorf("invalid Loom operator pubkey: %w", err)
@@ -310,6 +392,12 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key,
 			{"commit", req.CommitSHA}, {"branch", req.Branch}, {"trigger", req.Trigger},
 			{"triggered-by", req.TriggeredBy}, {"workflow", req.WorkflowPath},
 			{"publisher", ephemeral.Public().Hex()}, {"t", "hive-ci"},
+			{"pr", req.PREventID}, {"review", req.ReviewEventID}, {"audit", req.AuditEventID},
+			{"reviewer", req.ReviewerPubkey}, {"review-root", req.ReviewRootEventID},
+			{"review-base", req.ReviewBaseCommit}, {"tree", req.CommitTree},
+			{"workflow-digest", req.WorkflowDigest}, {"requester", req.Actor},
+			{"idempotency", req.TriggerEnvelopeID}, {"worker-ad", workerAdID},
+			{"review-policy", req.ReviewPolicyVersion}, {"policy-digest", req.ReviewPolicySHA256},
 		},
 		Content: "",
 	}
@@ -371,7 +459,7 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key,
 	return store.LoomJob{
 		DispatchKey: key, TriggerEnvelopeID: req.TriggerEnvelopeID,
 		WorkflowRunID: run.ID.Hex(), JobRequestID: request.ID.Hex(),
-		PublisherPub: ephemeral.Public().Hex(), WorkerPub: workerPub,
+		PublisherPub: ephemeral.Public().Hex(), WorkerPub: workerPub, WorkerAdID: workerAdID,
 		Owner: req.Owner, RepoName: req.RepoName, RepoID: req.RepoID,
 		CommitSHA: req.CommitSHA, WorkflowPath: req.WorkflowPath,
 		Branch:           req.Branch,
@@ -381,6 +469,32 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key,
 }
 
 func (d *Dispatcher) publishAttempt(ctx context.Context, job store.LoomJob) error {
+	current, err := d.store.GetLoomJobByWorkflowRunID(ctx, job.WorkflowRunID)
+	if err != nil {
+		return fmt.Errorf("reload Loom dispatch before publish: %w", err)
+	}
+	if store.LoomJobTerminal(current) {
+		return &store.TriggerConflictError{Source: "loom-terminal", TriggerID: current.WorkflowRunID}
+	}
+	if current.DispatchKey != job.DispatchKey || current.WorkerPub != job.WorkerPub ||
+		current.WorkerAdID != job.WorkerAdID || current.WorkflowRunEvent != job.WorkflowRunEvent ||
+		current.JobRequestEvent != job.JobRequestEvent {
+		return fmt.Errorf("persisted Loom dispatch changed before publication")
+	}
+	if d.revalidator == nil {
+		return fmt.Errorf("HiveCI dispatch policy revalidator is unavailable")
+	}
+	if err := d.revalidator.RevalidateDispatch(ctx, current); err != nil {
+		return fmt.Errorf("revalidate persisted HiveCI dispatch: %w", err)
+	}
+	mintURL := ""
+	if d.paymentMode == "cashu" {
+		mintURL = d.mintURL
+	}
+	if _, ok := d.pool.Revalidate(job.WorkerPub, job.WorkerAdID, time.Now().UTC(), d.maxDuration,
+		d.paymentToken != "" || d.paymentMode == "cashu", mintURL); !ok {
+		return fmt.Errorf("%w: selected worker advertisement is stale, replaced, or no longer capable", errNoLoomWorker)
+	}
 	var run, request nostr.Event
 	if err := json.Unmarshal([]byte(job.WorkflowRunEvent), &run); err != nil {
 		return fmt.Errorf("decode persisted workflow event: %w", err)
@@ -397,12 +511,19 @@ func (d *Dispatcher) publishAttempt(ctx context.Context, job store.LoomJob) erro
 	if err := nostrverify.ValidateEventIDAndSignature(&request); err != nil {
 		return fmt.Errorf("persisted job event is invalid: %w", err)
 	}
+	if run.Kind != relay.KindHiveWorkflowRun || request.Kind != relay.KindLoomJobRequest ||
+		run.PubKey != request.PubKey || tagValue(request.Tags, "e") != run.ID.Hex() ||
+		tagValue(request.Tags, "p") != job.WorkerPub || tagValue(run.Tags, "publisher") != job.PublisherPub ||
+		tagValue(run.Tags, "worker-ad") != job.WorkerAdID {
+		return fmt.Errorf("persisted Loom request lineage does not match dispatch record")
+	}
 	errRun := d.publish(ctx, &run)
 	errRequest := d.publish(ctx, &request)
 	if errRun == nil && errRequest == nil {
 		if err := d.store.MarkLoomDispatchPublished(ctx, job.WorkflowRunID, time.Now().UTC()); err != nil {
 			return fmt.Errorf("mark Loom dispatch published: %w", err)
 		}
+		d.ensureSupersededCancellations(ctx, current)
 		return nil
 	}
 	publishErr := errors.Join(errRun, errRequest)
@@ -569,41 +690,41 @@ func dispatchKey(req DispatchRequest) (string, error) {
 	}
 	fields := []string{req.SourceEventID, req.OwnerPubkey, req.Owner, req.RepoName, req.RepoID,
 		req.CommitSHA, req.WorkflowPath, req.Branch, req.Trigger, req.TriggeredBy}
-	if strings.TrimSpace(req.TriggerEnvelopeID) != "" {
-		fields = append(fields, req.TriggerEnvelopeID, req.TriggerSource, req.TriggerID,
-			req.Actor, req.EvidenceJSON, req.PREventID, req.StatusEventID,
-			req.SourceCommit, req.SourceTree, req.PatchDigest, req.RepoAddress, req.PolicyVersion)
-	}
 	for _, field := range fields {
 		if strings.TrimSpace(field) == "" {
 			return "", fmt.Errorf("complete Loom dispatch request is required")
 		}
 	}
+	fields = append(fields, req.TriggerEnvelopeID, req.TriggerSource, req.TriggerID,
+		req.Actor, req.EvidenceJSON, req.PREventID, req.StatusEventID,
+		req.SourceCommit, req.SourceTree, req.PatchDigest, req.RepoAddress, req.PolicyVersion,
+		req.ReviewEventID, req.AuditEventID, req.ReviewerPubkey, req.ReviewRootEventID,
+		req.ReviewBaseCommit, req.ReviewPolicyVersion, req.ReviewPolicySHA256,
+		req.CommitTree, req.WorkflowDigest)
 	sum := sha256.Sum256([]byte(strings.Join(fields, "\x00")))
 	return "loom:" + hex.EncodeToString(sum[:]), nil
 }
 
 func validateTriggerEnvelopeRequest(req DispatchRequest) error {
 	binding := []string{req.TriggerEnvelopeID, req.TriggerSource, req.TriggerID, req.Actor,
-		req.EvidenceJSON, req.SourceCommit, req.SourceTree, req.PatchDigest, req.RepoAddress, req.PolicyVersion}
-	bound := strings.TrimSpace(req.TriggerEnvelopeID) != ""
-	if !bound {
-		for _, field := range binding[1:] {
-			if strings.TrimSpace(field) != "" {
-				return fmt.Errorf("partial merge-trigger envelope is not allowed")
-			}
-		}
-		return nil
-	}
+		req.EvidenceJSON, req.PREventID, req.SourceCommit, req.SourceTree, req.PatchDigest,
+		req.RepoAddress, req.PolicyVersion, req.ReviewEventID, req.AuditEventID,
+		req.ReviewerPubkey, req.ReviewRootEventID, req.ReviewBaseCommit,
+		req.ReviewPolicyVersion, req.ReviewPolicySHA256, req.CommitTree, req.WorkflowDigest}
 	for _, field := range binding {
 		if strings.TrimSpace(field) == "" {
-			return fmt.Errorf("complete merge-trigger envelope is required")
+			return fmt.Errorf("complete reviewed trigger authorization is required")
 		}
 	}
 	if !json.Valid([]byte(req.EvidenceJSON)) || !validHexLength(req.TriggerEnvelopeID, 64) ||
-		!validHexLength(req.PatchDigest, 64) ||
+		!validHexLength(req.PatchDigest, 64) || !validHexLength(req.PREventID, 64) ||
+		!validHexLength(req.ReviewEventID, 64) || !validHexLength(req.AuditEventID, 64) ||
+		!validHexLength(req.ReviewerPubkey, 64) || !validHexLength(req.ReviewRootEventID, 64) ||
+		!validHexLength(req.ReviewPolicySHA256, 64) || !validHexLength(req.WorkflowDigest, 64) ||
 		(!validHexLength(req.SourceCommit, 40) && !validHexLength(req.SourceCommit, 64)) ||
-		(!validHexLength(req.SourceTree, 40) && !validHexLength(req.SourceTree, 64)) {
+		(!validHexLength(req.SourceTree, 40) && !validHexLength(req.SourceTree, 64)) ||
+		(!validHexLength(req.ReviewBaseCommit, 40) && !validHexLength(req.ReviewBaseCommit, 64)) ||
+		(!validHexLength(req.CommitTree, 40) && !validHexLength(req.CommitTree, 64)) {
 		return fmt.Errorf("trigger envelope contains invalid evidence or an invalid identifier")
 	}
 	if strings.TrimSpace(req.Actor) != strings.TrimSpace(req.TriggeredBy) {
