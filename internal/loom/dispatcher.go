@@ -30,6 +30,10 @@ var errNoLoomWorker = errors.New("no eligible Loom worker")
 type DispatchRequest struct {
 	SourceEventID     string
 	TriggerEnvelopeID string
+	TriggerSource     string
+	TriggerID         string
+	Actor             string
+	EvidenceJSON      string
 	PREventID         string
 	StatusEventID     string
 	SourceCommit      string
@@ -59,6 +63,7 @@ type DispatchSigner interface {
 
 type DispatchStore interface {
 	GetLoomJobByDispatchKey(context.Context, string) (store.LoomJob, error)
+	GetLoomJobByTriggerEnvelope(context.Context, string, string) (store.LoomJob, error)
 	ClaimLoomOutbound(context.Context, store.LoomJob, store.LoomStatusUpdate, time.Time, time.Duration, int) (store.LoomJob, bool, error)
 	ListDueLoomDispatches(context.Context, time.Time, int) ([]store.LoomJob, error)
 	MarkLoomDispatchPublished(context.Context, string, time.Time) error
@@ -160,6 +165,20 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (bool, e
 	key, err := dispatchKey(req)
 	if err != nil {
 		return false, err
+	}
+	if req.TriggerEnvelopeID != "" {
+		if existing, err := d.store.GetLoomJobByTriggerEnvelope(ctx, req.TriggerEnvelopeID, req.WorkflowPath); err == nil {
+			if existing.DispatchKey != key {
+				return true, &store.TriggerConflictError{Source: req.TriggerSource, TriggerID: req.TriggerID}
+			}
+			d.ensureSupersededCancellations(ctx, existing)
+			if existing.DispatchState == "published" {
+				return true, nil
+			}
+			return true, d.publishAttempt(ctx, existing)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
 	}
 	if existing, err := d.store.GetLoomJobByDispatchKey(ctx, key); err == nil {
 		d.ensureSupersededCancellations(ctx, existing)
@@ -295,8 +314,13 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key,
 		Content: "",
 	}
 	if req.TriggerEnvelopeID != "" {
+		evidenceDigest := sha256.Sum256([]byte(req.EvidenceJSON))
 		run.Tags = append(run.Tags,
 			nostr.Tag{"trigger-envelope", req.TriggerEnvelopeID},
+			nostr.Tag{"trigger-source", req.TriggerSource},
+			nostr.Tag{"trigger-id", req.TriggerID},
+			nostr.Tag{"actor", req.Actor},
+			nostr.Tag{"evidence-digest", hex.EncodeToString(evidenceDigest[:])},
 			nostr.Tag{"pr-event", req.PREventID},
 			nostr.Tag{"status-event", req.StatusEventID},
 			nostr.Tag{"source-commit", req.SourceCommit},
@@ -345,7 +369,8 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key,
 		return store.LoomJob{}, err
 	}
 	return store.LoomJob{
-		DispatchKey: key, WorkflowRunID: run.ID.Hex(), JobRequestID: request.ID.Hex(),
+		DispatchKey: key, TriggerEnvelopeID: req.TriggerEnvelopeID,
+		WorkflowRunID: run.ID.Hex(), JobRequestID: request.ID.Hex(),
 		PublisherPub: ephemeral.Public().Hex(), WorkerPub: workerPub,
 		Owner: req.Owner, RepoName: req.RepoName, RepoID: req.RepoID,
 		CommitSHA: req.CommitSHA, WorkflowPath: req.WorkflowPath,
@@ -545,7 +570,8 @@ func dispatchKey(req DispatchRequest) (string, error) {
 	fields := []string{req.SourceEventID, req.OwnerPubkey, req.Owner, req.RepoName, req.RepoID,
 		req.CommitSHA, req.WorkflowPath, req.Branch, req.Trigger, req.TriggeredBy}
 	if strings.TrimSpace(req.TriggerEnvelopeID) != "" {
-		fields = append(fields, req.TriggerEnvelopeID, req.PREventID, req.StatusEventID,
+		fields = append(fields, req.TriggerEnvelopeID, req.TriggerSource, req.TriggerID,
+			req.Actor, req.EvidenceJSON, req.PREventID, req.StatusEventID,
 			req.SourceCommit, req.SourceTree, req.PatchDigest, req.RepoAddress, req.PolicyVersion)
 	}
 	for _, field := range fields {
@@ -558,8 +584,8 @@ func dispatchKey(req DispatchRequest) (string, error) {
 }
 
 func validateTriggerEnvelopeRequest(req DispatchRequest) error {
-	binding := []string{req.TriggerEnvelopeID, req.PREventID, req.StatusEventID, req.SourceCommit,
-		req.SourceTree, req.PatchDigest, req.RepoAddress, req.PolicyVersion}
+	binding := []string{req.TriggerEnvelopeID, req.TriggerSource, req.TriggerID, req.Actor,
+		req.EvidenceJSON, req.SourceCommit, req.SourceTree, req.PatchDigest, req.RepoAddress, req.PolicyVersion}
 	bound := strings.TrimSpace(req.TriggerEnvelopeID) != ""
 	if !bound {
 		for _, field := range binding[1:] {
@@ -574,14 +600,21 @@ func validateTriggerEnvelopeRequest(req DispatchRequest) error {
 			return fmt.Errorf("complete merge-trigger envelope is required")
 		}
 	}
-	if !validHexLength(req.TriggerEnvelopeID, 64) || !validHexLength(req.PREventID, 64) ||
-		!validHexLength(req.StatusEventID, 64) || !validHexLength(req.PatchDigest, 64) ||
+	if !json.Valid([]byte(req.EvidenceJSON)) || !validHexLength(req.TriggerEnvelopeID, 64) ||
+		!validHexLength(req.PatchDigest, 64) ||
 		(!validHexLength(req.SourceCommit, 40) && !validHexLength(req.SourceCommit, 64)) ||
 		(!validHexLength(req.SourceTree, 40) && !validHexLength(req.SourceTree, 64)) {
-		return fmt.Errorf("merge-trigger envelope contains an invalid identifier")
+		return fmt.Errorf("trigger envelope contains invalid evidence or an invalid identifier")
 	}
-	if !strings.EqualFold(strings.TrimSpace(req.SourceEventID), strings.TrimSpace(req.StatusEventID)) {
-		return fmt.Errorf("merge-trigger status event does not match source event")
+	if strings.TrimSpace(req.Actor) != strings.TrimSpace(req.TriggeredBy) {
+		return fmt.Errorf("trigger envelope actor does not match dispatch actor")
+	}
+	if req.TriggerSource == store.TriggerSourceNIP34MergeStatus {
+		if !validHexLength(req.PREventID, 64) || !validHexLength(req.StatusEventID, 64) ||
+			req.TriggerID != req.StatusEventID ||
+			!strings.EqualFold(strings.TrimSpace(req.SourceEventID), strings.TrimSpace(req.StatusEventID)) {
+			return fmt.Errorf("NIP-34 merge-trigger linkage is invalid")
+		}
 	}
 	wantRepo := fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement,
 		strings.TrimSpace(req.OwnerPubkey), strings.TrimSpace(req.RepoID))

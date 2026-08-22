@@ -48,6 +48,10 @@ const (
 
 var validCommitSHA = regexp.MustCompile(`^[0-9a-fA-F]{40,64}$`)
 
+// ErrTriggerWorkflow is terminal: immutable evidence requested a workflow
+// that does not exist exactly at the authorized commit.
+var ErrTriggerWorkflow = errors.New("authorized trigger workflow is unavailable")
+
 // Config controls the Hive-CI Tier A runner.
 type Config struct {
 	Enabled       bool
@@ -60,6 +64,11 @@ type Config struct {
 // Store resolves NIP-34 repository coordinates to local Gitea repositories.
 type Store interface {
 	GetProvisionedMappingByRepoAddr(ctx context.Context, pubkey string, repoID string) (store.Mapping, error)
+}
+
+type triggerEnvelopeStore interface {
+	Store
+	GetTriggerEnvelope(context.Context, string) (store.TriggerEnvelope, error)
 }
 
 // Signer signs operator-authored check/audit events. In production this is the
@@ -278,45 +287,94 @@ func (r *Runner) handlePullRequestEvent(ctx context.Context, ev *nostr.Event, so
 	return r.runForCommit(ctx, mapping, ev, sourceRelay, "pull_request", branch, commit, nil)
 }
 
-func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *nostr.Event, sourceRelay, trigger, branch, commit string, mergeEnvelope *store.MergeTriggerEnvelope) error {
-	if mergeEnvelope == nil {
+func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *nostr.Event, sourceRelay, trigger, branch, commit string, triggerEnvelope *store.TriggerEnvelope) error {
+	return r.runForSource(ctx, mapping, ev.ID.Hex(), ev.PubKey.Hex(), sourceRelay,
+		trigger, branch, commit, triggerEnvelope)
+}
+
+// RunTriggerEnvelope resumes a previously claimed source-neutral trigger. It
+// deliberately accepts only the durable envelope ID, so adapters cannot alter
+// authorization evidence between claim and workflow dispatch.
+func (r *Runner) RunTriggerEnvelope(ctx context.Context, envelopeID, sourceRelay string) error {
+	st, ok := r.store.(triggerEnvelopeStore)
+	if !ok {
+		return fmt.Errorf("durable trigger-envelope store unavailable")
+	}
+	envelope, err := st.GetTriggerEnvelope(ctx, envelopeID)
+	if err != nil {
+		return fmt.Errorf("load trigger envelope: %w", err)
+	}
+	ownerPub, repoID, ok := parseRepoAddr(envelope.RepoAddress)
+	if !ok {
+		return fmt.Errorf("stored trigger repository address is invalid")
+	}
+	mapping, err := st.GetProvisionedMappingByRepoAddr(ctx, ownerPub, repoID)
+	if err != nil {
+		return fmt.Errorf("resolve trigger repository: %w", err)
+	}
+	return r.runForSource(ctx, mapping, envelope.TriggerID, envelope.Actor, sourceRelay,
+		envelope.Action, envelope.Branch, envelope.AcceptedCommit, &envelope)
+}
+
+func (r *Runner) runForSource(ctx context.Context, mapping store.Mapping, sourceID, actor,
+	sourceRelay, trigger, branch, commit string, triggerEnvelope *store.TriggerEnvelope) error {
+	if triggerEnvelope == nil {
 		if !r.isRepoCIAllowed(mapping.Owner, mapping.RepoID) {
 			return nil
 		}
-		authorized, authErr := r.workflowAuthorAuthorized(ctx, mapping, ev.PubKey.Hex())
+		authorized, authErr := r.workflowAuthorAuthorized(ctx, mapping, actor)
 		if authErr != nil || !authorized {
 			r.logger.Warn("HiveCI ignored workflow from unauthorized author", "repo", mapping.RepoID,
-				"event", ev.ID.Hex(), "author", ev.PubKey.Hex(), "error", authErr)
+				"event", sourceID, "author", actor, "error", authErr)
 			return nil
 		}
+	} else if triggerEnvelope.AcceptedCommit != commit || triggerEnvelope.Action != trigger || triggerEnvelope.RepoAddress !=
+		fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement, mapping.Pubkey, mapping.RepoID) {
+		return &store.TriggerConflictError{Source: triggerEnvelope.Source, TriggerID: triggerEnvelope.TriggerID}
 	}
 	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
 	workflows, err := detectWorkflows(ctx, repoPath, commit)
 	if err != nil {
 		return fmt.Errorf("detect HiveCI workflows for %s/%s@%s: %w", mapping.Owner, mapping.RepoName, commit, err)
 	}
+	requestedWorkflow := ""
+	if triggerEnvelope != nil {
+		requestedWorkflow = triggerEnvelope.WorkflowPath
+	}
+	workflows, err = selectTriggerWorkflows(workflows, requestedWorkflow, commit)
+	if err != nil {
+		return err
+	}
 	if len(workflows) == 0 {
 		r.logger.Debug("HiveCI: no workflows for commit", "repo", mapping.RepoID, "commit", commit)
 		return nil
 	}
+	executionID := sourceID
+	if triggerEnvelope != nil {
+		executionID = triggerEnvelope.IdempotencyKey
+	}
 	for _, workflow := range workflows {
 		if r.remote != nil && r.remote.Enabled() && r.dispatchMode != "local" {
 			dispatchRequest := loom.DispatchRequest{
-				SourceEventID: ev.ID.Hex(), OwnerPubkey: mapping.Pubkey,
+				SourceEventID: sourceID, OwnerPubkey: mapping.Pubkey,
 				Owner: mapping.Owner, RepoName: mapping.RepoName, RepoID: mapping.RepoID,
 				CloneURL:  firstNonEmpty(mapping.AnnouncedCloneURL, mapping.CloneURL),
 				CommitSHA: commit, WorkflowPath: workflow,
-				Branch: branch, Trigger: trigger, TriggeredBy: ev.PubKey.Hex(),
+				Branch: branch, Trigger: trigger, TriggeredBy: actor,
 			}
-			if mergeEnvelope != nil {
-				dispatchRequest.TriggerEnvelopeID = mergeEnvelope.IdempotencyKey
-				dispatchRequest.PREventID = mergeEnvelope.PREventID
-				dispatchRequest.StatusEventID = mergeEnvelope.StatusEventID
-				dispatchRequest.SourceCommit = mergeEnvelope.SourceCommit
-				dispatchRequest.SourceTree = mergeEnvelope.SourceTree
-				dispatchRequest.PatchDigest = mergeEnvelope.PatchDigest
-				dispatchRequest.RepoAddress = mergeEnvelope.RepoAddress
-				dispatchRequest.PolicyVersion = mergeEnvelope.PolicyVersion
+			if triggerEnvelope != nil {
+				dispatchRequest.TriggerEnvelopeID = triggerEnvelope.IdempotencyKey
+				dispatchRequest.TriggerSource = triggerEnvelope.Source
+				dispatchRequest.TriggerID = triggerEnvelope.TriggerID
+				dispatchRequest.Actor = triggerEnvelope.Actor
+				dispatchRequest.EvidenceJSON = triggerEnvelope.EvidenceJSON
+				dispatchRequest.PREventID = triggerEnvelope.PREventID
+				dispatchRequest.StatusEventID = triggerEnvelope.StatusEventID
+				dispatchRequest.SourceCommit = triggerEnvelope.SourceCommit
+				dispatchRequest.SourceTree = triggerEnvelope.SourceTree
+				dispatchRequest.PatchDigest = triggerEnvelope.PatchDigest
+				dispatchRequest.RepoAddress = triggerEnvelope.RepoAddress
+				dispatchRequest.PolicyVersion = triggerEnvelope.PolicyVersion
 			}
 			handled, dispatchErr := r.remote.Dispatch(ctx, dispatchRequest)
 			if handled {
@@ -341,11 +399,11 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 		if !r.localEnabled {
 			continue
 		}
-		key := runKey(ev.ID.Hex(), commit, workflow)
+		key := runKey(executionID, commit, workflow)
 		if r.markStarted(key) {
 			continue
 		}
-		ref := localStatusRef(mapping, ev, trigger, commit, workflow)
+		ref := localStatusRef(mapping, executionID, trigger, commit, workflow)
 		claimed, err := r.claimCommitStatus(ctx, ref, "hive-ci: workflow queued")
 		if err != nil {
 			r.unmarkStarted(key)
@@ -356,7 +414,7 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 			// Delivery retries must never acquire execution ownership.
 			continue
 		}
-		record := r.runWorkflow(ctx, mapping, ev, sourceRelay, trigger, branch, commit, workflow)
+		record := r.runWorkflow(ctx, mapping, sourceID, sourceRelay, trigger, branch, commit, workflow)
 		terminalState := store.LoomStatusFailure
 		if record.Result == "success" {
 			terminalState = store.LoomStatusSuccess
@@ -374,7 +432,22 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 	return nil
 }
 
-func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, ev *nostr.Event, sourceRelay, trigger, branch, commit, workflow string) runRecord {
+func selectTriggerWorkflows(workflows []string, requested, commit string) ([]string, error) {
+	if requested == "" {
+		return workflows, nil
+	}
+	if requested != path.Clean(requested) || strings.HasPrefix(requested, "/") {
+		return nil, fmt.Errorf("%w: %q", ErrTriggerWorkflow, requested)
+	}
+	for _, workflow := range workflows {
+		if workflow == requested {
+			return []string{requested}, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %q is not present at %s", ErrTriggerWorkflow, requested, commit)
+}
+
+func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, sourceID, sourceRelay, trigger, branch, commit, workflow string) runRecord {
 	start := time.Now()
 	rec := runRecord{
 		SchemaVersion: checkResultSchema,
@@ -382,7 +455,7 @@ func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, ev *nos
 		Repository:    mapping.Owner + "/" + mapping.RepoName,
 		RepoID:        mapping.RepoID,
 		OwnerPubkey:   mapping.Pubkey,
-		SourceEventID: ev.ID.Hex(),
+		SourceEventID: sourceID,
 		SourceRelay:   sourceRelay,
 		Trigger:       trigger,
 		Branch:        branch,
@@ -751,8 +824,8 @@ func runKey(eventID, commit, workflow string) string {
 	return eventID + ":" + commit + ":" + workflow
 }
 
-func localStatusRef(mapping store.Mapping, ev *nostr.Event, trigger, commit, workflow string) loom.Ref {
-	rec := runRecord{SourceEventID: ev.ID.Hex(), Commit: commit, Workflow: workflow, Trigger: trigger}
+func localStatusRef(mapping store.Mapping, sourceID, trigger, commit, workflow string) loom.Ref {
+	rec := runRecord{SourceEventID: sourceID, Commit: commit, Workflow: workflow, Trigger: trigger}
 	return loom.Ref{
 		WorkflowRunID: "local:" + stableRunID(rec), Owner: mapping.Owner,
 		RepoName: mapping.RepoName, RepoID: mapping.RepoID, CommitSHA: commit,

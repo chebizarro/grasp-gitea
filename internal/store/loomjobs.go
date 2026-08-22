@@ -27,6 +27,7 @@ const (
 // LoomJob is an immutable correlation record created before work is dispatched.
 type LoomJob struct {
 	DispatchKey          string
+	TriggerEnvelopeID    string
 	WorkflowRunID        string
 	JobRequestID         string
 	PublisherPub         string
@@ -152,6 +153,14 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_loom_job_events_job
 			ON loom_job_events(workflow_run_id, seen_at)`,
+		`CREATE TABLE IF NOT EXISTS loom_trigger_runs (
+			trigger_envelope_id TEXT NOT NULL,
+			workflow_path TEXT NOT NULL,
+			dispatch_key TEXT NOT NULL UNIQUE,
+			workflow_run_id TEXT NOT NULL UNIQUE,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY(trigger_envelope_id, workflow_path)
+		)`,
 		`CREATE TABLE IF NOT EXISTS loom_status_deliveries (
 			workflow_run_id TEXT PRIMARY KEY,
 			state TEXT NOT NULL,
@@ -408,6 +417,9 @@ func (s *SQLiteStore) ClaimLoomOutbound(ctx context.Context, job LoomJob, update
 	defer tx.Rollback()
 	existing, lookupErr := getLoomJobTx(ctx, tx, "dispatch_key", job.DispatchKey)
 	if lookupErr == nil {
+		if err := claimLoomTriggerRunTx(ctx, tx, job, existing, now); err != nil {
+			return LoomJob{}, false, err
+		}
 		if err := tx.Commit(); err != nil {
 			return LoomJob{}, false, err
 		}
@@ -445,6 +457,9 @@ func (s *SQLiteStore) ClaimLoomOutbound(ctx context.Context, job LoomJob, update
 			return LoomJob{}, false, err
 		}
 		return existing, false, nil
+	}
+	if err := claimLoomTriggerRunTx(ctx, tx, job, job, now); err != nil {
+		return LoomJob{}, false, err
 	}
 	if update.ProtocolEventID != "" {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO loom_job_events(event_id, workflow_run_id, seen_at) VALUES(?, ?, ?)`,
@@ -665,6 +680,29 @@ func (s *SQLiteStore) GetLoomJobByDispatchKey(ctx context.Context, key string) (
 		return LoomJob{}, err
 	}
 	return getLoomJobRow(s.db.QueryRowContext(ctx, loomJobSelectSQL()+" WHERE dispatch_key = ?", strings.TrimSpace(key)))
+}
+
+// GetLoomJobByTriggerEnvelope resolves the one durable run correlated to an
+// immutable trigger identity and exact workflow. Retry ingestion uses this to
+// observe terminal state without deriving a new dispatch key.
+func (s *SQLiteStore) GetLoomJobByTriggerEnvelope(ctx context.Context, envelopeID, workflowPath string) (LoomJob, error) {
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return LoomJob{}, err
+	}
+	envelopeID, workflowPath = strings.TrimSpace(envelopeID), strings.TrimSpace(workflowPath)
+	var workflowRunID string
+	err := s.db.QueryRowContext(ctx, `SELECT workflow_run_id FROM loom_trigger_runs
+		WHERE trigger_envelope_id = ? AND workflow_path = ?`, envelopeID, workflowPath).Scan(&workflowRunID)
+	if err != nil {
+		return LoomJob{}, err
+	}
+	job, err := getLoomJobRow(s.db.QueryRowContext(ctx, loomJobSelectSQL()+
+		" WHERE workflow_run_id = ?", workflowRunID))
+	if err != nil {
+		return LoomJob{}, err
+	}
+	job.TriggerEnvelopeID = envelopeID
+	return job, nil
 }
 
 // ListDueLoomDispatches returns persisted signed events that still need relay acceptance.
@@ -1187,6 +1225,33 @@ func getLoomJobTx(ctx context.Context, tx *sql.Tx, column, value string) (LoomJo
 	return getLoomJobRow(tx.QueryRowContext(ctx, loomJobSelectSQL()+" WHERE "+column+" = ?", value))
 }
 
+func claimLoomTriggerRunTx(ctx context.Context, tx *sql.Tx, requested, stored LoomJob, now time.Time) error {
+	if requested.TriggerEnvelopeID == "" {
+		return nil
+	}
+	res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO loom_trigger_runs(
+		trigger_envelope_id, workflow_path, dispatch_key, workflow_run_id, created_at
+	) VALUES(?, ?, ?, ?, ?)`, requested.TriggerEnvelopeID, requested.WorkflowPath,
+		requested.DispatchKey, stored.WorkflowRunID, now.Unix())
+	if err != nil {
+		return fmt.Errorf("claim Loom trigger correlation: %w", err)
+	}
+	if inserted, _ := res.RowsAffected(); inserted > 0 {
+		return nil
+	}
+	var dispatchKey, workflowRunID string
+	err = tx.QueryRowContext(ctx, `SELECT dispatch_key, workflow_run_id FROM loom_trigger_runs
+		WHERE trigger_envelope_id = ? AND workflow_path = ?`, requested.TriggerEnvelopeID,
+		requested.WorkflowPath).Scan(&dispatchKey, &workflowRunID)
+	if err != nil {
+		return &TriggerConflictError{Source: "workflow", TriggerID: requested.TriggerEnvelopeID + "/" + requested.WorkflowPath}
+	}
+	if dispatchKey != requested.DispatchKey || workflowRunID != stored.WorkflowRunID {
+		return &TriggerConflictError{Source: "workflow", TriggerID: requested.TriggerEnvelopeID + "/" + requested.WorkflowPath}
+	}
+	return nil
+}
+
 func loomJobCountTx(ctx context.Context, tx *sql.Tx) (int64, error) {
 	var count int64
 	err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM loom_jobs`).Scan(&count)
@@ -1238,6 +1303,7 @@ func sameLoomCashuSpend(a, b LoomCashuSpend) bool {
 
 func normalizeLoomJob(job *LoomJob) {
 	job.DispatchKey = strings.TrimSpace(job.DispatchKey)
+	job.TriggerEnvelopeID = strings.TrimSpace(job.TriggerEnvelopeID)
 	job.WorkflowRunID = strings.TrimSpace(job.WorkflowRunID)
 	job.JobRequestID = strings.TrimSpace(job.JobRequestID)
 	job.PublisherPub = strings.TrimSpace(job.PublisherPub)
@@ -1300,6 +1366,9 @@ func validLoomState(state string) bool {
 func isLoomTerminal(state string) bool {
 	return state == LoomStatusSuccess || state == LoomStatusFailure || state == LoomStatusError
 }
+
+// LoomJobTerminal reports whether retry must fail closed for a correlated run.
+func LoomJobTerminal(job LoomJob) bool { return isLoomTerminal(job.Status) }
 
 func loomTerminalRank(source string) int {
 	switch source {

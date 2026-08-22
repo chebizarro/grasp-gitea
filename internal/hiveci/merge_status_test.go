@@ -675,3 +675,55 @@ func TestMergeEnvelopeSourceTreeMatchesGitObject(t *testing.T) {
 		t.Fatalf("source tree = %s, want %s", envelope.SourceTree, want)
 	}
 }
+
+func TestRunTriggerEnvelopeSelectsExactWorkflow(t *testing.T) {
+	fx := newMergeFixture(t, false)
+	remote := &mergeRemoteDispatcher{}
+	runner := newMergeRunner(fx, remote)
+	sourceTree := strings.TrimSpace(hiveGitOutput(t, "", "--git-dir", fx.repoPath,
+		"rev-parse", fx.sourceCommit+"^{tree}"))
+	claim := func(id, workflow string) store.TriggerEnvelope {
+		t.Helper()
+		envelope := store.TriggerEnvelope{
+			Source: "github", TriggerID: "delivery-" + id,
+			Actor: "octocat", Action: "workflow_dispatch", WorkflowPath: workflow, EvidenceJSON: `{"authorized":true}`,
+			SourceCommit: fx.sourceCommit, SourceTree: sourceTree,
+			PatchDigest: strings.Repeat("c", 64), AcceptedCommit: fx.acceptedCommit,
+			RepoAddress: fx.repoAddress(), PolicyVersion: "github.v1", Branch: "main",
+		}
+		envelope.IdempotencyKey = store.TriggerEnvelopeKey(envelope.Source, envelope.TriggerID)
+		stored, _, err := fx.store.ClaimTriggerEnvelope(fx.ctx, envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stored
+	}
+	valid := claim("a", ".gitea/workflows/deploy.yml")
+	if err := runner.RunTriggerEnvelope(fx.ctx, valid.IdempotencyKey, ""); err != nil {
+		t.Fatalf("run exact workflow: %v", err)
+	}
+	if len(remote.unique) != 1 {
+		t.Fatalf("exact trigger dispatched %d workflows, want 1", len(remote.unique))
+	}
+	for _, req := range remote.unique {
+		if req.WorkflowPath != valid.WorkflowPath || req.TriggerID != valid.TriggerID ||
+			req.TriggerSource != valid.Source || req.Actor != valid.Actor {
+			t.Fatalf("source-neutral dispatch = %#v", req)
+		}
+	}
+
+	missing := claim("b", ".gitea/workflows/missing.yml")
+	if err := runner.RunTriggerEnvelope(fx.ctx, missing.IdempotencyKey, ""); !errors.Is(err, ErrTriggerWorkflow) {
+		t.Fatalf("missing workflow error = %v, want ErrTriggerWorkflow", err)
+	}
+	if len(remote.unique) != 1 {
+		t.Fatal("missing workflow reached dispatcher")
+	}
+}
+
+func TestSelectTriggerWorkflowRejectsEmptyDetectedSet(t *testing.T) {
+	_, err := selectTriggerWorkflows(nil, ".gitea/workflows/deploy.yml", strings.Repeat("a", 40))
+	if !errors.Is(err, ErrTriggerWorkflow) {
+		t.Fatalf("empty detected workflow error = %v, want ErrTriggerWorkflow", err)
+	}
+}

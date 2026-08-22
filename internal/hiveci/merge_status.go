@@ -59,6 +59,10 @@ func (r *Runner) handleMergeStatus(ctx context.Context, ev *nostr.Event, sourceR
 	if !ok {
 		return fmt.Errorf("%w: durable merge-status store unavailable", ErrMissingPRLinkage)
 	}
+	encodedStatus, err := json.Marshal(ev)
+	if err != nil {
+		return fmt.Errorf("encode merge status evidence: %w", err)
+	}
 
 	// A previously claimed envelope is the durable authorization decision. On
 	// replay, resume the idempotent workflow dispatch without re-reading mutable
@@ -70,6 +74,11 @@ func (r *Runner) handleMergeStatus(ctx context.Context, ev *nostr.Event, sourceR
 		if existing.StatusEventID != ev.ID.Hex() || existing.IdempotencyKey != mergeTriggerKey(ev.ID.Hex()) {
 			return fmt.Errorf("stored merge-trigger identity is invalid")
 		}
+		if existing.EvidenceJSON != "" && (existing.Source != store.TriggerSourceNIP34MergeStatus ||
+			existing.TriggerID != ev.ID.Hex() || existing.Actor != ev.PubKey.Hex() ||
+			existing.Action != "push" || existing.EvidenceJSON != string(encodedStatus)) {
+			return &store.TriggerConflictError{Source: store.TriggerSourceNIP34MergeStatus, TriggerID: ev.ID.Hex()}
+		}
 		ownerPub, repoID, parsed := parseRepoAddr(existing.RepoAddress)
 		if !parsed {
 			return fmt.Errorf("stored merge-trigger repository address is invalid")
@@ -78,8 +87,17 @@ func (r *Runner) handleMergeStatus(ctx context.Context, ev *nostr.Event, sourceR
 		if err != nil {
 			return fmt.Errorf("recover merge-trigger repository mapping: %w", err)
 		}
-		err = r.runForCommit(ctx, mapping, ev, sourceRelay, "push", existing.Branch,
-			existing.AcceptedCommit, &existing)
+		resume := existing
+		if resume.EvidenceJSON == "" {
+			// Rows imported from the sibling schema predate actor/evidence
+			// columns. The replayed event was signature-verified by HandleEvent,
+			// so reconstruct only for this dispatch without mutating history.
+			resume.Actor = ev.PubKey.Hex()
+			resume.Action = "push"
+			resume.EvidenceJSON = string(encodedStatus)
+		}
+		err = r.runForCommit(ctx, mapping, ev, sourceRelay, "push", resume.Branch,
+			resume.AcceptedCommit, &resume)
 		if err == nil {
 			_ = st.DeletePendingMergeStatus(ctx, ev.ID.Hex())
 		}
@@ -111,10 +129,6 @@ func (r *Runner) handleMergeStatus(ctx context.Context, ev *nostr.Event, sourceR
 		return fmt.Errorf("%w: signer %s", ErrUnauthorizedMergeStatus, ev.PubKey.Hex())
 	}
 
-	encodedStatus, err := json.Marshal(ev)
-	if err != nil {
-		return fmt.Errorf("encode pending merge status: %w", err)
-	}
 	pending := store.PendingMergeStatus{
 		EventID: ev.ID.Hex(), EventJSON: string(encodedStatus), SourceRelay: sourceRelay,
 		ObservedAt: time.Now().UTC(),
@@ -257,7 +271,9 @@ func (r *Runner) handleMergeStatus(ctx context.Context, ev *nostr.Event, sourceR
 	}
 
 	envelope := store.MergeTriggerEnvelope{
-		IdempotencyKey: mergeTriggerKey(ev.ID.Hex()), PREventID: acceptedRevision.EventID,
+		IdempotencyKey: mergeTriggerKey(ev.ID.Hex()), Source: store.TriggerSourceNIP34MergeStatus,
+		TriggerID: ev.ID.Hex(), Actor: ev.PubKey.Hex(), Action: "push", EvidenceJSON: string(encodedStatus),
+		PREventID:     acceptedRevision.EventID,
 		StatusEventID: ev.ID.Hex(), SourceCommit: acceptedRevision.SourceCommit,
 		SourceTree: sourceTree, PatchDigest: patchDigest, AcceptedCommit: acceptedCommit,
 		RepoAddress: tags.repoAddress, PolicyVersion: mergeStatusPolicyVersion,
@@ -654,6 +670,5 @@ func validEventIDString(value string) bool {
 }
 
 func mergeTriggerKey(statusEventID string) string {
-	sum := sha256.Sum256([]byte("hiveci.nip34.merge-trigger.v1\x00" + strings.TrimSpace(statusEventID)))
-	return hex.EncodeToString(sum[:])
+	return store.TriggerEnvelopeKey(store.TriggerSourceNIP34MergeStatus, statusEventID)
 }

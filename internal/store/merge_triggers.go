@@ -5,7 +5,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -15,6 +18,29 @@ import (
 // ErrAmbiguousPRRevision means two different revisions have the same newest
 // Nostr timestamp. A caller must not guess which force-pushed tip was reviewed.
 var ErrAmbiguousPRRevision = errors.New("ambiguous latest pull-request revision")
+
+// ErrTriggerConflict identifies a terminal conflict between two claims for
+// the same durable trigger identity. Callers must not retry these errors: an
+// operator or policy change is required to resolve conflicting evidence.
+var ErrTriggerConflict = errors.New("trigger identity conflict")
+
+const TriggerSourceNIP34MergeStatus = "nip34-merge-status"
+
+// TriggerEnvelopeKey derives the stable claim key from a source-native action
+// identity. The NIP-34 domain is retained byte-for-byte for sibling-branch
+// compatibility.
+func TriggerEnvelopeKey(source, triggerID string) string {
+	source, triggerID = strings.TrimSpace(source), strings.TrimSpace(triggerID)
+	domain := "hiveci.trigger.v1"
+	if source == TriggerSourceNIP34MergeStatus {
+		domain = "hiveci.nip34.merge-trigger.v1"
+	}
+	sum := sha256.Sum256([]byte(domain + "\x00" + source + "\x00" + triggerID))
+	if source == TriggerSourceNIP34MergeStatus {
+		sum = sha256.Sum256([]byte(domain + "\x00" + triggerID))
+	}
+	return hex.EncodeToString(sum[:])
+}
 
 const maxPendingMergeStatuses = 4096
 
@@ -44,10 +70,19 @@ type AcceptedRepositoryState struct {
 	AcceptedAt     time.Time
 }
 
-// MergeTriggerEnvelope is the single immutable authorization and source-state
-// claim made before any Hive workflow request is emitted.
-type MergeTriggerEnvelope struct {
+// TriggerEnvelope is the single immutable authorization and source-state
+// claim made before any Hive workflow request is emitted. The legacy NIP-34
+// fields remain part of the common shape so kind-1631 consumers keep their
+// exact evidence while GitHub and Loom actions can use Source, TriggerID,
+// Actor, WorkflowPath, and EvidenceJSON without inventing another envelope.
+type TriggerEnvelope struct {
 	IdempotencyKey string
+	Source         string
+	TriggerID      string
+	Actor          string
+	Action         string
+	WorkflowPath   string
+	EvidenceJSON   string
 	PREventID      string
 	StatusEventID  string
 	SourceCommit   string
@@ -59,6 +94,24 @@ type MergeTriggerEnvelope struct {
 	Branch         string
 	CreatedAt      time.Time
 }
+
+// MergeTriggerEnvelope preserves the sibling kind-1631 API while all sources
+// share TriggerEnvelope persistence and replay semantics.
+type MergeTriggerEnvelope = TriggerEnvelope
+
+// TriggerConflictError carries the immutable identity that conflicted and is
+// explicitly non-retryable for webhook/subscription adapters.
+type TriggerConflictError struct {
+	Source    string
+	TriggerID string
+}
+
+func (e *TriggerConflictError) Error() string {
+	return fmt.Sprintf("%s: %s/%s", ErrTriggerConflict, e.Source, e.TriggerID)
+}
+
+func (e *TriggerConflictError) Unwrap() error      { return ErrTriggerConflict }
+func (e *TriggerConflictError) NonRetryable() bool { return true }
 
 // PendingMergeStatus retains a cryptographically valid status while its PR or
 // accepted-state dependencies arrive out of order. It is also the crash marker
@@ -112,6 +165,28 @@ func (s *SQLiteStore) EnsureMergeTriggerTables(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_hiveci_merge_trigger_pr
 			ON hiveci_merge_trigger_envelopes(repo_address, pr_event_id, created_at)`,
+		`CREATE TABLE IF NOT EXISTS hiveci_trigger_envelopes (
+			idempotency_key TEXT PRIMARY KEY,
+			trigger_source TEXT NOT NULL,
+			trigger_id TEXT NOT NULL,
+			actor TEXT NOT NULL DEFAULT '',
+			action TEXT NOT NULL DEFAULT '',
+			workflow_path TEXT NOT NULL DEFAULT '',
+			evidence_json TEXT NOT NULL DEFAULT '',
+			pr_event_id TEXT NOT NULL DEFAULT '',
+			status_event_id TEXT NOT NULL DEFAULT '',
+			source_commit TEXT NOT NULL,
+			source_tree TEXT NOT NULL,
+			patch_digest TEXT NOT NULL,
+			accepted_commit TEXT NOT NULL,
+			repo_address TEXT NOT NULL,
+			policy_version TEXT NOT NULL,
+			branch TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			UNIQUE(trigger_source, trigger_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_hiveci_trigger_pr
+			ON hiveci_trigger_envelopes(repo_address, pr_event_id, created_at)`,
 		`CREATE TABLE IF NOT EXISTS hiveci_pending_merge_statuses (
 			event_id TEXT PRIMARY KEY,
 			event_json TEXT NOT NULL,
@@ -126,6 +201,19 @@ func (s *SQLiteStore) EnsureMergeTriggerTables(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("initialize HiveCI merge-trigger persistence: %w", err)
 		}
+	}
+	// Import envelopes created by the sibling kind-1631 branch. Actor/evidence
+	// were not retained there, so those legacy rows remain replayable through
+	// their cryptographic status identity but are never upgraded by guessing.
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO hiveci_trigger_envelopes(
+		idempotency_key, trigger_source, trigger_id, action, pr_event_id, status_event_id,
+		source_commit, source_tree, patch_digest, accepted_commit, repo_address,
+		policy_version, branch, created_at
+	) SELECT idempotency_key, ?, status_event_id, 'push', pr_event_id, status_event_id,
+		source_commit, source_tree, patch_digest, accepted_commit, repo_address,
+		policy_version, branch, created_at FROM hiveci_merge_trigger_envelopes`,
+		TriggerSourceNIP34MergeStatus); err != nil {
+		return fmt.Errorf("import legacy HiveCI merge triggers: %w", err)
 	}
 	return nil
 }
@@ -348,63 +436,134 @@ func (s *SQLiteStore) GetAcceptedRepositoryState(ctx context.Context, repoAddres
 	return state, nil
 }
 
-// ClaimMergeTriggerEnvelope atomically persists an immutable trigger. A replay
-// returns the already stored envelope; conflicting identity is always an error.
-func (s *SQLiteStore) ClaimMergeTriggerEnvelope(ctx context.Context, envelope MergeTriggerEnvelope) (MergeTriggerEnvelope, bool, error) {
+// ClaimTriggerEnvelope atomically persists immutable authorization evidence.
+// An exact replay returns the stored envelope with claimed=false. Any change
+// under the same source identity or idempotency key is a typed terminal error.
+func (s *SQLiteStore) ClaimTriggerEnvelope(ctx context.Context, envelope TriggerEnvelope) (TriggerEnvelope, bool, error) {
 	normalizeMergeTriggerEnvelope(&envelope)
-	if envelope.IdempotencyKey == "" || envelope.PREventID == "" || envelope.StatusEventID == "" ||
+	if err := s.EnsureMergeTriggerTables(ctx); err != nil {
+		return TriggerEnvelope{}, false, err
+	}
+	// Observe an existing identity before validating the submitted replay. This
+	// makes even malformed mutations of a known immutable claim terminal rather
+	// than accidentally retryable.
+	var existing TriggerEnvelope
+	existingErr := error(sql.ErrNoRows)
+	if envelope.Source != "" && envelope.TriggerID != "" {
+		existing, existingErr = s.GetTriggerEnvelopeByIdentity(ctx, envelope.Source, envelope.TriggerID)
+	}
+	if errors.Is(existingErr, sql.ErrNoRows) && envelope.IdempotencyKey != "" {
+		existing, existingErr = s.GetTriggerEnvelope(ctx, envelope.IdempotencyKey)
+	}
+	if existingErr == nil {
+		if sameMergeTriggerEnvelope(existing, envelope) {
+			return existing, false, nil
+		}
+		return TriggerEnvelope{}, false, &TriggerConflictError{Source: envelope.Source, TriggerID: envelope.TriggerID}
+	}
+	if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+		return TriggerEnvelope{}, false, existingErr
+	}
+	if envelope.IdempotencyKey == "" || envelope.Source == "" || envelope.TriggerID == "" ||
+		envelope.Actor == "" || envelope.Action == "" || envelope.EvidenceJSON == "" || !json.Valid([]byte(envelope.EvidenceJSON)) ||
 		envelope.SourceCommit == "" || envelope.SourceTree == "" || envelope.PatchDigest == "" ||
 		envelope.AcceptedCommit == "" || envelope.RepoAddress == "" || envelope.PolicyVersion == "" || envelope.Branch == "" {
-		return MergeTriggerEnvelope{}, false, fmt.Errorf("complete merge-trigger envelope is required")
+		return TriggerEnvelope{}, false, fmt.Errorf("complete trigger envelope is required")
+	}
+	if envelope.IdempotencyKey != TriggerEnvelopeKey(envelope.Source, envelope.TriggerID) {
+		return TriggerEnvelope{}, false, fmt.Errorf("trigger envelope idempotency key does not match source identity")
+	}
+	if envelope.Source == TriggerSourceNIP34MergeStatus &&
+		(envelope.PREventID == "" || envelope.StatusEventID == "" || envelope.TriggerID != envelope.StatusEventID) {
+		return TriggerEnvelope{}, false, fmt.Errorf("complete NIP-34 merge-trigger linkage is required")
 	}
 	if envelope.CreatedAt.IsZero() {
 		envelope.CreatedAt = time.Now().UTC()
 	}
-	if err := s.EnsureMergeTriggerTables(ctx); err != nil {
-		return MergeTriggerEnvelope{}, false, err
-	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO hiveci_merge_trigger_envelopes(
-			idempotency_key, pr_event_id, status_event_id, source_commit, source_tree,
+		INSERT OR IGNORE INTO hiveci_trigger_envelopes(
+			idempotency_key, trigger_source, trigger_id, actor, action, workflow_path, evidence_json,
+			pr_event_id, status_event_id, source_commit, source_tree,
 			patch_digest, accepted_commit, repo_address, policy_version, branch, created_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, envelope.IdempotencyKey, envelope.PREventID, envelope.StatusEventID,
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, envelope.IdempotencyKey, envelope.Source, envelope.TriggerID, envelope.Actor,
+		envelope.Action, envelope.WorkflowPath, envelope.EvidenceJSON, envelope.PREventID, envelope.StatusEventID,
 		envelope.SourceCommit, envelope.SourceTree, envelope.PatchDigest,
 		envelope.AcceptedCommit, envelope.RepoAddress, envelope.PolicyVersion, envelope.Branch,
 		envelope.CreatedAt.UTC().Unix())
 	if err != nil {
-		return MergeTriggerEnvelope{}, false, fmt.Errorf("claim merge-trigger envelope: %w", err)
+		return TriggerEnvelope{}, false, fmt.Errorf("claim trigger envelope: %w", err)
 	}
 	inserted, err := res.RowsAffected()
 	if err != nil {
-		return MergeTriggerEnvelope{}, false, err
+		return TriggerEnvelope{}, false, err
 	}
-	stored, err := s.GetMergeTriggerEnvelopeByStatusID(ctx, envelope.StatusEventID)
+	stored, err := s.GetTriggerEnvelopeByIdentity(ctx, envelope.Source, envelope.TriggerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		stored, err = s.GetTriggerEnvelope(ctx, envelope.IdempotencyKey)
+	}
 	if err != nil {
-		return MergeTriggerEnvelope{}, false, err
+		return TriggerEnvelope{}, false, err
 	}
 	if !sameMergeTriggerEnvelope(stored, envelope) {
-		return MergeTriggerEnvelope{}, false, fmt.Errorf("merge status %q immutable envelope mismatch", envelope.StatusEventID)
+		return TriggerEnvelope{}, false, &TriggerConflictError{Source: envelope.Source, TriggerID: envelope.TriggerID}
 	}
 	return stored, inserted > 0, nil
+}
+
+// ClaimMergeTriggerEnvelope is the compatibility entry point for kind 1631.
+func (s *SQLiteStore) ClaimMergeTriggerEnvelope(ctx context.Context, envelope MergeTriggerEnvelope) (MergeTriggerEnvelope, bool, error) {
+	return s.ClaimTriggerEnvelope(ctx, envelope)
+}
+
+// GetTriggerEnvelope resolves the durable envelope idempotency key.
+func (s *SQLiteStore) GetTriggerEnvelope(ctx context.Context, idempotencyKey string) (TriggerEnvelope, error) {
+	if err := s.EnsureMergeTriggerTables(ctx); err != nil {
+		return TriggerEnvelope{}, err
+	}
+	return scanTriggerEnvelope(s.db.QueryRowContext(ctx, triggerEnvelopeSelectSQL()+
+		" WHERE idempotency_key = ?", strings.TrimSpace(idempotencyKey)))
+}
+
+// GetTriggerEnvelopeByIdentity resolves a source-native immutable action ID.
+func (s *SQLiteStore) GetTriggerEnvelopeByIdentity(ctx context.Context, source, triggerID string) (TriggerEnvelope, error) {
+	if err := s.EnsureMergeTriggerTables(ctx); err != nil {
+		return TriggerEnvelope{}, err
+	}
+	return scanTriggerEnvelope(s.db.QueryRowContext(ctx, triggerEnvelopeSelectSQL()+
+		" WHERE trigger_source = ? AND trigger_id = ?", strings.TrimSpace(source), strings.TrimSpace(triggerID)))
 }
 
 func (s *SQLiteStore) GetMergeTriggerEnvelopeByStatusID(ctx context.Context, statusEventID string) (MergeTriggerEnvelope, error) {
 	if err := s.EnsureMergeTriggerTables(ctx); err != nil {
 		return MergeTriggerEnvelope{}, err
 	}
-	var envelope MergeTriggerEnvelope
+	return scanTriggerEnvelope(s.db.QueryRowContext(ctx, triggerEnvelopeSelectSQL()+
+		" WHERE status_event_id = ?", strings.TrimSpace(statusEventID)))
+}
+
+func triggerEnvelopeSelectSQL() string {
+	return `SELECT idempotency_key, trigger_source, trigger_id, actor, action, workflow_path, evidence_json,
+		pr_event_id, status_event_id, source_commit, source_tree, patch_digest, accepted_commit,
+		repo_address, policy_version, branch, created_at FROM hiveci_trigger_envelopes`
+}
+
+func scanTriggerEnvelope(row reviewedPRRevisionScanner) (TriggerEnvelope, error) {
+	var envelope TriggerEnvelope
 	var createdAt int64
-	err := s.db.QueryRowContext(ctx, `
-		SELECT idempotency_key, pr_event_id, status_event_id, source_commit, source_tree,
-			patch_digest, accepted_commit, repo_address, policy_version, branch, created_at
-		FROM hiveci_merge_trigger_envelopes WHERE status_event_id = ?
-	`, strings.TrimSpace(statusEventID)).Scan(&envelope.IdempotencyKey, &envelope.PREventID,
+	err := row.Scan(&envelope.IdempotencyKey, &envelope.Source, &envelope.TriggerID,
+		&envelope.Actor, &envelope.Action, &envelope.WorkflowPath, &envelope.EvidenceJSON, &envelope.PREventID,
 		&envelope.StatusEventID, &envelope.SourceCommit, &envelope.SourceTree,
-		&envelope.PatchDigest, &envelope.AcceptedCommit, &envelope.RepoAddress, &envelope.PolicyVersion,
-		&envelope.Branch, &createdAt)
+		&envelope.PatchDigest, &envelope.AcceptedCommit, &envelope.RepoAddress,
+		&envelope.PolicyVersion, &envelope.Branch, &createdAt)
 	if err != nil {
-		return MergeTriggerEnvelope{}, err
+		return TriggerEnvelope{}, err
+	}
+	// Compatibility for databases claimed by the sibling branch before the
+	// source-neutral columns existed.
+	if envelope.Source == "" && envelope.StatusEventID != "" {
+		envelope.Source = TriggerSourceNIP34MergeStatus
+		envelope.TriggerID = envelope.StatusEventID
 	}
 	envelope.CreatedAt = time.Unix(createdAt, 0).UTC()
 	return envelope, nil
@@ -451,6 +610,12 @@ func normalizeAcceptedRepositoryState(state *AcceptedRepositoryState) {
 
 func normalizeMergeTriggerEnvelope(envelope *MergeTriggerEnvelope) {
 	envelope.IdempotencyKey = strings.TrimSpace(envelope.IdempotencyKey)
+	envelope.Source = strings.TrimSpace(envelope.Source)
+	envelope.TriggerID = strings.TrimSpace(envelope.TriggerID)
+	envelope.Actor = strings.TrimSpace(envelope.Actor)
+	envelope.Action = strings.TrimSpace(envelope.Action)
+	envelope.WorkflowPath = strings.TrimSpace(envelope.WorkflowPath)
+	envelope.EvidenceJSON = strings.TrimSpace(envelope.EvidenceJSON)
 	envelope.PREventID = strings.TrimSpace(envelope.PREventID)
 	envelope.StatusEventID = strings.TrimSpace(envelope.StatusEventID)
 	envelope.SourceCommit = strings.ToLower(strings.TrimSpace(envelope.SourceCommit))
@@ -466,6 +631,8 @@ func sameMergeTriggerEnvelope(a, b MergeTriggerEnvelope) bool {
 	normalizeMergeTriggerEnvelope(&a)
 	normalizeMergeTriggerEnvelope(&b)
 	return a.IdempotencyKey == b.IdempotencyKey && a.PREventID == b.PREventID &&
+		a.Source == b.Source && a.TriggerID == b.TriggerID && a.Actor == b.Actor && a.Action == b.Action &&
+		a.WorkflowPath == b.WorkflowPath && a.EvidenceJSON == b.EvidenceJSON &&
 		a.StatusEventID == b.StatusEventID && a.SourceCommit == b.SourceCommit &&
 		a.SourceTree == b.SourceTree && a.PatchDigest == b.PatchDigest &&
 		a.AcceptedCommit == b.AcceptedCommit &&

@@ -131,9 +131,14 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 	}
 	req := testDispatchRequest(operator.Public().Hex())
 	req.TriggerEnvelopeID = strings.Repeat("6", 64)
+	req.TriggerSource = store.TriggerSourceNIP34MergeStatus
+	req.TriggerID = req.SourceEventID
+	req.Actor = req.TriggeredBy
+	req.EvidenceJSON = `{"kind":1631}`
 	req.PREventID = strings.Repeat("1", 64)
 	req.StatusEventID = strings.Repeat("2", 64)
 	req.SourceEventID = req.StatusEventID
+	req.TriggerID = req.StatusEventID
 	req.SourceCommit = strings.Repeat("5", 40)
 	req.SourceTree = strings.Repeat("3", 40)
 	req.PatchDigest = strings.Repeat("4", 64)
@@ -152,6 +157,8 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 		tagValue(run.Tags, "trigger") != req.Trigger || tagValue(run.Tags, "triggered-by") != req.TriggeredBy ||
 		tagValue(run.Tags, "workflow") != req.WorkflowPath || tagValue(run.Tags, "publisher") == "" ||
 		tagValue(run.Tags, "t") != "hive-ci" || tagValue(run.Tags, "trigger-envelope") != req.TriggerEnvelopeID ||
+		tagValue(run.Tags, "trigger-source") != req.TriggerSource || tagValue(run.Tags, "trigger-id") != req.TriggerID ||
+		tagValue(run.Tags, "actor") != req.Actor || tagValue(run.Tags, "evidence-digest") == "" ||
 		tagValue(run.Tags, "pr-event") != req.PREventID || tagValue(run.Tags, "status-event") != req.StatusEventID ||
 		tagValue(run.Tags, "source-commit") != req.SourceCommit ||
 		tagValue(run.Tags, "source-tree") != req.SourceTree || tagValue(run.Tags, "patch-digest") != req.PatchDigest ||
@@ -200,11 +207,40 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 	if len(published) != 2 {
 		t.Fatal("already-published logical dispatch was published again")
 	}
+	correlated, err := st.GetLoomJobByTriggerEnvelope(ctx, req.TriggerEnvelopeID, req.WorkflowPath)
+	if err != nil || correlated.WorkflowRunID != job.WorkflowRunID || store.LoomJobTerminal(correlated) {
+		t.Fatalf("trigger correlation = %#v, %v", correlated, err)
+	}
+	if applied, err := st.ApplyLoomStatus(ctx, job.WorkflowRunID, store.LoomStatusUpdate{
+		State: store.LoomStatusSuccess, Context: Context("hive-ci", req.WorkflowPath),
+		Source: store.LoomSourceWorkflowResult, ProtocolEventID: "terminal-result",
+	}, time.Now().UTC()); err != nil || !applied {
+		t.Fatalf("apply terminal result = %v, %v", applied, err)
+	}
+	correlated, err = st.GetLoomJobByTriggerEnvelope(ctx, req.TriggerEnvelopeID, req.WorkflowPath)
+	if err != nil || !store.LoomJobTerminal(correlated) {
+		t.Fatalf("terminal trigger lookup = %#v, %v", correlated, err)
+	}
+	if handled, err := d.Dispatch(ctx, req); err != nil || !handled {
+		t.Fatalf("terminal exact replay = %v, %v", handled, err)
+	}
+	if len(published) != 2 {
+		t.Fatal("terminal exact replay published or created another run")
+	}
+	conflict := req
+	conflict.EvidenceJSON = `{"kind":1631,"conflict":true}`
+	if handled, err := d.Dispatch(ctx, conflict); !handled || !errors.Is(err, store.ErrTriggerConflict) {
+		t.Fatalf("conflicting Dispatch = %v, %v, want terminal conflict", handled, err)
+	}
 }
 
 func TestDispatchKeyRejectsInconsistentMergeEnvelope(t *testing.T) {
 	valid := testDispatchRequest(strings.Repeat("a", 64))
 	valid.TriggerEnvelopeID = strings.Repeat("6", 64)
+	valid.TriggerSource = store.TriggerSourceNIP34MergeStatus
+	valid.TriggerID = valid.SourceEventID
+	valid.Actor = valid.TriggeredBy
+	valid.EvidenceJSON = `{"kind":1631}`
 	valid.PREventID = strings.Repeat("1", 64)
 	valid.StatusEventID = valid.SourceEventID
 	valid.SourceCommit = strings.Repeat("5", 40)
