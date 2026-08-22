@@ -253,6 +253,11 @@ func main() {
 	hiveRunner.SetStatusSink(statusSink, cfg.LoomStatusContextPrefix)
 	hiveRunner.SetWorkflowAuthorizer(proactiveSyncSvc)
 	hiveRunner.SetRemoteDispatcher(loomDispatcher, cfg.LoomDispatchMode)
+	go func() {
+		if err := hiveRunner.RecoverPendingMergeStatuses(ctx); err != nil {
+			logger.Error("recover pending HiveCI merge statuses", "error", err)
+		}
+	}()
 	loomSvc := loom.New(loom.Config{
 		Enabled: cfg.LoomEnabled, ContextPrefix: cfg.LoomStatusContextPrefix,
 		FutureSkew: cfg.LoomFutureSkew, ResultGrace: cfg.LoomResultGrace,

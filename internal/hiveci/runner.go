@@ -218,6 +218,8 @@ func (r *Runner) HandleEvent(ctx context.Context, ev *nostr.Event, sourceRelay s
 		return r.handleRepositoryState(ctx, ev, sourceRelay)
 	case relay.KindPatch, relay.KindPROpen, relay.KindPRUpdate:
 		return r.handlePullRequestEvent(ctx, ev, sourceRelay)
+	case relay.KindStatusApplied:
+		return r.handleMergeStatus(ctx, ev, sourceRelay)
 	default:
 		return nil
 	}
@@ -232,8 +234,22 @@ func (r *Runner) handleRepositoryState(ctx context.Context, ev *nostr.Event, sou
 	if err != nil || !ok {
 		return err
 	}
+	if r.isRepoCIAllowed(mapping.Owner, mapping.RepoID) {
+		authorized, authErr := r.mergeStatusAuthorAuthorized(ctx, mapping, ev.PubKey.Hex())
+		if authErr != nil {
+			return fmt.Errorf("authorize repository state for HiveCI: %w", authErr)
+		}
+		if authorized {
+			if err := r.persistAcceptedRepositoryState(ctx, mapping, ev); err != nil {
+				return err
+			}
+			if err := r.retryPendingMergeStatuses(ctx); err != nil {
+				return err
+			}
+		}
+	}
 	for _, tip := range branchTips(ev.Tags) {
-		if err := r.runForCommit(ctx, mapping, ev, sourceRelay, "push", tip.Branch, tip.Commit); err != nil {
+		if err := r.runForCommit(ctx, mapping, ev, sourceRelay, "push", tip.Branch, tip.Commit, nil); err != nil {
 			return err
 		}
 	}
@@ -250,19 +266,29 @@ func (r *Runner) handlePullRequestEvent(ctx context.Context, ev *nostr.Event, so
 		r.logger.Debug("HiveCI: PR event has no usable c commit", "event", ev.ID.Hex(), "kind", ev.Kind)
 		return nil
 	}
+	if ev.Kind == relay.KindPROpen || ev.Kind == relay.KindPRUpdate {
+		if err := r.persistReviewedPRRevision(ctx, mapping, ev, commit); err != nil {
+			return err
+		}
+		if err := r.retryPendingMergeStatuses(ctx); err != nil {
+			return err
+		}
+	}
 	branch := firstNonEmpty(tagValue(ev.Tags, "branch-name"), tagValue(ev.Tags, "branch"), "pr")
-	return r.runForCommit(ctx, mapping, ev, sourceRelay, "pull_request", branch, commit)
+	return r.runForCommit(ctx, mapping, ev, sourceRelay, "pull_request", branch, commit, nil)
 }
 
-func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *nostr.Event, sourceRelay, trigger, branch, commit string) error {
-	if !r.isRepoCIAllowed(mapping.Owner, mapping.RepoID) {
-		return nil
-	}
-	authorized, authErr := r.workflowAuthorAuthorized(ctx, mapping, ev.PubKey.Hex())
-	if authErr != nil || !authorized {
-		r.logger.Warn("HiveCI ignored workflow from unauthorized author", "repo", mapping.RepoID,
-			"event", ev.ID.Hex(), "author", ev.PubKey.Hex(), "error", authErr)
-		return nil
+func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *nostr.Event, sourceRelay, trigger, branch, commit string, mergeEnvelope *store.MergeTriggerEnvelope) error {
+	if mergeEnvelope == nil {
+		if !r.isRepoCIAllowed(mapping.Owner, mapping.RepoID) {
+			return nil
+		}
+		authorized, authErr := r.workflowAuthorAuthorized(ctx, mapping, ev.PubKey.Hex())
+		if authErr != nil || !authorized {
+			r.logger.Warn("HiveCI ignored workflow from unauthorized author", "repo", mapping.RepoID,
+				"event", ev.ID.Hex(), "author", ev.PubKey.Hex(), "error", authErr)
+			return nil
+		}
 	}
 	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
 	workflows, err := detectWorkflows(ctx, repoPath, commit)
@@ -275,13 +301,24 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 	}
 	for _, workflow := range workflows {
 		if r.remote != nil && r.remote.Enabled() && r.dispatchMode != "local" {
-			handled, dispatchErr := r.remote.Dispatch(ctx, loom.DispatchRequest{
+			dispatchRequest := loom.DispatchRequest{
 				SourceEventID: ev.ID.Hex(), OwnerPubkey: mapping.Pubkey,
 				Owner: mapping.Owner, RepoName: mapping.RepoName, RepoID: mapping.RepoID,
 				CloneURL:  firstNonEmpty(mapping.AnnouncedCloneURL, mapping.CloneURL),
 				CommitSHA: commit, WorkflowPath: workflow,
 				Branch: branch, Trigger: trigger, TriggeredBy: ev.PubKey.Hex(),
-			})
+			}
+			if mergeEnvelope != nil {
+				dispatchRequest.TriggerEnvelopeID = mergeEnvelope.IdempotencyKey
+				dispatchRequest.PREventID = mergeEnvelope.PREventID
+				dispatchRequest.StatusEventID = mergeEnvelope.StatusEventID
+				dispatchRequest.SourceCommit = mergeEnvelope.SourceCommit
+				dispatchRequest.SourceTree = mergeEnvelope.SourceTree
+				dispatchRequest.PatchDigest = mergeEnvelope.PatchDigest
+				dispatchRequest.RepoAddress = mergeEnvelope.RepoAddress
+				dispatchRequest.PolicyVersion = mergeEnvelope.PolicyVersion
+			}
+			handled, dispatchErr := r.remote.Dispatch(ctx, dispatchRequest)
 			if handled {
 				if dispatchErr != nil {
 					r.logger.Warn("durable Loom dispatch awaits retry", "repo", mapping.RepoID, "workflow", workflow, "error", dispatchErr)

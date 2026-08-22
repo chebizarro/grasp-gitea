@@ -130,6 +130,15 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 		return nil
 	}
 	req := testDispatchRequest(operator.Public().Hex())
+	req.TriggerEnvelopeID = strings.Repeat("6", 64)
+	req.PREventID = strings.Repeat("1", 64)
+	req.StatusEventID = strings.Repeat("2", 64)
+	req.SourceEventID = req.StatusEventID
+	req.SourceCommit = strings.Repeat("5", 40)
+	req.SourceTree = strings.Repeat("3", 40)
+	req.PatchDigest = strings.Repeat("4", 64)
+	req.RepoAddress = "30617:" + req.OwnerPubkey + ":" + req.RepoID
+	req.PolicyVersion = "hiveci.nip34-merge-status.v1"
 	handled, err := d.Dispatch(ctx, req)
 	if err != nil || !handled {
 		t.Fatalf("Dispatch = %v, %v", handled, err)
@@ -142,7 +151,11 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 		tagValue(run.Tags, "commit") != req.CommitSHA || tagValue(run.Tags, "branch") != req.Branch ||
 		tagValue(run.Tags, "trigger") != req.Trigger || tagValue(run.Tags, "triggered-by") != req.TriggeredBy ||
 		tagValue(run.Tags, "workflow") != req.WorkflowPath || tagValue(run.Tags, "publisher") == "" ||
-		tagValue(run.Tags, "t") != "hive-ci" {
+		tagValue(run.Tags, "t") != "hive-ci" || tagValue(run.Tags, "trigger-envelope") != req.TriggerEnvelopeID ||
+		tagValue(run.Tags, "pr-event") != req.PREventID || tagValue(run.Tags, "status-event") != req.StatusEventID ||
+		tagValue(run.Tags, "source-commit") != req.SourceCommit ||
+		tagValue(run.Tags, "source-tree") != req.SourceTree || tagValue(run.Tags, "patch-digest") != req.PatchDigest ||
+		tagValue(run.Tags, "repo-address") != req.RepoAddress || tagValue(run.Tags, "policy") != req.PolicyVersion {
 		t.Fatalf("invalid kind-5401 tags: %#v", run.Tags)
 	}
 	secretTag := request.Tags.Find("secret")
@@ -186,6 +199,45 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 	}
 	if len(published) != 2 {
 		t.Fatal("already-published logical dispatch was published again")
+	}
+}
+
+func TestDispatchKeyRejectsInconsistentMergeEnvelope(t *testing.T) {
+	valid := testDispatchRequest(strings.Repeat("a", 64))
+	valid.TriggerEnvelopeID = strings.Repeat("6", 64)
+	valid.PREventID = strings.Repeat("1", 64)
+	valid.StatusEventID = valid.SourceEventID
+	valid.SourceCommit = strings.Repeat("5", 40)
+	valid.SourceTree = strings.Repeat("3", 40)
+	valid.PatchDigest = strings.Repeat("4", 64)
+	valid.RepoAddress = "30617:" + valid.OwnerPubkey + ":" + valid.RepoID
+	valid.PolicyVersion = "hiveci.nip34-merge-status.v1"
+	if _, err := dispatchKey(valid); err != nil {
+		t.Fatalf("valid merge envelope: %v", err)
+	}
+
+	tests := map[string]func(*DispatchRequest){
+		"partial": func(req *DispatchRequest) {
+			req.TriggerEnvelopeID = ""
+		},
+		"different status source": func(req *DispatchRequest) {
+			req.StatusEventID = strings.Repeat("2", 64)
+		},
+		"different repository": func(req *DispatchRequest) {
+			req.RepoAddress = "30617:" + req.OwnerPubkey + ":other"
+		},
+		"malformed envelope id": func(req *DispatchRequest) {
+			req.TriggerEnvelopeID = "not-an-id"
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			req := valid
+			mutate(&req)
+			if _, err := dispatchKey(req); err == nil {
+				t.Fatal("inconsistent merge envelope was accepted")
+			}
+		})
 	}
 }
 

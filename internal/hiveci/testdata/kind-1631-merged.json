@@ -1,0 +1,17 @@
+{
+  "id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "created_at": 1755734400,
+  "kind": 1631,
+  "tags": [
+    ["e", "1111111111111111111111111111111111111111111111111111111111111111", "", "root"],
+    ["e", "2222222222222222222222222222222222222222222222222222222222222222", "", "reply"],
+    ["a", "30617:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:canonical-repo"],
+    ["p", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+    ["p", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+    ["merge-commit", "3333333333333333333333333333333333333333"],
+    ["r", "3333333333333333333333333333333333333333"]
+  ],
+  "content": "Merged after review",
+  "sig": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+}

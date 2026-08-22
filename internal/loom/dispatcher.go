@@ -28,17 +28,25 @@ var errNoLoomWorker = errors.New("no eligible Loom worker")
 // DispatchRequest is an already-authorized workflow trigger from the shared
 // Hive-CI detector. TriggeredBy is the Nostr signer authorized by Resolver.
 type DispatchRequest struct {
-	SourceEventID string
-	OwnerPubkey   string
-	Owner         string
-	RepoName      string
-	RepoID        string
-	CloneURL      string
-	CommitSHA     string
-	WorkflowPath  string
-	Branch        string
-	Trigger       string
-	TriggeredBy   string
+	SourceEventID     string
+	TriggerEnvelopeID string
+	PREventID         string
+	StatusEventID     string
+	SourceCommit      string
+	SourceTree        string
+	PatchDigest       string
+	RepoAddress       string
+	PolicyVersion     string
+	OwnerPubkey       string
+	Owner             string
+	RepoName          string
+	RepoID            string
+	CloneURL          string
+	CommitSHA         string
+	WorkflowPath      string
+	Branch            string
+	Trigger           string
+	TriggeredBy       string
 }
 
 // DispatchSigner signs as the bridge and performs NIP-44 as that same author.
@@ -286,6 +294,18 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key,
 		},
 		Content: "",
 	}
+	if req.TriggerEnvelopeID != "" {
+		run.Tags = append(run.Tags,
+			nostr.Tag{"trigger-envelope", req.TriggerEnvelopeID},
+			nostr.Tag{"pr-event", req.PREventID},
+			nostr.Tag{"status-event", req.StatusEventID},
+			nostr.Tag{"source-commit", req.SourceCommit},
+			nostr.Tag{"source-tree", req.SourceTree},
+			nostr.Tag{"patch-digest", req.PatchDigest},
+			nostr.Tag{"repo-address", req.RepoAddress},
+			nostr.Tag{"policy", req.PolicyVersion},
+		)
+	}
 	if err := d.signer.SignEvent(ctx, run); err != nil {
 		return store.LoomJob{}, fmt.Errorf("sign Hive workflow run: %w", err)
 	}
@@ -519,8 +539,15 @@ func dispatchKey(req DispatchRequest) (string, error) {
 	if strings.TrimSpace(req.CloneURL) == "" {
 		return "", fmt.Errorf("Loom dispatch clone URL is required")
 	}
+	if err := validateTriggerEnvelopeRequest(req); err != nil {
+		return "", err
+	}
 	fields := []string{req.SourceEventID, req.OwnerPubkey, req.Owner, req.RepoName, req.RepoID,
 		req.CommitSHA, req.WorkflowPath, req.Branch, req.Trigger, req.TriggeredBy}
+	if strings.TrimSpace(req.TriggerEnvelopeID) != "" {
+		fields = append(fields, req.TriggerEnvelopeID, req.PREventID, req.StatusEventID,
+			req.SourceCommit, req.SourceTree, req.PatchDigest, req.RepoAddress, req.PolicyVersion)
+	}
 	for _, field := range fields {
 		if strings.TrimSpace(field) == "" {
 			return "", fmt.Errorf("complete Loom dispatch request is required")
@@ -528,6 +555,49 @@ func dispatchKey(req DispatchRequest) (string, error) {
 	}
 	sum := sha256.Sum256([]byte(strings.Join(fields, "\x00")))
 	return "loom:" + hex.EncodeToString(sum[:]), nil
+}
+
+func validateTriggerEnvelopeRequest(req DispatchRequest) error {
+	binding := []string{req.TriggerEnvelopeID, req.PREventID, req.StatusEventID, req.SourceCommit,
+		req.SourceTree, req.PatchDigest, req.RepoAddress, req.PolicyVersion}
+	bound := strings.TrimSpace(req.TriggerEnvelopeID) != ""
+	if !bound {
+		for _, field := range binding[1:] {
+			if strings.TrimSpace(field) != "" {
+				return fmt.Errorf("partial merge-trigger envelope is not allowed")
+			}
+		}
+		return nil
+	}
+	for _, field := range binding {
+		if strings.TrimSpace(field) == "" {
+			return fmt.Errorf("complete merge-trigger envelope is required")
+		}
+	}
+	if !validHexLength(req.TriggerEnvelopeID, 64) || !validHexLength(req.PREventID, 64) ||
+		!validHexLength(req.StatusEventID, 64) || !validHexLength(req.PatchDigest, 64) ||
+		(!validHexLength(req.SourceCommit, 40) && !validHexLength(req.SourceCommit, 64)) ||
+		(!validHexLength(req.SourceTree, 40) && !validHexLength(req.SourceTree, 64)) {
+		return fmt.Errorf("merge-trigger envelope contains an invalid identifier")
+	}
+	if !strings.EqualFold(strings.TrimSpace(req.SourceEventID), strings.TrimSpace(req.StatusEventID)) {
+		return fmt.Errorf("merge-trigger status event does not match source event")
+	}
+	wantRepo := fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement,
+		strings.TrimSpace(req.OwnerPubkey), strings.TrimSpace(req.RepoID))
+	if strings.TrimSpace(req.RepoAddress) != wantRepo {
+		return fmt.Errorf("merge-trigger repository address does not match dispatch target")
+	}
+	return nil
+}
+
+func validHexLength(value string, size int) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != size {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func buildWorkerCommand(template string, req DispatchRequest) (string, []string, error) {
