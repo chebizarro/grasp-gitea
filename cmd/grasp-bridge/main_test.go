@@ -5,6 +5,8 @@ package main
 
 import (
 	"testing"
+
+	"github.com/sharegap/grasp-gitea/internal/relay"
 )
 
 func TestMergeRelayURLsEmpty(t *testing.T) {
@@ -91,5 +93,18 @@ func TestRelaySubscriptionURLsKeepsPublicRelayWithoutEmbedded(t *testing.T) {
 	)
 	if len(result) != 1 || result[0] != "wss://grasp.example" {
 		t.Fatalf("expected public relay without embedded relay, got %v", result)
+	}
+}
+
+func TestLoomSubscriptionAddsWorkflowRunOnlyForActionIngress(t *testing.T) {
+	without := loomSubscriptionKinds(false)
+	for _, kind := range without {
+		if kind == relay.KindHiveWorkflowRun {
+			t.Fatal("default Loom subscription accepts workflow-run actions")
+		}
+	}
+	with := loomSubscriptionKinds(true)
+	if len(with) != len(without)+1 || with[len(with)-1] != relay.KindHiveWorkflowRun {
+		t.Fatalf("action subscription kinds = %v", with)
 	}
 }

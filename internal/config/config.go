@@ -84,6 +84,7 @@ type Config struct {
 
 	// Loom consumes canonical ads/results and dispatches trusted-fleet Hive-CI jobs.
 	LoomEnabled             bool
+	LoomActions             LoomActionsConfig
 	LoomDispatchMode        string
 	LoomWorkerPubkeys       []string
 	LoomRelayURLs           []string
@@ -159,6 +160,22 @@ type GitHubActionsConfig struct {
 	Enabled       bool
 	WebhookSecret string
 	Policies      []GitHubActionPolicy
+}
+
+// LoomActionPolicy is the static authorization boundary for signed kind-5401
+// dispatch/retry actions. Direct dispatch remains opt-in per repository.
+type LoomActionPolicy struct {
+	RepoAddress         string   `json:"repo_address"`
+	Actors              []string `json:"actors"`
+	Branches            []string `json:"branches"`
+	Workflows           []string `json:"workflows"`
+	AllowDirectDispatch bool     `json:"allow_direct_dispatch,omitempty"`
+	Version             string   `json:"version"`
+}
+
+type LoomActionsConfig struct {
+	Enabled  bool
+	Policies []LoomActionPolicy
 }
 
 // CredentialKey is one entry of the credential-encryption key ring.
@@ -249,6 +266,12 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("GITHUB_ACTION_POLICIES_JSON must be a JSON array: %w", err)
 		}
 	}
+	cfg.LoomActions.Enabled = boolEnv("LOOM_ACTIONS_ENABLED", false)
+	if raw := strings.TrimSpace(os.Getenv("LOOM_ACTION_POLICIES_JSON")); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &cfg.LoomActions.Policies); err != nil {
+			return Config{}, fmt.Errorf("LOOM_ACTION_POLICIES_JSON must be a JSON array: %w", err)
+		}
+	}
 
 	signerMasterKey, err := parseSignerMasterKey(os.Getenv("SIGNER_MASTER_KEY"))
 	if err != nil {
@@ -316,6 +339,17 @@ func Load() (Config, error) {
 		}
 		if !cfg.HiveCIEnabled && !(cfg.LoomEnabled && cfg.LoomDispatchMode != "local") {
 			return Config{}, fmt.Errorf("GitHub actions require HIVE_CI_ENABLED=true or remote Loom dispatch")
+		}
+	}
+	if cfg.LoomActions.Enabled {
+		if !cfg.LoomEnabled {
+			return Config{}, fmt.Errorf("LOOM_ENABLED=true is required when LOOM_ACTIONS_ENABLED=true")
+		}
+		if len(cfg.LoomActions.Policies) == 0 {
+			return Config{}, fmt.Errorf("LOOM_ACTION_POLICIES_JSON is required when LOOM_ACTIONS_ENABLED=true")
+		}
+		if !cfg.HiveCIEnabled && !(cfg.LoomEnabled && cfg.LoomDispatchMode != "local") {
+			return Config{}, fmt.Errorf("Loom actions require HIVE_CI_ENABLED=true or remote Loom dispatch")
 		}
 	}
 	if cfg.LoomEnabled && cfg.LoomDispatchMode != "local" {

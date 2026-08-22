@@ -45,6 +45,9 @@ func TestLoadMinimalValid(t *testing.T) {
 	if cfg.GitHubActions.Enabled {
 		t.Fatal("GitHub action ingress must default disabled")
 	}
+	if cfg.LoomActions.Enabled {
+		t.Fatal("Loom action ingress must default disabled")
+	}
 }
 
 func TestLoadGitHubActionIngressConfig(t *testing.T) {
@@ -323,6 +326,55 @@ func TestLoadLoomPhaseOneConfig(t *testing.T) {
 	}
 	if !cfg.LoomEnabled || len(cfg.LoomRelayURLs) != 2 || cfg.LoomStatusContextPrefix != "checks" {
 		t.Fatalf("unexpected Loom config: enabled=%v relays=%v prefix=%q", cfg.LoomEnabled, cfg.LoomRelayURLs, cfg.LoomStatusContextPrefix)
+	}
+}
+
+func TestLoadLoomActionIngressConfig(t *testing.T) {
+	actor := nostr.Generate().Public().Hex()
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com", "RELAY_URLS": "wss://relay",
+		"LOOM_ENABLED": "true", "LOOM_ACTIONS_ENABLED": "true", "HIVE_CI_ENABLED": "true", "CI_TRIGGER_REPOS": "*",
+		"LOOM_ACTION_POLICIES_JSON": `[{"repo_address":"30617:owner:repo","actors":["` + actor + `"],"branches":["main"],"workflows":[".gitea/workflows/deploy.yml"],"allow_direct_dispatch":true,"version":"v1"}]`,
+	})
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.LoomActions.Enabled || len(cfg.LoomActions.Policies) != 1 ||
+		!cfg.LoomActions.Policies[0].AllowDirectDispatch || cfg.LoomActions.Policies[0].Actors[0] != actor {
+		t.Fatalf("unexpected Loom action config: %#v", cfg.LoomActions)
+	}
+}
+
+func TestLoadLoomActionIngressFailsClosed(t *testing.T) {
+	base := map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com", "RELAY_URLS": "wss://relay",
+		"LOOM_ACTIONS_ENABLED": "true", "HIVE_CI_ENABLED": "true", "CI_TRIGGER_REPOS": "*",
+	}
+	setEnvs(t, base)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "LOOM_ENABLED") {
+		t.Fatalf("Loom action ingress without Loom accepted: %v", err)
+	}
+	t.Setenv("LOOM_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "POLICIES_JSON") {
+		t.Fatalf("Loom action ingress without policy accepted: %v", err)
+	}
+	t.Setenv("LOOM_ACTION_POLICIES_JSON", "not-json")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "JSON array") {
+		t.Fatalf("invalid Loom action policy JSON accepted: %v", err)
+	}
+}
+
+func TestLoadLoomActionsRejectsEmbeddedOnlySubscription(t *testing.T) {
+	actor := nostr.Generate().Public().Hex()
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com", "RELAY_URLS": "",
+		"EMBEDDED_RELAY": "true", "LOOM_ENABLED": "true", "LOOM_ACTIONS_ENABLED": "true",
+		"HIVE_CI_ENABLED": "true", "CI_TRIGGER_REPOS": "*",
+		"LOOM_ACTION_POLICIES_JSON": `[{"repo_address":"30617:owner:repo","actors":["` + actor + `"],"branches":["main"],"workflows":[".gitea/workflows/deploy.yml"],"version":"v1"}]`,
+	})
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "LOOM_RELAY_URLS") {
+		t.Fatalf("embedded-only Loom action subscription accepted: %v", err)
 	}
 }
 

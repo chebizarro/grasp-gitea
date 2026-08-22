@@ -67,6 +67,17 @@ func relaySubscriptionURLs(configured []string, embeddedURL string, publicEmbedd
 	return mergeRelayURLs(filtered, embeddedURL)
 }
 
+func loomSubscriptionKinds(includeActions bool) []nostr.Kind {
+	kinds := []nostr.Kind{
+		relay.KindLoomWorkerAd, relay.KindLoomJobStatus,
+		relay.KindLoomJobResult, relay.KindHiveWorkflowResult,
+	}
+	if includeActions {
+		kinds = append(kinds, relay.KindHiveWorkflowRun)
+	}
+	return kinds
+}
+
 func newServerSigner(ctx context.Context, cfg config.Config, st *store.SQLiteStore, relayURLs []string, logger *slog.Logger) (publisher.ServerSigner, error) {
 	if cfg.SignetBunkerURL != "" {
 		if cfg.Production() && len(cfg.SignerMasterKey) != 32 {
@@ -253,6 +264,28 @@ func main() {
 	hiveRunner.SetStatusSink(statusSink, cfg.LoomStatusContextPrefix)
 	hiveRunner.SetWorkflowAuthorizer(proactiveSyncSvc)
 	hiveRunner.SetRemoteDispatcher(loomDispatcher, cfg.LoomDispatchMode)
+	var loomActionIngestor *hiveci.LoomActionIngestor
+	if cfg.LoomActions.Enabled {
+		policies := make([]hiveci.LoomActionPolicy, 0, len(cfg.LoomActions.Policies))
+		for _, policy := range cfg.LoomActions.Policies {
+			policies = append(policies, hiveci.LoomActionPolicy{
+				RepoAddress: policy.RepoAddress, Actors: policy.Actors, Branches: policy.Branches,
+				Workflows: policy.Workflows, AllowDirectDispatch: policy.AllowDirectDispatch, Version: policy.Version,
+			})
+		}
+		localPubkey := ""
+		if serverSigner != nil {
+			localPubkey = serverSigner.PublicKey()
+		}
+		loomActionIngestor, err = hiveci.NewLoomActionIngestor(hiveci.LoomActionConfig{
+			Enabled: true, LocalPubkey: localPubkey, RepositoriesDir: cfg.GiteaRepositoriesDir, Policies: policies,
+		}, st, hiveRunner, logger)
+		if err != nil {
+			logger.Error("failed to configure Loom action ingress", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("signed Loom action ingress enabled", "policies", len(policies))
+	}
 	go func() {
 		if err := hiveRunner.RecoverPendingMergeStatuses(ctx); err != nil {
 			logger.Error("recover pending HiveCI merge statuses", "error", err)
@@ -500,20 +533,23 @@ func main() {
 	// these canonical kinds, so an empty LOOM_RELAY_URLS falls back only to the
 	// configured external relay set rather than the merged embedded set.
 	var loomSubscriber *relay.Subscriber
-	if loomSvc.Enabled() {
+	if loomSvc.Enabled() || (loomActionIngestor != nil && loomActionIngestor.Enabled()) {
 		if len(loomRelayURLs) == 0 {
 			logger.Warn("Loom enabled without an external LOOM_RELAY_URLS/RELAY_URLS subscriber")
 		} else {
 			loomHandler := func(ctx context.Context, ev *nostr.Event, sourceRelay string) error {
+				if loomActionIngestor != nil {
+					handled, err := loomActionIngestor.HandleEvent(ctx, ev, sourceRelay)
+					if handled || err != nil {
+						return err
+					}
+				}
 				if ev != nil && ev.Kind == relay.KindLoomWorkerAd {
 					return workerPool.HandleEvent(ev, time.Now().UTC())
 				}
 				return loomSvc.HandleEvent(ctx, ev, sourceRelay)
 			}
-			loomSubscriber = relay.NewWithKinds(loomRelayURLs, []nostr.Kind{
-				relay.KindLoomWorkerAd, relay.KindLoomJobStatus,
-				relay.KindLoomJobResult, relay.KindHiveWorkflowResult,
-			}, loomHandler, logger)
+			loomSubscriber = relay.NewWithKinds(loomRelayURLs, loomSubscriptionKinds(cfg.LoomActions.Enabled), loomHandler, logger)
 			loomSubscriber.Run(ctx)
 			logger.Info("canonical Loom inbound subscriber enabled", "relays", loomRelayURLs)
 		}
