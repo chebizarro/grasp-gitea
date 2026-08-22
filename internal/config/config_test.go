@@ -51,6 +51,38 @@ func TestLoadMinimalValid(t *testing.T) {
 	if cfg.LoomWorkerAdMaxAge != 15*time.Minute {
 		t.Fatalf("default Loom worker advertisement max age = %v", cfg.LoomWorkerAdMaxAge)
 	}
+	if cfg.HiveCIReleaseEnabled {
+		t.Fatal("immutable HiveCI release publication must default disabled")
+	}
+}
+
+func TestLoadHiveCIReleaseHarborConfig(t *testing.T) {
+	worker := nostr.Generate().Public().Hex()
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com", "RELAY_URLS": "wss://relay",
+		"LOOM_ENABLED": "true", "LOOM_DISPATCH_MODE": "remote", "LOOM_WORKER_PUBKEYS": worker,
+		"CI_PROTOCOL": "canonical", "CI_TRIGGER_REPOS": "*", "HIVE_CI_RELEASE_ENABLED": "true",
+		"HIVE_CI_HARBOR_URL": "https://harbor.example.com", "HIVE_CI_RELEASE_REPOSITORY": "sap/application",
+		"HIVE_CI_HARBOR_USERNAME": "robot$release", "HIVE_CI_HARBOR_PASSWORD_FILE": "/run/secrets/harbor-password",
+	})
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.HiveCIReleaseEnabled || cfg.HiveCIHarborURL != "https://harbor.example.com" ||
+		cfg.HiveCIReleaseRepository != "sap/application" || cfg.HiveCIHarborPasswordFile != "/run/secrets/harbor-password" {
+		t.Fatalf("unexpected HiveCI release config: %+v", cfg)
+	}
+
+	t.Setenv("HIVE_CI_HARBOR_PASSWORD_FILE", "relative-secret")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "absolute paths") {
+		t.Fatalf("relative Harbor credential file accepted: %v", err)
+	}
+	t.Setenv("HIVE_CI_HARBOR_PASSWORD_FILE", "/run/secrets/harbor-password")
+	t.Setenv("HIVE_CI_HARBOR_BEARER_TOKEN_FILE", "/run/secrets/harbor-token")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "either") {
+		t.Fatalf("mixed Harbor authentication accepted: %v", err)
+	}
 }
 
 func TestLoadHiveCIDispatchReviewPolicy(t *testing.T) {

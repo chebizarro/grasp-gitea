@@ -279,6 +279,31 @@ func main() {
 	hiveRunner.SetWorkflowAuthorizer(proactiveSyncSvc)
 	hiveRunner.SetDispatchPolicyGate(dispatchPolicyResolver)
 	hiveRunner.SetRemoteDispatcher(loomDispatcher, cfg.LoomDispatchMode)
+	var releaseFinalizer loom.ReleaseFinalizer
+	if cfg.HiveCIReleaseEnabled {
+		if serverSigner == nil {
+			logger.Error("HiveCI release publication requires the server Signet signer")
+			os.Exit(1)
+		}
+		harborRegistry, registryErr := hiveci.NewHarborRegistry(hiveci.HarborConfig{
+			Enabled: true, BaseURL: cfg.HiveCIHarborURL,
+			Username: cfg.HiveCIHarborUsername, PasswordFile: cfg.HiveCIHarborPasswordFile,
+			BearerTokenFile: cfg.HiveCIHarborBearerTokenFile,
+		})
+		if registryErr != nil {
+			logger.Error("failed to configure HiveCI Harbor release registry", "error", registryErr)
+			os.Exit(1)
+		}
+		imageRepository, registryErr := harborRegistry.ImageRepository(cfg.HiveCIReleaseRepository)
+		if registryErr != nil {
+			logger.Error("failed to derive pullable HiveCI Harbor repository", "error", registryErr)
+			os.Exit(1)
+		}
+		hiveRunner.SetReleasePublisher(hiveci.NewReleasePublisher(st, harborRegistry, serverSigner),
+			cfg.HiveCIReleaseRepository, imageRepository)
+		releaseFinalizer = hiveRunner
+		logger.Info("immutable HiveCI release publication enabled", "repository", cfg.HiveCIReleaseRepository)
+	}
 	loomDispatcher.SetDispatchRevalidator(hiveRunner)
 	go loomDispatcher.Run(ctx)
 	var loomActionIngestor *hiveci.LoomActionIngestor
@@ -313,6 +338,7 @@ func main() {
 		Enabled: cfg.LoomEnabled, ContextPrefix: cfg.LoomStatusContextPrefix,
 		FutureSkew: cfg.LoomFutureSkew, ResultGrace: cfg.LoomResultGrace,
 		LogFetcher: loom.NewBlossomFetcher(cfg.LoomLogMaxBytes), Wallet: loomWallet,
+		Release: releaseFinalizer,
 	}, st, statusSink, logger)
 	loomSvc.Run(ctx)
 

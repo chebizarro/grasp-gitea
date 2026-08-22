@@ -33,11 +33,18 @@ type Config struct {
 	QueueSize     int
 	LogFetcher    LogFetcher
 	Wallet        cashu.Wallet
+	Release       ReleaseFinalizer
 }
 
 type JobStore interface {
 	GetLoomJobByWorkflowRunID(context.Context, string) (store.LoomJob, error)
 	GetLoomJobByRequestID(context.Context, string) (store.LoomJob, error)
+}
+
+// ReleaseFinalizer is the fail-closed boundary between a worker's delegated
+// success claim and the operator-signed immutable release result.
+type ReleaseFinalizer interface {
+	FinalizeRelease(context.Context, store.LoomJob, *nostr.Event) error
 }
 
 type CashuChangeStore interface {
@@ -56,6 +63,7 @@ type Service struct {
 	logs                    LogFetcher
 	wallet                  cashu.Wallet
 	changeStore             CashuChangeStore
+	release                 ReleaseFinalizer
 }
 
 func New(cfg Config, st JobStore, sink StatusSink, logger *slog.Logger) *Service {
@@ -81,7 +89,7 @@ func New(cfg Config, st JobStore, sink StatusSink, logger *slog.Logger) *Service
 		enabled: cfg.Enabled && st != nil && sink != nil, store: st, sink: sink,
 		contextPrefix: cfg.ContextPrefix, futureSkew: cfg.FutureSkew,
 		resultGrace: cfg.ResultGrace, logger: logger, queue: make(chan nostr.Event, cfg.QueueSize),
-		logs: cfg.LogFetcher, wallet: cfg.Wallet, changeStore: changeStore,
+		logs: cfg.LogFetcher, wallet: cfg.Wallet, changeStore: changeStore, release: cfg.Release,
 	}
 }
 
@@ -193,6 +201,21 @@ func (s *Service) processEvent(ctx context.Context, ev *nostr.Event) error {
 	if err != nil {
 		return err
 	}
+	var verifiedLog *LogArtifact
+	if ev.Kind == relay.KindHiveWorkflowResult && state == store.LoomStatusSuccess && s.release != nil {
+		rawLogURL := resultLogURL(ev.Kind, ev.Tags)
+		if rawLogURL == "" || s.logs == nil {
+			return fmt.Errorf("successful workflow cannot publish release provenance: durable log verification is unavailable")
+		}
+		artifact, fetchErr := s.logs.Fetch(ctx, rawLogURL)
+		if fetchErr != nil {
+			return fmt.Errorf("successful workflow cannot publish release provenance: verify durable log: %w", fetchErr)
+		}
+		verifiedLog = &artifact
+		if err := s.release.FinalizeRelease(ctx, job, ev); err != nil {
+			return fmt.Errorf("successful workflow cannot publish release provenance: %w", err)
+		}
+	}
 	if ev.Kind == relay.KindLoomJobResult && s.wallet != nil && s.changeStore != nil {
 		if change := tagValue(ev.Tags, "change"); change != "" {
 			if err := s.redeemChange(ctx, job, ev.ID.Hex(), change); err != nil {
@@ -201,13 +224,17 @@ func (s *Service) processEvent(ctx context.Context, ev *nostr.Event) error {
 		}
 	}
 	if rawLogURL := resultLogURL(ev.Kind, ev.Tags); rawLogURL != "" && s.logs != nil {
-		artifact, fetchErr := s.logs.Fetch(ctx, rawLogURL)
+		artifact := LogArtifact{}
+		fetchErr := error(nil)
+		if verifiedLog != nil {
+			artifact = *verifiedLog
+		} else {
+			artifact, fetchErr = s.logs.Fetch(ctx, rawLogURL)
+		}
 		if fetchErr != nil {
 			state, description = store.LoomStatusError, "hive-ci: log artifact rejected"
-		} else {
-			if artifact.Tail != "" {
-				description = description + " — log: " + artifact.Tail
-			}
+		} else if artifact.Tail != "" {
+			description = description + " — log: " + artifact.Tail
 		}
 	}
 	availableAt := time.Now().UTC()

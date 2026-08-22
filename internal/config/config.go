@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -81,6 +82,15 @@ type Config struct {
 	HiveCIDispatchPolicies []HiveCIDispatchPolicy
 	HiveCIReviewMaxAge     time.Duration
 	HiveCIReviewFutureSkew time.Duration
+
+	// Immutable release publication is a separate, default-off gate. Harbor
+	// credentials are file references only; credential values never enter Config.
+	HiveCIReleaseEnabled        bool
+	HiveCIHarborURL             string
+	HiveCIReleaseRepository     string
+	HiveCIHarborUsername        string
+	HiveCIHarborPasswordFile    string
+	HiveCIHarborBearerTokenFile string
 
 	// GitHub action ingestion is an independent, default-off signed webhook
 	// boundary. Policies map an upstream GitHub repository to exactly one
@@ -204,79 +214,87 @@ type CredentialKey struct {
 // corresponds to 32 random bytes in base64/hex form.
 const minEdgeSecretLength = 43
 
+var releaseRepositoryRE = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$`)
+
 func Load() (Config, error) {
 	cfg := Config{
-		GiteaURL:                envOrDefault("GITEA_URL", "http://gitea:3000"),
-		GiteaAdminToken:         strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
-		ClonePrefix:             strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
-		RelayURLs:               csvEnv("RELAY_URLS"),
-		Listen:                  envOrDefault("LISTEN", ":8090"),
-		DBPath:                  envOrDefault("DB_PATH", "./mappings.db"),
-		PubkeyAllowlist:         parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
-		ProvisionRateLimit:      intEnv("PROVISION_RATE_LIMIT", 0),
-		HookRelayURL:            envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),
-		HookBinaryPath:          envOrDefault("HOOK_BINARY_PATH", "/usr/local/bin/grasp-pre-receive"),
-		GiteaRepositoriesDir:    envOrDefault("GITEA_REPOSITORIES_PATH", "/gitea-data/git/repositories"),
-		EmbeddedRelay:           boolEnv("EMBEDDED_RELAY", false),
-		EmbeddedRelayPort:       intEnv("EMBEDDED_RELAY_PORT", 3334),
-		EmbeddedRelayDB:         envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
-		ArchiveMode:             boolEnv("GRASP05_ARCHIVE_MODE", false),
-		AdminAPIToken:           strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
-		AuthEnabled:             boolEnv("AUTH_ENABLED", false),
-		BridgePublicURL:         strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
-		ChallengeTTL:            durationEnv("CHALLENGE_TTL", 5*time.Minute),
-		NIP46TrustedProxyCIDRs:  csvEnv("NIP46_TRUSTED_PROXY_CIDRS"),
-		ProactiveSyncInterval:   normalizeProactiveSyncInterval(durationEnv("PROACTIVE_SYNC_INTERVAL", time.Hour)),
-		ProfileSyncEnabled:      boolEnv("PROFILE_SYNC_ENABLED", false),
-		ProfileSyncInterval:     durationEnv("PROFILE_SYNC_INTERVAL", 10*time.Minute),
-		ProfileSyncWorkers:      intEnv("PROFILE_SYNC_WORKERS", 4),
-		SignerMasterKey:         nil,
-		SignetBunkerURL:         strings.TrimSpace(os.Getenv("SIGNET_BUNKER_URL")),
-		BridgeNsec:              strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
-		Environment:             firstEnv("GRASP_ENV", "APP_ENV", "ENVIRONMENT"),
-		MirrorCallbackToken:     strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
-		GiteaWebhookSecret:      strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
-		GraspPublicURL:          strings.TrimRight(strings.TrimSpace(os.Getenv("GRASP_PUBLIC_URL")), "/"),
-		GraspRelayURL:           strings.TrimRight(strings.TrimSpace(os.Getenv("GRASP_RELAY_URL")), "/"),
-		GitBackendUser:          strings.TrimSpace(os.Getenv("GIT_BACKEND_USER")),
-		GitBackendPassword:      strings.TrimSpace(os.Getenv("GIT_BACKEND_PASSWORD")),
-		CIEnabled:               boolEnv("CI_ENABLED", false),
-		CITriggerRepos:          csvEnv("CI_TRIGGER_REPOS"),
-		HiveCIEnabled:           boolEnv("HIVE_CI_ENABLED", false),
-		HiveCIActPath:           envOrDefault("HIVE_CI_ACT_PATH", "/usr/bin/act"),
-		HiveCIRunTimeout:        boundedDurationEnv("HIVE_CI_RUN_TIMEOUT", 15*time.Minute, time.Second, time.Hour),
-		HiveCIMaxConcurrent:     boundedIntEnv("HIVE_CI_MAX_CONCURRENT", 2, 1, 16),
-		HiveCIReviewMaxAge:      boundedDurationEnv("HIVE_CI_REVIEW_MAX_AGE", 24*time.Hour, time.Minute, 30*24*time.Hour),
-		HiveCIReviewFutureSkew:  boundedDurationEnv("HIVE_CI_REVIEW_FUTURE_SKEW", 5*time.Minute, time.Second, time.Hour),
-		LoomEnabled:             boolEnv("LOOM_ENABLED", false),
-		LoomDispatchMode:        strings.ToLower(envOrDefault("LOOM_DISPATCH_MODE", "local")),
-		LoomWorkerPubkeys:       csvEnv("LOOM_WORKER_PUBKEYS"),
-		LoomRelayURLs:           csvEnv("LOOM_RELAY_URLS"),
-		LoomJobMaxDuration:      boundedDurationEnv("LOOM_JOB_MAX_DURATION", 15*time.Minute, time.Second, time.Hour),
-		LoomJobCmdTemplate:      strings.TrimSpace(os.Getenv("LOOM_JOB_CMD_TEMPLATE")),
-		LoomStatusContextPrefix: envOrDefault("LOOM_STATUS_CONTEXT_PREFIX", "hive-ci"),
-		LoomMintURL:             strings.TrimSpace(os.Getenv("LOOM_MINT_URL")),
-		LoomStaticPaymentToken:  strings.TrimSpace(os.Getenv("LOOM_STATIC_PAYMENT_TOKEN")),
-		LoomPaymentMode:         strings.ToLower(envOrDefault("LOOM_PAYMENT_MODE", "trusted")),
-		LoomCashuWalletPath:     strings.TrimSpace(os.Getenv("LOOM_CASHU_WALLET_PATH")),
-		LoomCashuMaxPayment:     uint64Env("LOOM_CASHU_MAX_PAYMENT", 0),
-		LoomLogMaxBytes:         int64(boundedIntEnv("LOOM_LOG_MAX_BYTES", 1<<20, 1024, 10<<20)),
-		LoomJobTTL:              boundedDurationEnv("LOOM_JOB_TTL", 7*24*time.Hour, time.Hour, 30*24*time.Hour),
-		LoomMaxJobs:             boundedIntEnv("LOOM_MAX_JOBS", 4096, 1, 100000),
-		LoomWorkerAdMaxAge:      boundedDurationEnv("LOOM_WORKER_AD_MAX_AGE", 15*time.Minute, time.Second, 24*time.Hour),
-		LoomFutureSkew:          boundedDurationEnv("LOOM_FUTURE_SKEW", 5*time.Minute, time.Second, time.Hour),
-		LoomResultGrace:         boundedDurationEnv("LOOM_RESULT_GRACE", 30*time.Second, time.Second, 10*time.Minute),
-		CIProtocol:              strings.ToLower(envOrDefault("CI_PROTOCOL", "canonical")),
-		NIP34StatusSyncEnabled:  boolEnv("NIP34_STATUS_SYNC_ENABLED", false),
-		BridgeTokensEnabled:     boolEnv("BRIDGE_TOKENS_ENABLED", false),
-		GiteaAdminUser:          strings.TrimSpace(os.Getenv("GITEA_ADMIN_USER")),
-		EdgeSharedSecret:        strings.TrimSpace(os.Getenv("GRASP_EDGE_SHARED_SECRET")),
-		FullProxyEnabled:        boolEnv("GITEA_FULL_PROXY_ENABLED", false),
-		TokenTTLDefault:         durationEnv("BRIDGE_TOKEN_TTL_DEFAULT", 30*24*time.Hour),
-		TokenTTLMin:             durationEnv("BRIDGE_TOKEN_TTL_MIN", time.Hour),
-		TokenTTLMax:             durationEnv("BRIDGE_TOKEN_TTL_MAX", 90*24*time.Hour),
-		AuthAuditRetention:      boundedDurationEnv("AUTH_AUDIT_RETENTION", 90*24*time.Hour, 24*time.Hour, 365*24*time.Hour),
-		ShutdownGrace:           boundedDurationEnv("SHUTDOWN_GRACE", 5*time.Minute, time.Second, 30*time.Minute),
+		GiteaURL:                    envOrDefault("GITEA_URL", "http://gitea:3000"),
+		GiteaAdminToken:             strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
+		ClonePrefix:                 strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
+		RelayURLs:                   csvEnv("RELAY_URLS"),
+		Listen:                      envOrDefault("LISTEN", ":8090"),
+		DBPath:                      envOrDefault("DB_PATH", "./mappings.db"),
+		PubkeyAllowlist:             parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
+		ProvisionRateLimit:          intEnv("PROVISION_RATE_LIMIT", 0),
+		HookRelayURL:                envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),
+		HookBinaryPath:              envOrDefault("HOOK_BINARY_PATH", "/usr/local/bin/grasp-pre-receive"),
+		GiteaRepositoriesDir:        envOrDefault("GITEA_REPOSITORIES_PATH", "/gitea-data/git/repositories"),
+		EmbeddedRelay:               boolEnv("EMBEDDED_RELAY", false),
+		EmbeddedRelayPort:           intEnv("EMBEDDED_RELAY_PORT", 3334),
+		EmbeddedRelayDB:             envOrDefault("EMBEDDED_RELAY_DB", "/data/relay-db"),
+		ArchiveMode:                 boolEnv("GRASP05_ARCHIVE_MODE", false),
+		AdminAPIToken:               strings.TrimSpace(os.Getenv("ADMIN_API_TOKEN")),
+		AuthEnabled:                 boolEnv("AUTH_ENABLED", false),
+		BridgePublicURL:             strings.TrimRight(strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")), "/"),
+		ChallengeTTL:                durationEnv("CHALLENGE_TTL", 5*time.Minute),
+		NIP46TrustedProxyCIDRs:      csvEnv("NIP46_TRUSTED_PROXY_CIDRS"),
+		ProactiveSyncInterval:       normalizeProactiveSyncInterval(durationEnv("PROACTIVE_SYNC_INTERVAL", time.Hour)),
+		ProfileSyncEnabled:          boolEnv("PROFILE_SYNC_ENABLED", false),
+		ProfileSyncInterval:         durationEnv("PROFILE_SYNC_INTERVAL", 10*time.Minute),
+		ProfileSyncWorkers:          intEnv("PROFILE_SYNC_WORKERS", 4),
+		SignerMasterKey:             nil,
+		SignetBunkerURL:             strings.TrimSpace(os.Getenv("SIGNET_BUNKER_URL")),
+		BridgeNsec:                  strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
+		Environment:                 firstEnv("GRASP_ENV", "APP_ENV", "ENVIRONMENT"),
+		MirrorCallbackToken:         strings.TrimSpace(os.Getenv("MIRROR_CALLBACK_TOKEN")),
+		GiteaWebhookSecret:          strings.TrimSpace(os.Getenv("GITEA_WEBHOOK_SECRET")),
+		GraspPublicURL:              strings.TrimRight(strings.TrimSpace(os.Getenv("GRASP_PUBLIC_URL")), "/"),
+		GraspRelayURL:               strings.TrimRight(strings.TrimSpace(os.Getenv("GRASP_RELAY_URL")), "/"),
+		GitBackendUser:              strings.TrimSpace(os.Getenv("GIT_BACKEND_USER")),
+		GitBackendPassword:          strings.TrimSpace(os.Getenv("GIT_BACKEND_PASSWORD")),
+		CIEnabled:                   boolEnv("CI_ENABLED", false),
+		CITriggerRepos:              csvEnv("CI_TRIGGER_REPOS"),
+		HiveCIEnabled:               boolEnv("HIVE_CI_ENABLED", false),
+		HiveCIActPath:               envOrDefault("HIVE_CI_ACT_PATH", "/usr/bin/act"),
+		HiveCIRunTimeout:            boundedDurationEnv("HIVE_CI_RUN_TIMEOUT", 15*time.Minute, time.Second, time.Hour),
+		HiveCIMaxConcurrent:         boundedIntEnv("HIVE_CI_MAX_CONCURRENT", 2, 1, 16),
+		HiveCIReviewMaxAge:          boundedDurationEnv("HIVE_CI_REVIEW_MAX_AGE", 24*time.Hour, time.Minute, 30*24*time.Hour),
+		HiveCIReviewFutureSkew:      boundedDurationEnv("HIVE_CI_REVIEW_FUTURE_SKEW", 5*time.Minute, time.Second, time.Hour),
+		HiveCIReleaseEnabled:        boolEnv("HIVE_CI_RELEASE_ENABLED", false),
+		HiveCIHarborURL:             strings.TrimRight(strings.TrimSpace(os.Getenv("HIVE_CI_HARBOR_URL")), "/"),
+		HiveCIReleaseRepository:     strings.TrimSpace(os.Getenv("HIVE_CI_RELEASE_REPOSITORY")),
+		HiveCIHarborUsername:        strings.TrimSpace(os.Getenv("HIVE_CI_HARBOR_USERNAME")),
+		HiveCIHarborPasswordFile:    strings.TrimSpace(os.Getenv("HIVE_CI_HARBOR_PASSWORD_FILE")),
+		HiveCIHarborBearerTokenFile: strings.TrimSpace(os.Getenv("HIVE_CI_HARBOR_BEARER_TOKEN_FILE")),
+		LoomEnabled:                 boolEnv("LOOM_ENABLED", false),
+		LoomDispatchMode:            strings.ToLower(envOrDefault("LOOM_DISPATCH_MODE", "local")),
+		LoomWorkerPubkeys:           csvEnv("LOOM_WORKER_PUBKEYS"),
+		LoomRelayURLs:               csvEnv("LOOM_RELAY_URLS"),
+		LoomJobMaxDuration:          boundedDurationEnv("LOOM_JOB_MAX_DURATION", 15*time.Minute, time.Second, time.Hour),
+		LoomJobCmdTemplate:          strings.TrimSpace(os.Getenv("LOOM_JOB_CMD_TEMPLATE")),
+		LoomStatusContextPrefix:     envOrDefault("LOOM_STATUS_CONTEXT_PREFIX", "hive-ci"),
+		LoomMintURL:                 strings.TrimSpace(os.Getenv("LOOM_MINT_URL")),
+		LoomStaticPaymentToken:      strings.TrimSpace(os.Getenv("LOOM_STATIC_PAYMENT_TOKEN")),
+		LoomPaymentMode:             strings.ToLower(envOrDefault("LOOM_PAYMENT_MODE", "trusted")),
+		LoomCashuWalletPath:         strings.TrimSpace(os.Getenv("LOOM_CASHU_WALLET_PATH")),
+		LoomCashuMaxPayment:         uint64Env("LOOM_CASHU_MAX_PAYMENT", 0),
+		LoomLogMaxBytes:             int64(boundedIntEnv("LOOM_LOG_MAX_BYTES", 1<<20, 1024, 10<<20)),
+		LoomJobTTL:                  boundedDurationEnv("LOOM_JOB_TTL", 7*24*time.Hour, time.Hour, 30*24*time.Hour),
+		LoomMaxJobs:                 boundedIntEnv("LOOM_MAX_JOBS", 4096, 1, 100000),
+		LoomWorkerAdMaxAge:          boundedDurationEnv("LOOM_WORKER_AD_MAX_AGE", 15*time.Minute, time.Second, 24*time.Hour),
+		LoomFutureSkew:              boundedDurationEnv("LOOM_FUTURE_SKEW", 5*time.Minute, time.Second, time.Hour),
+		LoomResultGrace:             boundedDurationEnv("LOOM_RESULT_GRACE", 30*time.Second, time.Second, 10*time.Minute),
+		CIProtocol:                  strings.ToLower(envOrDefault("CI_PROTOCOL", "canonical")),
+		NIP34StatusSyncEnabled:      boolEnv("NIP34_STATUS_SYNC_ENABLED", false),
+		BridgeTokensEnabled:         boolEnv("BRIDGE_TOKENS_ENABLED", false),
+		GiteaAdminUser:              strings.TrimSpace(os.Getenv("GITEA_ADMIN_USER")),
+		EdgeSharedSecret:            strings.TrimSpace(os.Getenv("GRASP_EDGE_SHARED_SECRET")),
+		FullProxyEnabled:            boolEnv("GITEA_FULL_PROXY_ENABLED", false),
+		TokenTTLDefault:             durationEnv("BRIDGE_TOKEN_TTL_DEFAULT", 30*24*time.Hour),
+		TokenTTLMin:                 durationEnv("BRIDGE_TOKEN_TTL_MIN", time.Hour),
+		TokenTTLMax:                 durationEnv("BRIDGE_TOKEN_TTL_MAX", 90*24*time.Hour),
+		AuthAuditRetention:          boundedDurationEnv("AUTH_AUDIT_RETENTION", 90*24*time.Hour, 24*time.Hour, 365*24*time.Hour),
+		ShutdownGrace:               boundedDurationEnv("SHUTDOWN_GRACE", 5*time.Minute, time.Second, 30*time.Minute),
 	}
 	cfg.GitHubActions.Enabled = boolEnv("GITHUB_ACTIONS_ENABLED", false)
 	cfg.GitHubActions.WebhookSecret = strings.TrimSpace(os.Getenv("GITHUB_ACTIONS_WEBHOOK_SECRET"))
@@ -376,6 +394,31 @@ func Load() (Config, error) {
 		}
 		if !cfg.HiveCIEnabled && !(cfg.LoomEnabled && cfg.LoomDispatchMode != "local") {
 			return Config{}, fmt.Errorf("Loom actions require HIVE_CI_ENABLED=true or remote Loom dispatch")
+		}
+	}
+	if cfg.HiveCIReleaseEnabled {
+		if !cfg.LoomEnabled || cfg.LoomDispatchMode == "local" || cfg.CIProtocol != "canonical" {
+			return Config{}, fmt.Errorf("HIVE_CI_RELEASE_ENABLED requires canonical remote Loom dispatch")
+		}
+		u, err := url.Parse(cfg.HiveCIHarborURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil ||
+			u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+			return Config{}, fmt.Errorf("HIVE_CI_HARBOR_URL must be an absolute credential-free HTTPS URL")
+		}
+		if !releaseRepositoryRE.MatchString(cfg.HiveCIReleaseRepository) {
+			return Config{}, fmt.Errorf("HIVE_CI_RELEASE_REPOSITORY must be a lowercase OCI repository without registry, tag, or digest")
+		}
+		if cfg.HiveCIHarborBearerTokenFile != "" &&
+			(cfg.HiveCIHarborUsername != "" || cfg.HiveCIHarborPasswordFile != "") {
+			return Config{}, fmt.Errorf("configure either HIVE_CI_HARBOR_BEARER_TOKEN_FILE or basic Harbor authentication")
+		}
+		if (cfg.HiveCIHarborUsername == "") != (cfg.HiveCIHarborPasswordFile == "") {
+			return Config{}, fmt.Errorf("HIVE_CI_HARBOR_USERNAME and HIVE_CI_HARBOR_PASSWORD_FILE must be configured together")
+		}
+		for _, filename := range []string{cfg.HiveCIHarborPasswordFile, cfg.HiveCIHarborBearerTokenFile} {
+			if filename != "" && !filepath.IsAbs(filename) {
+				return Config{}, fmt.Errorf("Harbor credential files must use absolute paths")
+			}
 		}
 	}
 	if cfg.LoomEnabled && cfg.LoomDispatchMode != "local" {

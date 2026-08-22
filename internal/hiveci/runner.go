@@ -98,14 +98,18 @@ type Runner struct {
 	mu      sync.Mutex
 	started map[string]time.Time
 
-	publish            func(context.Context, *nostr.Event) error
-	statusSink         loom.StatusSink
-	statusPrefix       string
-	remote             RemoteDispatcher
-	dispatchMode       string
-	authorizer         WorkflowAuthorizer
-	dispatchGate       DispatchPolicyGate
-	provenanceVerifier SourceProvenanceVerifier
+	publish                func(context.Context, *nostr.Event) error
+	statusSink             loom.StatusSink
+	statusPrefix           string
+	remote                 RemoteDispatcher
+	dispatchMode           string
+	authorizer             WorkflowAuthorizer
+	dispatchGate           DispatchPolicyGate
+	provenanceVerifier     SourceProvenanceVerifier
+	releasePublisher       *ReleasePublisher
+	releaseRepository      string
+	releaseImageRepository string
+	releaseLineageVerifier ReleaseLineageVerifier
 }
 
 type WorkflowAuthorizer interface {
@@ -193,6 +197,7 @@ func New(cfg Config, st Store, signer Signer, relayURLs []string, repositoriesDi
 		provenanceVerifier: SourceProvenanceResolver{},
 	}
 	r.publish = r.publishToRelays
+	r.releaseLineageVerifier = r
 	return r
 }
 

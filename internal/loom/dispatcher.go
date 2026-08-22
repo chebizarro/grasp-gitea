@@ -383,6 +383,10 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key 
 	if err != nil {
 		return store.LoomJob{}, fmt.Errorf("invalid selected worker pubkey: %w", err)
 	}
+	workerCapability, err := signedWorkerCapability(workerAd.Event)
+	if err != nil {
+		return store.LoomJob{}, err
+	}
 	ephemeral := nostr.Generate()
 	nsec := nip19.EncodeNsec(ephemeral)
 	encrypted, err := d.signer.NIP44Encrypt(ctx, worker, nsec)
@@ -401,7 +405,8 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key 
 			{"review-base", req.ReviewBaseCommit}, {"tree", req.CommitTree},
 			{"workflow-digest", req.WorkflowDigest}, {"source-provenance", req.SourceProvenanceRef},
 			{"source-repo", req.SourceRepoIdentity}, {"source-clone", req.CloneURL}, {"requester", req.Actor},
-			{"idempotency", req.TriggerEnvelopeID}, {"worker-ad", workerAdID},
+			{"idempotency", req.TriggerEnvelopeID}, {"worker", workerPub}, {"worker-ad", workerAdID},
+			{"worker-capability", workerCapability},
 			{"review-policy", req.ReviewPolicyVersion}, {"policy-digest", req.ReviewPolicySHA256},
 		},
 		Content: "",
@@ -471,6 +476,26 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key 
 		WorkflowRunEvent: string(runBytes), JobRequestEvent: string(requestBytes),
 		CreatedAt: now,
 	}, nil
+}
+
+func signedWorkerCapability(event nostr.Event) (string, error) {
+	capability := make(nostr.Tags, 0)
+	for _, tag := range event.Tags {
+		if len(tag) >= 2 && (tag[0] == "S" || tag[0] == "A") {
+			capability = append(capability, append(nostr.Tag(nil), tag...))
+		}
+	}
+	if len(capability) == 0 {
+		return "", fmt.Errorf("selected worker advertisement has no signed capability")
+	}
+	encoded, err := json.Marshal(capability)
+	if err != nil {
+		return "", fmt.Errorf("encode selected worker capability: %w", err)
+	}
+	if len(encoded) > 512 {
+		return "", fmt.Errorf("selected worker capability exceeds release evidence limit")
+	}
+	return string(encoded), nil
 }
 
 func (d *Dispatcher) publishAttempt(ctx context.Context, job store.LoomJob) error {

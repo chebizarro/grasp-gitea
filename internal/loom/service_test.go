@@ -208,6 +208,62 @@ func TestProcessEventRedeemsCashuChangeOnce(t *testing.T) {
 	}
 }
 
+type captureReleaseFinalizer struct {
+	calls int
+	err   error
+}
+
+func (f *captureReleaseFinalizer) FinalizeRelease(context.Context, store.LoomJob, *nostr.Event) error {
+	f.calls++
+	return f.err
+}
+
+func TestProcessEventRequiresReleaseOnlyForSuccessfulWorkflow(t *testing.T) {
+	publisher := nostr.Generate()
+	job := store.LoomJob{WorkflowRunID: "run", PublisherPub: publisher.Public().Hex(),
+		Owner: "alice", RepoName: "repo", RepoID: "r", CommitSHA: "abc", WorkflowPath: "ci.yml"}
+	sink := &captureSink{}
+	finalizer := &captureReleaseFinalizer{err: errors.New("incomplete artifact")}
+	svc := New(Config{Enabled: true, Release: finalizer,
+		LogFetcher: fixedLogFetcher{artifact: LogArtifact{Tail: "verified"}}}, fixedJobStore{job}, sink, nil)
+
+	success := &nostr.Event{PubKey: publisher.Public(), ID: nostr.ID{11}, Kind: relay.KindHiveWorkflowResult,
+		CreatedAt: nostr.Now(), Tags: nostr.Tags{{"e", "run"}, {"status", "success"}, {"log_url", "https://logs.example/digest"}}}
+	if err := svc.processEvent(context.Background(), success); err == nil {
+		t.Fatal("successful workflow bypassed failed release finalization")
+	}
+	if finalizer.calls != 1 || len(sink.statuses) != 0 {
+		t.Fatalf("failed release reached success sink: calls=%d statuses=%d", finalizer.calls, len(sink.statuses))
+	}
+
+	failure := &nostr.Event{PubKey: publisher.Public(), ID: nostr.ID{12}, Kind: relay.KindHiveWorkflowResult,
+		CreatedAt: nostr.Now(), Tags: nostr.Tags{{"e", "run"}, {"status", "failure"}}}
+	if err := svc.processEvent(context.Background(), failure); err != nil {
+		t.Fatal(err)
+	}
+	if finalizer.calls != 1 || len(sink.statuses) != 1 || sink.statuses[0].State != store.LoomStatusFailure {
+		t.Fatalf("failed workflow invoked release or lost failure status: calls=%d statuses=%#v", finalizer.calls, sink.statuses)
+	}
+}
+
+func TestProcessEventVerifiesDurableLogBeforeRelease(t *testing.T) {
+	publisher := nostr.Generate()
+	job := store.LoomJob{WorkflowRunID: "run", PublisherPub: publisher.Public().Hex(),
+		Owner: "alice", RepoName: "repo", RepoID: "r", CommitSHA: "abc", WorkflowPath: "ci.yml"}
+	finalizer := &captureReleaseFinalizer{}
+	svc := New(Config{Enabled: true, Release: finalizer,
+		LogFetcher: fixedLogFetcher{err: errors.New("digest mismatch")}}, fixedJobStore{job}, &captureSink{}, nil)
+	success := &nostr.Event{PubKey: publisher.Public(), ID: nostr.ID{13}, Kind: relay.KindHiveWorkflowResult,
+		CreatedAt: nostr.Now(), Tags: nostr.Tags{{"e", "run"}, {"status", "success"}, {"log_url", "https://logs.example/digest"}}}
+	if err := svc.processEvent(context.Background(), success); err == nil ||
+		!strings.Contains(err.Error(), "verify durable log") {
+		t.Fatalf("error=%v, want durable log rejection", err)
+	}
+	if finalizer.calls != 0 {
+		t.Fatalf("release finalized before durable log verification: calls=%d", finalizer.calls)
+	}
+}
+
 type fixedLogFetcher struct {
 	artifact LogArtifact
 	err      error

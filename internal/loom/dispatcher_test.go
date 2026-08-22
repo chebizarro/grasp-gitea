@@ -217,7 +217,8 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 		tagValue(run.Tags, "source-repo") != req.SourceRepoIdentity ||
 		tagValue(run.Tags, "source-clone") != req.CloneURL ||
 		tagValue(run.Tags, "requester") != req.Actor || tagValue(run.Tags, "idempotency") != req.TriggerEnvelopeID ||
-		tagValue(run.Tags, "worker-ad") == "" || tagValue(run.Tags, "policy-digest") != req.ReviewPolicySHA256 {
+		tagValue(run.Tags, "worker") != worker.Public().Hex() || tagValue(run.Tags, "worker-ad") == "" ||
+		tagValue(run.Tags, "worker-capability") == "" || tagValue(run.Tags, "policy-digest") != req.ReviewPolicySHA256 {
 		t.Fatalf("invalid kind-5401 tags: %#v", run.Tags)
 	}
 	secretTag := request.Tags.Find("secret")
