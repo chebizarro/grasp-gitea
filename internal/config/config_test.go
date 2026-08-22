@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,6 +41,47 @@ func TestLoadMinimalValid(t *testing.T) {
 	}
 	if len(cfg.RelayURLs) != 1 || cfg.RelayURLs[0] != "wss://relay.example.com" {
 		t.Errorf("expected 1 relay URL, got %v", cfg.RelayURLs)
+	}
+	if cfg.GitHubActions.Enabled {
+		t.Fatal("GitHub action ingress must default disabled")
+	}
+}
+
+func TestLoadGitHubActionIngressConfig(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com", "RELAY_URLS": "wss://relay",
+		"HIVE_CI_ENABLED": "true", "CI_TRIGGER_REPOS": "*", "GITHUB_ACTIONS_ENABLED": "true",
+		"GITHUB_ACTIONS_WEBHOOK_SECRET": "github-secret",
+		"GITHUB_ACTION_POLICIES_JSON":   `[{"repository":"upstream/repo","repository_id":123,"repo_address":"30617:pubkey:repo","actors":["release-bot"],"actor_ids":[456],"events":["workflow_dispatch"],"protected_branches":["main"],"workflows":[".github/workflows/deploy.yml"],"repository_dispatch_actions":["deploy"],"version":"v1"}]`,
+	})
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.GitHubActions.Enabled || cfg.GitHubActions.WebhookSecret != "github-secret" || len(cfg.GitHubActions.Policies) != 1 {
+		t.Fatalf("unexpected GitHub config: %#v", cfg.GitHubActions.Policies)
+	}
+	if got := cfg.GitHubActions.Policies[0]; got.Repository != "upstream/repo" || got.RepoAddress != "30617:pubkey:repo" || len(got.Actors) != 1 {
+		t.Fatalf("unexpected policy: %#v", got)
+	}
+}
+
+func TestLoadGitHubActionIngressFailsClosed(t *testing.T) {
+	base := map[string]string{
+		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com", "RELAY_URLS": "wss://relay",
+		"HIVE_CI_ENABLED": "true", "CI_TRIGGER_REPOS": "*", "GITHUB_ACTIONS_ENABLED": "true",
+	}
+	setEnvs(t, base)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WEBHOOK_SECRET") {
+		t.Fatalf("missing GitHub secret accepted: %v", err)
+	}
+	t.Setenv("GITHUB_ACTIONS_WEBHOOK_SECRET", "secret")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "POLICIES_JSON") {
+		t.Fatalf("missing GitHub policy accepted: %v", err)
+	}
+	t.Setenv("GITHUB_ACTION_POLICIES_JSON", "not-json")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "JSON array") {
+		t.Fatalf("invalid GitHub policy JSON accepted: %v", err)
 	}
 }
 

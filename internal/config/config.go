@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -76,6 +77,11 @@ type Config struct {
 	HiveCIRunTimeout    time.Duration
 	HiveCIMaxConcurrent int
 
+	// GitHub action ingestion is an independent, default-off signed webhook
+	// boundary. Policies map an upstream GitHub repository to exactly one
+	// provisioned canonical NIP-34 repository coordinate.
+	GitHubActions GitHubActionsConfig
+
 	// Loom consumes canonical ads/results and dispatches trusted-fleet Hive-CI jobs.
 	LoomEnabled             bool
 	LoomDispatchMode        string
@@ -131,6 +137,28 @@ type Config struct {
 	ProfileSyncEnabled  bool
 	ProfileSyncInterval time.Duration
 	ProfileSyncWorkers  int
+}
+
+// GitHubActionPolicy is the static, recoverable authorization policy for one
+// GitHub mirror. GitHub user and repository names are compared
+// case-insensitively; workflow paths and branch names are exact.
+type GitHubActionPolicy struct {
+	Repository                string   `json:"repository"`
+	RepositoryID              int64    `json:"repository_id"`
+	RepoAddress               string   `json:"repo_address"`
+	Actors                    []string `json:"actors"`
+	ActorIDs                  []int64  `json:"actor_ids"`
+	Events                    []string `json:"events"`
+	ProtectedBranches         []string `json:"protected_branches"`
+	Workflows                 []string `json:"workflows"`
+	RepositoryDispatchActions []string `json:"repository_dispatch_actions,omitempty"`
+	Version                   string   `json:"version"`
+}
+
+type GitHubActionsConfig struct {
+	Enabled       bool
+	WebhookSecret string
+	Policies      []GitHubActionPolicy
 }
 
 // CredentialKey is one entry of the credential-encryption key ring.
@@ -214,6 +242,13 @@ func Load() (Config, error) {
 		AuthAuditRetention:      boundedDurationEnv("AUTH_AUDIT_RETENTION", 90*24*time.Hour, 24*time.Hour, 365*24*time.Hour),
 		ShutdownGrace:           boundedDurationEnv("SHUTDOWN_GRACE", 5*time.Minute, time.Second, 30*time.Minute),
 	}
+	cfg.GitHubActions.Enabled = boolEnv("GITHUB_ACTIONS_ENABLED", false)
+	cfg.GitHubActions.WebhookSecret = strings.TrimSpace(os.Getenv("GITHUB_ACTIONS_WEBHOOK_SECRET"))
+	if raw := strings.TrimSpace(os.Getenv("GITHUB_ACTION_POLICIES_JSON")); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &cfg.GitHubActions.Policies); err != nil {
+			return Config{}, fmt.Errorf("GITHUB_ACTION_POLICIES_JSON must be a JSON array: %w", err)
+		}
+	}
 
 	signerMasterKey, err := parseSignerMasterKey(os.Getenv("SIGNER_MASTER_KEY"))
 	if err != nil {
@@ -271,6 +306,17 @@ func Load() (Config, error) {
 	}
 	if cfg.HiveCIEnabled && len(cfg.CITriggerRepos) == 0 {
 		return Config{}, fmt.Errorf("CI_TRIGGER_REPOS is required when HIVE_CI_ENABLED=true")
+	}
+	if cfg.GitHubActions.Enabled {
+		if cfg.GitHubActions.WebhookSecret == "" {
+			return Config{}, fmt.Errorf("GITHUB_ACTIONS_WEBHOOK_SECRET is required when GITHUB_ACTIONS_ENABLED=true")
+		}
+		if len(cfg.GitHubActions.Policies) == 0 {
+			return Config{}, fmt.Errorf("GITHUB_ACTION_POLICIES_JSON is required when GITHUB_ACTIONS_ENABLED=true")
+		}
+		if !cfg.HiveCIEnabled && !(cfg.LoomEnabled && cfg.LoomDispatchMode != "local") {
+			return Config{}, fmt.Errorf("GitHub actions require HIVE_CI_ENABLED=true or remote Loom dispatch")
+		}
 	}
 	if cfg.LoomEnabled && cfg.LoomDispatchMode != "local" {
 		if cfg.CIProtocol != "canonical" {

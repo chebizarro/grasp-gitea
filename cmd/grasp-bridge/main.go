@@ -288,6 +288,26 @@ func main() {
 	}
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
+	if cfg.GitHubActions.Enabled {
+		policies := make([]hiveci.GitHubActionPolicy, 0, len(cfg.GitHubActions.Policies))
+		for _, policy := range cfg.GitHubActions.Policies {
+			policies = append(policies, hiveci.GitHubActionPolicy{
+				Repository: policy.Repository, RepositoryID: policy.RepositoryID,
+				RepoAddress: policy.RepoAddress, Actors: policy.Actors, ActorIDs: policy.ActorIDs, Events: policy.Events,
+				ProtectedBranches: policy.ProtectedBranches, Workflows: policy.Workflows,
+				RepositoryDispatchActions: policy.RepositoryDispatchActions, Version: policy.Version,
+			})
+		}
+		githubActions, err := hiveci.NewGitHubActionHandler(hiveci.GitHubActionConfig{
+			Secret: cfg.GitHubActions.WebhookSecret, RepositoriesDir: cfg.GiteaRepositoriesDir, Policies: policies,
+		}, st, hiveRunner, logger)
+		if err != nil {
+			logger.Error("failed to configure GitHub action ingress", "error", err)
+			os.Exit(1)
+		}
+		apiServer.AddRouteRegistrar(githubActions.RegisterRoutes)
+		logger.Info("GitHub action ingress enabled", "route", hiveci.GitHubActionsRoute, "policies", len(policies))
+	}
 	var bridgeTokenSvc *auth.TokenService
 	var proxyNostrVerifier *auth.ProxyNIP98Verifier
 	if relayRootHandler != nil {
