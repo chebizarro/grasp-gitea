@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -69,6 +70,8 @@ type Store interface {
 type triggerEnvelopeStore interface {
 	Store
 	GetTriggerEnvelope(context.Context, string) (store.TriggerEnvelope, error)
+	SaveSourceProvenanceEvidence(context.Context, store.SourceProvenanceEvidence) error
+	GetSourceProvenanceEvidence(context.Context, string) (store.SourceProvenanceEvidence, error)
 }
 
 // Signer signs operator-authored check/audit events. In production this is the
@@ -95,13 +98,14 @@ type Runner struct {
 	mu      sync.Mutex
 	started map[string]time.Time
 
-	publish      func(context.Context, *nostr.Event) error
-	statusSink   loom.StatusSink
-	statusPrefix string
-	remote       RemoteDispatcher
-	dispatchMode string
-	authorizer   WorkflowAuthorizer
-	dispatchGate DispatchPolicyGate
+	publish            func(context.Context, *nostr.Event) error
+	statusSink         loom.StatusSink
+	statusPrefix       string
+	remote             RemoteDispatcher
+	dispatchMode       string
+	authorizer         WorkflowAuthorizer
+	dispatchGate       DispatchPolicyGate
+	provenanceVerifier SourceProvenanceVerifier
 }
 
 type WorkflowAuthorizer interface {
@@ -120,29 +124,37 @@ type DispatchPolicyGate interface {
 	Resolve(context.Context, store.TriggerEnvelope) (DispatchApproval, error)
 }
 
+// SourceProvenanceVerifier independently resolves canonical and mirrored Git
+// objects. The production default uses an isolated credential-free clone; the
+// interface permits hermetic tests without weakening the runtime default.
+type SourceProvenanceVerifier interface {
+	Resolve(context.Context, SourceProvenanceRequest) (store.SourceProvenanceEvidence, error)
+}
+
 type branchTip struct {
 	Branch string
 	Commit string
 }
 
 type runRecord struct {
-	SchemaVersion string `json:"schema_version"`
-	Project       string `json:"project"`
-	Repository    string `json:"repository"`
-	RepoID        string `json:"repo_id"`
-	OwnerPubkey   string `json:"owner_pubkey"`
-	SourceEventID string `json:"source_event_id"`
-	SourceRelay   string `json:"source_relay,omitempty"`
-	Trigger       string `json:"trigger"`
-	Branch        string `json:"branch,omitempty"`
-	Commit        string `json:"commit"`
-	Workflow      string `json:"workflow"`
-	Result        string `json:"result"`
-	Reason        string `json:"reason"`
-	BlocksMerge   bool   `json:"blocks_merge"`
-	ExitCode      int    `json:"exit_code"`
-	DurationMS    int64  `json:"duration_ms"`
-	OutputTail    string `json:"output_tail,omitempty"`
+	SchemaVersion       string `json:"schema_version"`
+	Project             string `json:"project"`
+	Repository          string `json:"repository"`
+	RepoID              string `json:"repo_id"`
+	OwnerPubkey         string `json:"owner_pubkey"`
+	SourceEventID       string `json:"source_event_id"`
+	SourceRelay         string `json:"source_relay,omitempty"`
+	Trigger             string `json:"trigger"`
+	Branch              string `json:"branch,omitempty"`
+	Commit              string `json:"commit"`
+	Workflow            string `json:"workflow"`
+	SourceProvenanceRef string `json:"source_provenance_ref,omitempty"`
+	Result              string `json:"result"`
+	Reason              string `json:"reason"`
+	BlocksMerge         bool   `json:"blocks_merge"`
+	ExitCode            int    `json:"exit_code"`
+	DurationMS          int64  `json:"duration_ms"`
+	OutputTail          string `json:"output_tail,omitempty"`
 }
 
 // New creates a runner. Disabled runners are safe no-ops.
@@ -166,21 +178,136 @@ func New(cfg Config, st Store, signer Signer, relayURLs []string, repositoriesDi
 	}
 	localEnabled := cfg.Enabled && st != nil && signer != nil && repositoriesDir != "" && actPath != ""
 	r := &Runner{
-		enabled:         localEnabled,
-		localEnabled:    localEnabled,
-		actPath:         actPath,
-		store:           st,
-		signer:          signer,
-		relayURLs:       append([]string(nil), relayURLs...),
-		repositoriesDir: repositoriesDir,
-		logger:          logger,
-		runTimeout:      runTimeout,
-		runSlots:        make(chan struct{}, maxConcurrent),
-		triggerRepos:    append([]string(nil), cfg.TriggerRepos...),
-		started:         make(map[string]time.Time),
+		enabled:            localEnabled,
+		localEnabled:       localEnabled,
+		actPath:            actPath,
+		store:              st,
+		signer:             signer,
+		relayURLs:          append([]string(nil), relayURLs...),
+		repositoriesDir:    repositoriesDir,
+		logger:             logger,
+		runTimeout:         runTimeout,
+		runSlots:           make(chan struct{}, maxConcurrent),
+		triggerRepos:       append([]string(nil), cfg.TriggerRepos...),
+		started:            make(map[string]time.Time),
+		provenanceVerifier: SourceProvenanceResolver{},
 	}
 	r.publish = r.publishToRelays
 	return r
+}
+
+// SetSourceProvenanceVerifier replaces the canonical resolver. It is intended
+// for hermetic tests and controlled embeddings; nil remains fail closed.
+func (r *Runner) SetSourceProvenanceVerifier(verifier SourceProvenanceVerifier) {
+	if r != nil {
+		r.provenanceVerifier = verifier
+	}
+}
+
+type canonicalSource struct {
+	repoIdentity string
+	cloneURL     string
+}
+
+func canonicalSourceForEnvelope(mapping store.Mapping, envelope store.TriggerEnvelope) (canonicalSource, error) {
+	if envelope.Source == TriggerSourceGitHubActions {
+		var evidence normalizedGitHubEvidence
+		if err := json.Unmarshal([]byte(envelope.EvidenceJSON), &evidence); err != nil ||
+			evidence.RepoAddress != envelope.RepoAddress || evidence.Repository == "" {
+			return canonicalSource{}, dispatchPolicyDenied("GitHub trigger lacks policy-bound canonical repository identity")
+		}
+		repository := strings.ToLower(strings.Trim(strings.TrimSpace(evidence.Repository), "/"))
+		parts := strings.Split(repository, "/")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" ||
+			strings.ContainsAny(repository, "\\@?#%\x00\r\n\t") || strings.Contains(repository, "..") {
+			return canonicalSource{}, dispatchPolicyDenied("GitHub trigger canonical repository identity is invalid")
+		}
+		u := (&url.URL{Scheme: "https", Host: "github.com", Path: "/" + repository + ".git"}).String()
+		return canonicalSource{repoIdentity: u, cloneURL: u}, nil
+	}
+	identity, err := store.SanitizeSourceRepoIdentity(envelope.RepoAddress)
+	if err != nil {
+		return canonicalSource{}, dispatchPolicyDenied("trigger canonical repository identity is invalid")
+	}
+	cloneURL, err := credentialFreeCanonicalCloneURL(mapping.AnnouncedCloneURL)
+	if err != nil {
+		return canonicalSource{}, dispatchPolicyDenied("canonical announced clone URL is unavailable or unsafe")
+	}
+	return canonicalSource{repoIdentity: identity, cloneURL: cloneURL}, nil
+}
+
+func sourceProvenanceRequest(canonical canonicalSource, repoPath string, envelope store.TriggerEnvelope,
+	approval DispatchApproval, acceptedTree string) SourceProvenanceRequest {
+	return SourceProvenanceRequest{
+		RepoIdentity: canonical.repoIdentity, CanonicalCloneURL: canonical.cloneURL, MirrorRepoPath: repoPath,
+		ReviewBaseCommit: approval.BaseCommit, SourceCommit: envelope.SourceCommit,
+		SourceTree: envelope.SourceTree, AcceptedCommit: envelope.AcceptedCommit,
+		AcceptedTree: acceptedTree, SignedReviewDiffSHA256: approval.DiffSHA256,
+	}
+}
+
+func (r *Runner) resolveFreshSourceProvenance(ctx context.Context, request SourceProvenanceRequest) (store.SourceProvenanceEvidence, error) {
+	if r == nil || r.provenanceVerifier == nil {
+		return store.SourceProvenanceEvidence{}, dispatchPolicyDenied("independent source provenance verifier is unavailable")
+	}
+	evidence, err := r.provenanceVerifier.Resolve(ctx, request)
+	if err != nil {
+		return store.SourceProvenanceEvidence{}, dispatchPolicyDenied("independent source provenance verification failed: %v", err)
+	}
+	if !sourceProvenanceMatchesRequest(evidence, request) {
+		return store.SourceProvenanceEvidence{}, dispatchPolicyDenied("independent source provenance result does not match requested immutable build identity")
+	}
+	return evidence, nil
+}
+
+func sourceProvenanceMatchesRequest(evidence store.SourceProvenanceEvidence, request SourceProvenanceRequest) bool {
+	return evidence.RepoIdentity == request.RepoIdentity && evidence.ReviewBaseCommit == strings.ToLower(request.ReviewBaseCommit) &&
+		evidence.SourceCommit == strings.ToLower(request.SourceCommit) && evidence.SourceTree == strings.ToLower(request.SourceTree) &&
+		evidence.AcceptedCommit == strings.ToLower(request.AcceptedCommit) && evidence.AcceptedTree == strings.ToLower(request.AcceptedTree) &&
+		evidence.SignedReviewPatchSHA256 == strings.ToLower(request.SignedReviewDiffSHA256)
+}
+
+func sameSourceProvenanceSecurityEvidence(a, b store.SourceProvenanceEvidence) bool {
+	return a.EvidenceRef == b.EvidenceRef && a.SchemaVersion == b.SchemaVersion &&
+		a.RepoIdentity == b.RepoIdentity && a.ReviewBaseCommit == b.ReviewBaseCommit &&
+		a.SourceCommit == b.SourceCommit && a.SourceTree == b.SourceTree &&
+		a.AcceptedCommit == b.AcceptedCommit && a.AcceptedTree == b.AcceptedTree &&
+		a.CanonicalCommit == b.CanonicalCommit && a.CanonicalTree == b.CanonicalTree &&
+		a.MirrorCommit == b.MirrorCommit && a.MirrorTree == b.MirrorTree &&
+		a.SignedReviewPatchSHA256 == b.SignedReviewPatchSHA256 &&
+		a.SourceDiffSHA256 == b.SourceDiffSHA256 && a.MergeResultDiffSHA256 == b.MergeResultDiffSHA256
+}
+
+func (r *Runner) persistFreshSourceProvenance(ctx context.Context, st triggerEnvelopeStore,
+	request SourceProvenanceRequest) (store.SourceProvenanceEvidence, error) {
+	fresh, err := r.resolveFreshSourceProvenance(ctx, request)
+	if err != nil {
+		return store.SourceProvenanceEvidence{}, err
+	}
+	if err := st.SaveSourceProvenanceEvidence(ctx, fresh); err != nil {
+		return store.SourceProvenanceEvidence{}, dispatchPolicyDenied("persist source provenance evidence: %v", err)
+	}
+	stored, err := st.GetSourceProvenanceEvidence(ctx, fresh.EvidenceRef)
+	if err != nil || !sameSourceProvenanceSecurityEvidence(stored, fresh) {
+		return store.SourceProvenanceEvidence{}, dispatchPolicyDenied("persisted source provenance evidence does not match verification")
+	}
+	return stored, nil
+}
+
+func (r *Runner) revalidateSourceProvenance(ctx context.Context, st triggerEnvelopeStore,
+	request SourceProvenanceRequest, submittedRef string) (store.SourceProvenanceEvidence, error) {
+	stored, err := st.GetSourceProvenanceEvidence(ctx, strings.TrimSpace(submittedRef))
+	if err != nil {
+		return store.SourceProvenanceEvidence{}, dispatchPolicyDenied("submitted source provenance evidence is unavailable")
+	}
+	fresh, err := r.resolveFreshSourceProvenance(ctx, request)
+	if err != nil {
+		return store.SourceProvenanceEvidence{}, err
+	}
+	if fresh.EvidenceRef != submittedRef || !sameSourceProvenanceSecurityEvidence(stored, fresh) {
+		return store.SourceProvenanceEvidence{}, dispatchPolicyDenied("submitted source provenance evidence does not match independent revalidation")
+	}
+	return stored, nil
 }
 
 // SetStatusSink routes local Tier-A results through the shared durable sink.
@@ -258,8 +385,7 @@ func (r *Runner) ValidateDispatchRequest(ctx context.Context, req loom.DispatchR
 	if err != nil {
 		return dispatchPolicyDenied("dispatch repository mapping is unavailable: %v", err)
 	}
-	if mapping.Owner != req.Owner || mapping.RepoName != req.RepoName ||
-		firstNonEmpty(mapping.AnnouncedCloneURL, mapping.CloneURL) != req.CloneURL {
+	if mapping.Owner != req.Owner || mapping.RepoName != req.RepoName {
 		return dispatchPolicyDenied("dispatch repository mapping changed")
 	}
 	approval, err := r.dispatchGate.Resolve(ctx, envelope)
@@ -279,6 +405,22 @@ func (r *Runner) ValidateDispatchRequest(ctx context.Context, req loom.DispatchR
 	}
 	if tree != strings.ToLower(req.CommitTree) {
 		return dispatchPolicyDenied("dispatch accepted tree changed")
+	}
+	canonical, err := canonicalSourceForEnvelope(mapping, envelope)
+	if err != nil {
+		return err
+	}
+	if req.SourceRepoIdentity != canonical.repoIdentity || req.CloneURL != canonical.cloneURL {
+		return dispatchPolicyDenied("dispatch canonical repository identity changed")
+	}
+	provenance, err := r.revalidateSourceProvenance(ctx, st,
+		sourceProvenanceRequest(canonical, repoPath, envelope, approval, tree), req.SourceProvenanceRef)
+	if err != nil {
+		return err
+	}
+	if provenance.AcceptedCommit != req.CommitSHA || provenance.AcceptedTree != req.CommitTree ||
+		provenance.RepoIdentity != req.SourceRepoIdentity {
+		return dispatchPolicyDenied("dispatch build identity does not match source provenance")
 	}
 	digest, err := workflowBlobDigest(ctx, repoPath, req.CommitSHA, req.WorkflowPath)
 	if err != nil {
@@ -316,10 +458,6 @@ func (r *Runner) RevalidateDispatch(ctx context.Context, job store.LoomJob) erro
 	if !ok {
 		return dispatchPolicyDenied("persisted trigger repository is invalid")
 	}
-	mapping, err := st.GetProvisionedMappingByRepoAddr(ctx, ownerPub, repoID)
-	if err != nil {
-		return dispatchPolicyDenied("dispatch repository mapping is unavailable: %v", err)
-	}
 	evidenceDigest := sha256.Sum256([]byte(envelope.EvidenceJSON))
 	if tagValue(run.Tags, "evidence-digest") != hex.EncodeToString(evidenceDigest[:]) ||
 		tagValue(run.Tags, "a") != envelope.RepoAddress || tagValue(run.Tags, "worker-ad") != job.WorkerAdID ||
@@ -338,8 +476,10 @@ func (r *Runner) RevalidateDispatch(ctx context.Context, job store.LoomJob) erro
 		ReviewRootEventID: tagValue(run.Tags, "review-root"), ReviewBaseCommit: tagValue(run.Tags, "review-base"),
 		ReviewPolicyVersion: tagValue(run.Tags, "review-policy"), ReviewPolicySHA256: tagValue(run.Tags, "policy-digest"),
 		CommitTree: tagValue(run.Tags, "tree"), WorkflowDigest: tagValue(run.Tags, "workflow-digest"),
-		OwnerPubkey: ownerPub, Owner: job.Owner, RepoName: job.RepoName, RepoID: repoID,
-		CloneURL: firstNonEmpty(mapping.AnnouncedCloneURL, mapping.CloneURL), CommitSHA: job.CommitSHA,
+		SourceProvenanceRef: tagValue(run.Tags, "source-provenance"),
+		SourceRepoIdentity:  tagValue(run.Tags, "source-repo"),
+		OwnerPubkey:         ownerPub, Owner: job.Owner, RepoName: job.RepoName, RepoID: repoID,
+		CloneURL: tagValue(run.Tags, "source-clone"), CommitSHA: job.CommitSHA,
 		WorkflowPath: job.WorkflowPath, Branch: job.Branch, Trigger: tagValue(run.Tags, "trigger"),
 		TriggeredBy: tagValue(run.Tags, "triggered-by"),
 	}
@@ -476,11 +616,17 @@ func (r *Runner) runForSource(ctx context.Context, mapping store.Mapping, source
 	}
 	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
 	var approval DispatchApproval
+	var provenance store.SourceProvenanceEvidence
+	var canonical canonicalSource
 	acceptedTree := ""
 	remoteAuthorized := false
-	if r.remote != nil && r.remote.Enabled() && r.dispatchMode != "local" && triggerEnvelope != nil {
+	if triggerEnvelope != nil {
 		if r.dispatchGate == nil {
-			return dispatchPolicyDenied("remote dispatch review gate is unavailable")
+			return dispatchPolicyDenied("dispatch review gate is unavailable")
+		}
+		st, ok := r.store.(triggerEnvelopeStore)
+		if !ok {
+			return dispatchPolicyDenied("durable source provenance store is unavailable")
 		}
 		resolved, err := r.dispatchGate.Resolve(ctx, *triggerEnvelope)
 		if err != nil {
@@ -490,7 +636,17 @@ func (r *Runner) runForSource(ctx context.Context, mapping store.Mapping, source
 		if err != nil {
 			return err
 		}
-		approval, remoteAuthorized = resolved, true
+		canonical, err = canonicalSourceForEnvelope(mapping, *triggerEnvelope)
+		if err != nil {
+			return err
+		}
+		provenance, err = r.persistFreshSourceProvenance(ctx, st,
+			sourceProvenanceRequest(canonical, repoPath, *triggerEnvelope, resolved, acceptedTree))
+		if err != nil {
+			return err
+		}
+		approval = resolved
+		remoteAuthorized = r.remote != nil && r.remote.Enabled() && r.dispatchMode != "local"
 	}
 	workflows, err := detectWorkflows(ctx, repoPath, commit)
 	if err != nil {
@@ -521,8 +677,9 @@ func (r *Runner) runForSource(ctx context.Context, mapping store.Mapping, source
 			dispatchRequest := loom.DispatchRequest{
 				SourceEventID: sourceID, OwnerPubkey: mapping.Pubkey,
 				Owner: mapping.Owner, RepoName: mapping.RepoName, RepoID: mapping.RepoID,
-				CloneURL:  firstNonEmpty(mapping.AnnouncedCloneURL, mapping.CloneURL),
-				CommitSHA: commit, WorkflowPath: workflow,
+				CloneURL: canonical.cloneURL, SourceRepoIdentity: canonical.repoIdentity,
+				SourceProvenanceRef: provenance.EvidenceRef,
+				CommitSHA:           commit, WorkflowPath: workflow,
 				Branch: branch, Trigger: trigger, TriggeredBy: actor,
 				CommitTree: acceptedTree, WorkflowDigest: workflowDigest,
 				ReviewEventID: approval.ReviewEventID, AuditEventID: approval.AuditEventID,
@@ -582,7 +739,7 @@ func (r *Runner) runForSource(ctx context.Context, mapping store.Mapping, source
 			// Delivery retries must never acquire execution ownership.
 			continue
 		}
-		record := r.runWorkflow(ctx, mapping, sourceID, sourceRelay, trigger, branch, commit, workflow)
+		record := r.runWorkflow(ctx, mapping, sourceID, sourceRelay, trigger, branch, commit, workflow, provenance.EvidenceRef)
 		terminalState := store.LoomStatusFailure
 		if record.Result == "success" {
 			terminalState = store.LoomStatusSuccess
@@ -657,24 +814,25 @@ func selectTriggerWorkflows(workflows []string, requested, commit string) ([]str
 	return nil, fmt.Errorf("%w: %q is not present at %s", ErrTriggerWorkflow, requested, commit)
 }
 
-func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, sourceID, sourceRelay, trigger, branch, commit, workflow string) runRecord {
+func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, sourceID, sourceRelay, trigger, branch, commit, workflow, provenanceRef string) runRecord {
 	start := time.Now()
 	rec := runRecord{
-		SchemaVersion: checkResultSchema,
-		Project:       mapping.Owner + "/" + mapping.RepoID,
-		Repository:    mapping.Owner + "/" + mapping.RepoName,
-		RepoID:        mapping.RepoID,
-		OwnerPubkey:   mapping.Pubkey,
-		SourceEventID: sourceID,
-		SourceRelay:   sourceRelay,
-		Trigger:       trigger,
-		Branch:        branch,
-		Commit:        commit,
-		Workflow:      workflow,
-		Result:        "failure",
-		Reason:        "act did not complete",
-		BlocksMerge:   true,
-		ExitCode:      -1,
+		SchemaVersion:       checkResultSchema,
+		Project:             mapping.Owner + "/" + mapping.RepoID,
+		Repository:          mapping.Owner + "/" + mapping.RepoName,
+		RepoID:              mapping.RepoID,
+		OwnerPubkey:         mapping.Pubkey,
+		SourceEventID:       sourceID,
+		SourceRelay:         sourceRelay,
+		Trigger:             trigger,
+		Branch:              branch,
+		Commit:              commit,
+		Workflow:            workflow,
+		SourceProvenanceRef: provenanceRef,
+		Result:              "failure",
+		Reason:              "act did not complete",
+		BlocksMerge:         true,
+		ExitCode:            -1,
 	}
 
 	select {
@@ -774,18 +932,19 @@ func (r *Runner) buildCheckResultEvent(mapping store.Mapping, rec runRecord) (*n
 
 func (r *Runner) buildAuditEvent(mapping store.Mapping, rec runRecord) (*nostr.Event, error) {
 	audit := map[string]any{
-		"schema_version":  auditSchema,
-		"project":         rec.Project,
-		"repository":      rec.Repository,
-		"decision":        rec.Result,
-		"reason":          rec.Reason,
-		"blocks_merge":    rec.BlocksMerge,
-		"source_event_id": rec.SourceEventID,
-		"commit":          rec.Commit,
-		"branch":          rec.Branch,
-		"workflow":        rec.Workflow,
-		"duration_ms":     rec.DurationMS,
-		"exit_code":       rec.ExitCode,
+		"schema_version":        auditSchema,
+		"project":               rec.Project,
+		"repository":            rec.Repository,
+		"decision":              rec.Result,
+		"reason":                rec.Reason,
+		"blocks_merge":          rec.BlocksMerge,
+		"source_event_id":       rec.SourceEventID,
+		"commit":                rec.Commit,
+		"branch":                rec.Branch,
+		"workflow":              rec.Workflow,
+		"source_provenance_ref": rec.SourceProvenanceRef,
+		"duration_ms":           rec.DurationMS,
+		"exit_code":             rec.ExitCode,
 	}
 	content, err := json.Marshal(audit)
 	if err != nil {
@@ -817,6 +976,9 @@ func commonRunTags(mapping store.Mapping, rec runRecord) nostr.Tags {
 	}
 	if rec.SourceRelay != "" {
 		tags = append(tags, nostr.Tag{"relay", rec.SourceRelay})
+	}
+	if rec.SourceProvenanceRef != "" {
+		tags = append(tags, nostr.Tag{"source-provenance", rec.SourceProvenanceRef})
 	}
 	return tags
 }

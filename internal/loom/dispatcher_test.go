@@ -213,6 +213,9 @@ func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 		tagValue(run.Tags, "pr") != req.PREventID || tagValue(run.Tags, "review") != req.ReviewEventID ||
 		tagValue(run.Tags, "audit") != req.AuditEventID || tagValue(run.Tags, "reviewer") != req.ReviewerPubkey ||
 		tagValue(run.Tags, "tree") != req.CommitTree || tagValue(run.Tags, "workflow-digest") != req.WorkflowDigest ||
+		tagValue(run.Tags, "source-provenance") != req.SourceProvenanceRef ||
+		tagValue(run.Tags, "source-repo") != req.SourceRepoIdentity ||
+		tagValue(run.Tags, "source-clone") != req.CloneURL ||
 		tagValue(run.Tags, "requester") != req.Actor || tagValue(run.Tags, "idempotency") != req.TriggerEnvelopeID ||
 		tagValue(run.Tags, "worker-ad") == "" || tagValue(run.Tags, "policy-digest") != req.ReviewPolicySHA256 {
 		t.Fatalf("invalid kind-5401 tags: %#v", run.Tags)
@@ -327,6 +330,18 @@ func TestDispatchKeyRejectsInconsistentMergeEnvelope(t *testing.T) {
 		"malformed envelope id": func(req *DispatchRequest) {
 			req.TriggerEnvelopeID = "not-an-id"
 		},
+		"missing provenance": func(req *DispatchRequest) {
+			req.SourceProvenanceRef = ""
+		},
+		"malformed provenance": func(req *DispatchRequest) {
+			req.SourceProvenanceRef = store.SourceProvenanceReferencePrefix + "nope"
+		},
+		"mutable source identity": func(req *DispatchRequest) {
+			req.SourceRepoIdentity = "refs/heads/main"
+		},
+		"credential-bearing clone URL": func(req *DispatchRequest) {
+			req.CloneURL = "https://user:secret@example.com/repo.git"
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -336,6 +351,23 @@ func TestDispatchKeyRejectsInconsistentMergeEnvelope(t *testing.T) {
 				t.Fatal("inconsistent merge envelope was accepted")
 			}
 		})
+	}
+}
+
+func TestDispatchKeyBindsCredentialFreeCloneTransport(t *testing.T) {
+	original := testDispatchRequest(strings.Repeat("a", 64))
+	originalKey, err := dispatchKey(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := original
+	changed.CloneURL = "https://mirror.example/alice/repo.git"
+	changedKey, err := dispatchKey(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedKey == originalKey {
+		t.Fatal("clone transport change did not alter dispatch key")
 	}
 }
 
@@ -592,6 +624,8 @@ func testDispatchRequest(owner string) DispatchRequest {
 		ReviewRootEventID: stringsOf('f', 64), ReviewBaseCommit: stringsOf('7', 40),
 		ReviewPolicyVersion: "review-policy-v1", ReviewPolicySHA256: stringsOf('8', 64),
 		CommitTree: stringsOf('9', 40), WorkflowDigest: stringsOf('c', 64),
+		SourceProvenanceRef: store.SourceProvenanceReferencePrefix + stringsOf('0', 64),
+		SourceRepoIdentity:  "30617:" + owner + ":repo",
 	}
 }
 
@@ -601,4 +635,25 @@ func stringsOf(ch byte, n int) string {
 		out[i] = ch
 	}
 	return string(out)
+}
+
+func TestBuildWorkerCommandRejectsMutableBranchAndCredentialedTransport(t *testing.T) {
+	req := testDispatchRequest(strings.Repeat("a", 64))
+	if _, _, err := buildWorkerCommand(`["sh","-c","git checkout {branch}"]`, req); err == nil {
+		t.Fatal("mutable branch placeholder was accepted as build input")
+	}
+	if _, _, err := buildWorkerCommand(`["sh","-c","git clone {clone_url}"]`, req); err == nil {
+		t.Fatal("request-controlled placeholder embedded in shell script was accepted")
+	}
+	cmd, args, err := buildWorkerCommand(`["sh","-c","git clone --no-checkout \"$1\" repo","hive-ci","{clone_url}"]`, req)
+	if err != nil || cmd != "sh" || len(args) != 4 || args[3] != req.CloneURL {
+		t.Fatalf("structured positional placeholder rejected: cmd=%q args=%q err=%v", cmd, args, err)
+	}
+	secretURL := "https://build-user:super-secret@example.com/repo.git"
+	req.CloneURL = secretURL
+	if _, err := dispatchKey(req); err == nil {
+		t.Fatal("credential-bearing clone URL was accepted")
+	} else if strings.Contains(err.Error(), "build-user") || strings.Contains(err.Error(), "super-secret") || strings.Contains(err.Error(), secretURL) {
+		t.Fatalf("credential-bearing clone URL disclosed in error: %v", err)
+	}
 }

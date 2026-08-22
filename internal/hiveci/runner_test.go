@@ -166,14 +166,48 @@ type recordingRemoteDispatcher struct {
 	enabled  bool
 }
 
-type allowDispatchGate struct{}
+type allowSourceProvenanceVerifier struct{}
 
-func (allowDispatchGate) Resolve(_ context.Context, envelope store.TriggerEnvelope) (DispatchApproval, error) {
+func (allowSourceProvenanceVerifier) Resolve(_ context.Context, request SourceProvenanceRequest) (store.SourceProvenanceEvidence, error) {
+	ref, err := store.SourceProvenanceReference(request.RepoIdentity, request.AcceptedCommit, request.AcceptedTree)
+	if err != nil {
+		return store.SourceProvenanceEvidence{}, err
+	}
+	base := strings.ToLower(request.ReviewBaseCommit)
+	return store.SourceProvenanceEvidence{
+		EvidenceRef: ref, SchemaVersion: store.SourceProvenanceSchemaV1, RepoIdentity: request.RepoIdentity,
+		ReviewBaseCommit: base, SourceCommit: strings.ToLower(request.SourceCommit), SourceTree: strings.ToLower(request.SourceTree),
+		AcceptedCommit: strings.ToLower(request.AcceptedCommit), AcceptedTree: strings.ToLower(request.AcceptedTree),
+		CanonicalCommit: strings.ToLower(request.AcceptedCommit), CanonicalTree: strings.ToLower(request.AcceptedTree),
+		MirrorCommit: strings.ToLower(request.AcceptedCommit), MirrorTree: strings.ToLower(request.AcceptedTree),
+		SignedReviewPatchSHA256: strings.ToLower(request.SignedReviewDiffSHA256),
+		SourceDiffSHA256:        strings.ToLower(request.SignedReviewDiffSHA256),
+		MergeResultDiffSHA256:   strings.ToLower(request.SignedReviewDiffSHA256), VerifiedAt: time.Unix(1, 0).UTC(),
+	}, nil
+}
+
+type mismatchedSourceProvenanceVerifier struct{}
+
+func (mismatchedSourceProvenanceVerifier) Resolve(ctx context.Context, request SourceProvenanceRequest) (store.SourceProvenanceEvidence, error) {
+	evidence, err := (allowSourceProvenanceVerifier{}).Resolve(ctx, request)
+	if err == nil {
+		evidence.SourceDiffSHA256 = strings.Repeat("f", 64)
+	}
+	return evidence, err
+}
+
+type allowDispatchGate struct{ baseCommit string }
+
+func (g allowDispatchGate) Resolve(_ context.Context, envelope store.TriggerEnvelope) (DispatchApproval, error) {
+	base := strings.TrimSpace(g.baseCommit)
+	if base == "" {
+		base = strings.Repeat("1", 40)
+	}
 	return DispatchApproval{
 		ReviewEventID: strings.Repeat("d", 64), AuditEventID: strings.Repeat("e", 64),
 		ReviewerPubkey: strings.Repeat("f", 64), RepoAddress: envelope.RepoAddress,
 		RootEventID: strings.Repeat("a", 64), PatchEventID: strings.ToLower(envelope.PREventID),
-		BaseCommit: strings.Repeat("1", 40), SourceCommit: strings.ToLower(envelope.SourceCommit),
+		BaseCommit: base, SourceCommit: strings.ToLower(envelope.SourceCommit),
 		SourceTree: strings.ToLower(envelope.SourceTree), DiffSHA256: strings.ToLower(envelope.PatchDigest),
 		PolicyVersion: "review-policy-v1", PolicySHA256: strings.Repeat("2", 64),
 	}, nil

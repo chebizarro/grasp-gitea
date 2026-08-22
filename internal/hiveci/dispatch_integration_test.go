@@ -96,6 +96,7 @@ func newDispatchIntegrationFixture(t *testing.T) *dispatchIntegrationFixture {
 	validator := New(Config{Enabled: false}, fx.store, nil, nil, fx.repositoriesDir,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	validator.SetDispatchPolicyGate(resolver)
+	validator.SetSourceProvenanceVerifier(allowSourceProvenanceVerifier{})
 	worker := nostr.Generate()
 	pool := loom.NewWorkerPool(loom.WorkerPoolConfig{
 		Allowlist: []string{worker.Public().Hex()}, RequiredSoftware: []string{"act"}, AdTTL: time.Hour, FutureSkew: time.Minute,
@@ -259,12 +260,28 @@ func TestReviewedTriggerDispatchIntegrationRejectsBeforeSideEffects(t *testing.T
 			fx.approve(t, 398, 399)
 			fx.req.WorkflowDigest = strings.Repeat("e", 64)
 		},
+		"missing provenance evidence": func(t *testing.T, fx *dispatchIntegrationFixture) {
+			fx.approve(t, 398, 399)
+			fx.req.SourceProvenanceRef = ""
+		},
+		"tampered provenance evidence": func(t *testing.T, fx *dispatchIntegrationFixture) {
+			fx.approve(t, 398, 399)
+			fx.req.SourceProvenanceRef = store.SourceProvenanceReferencePrefix + strings.Repeat("f", 64)
+		},
+		"mismatched source repository": func(t *testing.T, fx *dispatchIntegrationFixture) {
+			fx.approve(t, 398, 399)
+			fx.req.SourceRepoIdentity = "30617:" + strings.Repeat("f", 64) + ":other"
+		},
+		"credential-bearing build URL": func(t *testing.T, fx *dispatchIntegrationFixture) {
+			fx.approve(t, 398, 399)
+			fx.req.CloneURL = "https://user:secret@example.com/repo.git"
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
 			fx := newDispatchIntegrationFixture(t)
 			mutate(t, fx)
-			if handled, err := fx.dispatcher.Dispatch(fx.merge.ctx, fx.req); handled || !errors.Is(err, ErrDispatchPolicyDenied) {
+			if handled, err := fx.dispatcher.Dispatch(fx.merge.ctx, fx.req); handled || err == nil {
 				t.Fatalf("rejected dispatch = %v, %v", handled, err)
 			}
 			if len(fx.signer.signed) != 0 || len(fx.published) != 0 {
@@ -300,6 +317,16 @@ func TestReviewedTriggerOutboxRetryRevalidatesCurrentEvidence(t *testing.T) {
 		},
 		"approval becomes stale": func(_ *testing.T, fx *dispatchIntegrationFixture) {
 			fx.resolver.now = func() time.Time { return fx.now.Add(2 * time.Hour) }
+		},
+		"provenance evidence changes": func(_ *testing.T, fx *dispatchIntegrationFixture) {
+			fx.validator.SetSourceProvenanceVerifier(mismatchedSourceProvenanceVerifier{})
+		},
+		"canonical clone mapping changes": func(t *testing.T, fx *dispatchIntegrationFixture) {
+			mapping := fx.merge.mapping
+			mapping.AnnouncedCloneURL = "file:///tmp/other-canonical.git"
+			if err := fx.merge.store.UpsertMapping(fx.merge.ctx, mapping); err != nil {
+				t.Fatal(err)
+			}
 		},
 		"worker advertisement replaced": func(t *testing.T, fx *dispatchIntegrationFixture) {
 			replacementAt := time.Now().UTC().Truncate(time.Second).Add(time.Second)

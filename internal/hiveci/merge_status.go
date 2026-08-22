@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -604,14 +605,19 @@ func requireCommitObject(ctx context.Context, repoPath, commit string) error {
 	return nil
 }
 
-func validateMergeRelationship(ctx context.Context, repoPath, sourceCommit, acceptedCommit string) (string, error) {
+type mergeRelationship struct {
+	base        string
+	firstParent string
+}
+
+func resolveMergeRelationship(ctx context.Context, repoPath, sourceCommit, acceptedCommit string) (mergeRelationship, error) {
 	parentsLine, err := gitOutput(ctx, repoPath, "rev-list", "--parents", "-n", "1", acceptedCommit)
 	if err != nil {
-		return "", fmt.Errorf("%w: resolve accepted commit parents: %v", ErrMissingGitObject, err)
+		return mergeRelationship{}, fmt.Errorf("%w: resolve accepted commit parents: %v", ErrMissingGitObject, err)
 	}
 	parts := strings.Fields(parentsLine)
 	if len(parts) < 2 || !strings.EqualFold(parts[0], acceptedCommit) {
-		return "", fmt.Errorf("%w: accepted commit has no unambiguous base", ErrForcePushAmbiguity)
+		return mergeRelationship{}, fmt.Errorf("%w: accepted commit has no unambiguous base", ErrForcePushAmbiguity)
 	}
 	firstParent := parts[1]
 	if strings.EqualFold(sourceCommit, acceptedCommit) {
@@ -619,25 +625,29 @@ func validateMergeRelationship(ctx context.Context, repoPath, sourceCommit, acce
 		// branch at review time. Guessing its first parent would hash only the
 		// final commit of a multi-commit PR, so fail closed until the reviewed
 		// merge base is explicitly bound by a future policy version.
-		return "", fmt.Errorf("%w: fast-forward merge base was not review-bound", ErrForcePushAmbiguity)
+		return mergeRelationship{}, fmt.Errorf("%w: fast-forward merge base was not review-bound", ErrForcePushAmbiguity)
 	}
 	if len(parts) != 3 || !strings.EqualFold(parts[2], sourceCommit) {
-		return "", fmt.Errorf("%w: reviewed source is not the unique merged parent", ErrForcePushAmbiguity)
+		return mergeRelationship{}, fmt.Errorf("%w: reviewed source is not the unique merged parent", ErrForcePushAmbiguity)
 	}
 	bases, err := gitOutput(ctx, repoPath, "merge-base", "--all", firstParent, sourceCommit)
 	if err != nil {
-		return "", fmt.Errorf("%w: resolve reviewed merge base: %v", ErrForcePushAmbiguity, err)
+		return mergeRelationship{}, fmt.Errorf("%w: resolve reviewed merge base: %v", ErrForcePushAmbiguity, err)
 	}
 	baseFields := strings.Fields(bases)
 	if len(baseFields) != 1 || !validCommitSHA.MatchString(baseFields[0]) {
-		return "", fmt.Errorf("%w: reviewed source has multiple or missing merge bases", ErrForcePushAmbiguity)
+		return mergeRelationship{}, fmt.Errorf("%w: reviewed source has multiple or missing merge bases", ErrForcePushAmbiguity)
 	}
-	return baseFields[0], nil
+	return mergeRelationship{base: strings.ToLower(baseFields[0]), firstParent: strings.ToLower(firstParent)}, nil
+}
+
+func validateMergeRelationship(ctx context.Context, repoPath, sourceCommit, acceptedCommit string) (string, error) {
+	relationship, err := resolveMergeRelationship(ctx, repoPath, sourceCommit, acceptedCommit)
+	return relationship.base, err
 }
 
 func sourcePatchDigest(ctx context.Context, repoPath, base, sourceCommit string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--no-renames", base, sourceCommit, "--")
-	out, err := cmd.Output()
+	out, err := deterministicGitDiff(ctx, "git", noninteractiveGitEnv(os.TempDir()), repoPath, base, sourceCommit)
 	if err != nil {
 		return "", fmt.Errorf("%w: compute reviewed patch: %v", ErrMissingGitObject, err)
 	}

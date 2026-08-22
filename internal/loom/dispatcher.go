@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -50,6 +52,8 @@ type DispatchRequest struct {
 	ReviewPolicySHA256  string
 	CommitTree          string
 	WorkflowDigest      string
+	SourceProvenanceRef string
+	SourceRepoIdentity  string
 	OwnerPubkey         string
 	Owner               string
 	RepoName            string
@@ -395,7 +399,8 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key 
 			{"pr", req.PREventID}, {"review", req.ReviewEventID}, {"audit", req.AuditEventID},
 			{"reviewer", req.ReviewerPubkey}, {"review-root", req.ReviewRootEventID},
 			{"review-base", req.ReviewBaseCommit}, {"tree", req.CommitTree},
-			{"workflow-digest", req.WorkflowDigest}, {"requester", req.Actor},
+			{"workflow-digest", req.WorkflowDigest}, {"source-provenance", req.SourceProvenanceRef},
+			{"source-repo", req.SourceRepoIdentity}, {"source-clone", req.CloneURL}, {"requester", req.Actor},
 			{"idempotency", req.TriggerEnvelopeID}, {"worker-ad", workerAdID},
 			{"review-policy", req.ReviewPolicyVersion}, {"policy-digest", req.ReviewPolicySHA256},
 		},
@@ -689,7 +694,7 @@ func dispatchKey(req DispatchRequest) (string, error) {
 		return "", err
 	}
 	fields := []string{req.SourceEventID, req.OwnerPubkey, req.Owner, req.RepoName, req.RepoID,
-		req.CommitSHA, req.WorkflowPath, req.Branch, req.Trigger, req.TriggeredBy}
+		req.CloneURL, req.CommitSHA, req.WorkflowPath, req.Branch, req.Trigger, req.TriggeredBy}
 	for _, field := range fields {
 		if strings.TrimSpace(field) == "" {
 			return "", fmt.Errorf("complete Loom dispatch request is required")
@@ -700,7 +705,7 @@ func dispatchKey(req DispatchRequest) (string, error) {
 		req.SourceCommit, req.SourceTree, req.PatchDigest, req.RepoAddress, req.PolicyVersion,
 		req.ReviewEventID, req.AuditEventID, req.ReviewerPubkey, req.ReviewRootEventID,
 		req.ReviewBaseCommit, req.ReviewPolicyVersion, req.ReviewPolicySHA256,
-		req.CommitTree, req.WorkflowDigest)
+		req.CommitTree, req.WorkflowDigest, req.SourceProvenanceRef, req.SourceRepoIdentity)
 	sum := sha256.Sum256([]byte(strings.Join(fields, "\x00")))
 	return "loom:" + hex.EncodeToString(sum[:]), nil
 }
@@ -710,7 +715,8 @@ func validateTriggerEnvelopeRequest(req DispatchRequest) error {
 		req.EvidenceJSON, req.PREventID, req.SourceCommit, req.SourceTree, req.PatchDigest,
 		req.RepoAddress, req.PolicyVersion, req.ReviewEventID, req.AuditEventID,
 		req.ReviewerPubkey, req.ReviewRootEventID, req.ReviewBaseCommit,
-		req.ReviewPolicyVersion, req.ReviewPolicySHA256, req.CommitTree, req.WorkflowDigest}
+		req.ReviewPolicyVersion, req.ReviewPolicySHA256, req.CommitTree, req.WorkflowDigest,
+		req.SourceProvenanceRef, req.SourceRepoIdentity}
 	for _, field := range binding {
 		if strings.TrimSpace(field) == "" {
 			return fmt.Errorf("complete reviewed trigger authorization is required")
@@ -721,6 +727,7 @@ func validateTriggerEnvelopeRequest(req DispatchRequest) error {
 		!validHexLength(req.ReviewEventID, 64) || !validHexLength(req.AuditEventID, 64) ||
 		!validHexLength(req.ReviewerPubkey, 64) || !validHexLength(req.ReviewRootEventID, 64) ||
 		!validHexLength(req.ReviewPolicySHA256, 64) || !validHexLength(req.WorkflowDigest, 64) ||
+		!validSourceProvenanceRef(req.SourceProvenanceRef) ||
 		(!validHexLength(req.SourceCommit, 40) && !validHexLength(req.SourceCommit, 64)) ||
 		(!validHexLength(req.SourceTree, 40) && !validHexLength(req.SourceTree, 64)) ||
 		(!validHexLength(req.ReviewBaseCommit, 40) && !validHexLength(req.ReviewBaseCommit, 64)) ||
@@ -737,10 +744,46 @@ func validateTriggerEnvelopeRequest(req DispatchRequest) error {
 			return fmt.Errorf("NIP-34 merge-trigger linkage is invalid")
 		}
 	}
+	identity, err := store.SanitizeSourceRepoIdentity(req.SourceRepoIdentity)
+	if err != nil || identity != req.SourceRepoIdentity {
+		return fmt.Errorf("source provenance repository identity is invalid")
+	}
+	if err := validateCredentialFreeCloneURL(req.CloneURL); err != nil {
+		return err
+	}
 	wantRepo := fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement,
 		strings.TrimSpace(req.OwnerPubkey), strings.TrimSpace(req.RepoID))
 	if strings.TrimSpace(req.RepoAddress) != wantRepo {
 		return fmt.Errorf("merge-trigger repository address does not match dispatch target")
+	}
+	return nil
+}
+
+func validSourceProvenanceRef(value string) bool {
+	return strings.HasPrefix(value, store.SourceProvenanceReferencePrefix) &&
+		validHexLength(strings.TrimPrefix(value, store.SourceProvenanceReferencePrefix), 64)
+}
+
+func validateCredentialFreeCloneURL(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.ContainsAny(raw, "\x00\r\n\t") {
+		return fmt.Errorf("credential-free immutable clone URL is required")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return fmt.Errorf("credential-free immutable clone URL is required")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		if u.Host == "" || u.Path == "" || u.Path == "/" {
+			return fmt.Errorf("credential-free immutable clone URL is required")
+		}
+	case "file":
+		if u.Host != "" || !filepath.IsAbs(u.Path) {
+			return fmt.Errorf("credential-free immutable clone URL is required")
+		}
+	default:
+		return fmt.Errorf("credential-free immutable clone URL is required")
 	}
 	return nil
 }
@@ -773,12 +816,20 @@ func buildWorkerCommand(template string, req DispatchRequest) (string, []string,
 	}
 	replacements := map[string]string{
 		"{clone_url}": req.CloneURL, "{commit}": req.CommitSHA, "{trigger}": req.Trigger,
-		"{workflow}": req.WorkflowPath, "{branch}": req.Branch,
+		"{workflow}":   req.WorkflowPath,
 		"{repository}": req.Owner + "/" + req.RepoName, "{repo_id}": req.RepoID,
 	}
-	for i := range words {
-		for old, replacement := range replacements {
-			words[i] = strings.ReplaceAll(words[i], old, replacement)
+	for i, word := range words {
+		if strings.Contains(word, "{branch}") {
+			return "", nil, fmt.Errorf("LOOM_JOB_CMD_TEMPLATE may not use mutable branch identity")
+		}
+		for placeholder := range replacements {
+			if strings.Contains(word, placeholder) && word != placeholder {
+				return "", nil, fmt.Errorf("LOOM_JOB_CMD_TEMPLATE request placeholders must be complete argv elements")
+			}
+		}
+		if replacement, ok := replacements[word]; ok {
+			words[i] = replacement
 		}
 	}
 	if strings.TrimSpace(words[0]) == "" {

@@ -145,7 +145,8 @@ func TestMergeStatusAcceptsConfiguredBridgeAuthor(t *testing.T) {
 	bridge := newFakeSigner(t)
 	runner := New(Config{Enabled: false, TriggerRepos: []string{"*"}}, fx.store, bridge, nil,
 		fx.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	runner.SetDispatchPolicyGate(allowDispatchGate{})
+	runner.SetDispatchPolicyGate(allowDispatchGate{baseCommit: fx.baseCommit})
+	runner.SetSourceProvenanceVerifier(allowSourceProvenanceVerifier{})
 	runner.SetRemoteDispatcher(remote, "remote")
 	status := fx.statusEvent(t, bridge.priv, false, fx.acceptedCommit, fx.stateCreatedAt+1)
 	if err := runner.HandleEvent(fx.ctx, status, ""); err != nil {
@@ -484,7 +485,8 @@ func TestSyntheticCanonicalKind1631Fixture(t *testing.T) {
 func newMergeRunner(fx *mergeFixture, remote *mergeRemoteDispatcher) *Runner {
 	runner := New(Config{Enabled: false, TriggerRepos: []string{"*"}}, fx.store, nil, nil,
 		fx.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	runner.SetDispatchPolicyGate(allowDispatchGate{})
+	runner.SetDispatchPolicyGate(allowDispatchGate{baseCommit: fx.baseCommit})
+	runner.SetSourceProvenanceVerifier(allowSourceProvenanceVerifier{})
 	runner.SetRemoteDispatcher(remote, "remote")
 	return runner
 }
@@ -562,6 +564,10 @@ func newMergeFixture(t *testing.T, withUpdate bool) *mergeFixture {
 		t.Fatal(err)
 	}
 	hiveGit(t, dir, "clone", "--bare", work, repoPath)
+	mapping.AnnouncedCloneURL = "file://" + filepath.ToSlash(work)
+	if err := st.UpsertMapping(ctx, mapping); err != nil {
+		t.Fatal(err)
+	}
 
 	fx := &mergeFixture{ctx: ctx, store: st, dbPath: dbPath, mapping: mapping, ownerPriv: ownerPriv,
 		contributorPriv: contributorPriv, repositoriesDir: repositoriesDir, repoPath: repoPath,
