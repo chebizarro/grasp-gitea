@@ -447,7 +447,7 @@ func parseMergeStatusTags(tags nostr.Tags) (mergeStatusTags, error) {
 	if rootID == "" || replyID == rootID {
 		return mergeStatusTags{}, fmt.Errorf("%w: exactly one distinct root linkage is required", ErrMalformedMergeStatus)
 	}
-	mergeCommit, err := strictSingleSHAValue(tags, "merge-commit")
+	mergeCommit, err := strictMergeCommitValue(tags)
 	if err != nil {
 		return mergeStatusTags{}, fmt.Errorf("%w: %v", ErrMalformedMergeStatus, err)
 	}
@@ -511,6 +511,23 @@ func strictExactlyOneTagValue(tags nostr.Tags, key string) (string, error) {
 	}
 	if value == "" {
 		return "", fmt.Errorf("missing %s tag", key)
+	}
+	return value, nil
+}
+
+func strictMergeCommitValue(tags nostr.Tags) (string, error) {
+	var value string
+	for _, tag := range tags {
+		if len(tag) == 0 || (tag[0] != "merge-commit" && tag[0] != "merge-commit-id") {
+			continue
+		}
+		if len(tag) != 2 || value != "" || !validCommitSHA.MatchString(strings.TrimSpace(tag[1])) {
+			return "", fmt.Errorf("exactly one valid merge-commit or merge-commit-id tag is required")
+		}
+		value = strings.TrimSpace(tag[1])
+	}
+	if value == "" {
+		return "", fmt.Errorf("missing merge-commit or merge-commit-id tag")
 	}
 	return value, nil
 }
