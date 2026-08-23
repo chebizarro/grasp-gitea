@@ -4,6 +4,7 @@
 package hiveci
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"fiatjaf.com/nostr"
 
 	"github.com/sharegap/grasp-gitea/internal/loom"
+	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -480,6 +482,163 @@ func TestSyntheticCanonicalKind1631Fixture(t *testing.T) {
 	if tags.rootID == "" || tags.replyID == "" || tags.mergeCommit == "" || tags.repoAddress == "" {
 		t.Fatalf("incomplete fixture tags: %#v", tags)
 	}
+}
+
+func TestRecordedCanonicalKind1631Fixtures(t *testing.T) {
+	events := readRecordedKind1631Events(t)
+	fx := newMergeFixture(t, false)
+	remote := &mergeRemoteDispatcher{}
+	runner := newMergeRunner(fx, remote)
+	parsedMergeStatuses := 0
+	amberIngests := 0
+
+	for i := range events {
+		ev := &events[i]
+		t.Run(ev.ID.Hex()[:12], func(t *testing.T) {
+			if ev.Kind != relay.KindStatusApplied {
+				t.Fatalf("kind = %d, want relay.KindStatusApplied", ev.Kind)
+			}
+			if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
+				t.Fatalf("recorded canonical event signature: %v", err)
+			}
+
+			repoAddress, err := strictRepoAddress(ev.Tags)
+			if err != nil {
+				t.Fatalf("recorded repository address: %v", err)
+			}
+			_, repoID, ok := parseRepoAddr(repoAddress)
+			if !ok {
+				t.Fatalf("parse repository address %q", repoAddress)
+			}
+
+			var rootID, replyID string
+			for _, tag := range ev.Tags {
+				if len(tag) < 4 || tag[0] != "e" {
+					continue
+				}
+				switch tag[3] {
+				case "root":
+					rootID = tag[1]
+				case "reply":
+					replyID = tag[1]
+				}
+			}
+			if !validEventIDString(rootID) {
+				t.Fatalf("invalid recorded root thread: %q", rootID)
+			}
+			if quoted := tagValue(ev.Tags, "q"); quoted != "" && quoted != rootID {
+				t.Fatalf("quoted proposal = %s, root = %s", quoted, rootID)
+			}
+
+			mergeCommit := tagValue(ev.Tags, "merge-commit-id")
+			if mergeCommit == "" {
+				mergeCommit = tagValue(ev.Tags, "merge-commit")
+			}
+			if mergeCommit == "" {
+				return
+			}
+			parsedMergeStatuses++
+			parsed, err := parseMergeStatusTags(ev.Tags)
+			if err != nil {
+				t.Fatalf("parse recorded canonical merge status: %v", err)
+			}
+			if parsed.repoAddress != repoAddress || parsed.rootID != rootID || parsed.replyID != replyID || parsed.mergeCommit != mergeCommit {
+				t.Fatalf("parsed tags = %#v, want repo=%s root=%s reply=%s commit=%s",
+					parsed, repoAddress, rootID, replyID, mergeCommit)
+			}
+
+			matchedR := false
+			for _, tag := range ev.Tags {
+				if len(tag) >= 2 && tag[0] == "r" && tag[1] == mergeCommit {
+					matchedR = true
+				}
+			}
+			if !matchedR {
+				t.Fatalf("merge commit %s has no matching r tag", mergeCommit)
+			}
+
+			if repoID == "Amber" {
+				amberIngests++
+				err := runner.HandleEvent(fx.ctx, ev, "wss://relay.sharegap.net")
+				want := fmt.Sprintf("%s: repository %s is not provisioned", ErrMissingPRLinkage, repoAddress)
+				if !errors.Is(err, ErrMissingPRLinkage) || err.Error() != want {
+					t.Fatalf("ingest error = %v, want %q", err, want)
+				}
+				assertNoMergeTrigger(t, fx, remote, ev.ID.Hex())
+			}
+		})
+	}
+	if parsedMergeStatuses != 15 {
+		t.Fatalf("parsed merge statuses = %d, want 15", parsedMergeStatuses)
+	}
+	if amberIngests != 11 {
+		t.Fatalf("Amber ingest attempts = %d, want 11", amberIngests)
+	}
+}
+
+func TestRecordedCanonicalKind1631FailsClosedOnAuthorization(t *testing.T) {
+	events := readRecordedKind1631Events(t)
+	var recorded *nostr.Event
+	var tags mergeStatusTags
+	for i := range events {
+		parsed, err := parseMergeStatusTags(events[i].Tags)
+		if err == nil && strings.HasSuffix(parsed.repoAddress, ":Amber") {
+			recorded = &events[i]
+			tags = parsed
+			break
+		}
+	}
+	if recorded == nil {
+		t.Fatal("recorded Amber merge status not found")
+	}
+
+	fx := newMergeFixture(t, false)
+	ownerPub, repoID, ok := parseRepoAddr(tags.repoAddress)
+	if !ok {
+		t.Fatalf("parse recorded repository address %q", tags.repoAddress)
+	}
+	if err := fx.store.UpsertMapping(fx.ctx, store.Mapping{
+		Npub: "npub1recorded", RepoID: repoID, Pubkey: ownerPub, Owner: "recorded", RepoName: repoID,
+		GiteaRepoID: 84, CloneURL: "https://git.example/recorded/Amber.git", SourceEvent: "recorded", HookInstalled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	remote := &mergeRemoteDispatcher{}
+	runner := newMergeRunner(fx, remote)
+	runner.SetWorkflowAuthorizer(mergeAuthorizer{})
+	err := runner.HandleEvent(fx.ctx, recorded, "wss://relay.sharegap.net")
+	want := fmt.Sprintf("%s: signer %s", ErrUnauthorizedMergeStatus, recorded.PubKey.Hex())
+	if !errors.Is(err, ErrUnauthorizedMergeStatus) || err.Error() != want {
+		t.Fatalf("ingest error = %v, want %q", err, want)
+	}
+	assertNoMergeTrigger(t, fx, remote, recorded.ID.Hex())
+}
+
+func readRecordedKind1631Events(t *testing.T) []nostr.Event {
+	t.Helper()
+	file, err := os.Open(filepath.Join("testdata", "recorded-kind-1631.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	var events []nostr.Event
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var ev nostr.Event
+		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
+			t.Fatalf("decode recorded event line %d: %v", len(events)+1, err)
+		}
+		events = append(events, ev)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 20 {
+		t.Fatalf("recorded events = %d, want 20", len(events))
+	}
+	return events
 }
 
 func newMergeRunner(fx *mergeFixture, remote *mergeRemoteDispatcher) *Runner {
