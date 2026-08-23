@@ -23,6 +23,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/nostrprofile"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
+	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -34,11 +35,17 @@ type Service struct {
 	logger    *slog.Logger
 	installer *hooks.Installer
 	resolver  *nip05resolve.Resolver
+	policy    *policy.Store
 
 	// repoMu serializes provisioning per (npub, repoID) to prevent concurrent
 	// races when multiple events for the same repo arrive simultaneously.
 	repoMu    sync.Mutex
 	repoLocks map[string]*sync.Mutex
+}
+
+// SetPolicyStore makes repository admission consult live policy snapshots.
+func (s *Service) SetPolicyStore(store *policy.Store) {
+	s.policy = store
 }
 
 type Result struct {
@@ -425,9 +432,13 @@ func (s *Service) EnsureUploadPackCapabilities(ctx context.Context) error {
 }
 
 func (s *Service) validatePolicy(ctx context.Context, npub string, pubkey string) error {
-	if s.cfg.AllowlistEnabled() {
-		if _, ok := s.cfg.PubkeyAllowlist[pubkey]; !ok {
-			if _, ok := s.cfg.PubkeyAllowlist[npub]; !ok {
+	allowlist := s.cfg.PubkeyAllowlist
+	if snapshot := s.policy.Current(); snapshot != nil {
+		allowlist = snapshot.PubkeyAllowlist
+	}
+	if len(allowlist) > 0 {
+		if _, ok := allowlist[pubkey]; !ok {
+			if _, ok := allowlist[npub]; !ok {
 				return fmt.Errorf("pubkey %s not allowlisted", pubkey)
 			}
 		}

@@ -21,6 +21,7 @@ import (
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/nostrstate"
+	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -47,6 +48,7 @@ type Service struct {
 	ciEnabled      bool
 	ciTriggerRepos []string
 	ciDedup        *ciDedup
+	policy         *policy.Store
 }
 
 // StateSigner reports whether user grant signing is available.

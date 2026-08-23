@@ -22,6 +22,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/nostrauthz"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
+	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/purgatory"
 	"github.com/sharegap/grasp-gitea/internal/relay"
@@ -180,7 +181,7 @@ func relayStateOwnerHints(ev *nostr.Event, repoID string) map[string]struct{} {
 	return hints
 }
 
-func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Logger) (string, http.Handler, func(context.Context) error, error) {
+func startEmbeddedRelay(ctx context.Context, cfg config.Config, policies *policy.Store, logger *slog.Logger) (string, http.Handler, func(context.Context) error, error) {
 	if !cfg.EmbeddedRelay {
 		return "", nil, func(context.Context) error { return nil }, nil
 	}
@@ -297,7 +298,7 @@ func startEmbeddedRelay(ctx context.Context, cfg config.Config, logger *slog.Log
 	}
 	go purgatorySvc.Run(ctx, 30*time.Second)
 
-	relayRootHandler := graspNIP11Handler(r, cfg)
+	relayRootHandler := graspNIP11Handler(r, cfg, policies)
 	addr := fmt.Sprintf(":%d", cfg.EmbeddedRelayPort)
 	httpServer := &http.Server{Addr: addr, Handler: relayRootHandler}
 	go func() {
@@ -475,17 +476,17 @@ func makeRepoPathResolver(cfg config.Config, mappings *store.SQLiteStore, stateR
 	}
 }
 
-func graspNIP11Handler(relayHandler *khatru.Relay, cfg config.Config) http.Handler {
+func graspNIP11Handler(relayHandler *khatru.Relay, cfg config.Config, policies *policy.Store) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.Header.Get("Accept"), "application/nostr+json") {
-			writeGRASPNIP11(w, relayHandler, cfg)
+			writeGRASPNIP11(w, relayHandler, cfg, policies)
 			return
 		}
 		relayHandler.ServeHTTP(w, r)
 	})
 }
 
-func writeGRASPNIP11(w http.ResponseWriter, relayHandler *khatru.Relay, cfg config.Config) {
+func writeGRASPNIP11(w http.ResponseWriter, relayHandler *khatru.Relay, cfg config.Config, policies *policy.Store) {
 	w.Header().Set("Content-Type", "application/nostr+json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
@@ -514,7 +515,11 @@ func writeGRASPNIP11(w http.ResponseWriter, relayHandler *khatru.Relay, cfg conf
 	// passes validation (beads phase1-t7j).
 	doc["supported_grasps"] = []string{"GRASP-01"}
 	doc["repo_acceptance_criteria"] = "Repository announcements must list this service in clone and relays tags; collaboration events must reference a hosted repository or accepted issue, patch, or pull request."
-	if cfg.AllowlistEnabled() {
+	allowlistEnabled := cfg.AllowlistEnabled()
+	if snapshot := policies.Current(); snapshot != nil {
+		allowlistEnabled = len(snapshot.PubkeyAllowlist) > 0
+	}
+	if allowlistEnabled {
 		doc["curation"] = "Repository announcements are limited to the configured pubkey allowlist."
 	}
 	_ = json.NewEncoder(w).Encode(doc)

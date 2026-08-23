@@ -127,6 +127,11 @@ AUTH_AUDIT_RETENTION=2160h
 SHUTDOWN_GRACE=5m
 ```
 
+Send `SIGHUP` to `grasp-bridge` to reload `PUBKEY_ALLOWLIST`, `CI_ENABLED`, and
+`CI_TRIGGER_REPOS` from the environment. Invalid configuration leaves the
+current policy active. Relay endpoint and all other configuration changes still
+require a restart.
+
 `SIGNER_MASTER_KEY` enables the persistent NIP-46 signer subsystem. With it set, owner and contributor events are unsigned templates until the outbound queue obtains the user's bunker signature. Without it, the bridge intentionally remains in legacy bridge-signed transition mode for bridge-originated owner state; contributor events from unlinked actors are skipped and counted as `unlinked_actor_skipped`.
 
 ## Nostr authentication for Gitea HTTP surfaces

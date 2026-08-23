@@ -27,6 +27,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/loom"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/outbox"
+	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
 	"github.com/sharegap/grasp-gitea/internal/profilesync"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
@@ -67,6 +68,15 @@ func relaySubscriptionURLs(configured []string, embeddedURL string, publicEmbedd
 	return mergeRelayURLs(filtered, embeddedURL)
 }
 
+func relayEndpointsDiffer(current, next config.Config) bool {
+	return !slices.Equal(current.RelayURLs, next.RelayURLs) ||
+		!slices.Equal(current.LoomRelayURLs, next.LoomRelayURLs) ||
+		current.GraspRelayURL != next.GraspRelayURL ||
+		current.HookRelayURL != next.HookRelayURL ||
+		current.EmbeddedRelay != next.EmbeddedRelay ||
+		current.EmbeddedRelayPort != next.EmbeddedRelayPort
+}
+
 func newServerSigner(ctx context.Context, cfg config.Config, st *store.SQLiteStore, relayURLs []string, logger *slog.Logger) (publisher.ServerSigner, error) {
 	if cfg.SignetBunkerURL != "" {
 		if cfg.Production() && len(cfg.SignerMasterKey) != 32 {
@@ -99,6 +109,7 @@ func main() {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
+	policies := policy.New(cfg)
 
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
@@ -111,6 +122,7 @@ func main() {
 	hookInstaller := hooks.NewInstaller(cfg.GiteaRepositoriesDir, cfg.HookBinaryPath, cfg.HookRelayURL)
 	nip05Resolver := nip05resolve.NewResolver(5 * time.Minute)
 	provisionerSvc := provisioner.New(cfg, st, giteaClient, hookInstaller, nip05Resolver, logger)
+	provisionerSvc.SetPolicyStore(policies)
 
 	// Reconcile any provisioning that was interrupted by a previous crash.
 	// This re-installs hooks for mappings saved with hook_installed=false.
@@ -129,8 +141,30 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	reloadSignals := make(chan os.Signal, 1)
+	signal.Notify(reloadSignals, syscall.SIGHUP)
+	defer signal.Stop(reloadSignals)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reloadSignals:
+				next, loadErr := config.Load()
+				if loadErr != nil {
+					logger.Error("policy reload failed; keeping current policy", "error", loadErr)
+					continue
+				}
+				if relayEndpointsDiffer(cfg, next) {
+					logger.Warn("relay endpoint configuration changed on SIGHUP; relay changes require a restart")
+				}
+				policies.Store(next)
+				logger.Info("policy reloaded", "pubkey_allowlist_entries", len(next.PubkeyAllowlist), "ci_enabled", next.CIEnabled, "ci_trigger_repos", next.CITriggerRepos)
+			}
+		}
+	}()
 
-	embeddedRelayURL, relayRootHandler, shutdownEmbedded, err := startEmbeddedRelay(ctx, cfg, logger)
+	embeddedRelayURL, relayRootHandler, shutdownEmbedded, err := startEmbeddedRelay(ctx, cfg, policies, logger)
 	if err != nil {
 		logger.Error("failed to start embedded relay", "error", err)
 		os.Exit(1)
@@ -189,8 +223,8 @@ func main() {
 		defer closer.Close()
 	}
 	publisherSvc := publisher.NewWithServerSigner(serverSigner, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
+	publisherSvc.SetPolicyStore(policies)
 	if cfg.CIEnabled && cfg.CIProtocol == "cascadia" && publisherSvc.Enabled() {
-		publisherSvc.SetCIConfig(true, cfg.CITriggerRepos)
 		logger.Warn("legacy Cascadia CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
 	} else if cfg.CIEnabled && cfg.CIProtocol == "canonical" {
 		logger.Info("canonical CI uses the Loom dispatcher; legacy CI_ENABLED publisher remains disabled")
@@ -250,6 +284,7 @@ func main() {
 		RunTimeout:    cfg.HiveCIRunTimeout,
 		MaxConcurrent: cfg.HiveCIMaxConcurrent,
 	}, st, serverSigner, relayURLs, cfg.GiteaRepositoriesDir, logger)
+	hiveRunner.SetPolicyStore(policies)
 	hiveRunner.SetStatusSink(statusSink, cfg.LoomStatusContextPrefix)
 	hiveRunner.SetWorkflowAuthorizer(proactiveSyncSvc)
 	hiveRunner.SetRemoteDispatcher(loomDispatcher, cfg.LoomDispatchMode)

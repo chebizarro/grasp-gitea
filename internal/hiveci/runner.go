@@ -29,6 +29,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/loom"
 	"github.com/sharegap/grasp-gitea/internal/nostrauthz"
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
+	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -82,6 +83,7 @@ type Runner struct {
 	runTimeout      time.Duration
 	runSlots        chan struct{}
 	triggerRepos    []string
+	policy          *policy.Store
 
 	mu      sync.Mutex
 	started map[string]time.Time
@@ -92,6 +94,13 @@ type Runner struct {
 	remote       RemoteDispatcher
 	dispatchMode string
 	authorizer   WorkflowAuthorizer
+}
+
+// SetPolicyStore makes local and remote CI dispatch consult live policy snapshots.
+func (r *Runner) SetPolicyStore(store *policy.Store) {
+	if r != nil {
+		r.policy = store
+	}
 }
 
 type WorkflowAuthorizer interface {
@@ -583,7 +592,11 @@ func (r *Runner) mappingForAddress(ctx context.Context, ev *nostr.Event) (store.
 
 func (r *Runner) isRepoCIAllowed(owner, repoID string) bool {
 	target := strings.TrimSpace(owner) + "/" + strings.TrimSpace(repoID)
-	for _, entry := range r.triggerRepos {
+	triggerRepos := r.triggerRepos
+	if snapshot := r.policy.Current(); snapshot != nil {
+		triggerRepos = snapshot.CITriggerRepos
+	}
+	for _, entry := range triggerRepos {
 		entry = strings.TrimSpace(entry)
 		if entry == "*" || entry == target {
 			return true

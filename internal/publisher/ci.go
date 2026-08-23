@@ -22,6 +22,7 @@ import (
 	cascadia "git.sharegap.net/cascadia/cascadia-go"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
+	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -89,8 +90,19 @@ func (s *Service) SetCIConfig(enabled bool, triggerRepos []string) {
 	s.ciDedup = newCIDedup()
 }
 
+// SetPolicyStore makes CI decisions consult live policy snapshots.
+func (s *Service) SetPolicyStore(store *policy.Store) {
+	s.policy = store
+	if s.ciDedup == nil {
+		s.ciDedup = newCIDedup()
+	}
+}
+
 // CIEnabled reports whether CI workflow-run publishing is active.
 func (s *Service) CIEnabled() bool {
+	if snapshot := s.policy.Current(); snapshot != nil {
+		return s.Enabled() && snapshot.CIEnabled
+	}
 	return s.Enabled() && s.ciEnabled
 }
 
@@ -214,7 +226,11 @@ func (s *Service) HandleStateEventCI(ctx context.Context, ev *nostr.Event, sourc
 
 // isRepoCIAllowed checks whether a repo is in the CI trigger allowlist.
 func (s *Service) isRepoCIAllowed(owner, repoID string) bool {
-	for _, entry := range s.ciTriggerRepos {
+	triggerRepos := s.ciTriggerRepos
+	if snapshot := s.policy.Current(); snapshot != nil {
+		triggerRepos = snapshot.CITriggerRepos
+	}
+	for _, entry := range triggerRepos {
 		if entry == "*" {
 			return true
 		}

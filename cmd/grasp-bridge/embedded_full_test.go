@@ -106,7 +106,7 @@ func TestEmbeddedRelayNIP11AdvertisesGRASPFields(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept", "application/nostr+json")
 	rec := httptest.NewRecorder()
-	graspNIP11Handler(rl, config.Config{}).ServeHTTP(rec, req)
+	graspNIP11Handler(rl, config.Config{}, nil).ServeHTTP(rec, req)
 
 	if rec.Code != 200 {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
@@ -146,7 +146,7 @@ func TestEmbeddedRelayNIP11IncludesCurationWhenAllowlisted(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept", "application/nostr+json")
 	rec := httptest.NewRecorder()
-	graspNIP11Handler(khatru.NewRelay(), config.Config{PubkeyAllowlist: map[string]struct{}{"pk": {}}}).ServeHTTP(rec, req)
+	graspNIP11Handler(khatru.NewRelay(), config.Config{PubkeyAllowlist: map[string]struct{}{"pk": {}}}, nil).ServeHTTP(rec, req)
 
 	var doc map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
