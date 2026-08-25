@@ -94,6 +94,54 @@ func TestHandleStateEventUnprovisionedRepo(t *testing.T) {
 	}
 }
 
+func TestAuthorizeStateEventAllowsManualMappingOwnerOnly(t *testing.T) {
+	ctx := context.Background()
+	ownerPriv := nostr.Generate().Hex()
+	ownerPub, err := derivePubHex(ownerPriv)
+	if err != nil {
+		t.Fatalf("owner public key: %v", err)
+	}
+	ownerPK, err := nostr.PubKeyFromHex(ownerPub)
+	if err != nil {
+		t.Fatalf("owner pubkey: %v", err)
+	}
+	repoID := "project"
+	mapping := store.Mapping{
+		Npub:     nip19.EncodeNpub(ownerPK),
+		RepoID:   repoID,
+		Pubkey:   ownerPub,
+		Owner:    "alice",
+		RepoName: repoID,
+	}
+	st := &stubStore{
+		stubResolver: stubResolver{mappings: map[string]store.Mapping{mapping.Npub + "/" + repoID: mapping}},
+		mappingsList: []store.Mapping{mapping},
+	}
+	svc := New(t.TempDir(), st, testLogger())
+
+	ownerState := signedTestEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", repoID},
+		{"refs/heads/main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	})
+	if err := svc.AuthorizeStateEvent(ctx, ownerState); err != nil {
+		t.Fatalf("owner state rejected for manual mapping: %v", err)
+	}
+	ok, err := svc.IsWorkflowAuthorAuthorized(ctx, mapping, ownerPub)
+	if err != nil || !ok {
+		t.Fatalf("owner workflow author = %v, %v; want true", ok, err)
+	}
+
+	attackerPriv := nostr.Generate().Hex()
+	attackerState := signedTestEvent(t, attackerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", repoID},
+		{"p", ownerPub},
+		{"refs/heads/main", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+	})
+	if err := svc.AuthorizeStateEvent(ctx, attackerState); err == nil {
+		t.Fatal("attacker state was accepted")
+	}
+}
+
 func TestValidRefPattern(t *testing.T) {
 	tests := []struct {
 		ref   string

@@ -3,6 +3,7 @@ package proactivesync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -161,6 +162,9 @@ func (s *Service) IsWorkflowAuthorAuthorized(ctx context.Context, mapping store.
 	}
 	events, confirmedCurrentOwner, err := s.authorityEvents(ctx, mapping)
 	if err != nil {
+		if errors.Is(err, nostrauthz.ErrAuthorityUnavailable) && authorKey.Hex() == mapping.Pubkey {
+			return true, nil
+		}
 		return false, err
 	}
 	ok, err := nostrauthz.NewResolver(events).IsAuthorized(authorKey.Hex(), repoCoordinate(mapping))
@@ -230,6 +234,11 @@ func (s *Service) resolveStateMapping(ctx context.Context, ev *nostr.Event) (sto
 	for _, mapping := range candidates {
 		events, confirmedCurrentOwner, err := s.authorityEvents(ctx, mapping)
 		if err != nil {
+			if errors.Is(err, nostrauthz.ErrAuthorityUnavailable) && signer == mapping.Pubkey {
+				resolvedAuthority = true
+				authorized = append(authorized, mapping)
+				continue
+			}
 			authorityErr = err
 			continue
 		}
