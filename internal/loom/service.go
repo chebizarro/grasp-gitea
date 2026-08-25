@@ -87,7 +87,9 @@ func New(cfg Config, st JobStore, sink StatusSink, logger *slog.Logger) *Service
 
 func (s *Service) Enabled() bool { return s != nil && s.enabled }
 
-// HandleEvent validates and enqueues without blocking on Gitea.
+// HandleEvent validates and enqueues without blocking on Gitea. The relay
+// subscriber is allowed to apply backpressure here; dropping terminal result
+// events would strand otherwise-complete workflow runs.
 func (s *Service) HandleEvent(ctx context.Context, ev *nostr.Event, _ string) error {
 	if !s.Enabled() || ev == nil || !isInboundKind(ev.Kind) {
 		return nil
@@ -102,8 +104,6 @@ func (s *Service) HandleEvent(ctx context.Context, ev *nostr.Event, _ string) er
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
-	default:
-		return fmt.Errorf("Loom inbound queue is full")
 	}
 }
 

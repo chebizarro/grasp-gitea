@@ -14,6 +14,38 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
+func TestHandleEventBackpressuresWhenQueueFull(t *testing.T) {
+	worker := nostr.Generate()
+	job := store.LoomJob{WorkflowRunID: "run", JobRequestID: "request",
+		WorkerPub: worker.Public().Hex(), Owner: "alice", RepoName: "repo",
+		RepoID: "r", CommitSHA: "abc", WorkflowPath: "ci.yml"}
+	svc := New(Config{Enabled: true, QueueSize: 1}, fixedJobStore{job}, &captureSink{}, nil)
+
+	first := nostr.Event{PubKey: worker.Public(), Kind: relay.KindLoomJobStatus,
+		CreatedAt: nostr.Now(), Tags: nostr.Tags{{"d", "request"}, {"e", "request"}, {"status", "running"}}}
+	if err := first.Sign(worker); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.HandleEvent(context.Background(), &first, "relay"); err != nil {
+		t.Fatalf("first event enqueue: %v", err)
+	}
+
+	second := nostr.Event{PubKey: worker.Public(), Kind: relay.KindLoomJobStatus,
+		CreatedAt: nostr.Now(), Tags: nostr.Tags{{"d", "request"}, {"e", "request"}, {"status", "running"}}}
+	if err := second.Sign(worker); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := svc.HandleEvent(ctx, &second, "relay")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("HandleEvent() error = %v, want context deadline", err)
+	}
+	if strings.Contains(err.Error(), "queue is full") {
+		t.Fatalf("HandleEvent() dropped event instead of applying backpressure: %v", err)
+	}
+}
+
 func TestMapResultTerminalStates(t *testing.T) {
 	tests := []struct {
 		name    string
