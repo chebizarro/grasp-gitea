@@ -193,7 +193,14 @@ func TestBuildWorkerCommandDefaultUsesIsolatedWorkspace(t *testing.T) {
 		t.Fatalf("default command = %q %#v", cmd, args)
 	}
 	script := args[1]
-	for _, want := range []string{"mktemp -d", "trap 'rm -rf \"$workdir\"' EXIT", "$workdir/repo"} {
+	for _, want := range []string{
+		"mktemp -d",
+		"trap 'rm -rf \"$workdir\"' EXIT",
+		"$workdir/repo",
+		"${HOME:-}/.docker/config.json",
+		"--container-options",
+		"/root/.docker:ro",
+	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("default script missing %q: %s", want, script)
 		}

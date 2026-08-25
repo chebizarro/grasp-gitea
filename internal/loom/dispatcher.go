@@ -533,7 +533,7 @@ func dispatchKey(req DispatchRequest) (string, error) {
 func buildWorkerCommand(template string, req DispatchRequest) (string, []string, error) {
 	if strings.TrimSpace(template) == "" {
 		return "sh", []string{"-c",
-			`workdir=$(mktemp -d "${TMPDIR:-/tmp}/hive-ci.XXXXXX") && trap 'rm -rf "$workdir"' EXIT && git clone --no-checkout "$1" "$workdir/repo" && git -C "$workdir/repo" checkout --detach "$2" && cd "$workdir/repo" && act "$3" -W "$4" --rm`,
+			`workdir=$(mktemp -d "${TMPDIR:-/tmp}/hive-ci.XXXXXX") && trap 'rm -rf "$workdir"' EXIT && git clone --no-checkout "$1" "$workdir/repo" && git -C "$workdir/repo" checkout --detach "$2" && cd "$workdir/repo" && if [ -f "${HOME:-}/.docker/config.json" ]; then act "$3" -W "$4" --rm --container-options "-v ${HOME}/.docker:/root/.docker:ro"; else act "$3" -W "$4" --rm; fi`,
 			"hive-ci", req.CloneURL, req.CommitSHA, req.Trigger, req.WorkflowPath}, nil
 	}
 	var words []string
