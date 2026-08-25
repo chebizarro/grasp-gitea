@@ -198,8 +198,9 @@ func TestBuildWorkerCommandDefaultUsesIsolatedWorkspace(t *testing.T) {
 		"trap 'rm -rf \"$workdir\"' EXIT",
 		"$workdir/repo",
 		"${HOME:-}/.docker/config.json",
+		"$workdir/docker-config",
 		"--container-options",
-		"/root/.docker:ro",
+		"/root/.docker",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("default script missing %q: %s", want, script)
