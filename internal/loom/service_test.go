@@ -146,6 +146,12 @@ func TestProcessEventVerifiesWorkflowPublisherAndRequesterEcho(t *testing.T) {
 	sink := &captureSink{}
 	svc := New(Config{Enabled: true}, fixedJobStore{job}, sink, nil)
 
+	status := &nostr.Event{PubKey: worker.Public(), ID: nostr.ID{2}, Kind: relay.KindLoomJobStatus,
+		CreatedAt: nostr.Now(), Tags: nostr.Tags{{"d", request.ID.Hex()}, {"e", request.ID.Hex()}, {"status", "running"}}}
+	if err := svc.processEvent(context.Background(), status); err != nil {
+		t.Fatalf("worker status without requester echo rejected: %v", err)
+	}
+
 	result := &nostr.Event{PubKey: worker.Public(), ID: nostr.ID{3}, Kind: relay.KindLoomJobResult,
 		CreatedAt: nostr.Now(), Tags: nostr.Tags{{"e", request.ID.Hex()}, {"p", attacker.Public().Hex()}},
 		Content: `{"success":true}`}
@@ -177,8 +183,8 @@ func TestProcessEventVerifiesWorkflowPublisherAndRequesterEcho(t *testing.T) {
 	if err := svc.processEvent(context.Background(), workflow); err != nil {
 		t.Fatalf("delegated publisher result rejected: %v", err)
 	}
-	if len(sink.statuses) != 2 {
-		t.Fatalf("accepted statuses = %d, want 2", len(sink.statuses))
+	if len(sink.statuses) != 3 {
+		t.Fatalf("accepted statuses = %d, want 3", len(sink.statuses))
 	}
 }
 

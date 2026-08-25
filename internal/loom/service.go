@@ -162,8 +162,10 @@ func (s *Service) processEvent(ctx context.Context, ev *nostr.Event) error {
 		} else if d := tagValue(ev.Tags, "d"); d != "" && d != job.JobRequestID {
 			return fmt.Errorf("job result d reference does not match dispatch")
 		}
-		if err := validateRequesterEcho(job, ev.Tags); err != nil {
-			return err
+		if ev.Kind == relay.KindLoomJobResult {
+			if err := validateRequesterEcho(job, ev.Tags); err != nil {
+				return err
+			}
 		}
 	case relay.KindHiveWorkflowResult:
 		ref := tagValue(ev.Tags, "e")
