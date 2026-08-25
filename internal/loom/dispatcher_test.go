@@ -148,6 +148,26 @@ func TestWorkerPoolRejectsPricedCurrentAdWithoutTrustedUnpaidFeature(t *testing.
 	}
 }
 
+func TestBuildWorkerCommandDefaultUsesIsolatedWorkspace(t *testing.T) {
+	req := testDispatchRequest(nostr.Generate().Public().Hex())
+	cmd, args, err := buildWorkerCommand("", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd != "sh" || len(args) != 7 {
+		t.Fatalf("default command = %q %#v", cmd, args)
+	}
+	script := args[1]
+	for _, want := range []string{"mktemp -d", "trap 'rm -rf \"$workdir\"' EXIT", "$workdir/repo"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("default script missing %q: %s", want, script)
+		}
+	}
+	if args[3] != req.CloneURL || args[4] != req.CommitSHA || args[5] != req.Trigger || args[6] != req.WorkflowPath {
+		t.Fatalf("default command args = %#v", args)
+	}
+}
+
 func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "loom.db"))
