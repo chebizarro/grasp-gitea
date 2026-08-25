@@ -51,6 +51,27 @@ func signedWorkerAd(t *testing.T, worker nostr.SecretKey, created time.Time, sof
 	return ev
 }
 
+func signedCurrentWorkerAd(t *testing.T, worker nostr.SecretKey, created time.Time, trustedUnpaid bool) *nostr.Event {
+	t.Helper()
+	content := `{"capabilities":{"features":[]}}`
+	if trustedUnpaid {
+		content = `{"capabilities":{"features":["trusted_unpaid_internal_jobs"]}}`
+	}
+	ev := &nostr.Event{
+		Kind: relay.KindLoomWorkerAd, CreatedAt: nostr.Timestamp(created.Unix()),
+		Tags: nostr.Tags{
+			{"S", "act", "0.2.89", "/usr/local/bin/act"},
+			{"price", "cashu", "0.1", "sat", "https://mint.sharegap.net"},
+			{"metric", "second"}, {"min_duration", "10"}, {"max_duration", "3600"},
+		},
+		Content: content,
+	}
+	if err := ev.Sign(worker); err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
 func TestWorkerPoolAllowlistCanonicalLatestAndPaymentGate(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	worker := nostr.Generate()
@@ -96,9 +117,34 @@ func TestWorkerPoolAllowlistCanonicalLatestAndPaymentGate(t *testing.T) {
 	if _, ok := pool.Select(now.Add(time.Second), 15*time.Minute, true); !ok {
 		t.Fatal("priced worker rejected with static payment configured")
 	}
+	trustedPriced := signedCurrentWorkerAd(t, worker, now.Add(2*time.Second), true)
+	if err := pool.HandleEvent(trustedPriced, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := pool.Select(now.Add(2*time.Second), 30*time.Minute, false); !ok {
+		t.Fatal("trusted unpaid worker rejected in trusted-fleet mode")
+	}
 	future := signedWorkerAd(t, worker, now.Add(2*time.Minute), "act", "0")
 	if err := pool.HandleEvent(future, now); err == nil {
 		t.Fatal("future-skewed worker advertisement accepted")
+	}
+}
+
+func TestWorkerPoolRejectsPricedCurrentAdWithoutTrustedUnpaidFeature(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	worker := nostr.Generate()
+	pool := NewWorkerPool(WorkerPoolConfig{
+		Allowlist: []string{worker.Public().Hex()}, RequiredSoftware: []string{"act"},
+		AdTTL: time.Hour, FutureSkew: time.Minute,
+	})
+	if err := pool.HandleEvent(signedCurrentWorkerAd(t, worker, now, false), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := pool.Select(now, 30*time.Minute, false); ok {
+		t.Fatal("priced current-format worker selected without payment or trusted unpaid feature")
+	}
+	if selected, ok := pool.SelectForMint(now, 30*time.Minute, "https://mint.sharegap.net"); !ok || selected.Prices["https://mint.sharegap.net"] != 1 {
+		t.Fatalf("current-format Cashu price not selectable in paid mode: %#v %v", selected.Prices, ok)
 	}
 }
 

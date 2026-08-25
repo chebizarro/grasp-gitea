@@ -1,7 +1,9 @@
 package loom
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +33,7 @@ type WorkerAd struct {
 	MinDuration     time.Duration
 	MaxDuration     time.Duration
 	RequiresPayment bool
+	TrustedUnpaid   bool
 	Prices          map[string]uint64
 }
 
@@ -173,7 +176,7 @@ func (p *WorkerPool) eligible(ad WorkerAd, jobBound time.Duration, paymentConfig
 	if ad.MinDuration > jobBound || ad.MaxDuration < jobBound {
 		return false
 	}
-	if ad.RequiresPayment && !paymentConfigured {
+	if ad.RequiresPayment && !paymentConfigured && !ad.TrustedUnpaid {
 		return false
 	}
 	return true
@@ -181,6 +184,7 @@ func (p *WorkerPool) eligible(ad WorkerAd, jobBound time.Duration, paymentConfig
 
 func parseWorkerAd(ev nostr.Event) (WorkerAd, error) {
 	ad := WorkerAd{Event: ev, Software: map[string]string{}, Prices: map[string]uint64{}}
+	ad.TrustedUnpaid = workerAdHasFeature(ev.Content, "trusted_unpaid_internal_jobs")
 	var minSet, maxSet bool
 	for _, tag := range ev.Tags {
 		if len(tag) < 2 {
@@ -209,14 +213,15 @@ func parseWorkerAd(ev nostr.Event) (WorkerAd, error) {
 				ad.MaxDuration, maxSet = duration, true
 			}
 		case "price":
-			if len(tag) < 4 {
+			mintRaw, priceRaw, unitRaw, err := workerPriceTag(tag)
+			if err != nil {
 				return WorkerAd{}, fmt.Errorf("malformed worker price")
 			}
-			mintURL, err := cashu.NormalizeMintURL(tag[1])
-			if err != nil || !strings.EqualFold(strings.TrimSpace(tag[3]), "sat") {
+			mintURL, err := cashu.NormalizeMintURL(mintRaw)
+			if err != nil || !strings.EqualFold(strings.TrimSpace(unitRaw), "sat") {
 				return WorkerAd{}, fmt.Errorf("invalid worker price mint/unit")
 			}
-			price, err := strconv.ParseUint(strings.TrimSpace(tag[2]), 10, 64)
+			price, err := parseAdvertisedPrice(priceRaw)
 			if err != nil {
 				return WorkerAd{}, fmt.Errorf("invalid worker price")
 			}
@@ -232,6 +237,57 @@ func parseWorkerAd(ev nostr.Event) (WorkerAd, error) {
 		return WorkerAd{}, fmt.Errorf("invalid worker duration bounds")
 	}
 	return ad, nil
+}
+
+func workerPriceTag(tag nostr.Tag) (mintURL, price, unit string, err error) {
+	if len(tag) >= 5 && strings.EqualFold(strings.TrimSpace(tag[1]), "cashu") {
+		return tag[4], tag[2], tag[3], nil
+	}
+	if len(tag) >= 4 {
+		return tag[1], tag[2], tag[3], nil
+	}
+	return "", "", "", fmt.Errorf("too few fields")
+}
+
+func parseAdvertisedPrice(raw string) (uint64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, fmt.Errorf("empty price")
+	}
+	if !strings.ContainsAny(raw, ".eE") {
+		return strconv.ParseUint(raw, 10, 64)
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, fmt.Errorf("invalid decimal price")
+	}
+	if value == 0 {
+		return 0, nil
+	}
+	if value > float64(^uint64(0)) {
+		return 0, fmt.Errorf("decimal price overflows uint64")
+	}
+	// Cashu tokens are integer sats; round fractional sat/sec advertisements up
+	// if a future paid dispatcher uses this path. Trusted mode only uses the
+	// non-zero price as a payment-required signal.
+	return uint64(math.Ceil(value)), nil
+}
+
+func workerAdHasFeature(content, feature string) bool {
+	var payload struct {
+		Capabilities struct {
+			Features []string `json:"features"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal([]byte(content), &payload); err != nil {
+		return false
+	}
+	for _, candidate := range payload.Capabilities.Features {
+		if strings.EqualFold(strings.TrimSpace(candidate), feature) {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalNewer(candidate, current nostr.Event) bool {
