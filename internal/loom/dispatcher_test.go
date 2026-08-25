@@ -72,6 +72,16 @@ func signedCurrentWorkerAd(t *testing.T, worker nostr.SecretKey, created time.Ti
 	return ev
 }
 
+func signedCurrentWorkerAdWithQueue(t *testing.T, worker nostr.SecretKey, created time.Time, depth, max int) *nostr.Event {
+	t.Helper()
+	ev := signedCurrentWorkerAd(t, worker, created, true)
+	ev.Content = fmt.Sprintf(`{"max_concurrent_jobs":%d,"current_queue_depth":%d,"capabilities":{"features":["trusted_unpaid_internal_jobs"]}}`, max, depth)
+	if err := ev.Sign(worker); err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
 func TestWorkerPoolAllowlistCanonicalLatestAndPaymentGate(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	worker := nostr.Generate()
@@ -145,6 +155,31 @@ func TestWorkerPoolRejectsPricedCurrentAdWithoutTrustedUnpaidFeature(t *testing.
 	}
 	if selected, ok := pool.SelectForMint(now, 30*time.Minute, "https://mint.sharegap.net"); !ok || selected.Prices["https://mint.sharegap.net"] != 1 {
 		t.Fatalf("current-format Cashu price not selectable in paid mode: %#v %v", selected.Prices, ok)
+	}
+}
+
+func TestWorkerPoolSkipsFullWorkerAndAcceptsNewerCapacity(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	worker := nostr.Generate()
+	pool := NewWorkerPool(WorkerPoolConfig{
+		Allowlist: []string{worker.Public().Hex()}, RequiredSoftware: []string{"act"},
+		AdTTL: time.Hour, FutureSkew: time.Minute,
+	})
+	if err := pool.HandleEvent(signedCurrentWorkerAdWithQueue(t, worker, now, 4, 4), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := pool.Select(now, 30*time.Minute, false); ok {
+		t.Fatal("worker advertising a full queue was selected")
+	}
+	if err := pool.HandleEvent(signedCurrentWorkerAdWithQueue(t, worker, now.Add(time.Second), 3, 4), now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	selected, ok := pool.Select(now.Add(time.Second), 30*time.Minute, false)
+	if !ok {
+		t.Fatal("worker with available queue capacity was rejected")
+	}
+	if selected.QueueDepth != 3 || selected.MaxJobs != 4 {
+		t.Fatalf("queue telemetry = depth %d max %d, want 3/4", selected.QueueDepth, selected.MaxJobs)
 	}
 }
 

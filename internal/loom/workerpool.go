@@ -32,6 +32,8 @@ type WorkerAd struct {
 	Software        map[string]string
 	MinDuration     time.Duration
 	MaxDuration     time.Duration
+	MaxJobs         int
+	QueueDepth      int
 	RequiresPayment bool
 	TrustedUnpaid   bool
 	Prices          map[string]uint64
@@ -176,6 +178,9 @@ func (p *WorkerPool) eligible(ad WorkerAd, jobBound time.Duration, paymentConfig
 	if ad.MinDuration > jobBound || ad.MaxDuration < jobBound {
 		return false
 	}
+	if ad.MaxJobs > 0 && ad.QueueDepth >= ad.MaxJobs {
+		return false
+	}
 	if ad.RequiresPayment && !paymentConfigured && !ad.TrustedUnpaid {
 		return false
 	}
@@ -185,6 +190,7 @@ func (p *WorkerPool) eligible(ad WorkerAd, jobBound time.Duration, paymentConfig
 func parseWorkerAd(ev nostr.Event) (WorkerAd, error) {
 	ad := WorkerAd{Event: ev, Software: map[string]string{}, Prices: map[string]uint64{}}
 	ad.TrustedUnpaid = workerAdHasFeature(ev.Content, "trusted_unpaid_internal_jobs")
+	ad.MaxJobs, ad.QueueDepth = workerAdQueue(ev.Content)
 	var minSet, maxSet bool
 	for _, tag := range ev.Tags {
 		if len(tag) < 2 {
@@ -288,6 +294,23 @@ func workerAdHasFeature(content, feature string) bool {
 		}
 	}
 	return false
+}
+
+func workerAdQueue(content string) (maxJobs, queueDepth int) {
+	var payload struct {
+		MaxConcurrentJobs int `json:"max_concurrent_jobs"`
+		CurrentQueueDepth int `json:"current_queue_depth"`
+	}
+	if err := json.Unmarshal([]byte(content), &payload); err != nil {
+		return 0, 0
+	}
+	if payload.MaxConcurrentJobs < 0 {
+		payload.MaxConcurrentJobs = 0
+	}
+	if payload.CurrentQueueDepth < 0 {
+		payload.CurrentQueueDepth = 0
+	}
+	return payload.MaxConcurrentJobs, payload.CurrentQueueDepth
 }
 
 func canonicalNewer(candidate, current nostr.Event) bool {
