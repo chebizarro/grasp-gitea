@@ -230,6 +230,9 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 	defer mu.Unlock()
 
 	relayURLs := s.cfg.RelayURLs
+	if snapshot := s.policy.Current(); snapshot != nil {
+		relayURLs = snapshot.RelayURLs
+	}
 	if sourceRelay != "manual" && sourceRelay != "" {
 		// Try the source relay first (it just delivered this event, likely has kind 0 too).
 		relayURLs = append([]string{sourceRelay}, relayURLs...)
@@ -444,12 +447,16 @@ func (s *Service) validatePolicy(ctx context.Context, npub string, pubkey string
 		}
 	}
 
-	if s.cfg.ProvisionRateLimit > 0 {
+	rateLimit := s.cfg.ProvisionRateLimit
+	if snapshot := s.policy.Current(); snapshot != nil {
+		rateLimit = snapshot.ProvisionRateLimit
+	}
+	if rateLimit > 0 {
 		count, err := s.store.ProvisionCountSince(ctx, pubkey, time.Now().Add(-1*time.Hour))
 		if err != nil {
 			return err
 		}
-		if count >= s.cfg.ProvisionRateLimit {
+		if count >= rateLimit {
 			return fmt.Errorf("rate limit exceeded for pubkey %s", pubkey)
 		}
 	}
@@ -468,10 +475,14 @@ func getTagValue(tags nostr.Tags, key string) string {
 // serviceRelayURL returns the relay URL announcements must advertise: the
 // canonical GRASP relay origin when configured, otherwise the hook relay.
 func (s *Service) serviceRelayURL() string {
-	if s.cfg.GraspRelayURL != "" {
-		return s.cfg.GraspRelayURL
+	graspRelayURL, hookRelayURL := s.cfg.GraspRelayURL, s.cfg.HookRelayURL
+	if snapshot := s.policy.Current(); snapshot != nil {
+		graspRelayURL, hookRelayURL = snapshot.GraspRelayURL, snapshot.HookRelayURL
 	}
-	return s.cfg.HookRelayURL
+	if graspRelayURL != "" {
+		return graspRelayURL
+	}
+	return hookRelayURL
 }
 
 // findCloneForService accepts the canonical GRASP-01 npub-form clone URL

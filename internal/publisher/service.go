@@ -477,12 +477,20 @@ func (s *Service) PublishSigned(ctx context.Context, ev *nostr.Event) error {
 	return s.publishToRelays(ctx, ev)
 }
 
+func (s *Service) currentRelayURLs() []string {
+	if snapshot := s.policy.Current(); snapshot != nil {
+		return snapshot.RelayURLs
+	}
+	return s.relayURLs
+}
+
 // FetchEvent retrieves a single event by ID from the configured relays.
 // It queries relays in order and returns the first match. It returns
 // (nil, nil) when the event is not found on any relay (a normal condition,
 // not an error), and a non-nil error only when no relay could be queried.
 func (s *Service) FetchEvent(ctx context.Context, id string) (*nostr.Event, error) {
-	if len(s.relayURLs) == 0 {
+	relayURLs := s.currentRelayURLs()
+	if len(relayURLs) == 0 {
 		return nil, fmt.Errorf("no relay URLs configured")
 	}
 
@@ -492,7 +500,7 @@ func (s *Service) FetchEvent(ctx context.Context, id string) (*nostr.Event, erro
 	}
 
 	var queried int
-	for _, url := range s.relayURLs {
+	for _, url := range relayURLs {
 		qCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		r, err := nostr.RelayConnect(qCtx, url, nostr.RelayOptions{})
 		if err != nil {
@@ -515,7 +523,7 @@ func (s *Service) FetchEvent(ctx context.Context, id string) (*nostr.Event, erro
 	}
 
 	if queried == 0 {
-		return nil, fmt.Errorf("event %s: all %d relays unreachable", id, len(s.relayURLs))
+		return nil, fmt.Errorf("event %s: all %d relays unreachable", id, len(relayURLs))
 	}
 	return nil, nil // queried successfully but not found
 }
@@ -523,12 +531,13 @@ func (s *Service) FetchEvent(ctx context.Context, id string) (*nostr.Event, erro
 // publishToRelays publishes an event to all configured relays.
 // Returns an error only if no relay accepted the event.
 func (s *Service) publishToRelays(ctx context.Context, ev *nostr.Event) error {
-	if len(s.relayURLs) == 0 {
+	relayURLs := s.currentRelayURLs()
+	if len(relayURLs) == 0 {
 		return fmt.Errorf("no relay URLs configured")
 	}
 
 	var succeeded int
-	for _, url := range s.relayURLs {
+	for _, url := range relayURLs {
 		pubCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		r, err := nostr.RelayConnect(pubCtx, url, nostr.RelayOptions{})
 		if err != nil {
@@ -547,7 +556,7 @@ func (s *Service) publishToRelays(ctx context.Context, ev *nostr.Event) error {
 	}
 
 	if succeeded == 0 {
-		return fmt.Errorf("event %s rejected by all %d relays", ev.ID.Hex(), len(s.relayURLs))
+		return fmt.Errorf("event %s rejected by all %d relays", ev.ID.Hex(), len(relayURLs))
 	}
 	return nil
 }

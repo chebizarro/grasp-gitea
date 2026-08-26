@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/giteaproxy"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
+	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/signer"
@@ -33,6 +35,7 @@ type Server struct {
 	giteaProxy          *giteaproxy.Proxy
 	rootRelayHandler    http.Handler
 	signerAuthorizer    SignerAuthorizer
+	policyStore         *policy.Store
 }
 
 type SignerAuthorizer interface {
@@ -98,6 +101,8 @@ func (s *Server) SetSignerAuthorizer(authorizer SignerAuthorizer) {
 	s.signerAuthorizer = authorizer
 }
 
+func (s *Server) SetPolicyStore(store *policy.Store) { s.policyStore = store }
+
 // AddRouteRegistrar lets optional subsystems register extra routes on the main mux.
 func (s *Server) AddRouteRegistrar(register func(*http.ServeMux)) {
 	if register != nil {
@@ -116,6 +121,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/repository-state/propose", method(http.MethodPost, s.requireAuth(s.proposeRepositoryState)))
 	mux.HandleFunc("/repository-state/proposed", method(http.MethodGet, s.requireAuth(s.proposedRepositoryState)))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.requireAuth(s.manualProvision)))
+	mux.HandleFunc("/admin/policy", s.requireAuth(s.policyDocument))
+	mux.HandleFunc("/admin/policy/", s.requireAuth(s.policyGroup))
 	mux.HandleFunc("/internal/mirror-sync", method(http.MethodPost, s.requireMirrorAuth(s.mirrorSync)))
 
 	// Gitea webhook endpoint for NIP-34 events (PRs, issues, patches, labels)
@@ -130,6 +137,56 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.rootHandler)
 
 	return mux
+}
+
+func (s *Server) policyDocument(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.policyStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "policy store is not configured"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.policyStore.Document())
+}
+
+func (s *Server) policyGroup(w http.ResponseWriter, r *http.Request) {
+	if s.policyStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "policy store is not configured"})
+		return
+	}
+	group := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/policy/"), "/")
+	if group == "" || strings.Contains(group, "/") {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown policy group"})
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		value, ok := s.policyStore.Group(group)
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown policy group"})
+			return
+		}
+		writeJSON(w, http.StatusOK, value)
+	case http.MethodPut:
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+		if err := s.policyStore.UpdateGroup(group, raw); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		value, _ := s.policyStore.Group(group)
+		writeJSON(w, http.StatusOK, value)
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
 }
 
 // requireAuth wraps an administrative handler with fail-closed bearer-token

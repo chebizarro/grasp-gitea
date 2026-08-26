@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/sharegap/grasp-gitea/internal/policy"
 )
 
 // uploadPackCapabilities are the per-repository git settings GRASP-01 servers
@@ -30,6 +32,16 @@ type Installer struct {
 	repositoriesPath string
 	hookBinaryPath   string
 	hookRelayURL     string
+	policy           *policy.Store
+}
+
+func (i *Installer) SetPolicyStore(store *policy.Store) { i.policy = store }
+
+func (i *Installer) relayURL() string {
+	if snapshot := i.policy.Current(); snapshot != nil && snapshot.HookRelayURL != "" {
+		return snapshot.HookRelayURL
+	}
+	return i.hookRelayURL
 }
 
 func NewInstaller(repositoriesPath string, hookBinaryPath string, hookRelayURL string) *Installer {
@@ -44,11 +56,12 @@ func NewInstaller(repositoriesPath string, hookBinaryPath string, hookRelayURL s
 // orgName is the Gitea org (may be a NIP-05 local-part or hex prefix).
 // npub is the canonical Nostr identity passed to the hook for state lookups.
 func (i *Installer) Install(orgName string, npub string, repoID string) error {
+	hookRelayURL := i.relayURL()
 	// Validate all values that will be embedded in the shell script to
 	// prevent injection. Values should only contain alphanumeric, colon,
 	// slash, underscore, period, and hyphen characters.
 	for name, val := range map[string]string{
-		"hookRelayURL":   i.hookRelayURL,
+		"hookRelayURL":   hookRelayURL,
 		"npub":           npub,
 		"repoID":         repoID,
 		"hookBinaryPath": i.hookBinaryPath,
@@ -70,7 +83,7 @@ func (i *Installer) Install(orgName string, npub string, repoID string) error {
 
 	hookPath := filepath.Join(hooksDir, "pre-receive")
 	script := fmt.Sprintf("#!/bin/sh\nexport GRASP_HOOK_RELAY_URL='%s'\nexport GRASP_REPO_NPUB='%s'\nexport GRASP_REPO_ID='%s'\nexec '%s' \"$@\"\n",
-		i.hookRelayURL, npub, repoID, i.hookBinaryPath)
+		hookRelayURL, npub, repoID, i.hookBinaryPath)
 
 	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
 		return fmt.Errorf("write pre-receive hook: %w", err)

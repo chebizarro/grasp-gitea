@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -81,6 +82,22 @@ func TestLoadMissingRelayURLs(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Fatal("expected error for missing RELAY_URLS")
+	}
+}
+
+func TestLoadExistingPolicyDoesNotRequireLegacyMutableEnv(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN": "token", "CLONE_PREFIX": "https://git.example.com",
+		"RELAY_URLS": "", "EMBEDDED_RELAY": "", "CI_TRIGGER_REPOS": "",
+	})
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GRASP_CONFIG_PATH", path)
+	t.Setenv("HIVE_CI_ENABLED", "true")
+	if _, err := Load(); err != nil {
+		t.Fatalf("existing projection should make legacy mutable env optional: %v", err)
 	}
 }
 

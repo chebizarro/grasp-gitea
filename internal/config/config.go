@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -16,6 +17,10 @@ import (
 )
 
 type Config struct {
+	// PolicyPath is the immutable boot coordinate for the persisted mutable
+	// policy projection. Legacy policy env values only seed this file once.
+	PolicyPath             string
+	ConfigFabricEnabled    bool
 	GiteaURL               string
 	GiteaAdminToken        string
 	ClonePrefix            string
@@ -71,10 +76,15 @@ type Config struct {
 	CITriggerRepos []string // ["*"] or ["owner/repo-id", ...]
 
 	// Hive-CI Tier A runs act locally and publishes signed check/audit results.
-	HiveCIEnabled       bool
-	HiveCIActPath       string
-	HiveCIRunTimeout    time.Duration
-	HiveCIMaxConcurrent int
+	HiveCIEnabled           bool
+	HiveCIActPath           string
+	HiveCIRunTimeout        time.Duration
+	HiveCIMaxConcurrent     int
+	HiveCINostrRelays       []string
+	HiveCICashuMintURL      string
+	HiveCIBlossomURL        string
+	HiveCIJobTimeoutMinutes int
+	HiveCICloneURLTemplate  string
 
 	// Loom consumes canonical ads/results and dispatches trusted-fleet Hive-CI jobs.
 	LoomEnabled             bool
@@ -146,6 +156,8 @@ const minEdgeSecretLength = 43
 func Load() (Config, error) {
 	cfg := Config{
 		GiteaURL:                envOrDefault("GITEA_URL", "http://gitea:3000"),
+		PolicyPath:              envOrDefault("GRASP_CONFIG_PATH", "/data/config.json"),
+		ConfigFabricEnabled:     boolEnv("GRASP_CONFIG_FABRIC_ENABLED", false),
 		GiteaAdminToken:         strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
 		ClonePrefix:             strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
 		RelayURLs:               csvEnv("RELAY_URLS"),
@@ -185,6 +197,11 @@ func Load() (Config, error) {
 		HiveCIActPath:           envOrDefault("HIVE_CI_ACT_PATH", "/usr/bin/act"),
 		HiveCIRunTimeout:        boundedDurationEnv("HIVE_CI_RUN_TIMEOUT", 15*time.Minute, time.Second, time.Hour),
 		HiveCIMaxConcurrent:     boundedIntEnv("HIVE_CI_MAX_CONCURRENT", 2, 1, 16),
+		HiveCINostrRelays:       csvEnv("NOSTR_RELAYS"),
+		HiveCICashuMintURL:      strings.TrimSpace(os.Getenv("CASHU_MINT_URL")),
+		HiveCIBlossomURL:        strings.TrimSpace(os.Getenv("BLOSSOM_URL")),
+		HiveCIJobTimeoutMinutes: boundedIntEnv("JOB_TIMEOUT_MINUTES", 15, 1, 60),
+		HiveCICloneURLTemplate:  strings.TrimSpace(os.Getenv("HIVECI_CLONE_URL_TEMPLATE")),
 		LoomEnabled:             boolEnv("LOOM_ENABLED", false),
 		LoomDispatchMode:        strings.ToLower(envOrDefault("LOOM_DISPATCH_MODE", "local")),
 		LoomWorkerPubkeys:       csvEnv("LOOM_WORKER_PUBKEYS"),
@@ -214,6 +231,11 @@ func Load() (Config, error) {
 		AuthAuditRetention:      boundedDurationEnv("AUTH_AUDIT_RETENTION", 90*24*time.Hour, 24*time.Hour, 365*24*time.Hour),
 		ShutdownGrace:           boundedDurationEnv("SHUTDOWN_GRACE", 5*time.Minute, time.Second, 30*time.Minute),
 	}
+	_, policyStatErr := os.Stat(cfg.PolicyPath)
+	hasPersistedPolicy := policyStatErr == nil
+	if policyStatErr != nil && !errors.Is(policyStatErr, os.ErrNotExist) {
+		return Config{}, fmt.Errorf("stat GRASP_CONFIG_PATH: %w", policyStatErr)
+	}
 
 	signerMasterKey, err := parseSignerMasterKey(os.Getenv("SIGNER_MASTER_KEY"))
 	if err != nil {
@@ -235,11 +257,11 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("CLONE_PREFIX is required (e.g. https://git.example.com)")
 	}
 
-	if len(cfg.RelayURLs) == 0 && !cfg.EmbeddedRelay {
+	if !hasPersistedPolicy && len(cfg.RelayURLs) == 0 && !cfg.EmbeddedRelay {
 		return Config{}, fmt.Errorf("RELAY_URLS is required (or set EMBEDDED_RELAY=true for embedded-only mode)")
 	}
 
-	if cfg.LoomEnabled && len(cfg.LoomRelayURLs) == 0 && len(cfg.RelayURLs) == 0 {
+	if !hasPersistedPolicy && cfg.LoomEnabled && len(cfg.LoomRelayURLs) == 0 && len(cfg.RelayURLs) == 0 {
 		return Config{}, fmt.Errorf("LOOM_RELAY_URLS or external RELAY_URLS is required when LOOM_ENABLED=true; the embedded relay rejects Loom kinds")
 	}
 	if cfg.LoomDispatchMode != "local" && cfg.LoomDispatchMode != "remote" && cfg.LoomDispatchMode != "both" {
@@ -269,14 +291,14 @@ func Load() (Config, error) {
 	if !cfg.LoomEnabled && cfg.LoomDispatchMode != "local" {
 		return Config{}, fmt.Errorf("LOOM_ENABLED=true is required for non-local LOOM_DISPATCH_MODE")
 	}
-	if cfg.HiveCIEnabled && len(cfg.CITriggerRepos) == 0 {
+	if !hasPersistedPolicy && cfg.HiveCIEnabled && len(cfg.CITriggerRepos) == 0 {
 		return Config{}, fmt.Errorf("CI_TRIGGER_REPOS is required when HIVE_CI_ENABLED=true")
 	}
 	if cfg.LoomEnabled && cfg.LoomDispatchMode != "local" {
 		if cfg.CIProtocol != "canonical" {
 			return Config{}, fmt.Errorf("remote Loom dispatch requires CI_PROTOCOL=canonical")
 		}
-		if len(cfg.CITriggerRepos) == 0 {
+		if !hasPersistedPolicy && len(cfg.CITriggerRepos) == 0 {
 			return Config{}, fmt.Errorf("CI_TRIGGER_REPOS is required for remote Loom dispatch")
 		}
 		if len(cfg.LoomWorkerPubkeys) == 0 {
@@ -328,7 +350,7 @@ func Load() (Config, error) {
 		if cfg.BridgePublicURL == "" {
 			return Config{}, fmt.Errorf("BRIDGE_PUBLIC_URL is required when BRIDGE_TOKENS_ENABLED=true")
 		}
-		if !cfg.FullProxyEnabled {
+		if !hasPersistedPolicy && !cfg.FullProxyEnabled {
 			return Config{}, fmt.Errorf("GITEA_FULL_PROXY_ENABLED=true is required when BRIDGE_TOKENS_ENABLED=true; minting tokens without downstream Gitea isolation would allow scope bypass")
 		}
 	}
@@ -337,10 +359,10 @@ func Load() (Config, error) {
 	if cfg.EdgeSharedSecret != "" && len(cfg.EdgeSharedSecret) < minEdgeSecretLength {
 		return Config{}, fmt.Errorf("GRASP_EDGE_SHARED_SECRET must be at least %d characters of high-entropy random data", minEdgeSecretLength)
 	}
-	if cfg.FullProxyEnabled && cfg.AuthEnabled && cfg.EdgeSharedSecret == "" {
+	if !hasPersistedPolicy && cfg.FullProxyEnabled && cfg.AuthEnabled && cfg.EdgeSharedSecret == "" {
 		return Config{}, fmt.Errorf("GRASP_EDGE_SHARED_SECRET is required when GITEA_FULL_PROXY_ENABLED=true and AUTH_ENABLED=true; browser session handoff cannot be authenticated without it")
 	}
-	if cfg.Production() && cfg.FullProxyEnabled && cfg.EdgeSharedSecret == "" {
+	if !hasPersistedPolicy && cfg.Production() && cfg.FullProxyEnabled && cfg.EdgeSharedSecret == "" {
 		return Config{}, fmt.Errorf("GRASP_EDGE_SHARED_SECRET is required in production when GITEA_FULL_PROXY_ENABLED=true")
 	}
 
@@ -351,7 +373,7 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("SIGNER_MASTER_KEY is required for production durable signing")
 	}
 
-	if cfg.ProfileSyncEnabled {
+	if !hasPersistedPolicy && cfg.ProfileSyncEnabled {
 		// Profile sync mints admin PATs and edits users via the admin API,
 		// which Gitea gates behind Basic admin auth.
 		if cfg.GiteaAdminUser == "" {

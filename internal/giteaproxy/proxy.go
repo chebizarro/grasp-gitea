@@ -20,6 +20,7 @@ import (
 
 	"github.com/sharegap/grasp-gitea/internal/auth"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
+	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -91,6 +92,7 @@ type Proxy struct {
 	serviceUser     string
 	servicePassword string
 	fullProxy       bool
+	policy          *policy.Store
 
 	proxy   *httputil.ReverseProxy
 	tokens  Authenticator
@@ -225,7 +227,19 @@ func newTransport() *http.Transport {
 
 // FullProxyEnabled reports whether unmatched paths are proxied to Gitea.
 func (p *Proxy) FullProxyEnabled() bool {
-	return p != nil && p.fullProxy
+	if p == nil {
+		return false
+	}
+	if snapshot := p.policy.Current(); snapshot != nil {
+		return snapshot.FullProxyEnabled
+	}
+	return p.fullProxy
+}
+
+func (p *Proxy) SetPolicyStore(store *policy.Store) {
+	if p != nil {
+		p.policy = store
+	}
 }
 
 // ServeHTTP proxies an ordinary Gitea request: UI, REST, packages, LFS, and

@@ -18,7 +18,9 @@ import (
 
 	"fiatjaf.com/nostr"
 
+	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/loom"
+	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
@@ -227,6 +229,35 @@ func TestRunnerRemoteOnlyNeverFallsBackToLocal(t *testing.T) {
 	}
 	if _, err := os.Stat(argsPath); !os.IsNotExist(err) {
 		t.Fatal("remote-only mode executed local act with an unavailable dispatcher")
+	}
+}
+
+func TestRunnerUsesLivePersistedHivePolicy(t *testing.T) {
+	t.Setenv("NOSTR_RELAYS", "wss://ambient.invalid")
+	policies := policy.New(config.Config{
+		RelayURLs: []string{"wss://bridge.example"}, ProfileSyncInterval: 10 * time.Minute, ProfileSyncWorkers: 4,
+		HiveCINostrRelays: []string{"wss://hive.example"}, HiveCICashuMintURL: "https://mint.example",
+		HiveCIBlossomURL: "https://blossom.example", HiveCIJobTimeoutMinutes: 23,
+		HiveCICloneURLTemplate: "https://git.example/{owner}/{repo_id}.git",
+	})
+	runner := New(Config{}, nil, nil, nil, "", nil)
+	runner.SetPolicyStore(policies)
+	mapping := store.Mapping{Owner: "alice", RepoName: "repository", RepoID: "stable-id", AnnouncedCloneURL: "https://old.invalid/repo.git"}
+	if got := runner.cloneURL(mapping); got != "https://git.example/alice/stable-id.git" {
+		t.Fatalf("clone URL = %q", got)
+	}
+	env := runner.workflowEnvironment()
+	want := map[string]string{"NOSTR_RELAYS": "wss://hive.example", "CASHU_MINT_URL": "https://mint.example", "BLOSSOM_URL": "https://blossom.example", "JOB_TIMEOUT_MINUTES": "23"}
+	for key, value := range want {
+		found := false
+		for _, entry := range env {
+			if entry == key+"="+value {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("missing persisted %s in workflow environment", key)
+		}
 	}
 }
 

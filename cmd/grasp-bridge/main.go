@@ -77,6 +77,63 @@ func relayEndpointsDiffer(current, next config.Config) bool {
 		current.EmbeddedRelayPort != next.EmbeddedRelayPort
 }
 
+func liveRelayURLs(policies *policy.Store, embeddedURL string) []string {
+	snapshot := policies.Current()
+	if snapshot == nil {
+		return nil
+	}
+	if !snapshot.EmbeddedRelay {
+		embeddedURL = ""
+	}
+	return relaySubscriptionURLs(snapshot.RelayURLs, embeddedURL, snapshot.GraspRelayURL)
+}
+
+func runLiveRelaySubscriber(ctx context.Context, policies *policy.Store, embeddedURL string, handler relay.Handler, logger *slog.Logger) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			changes := policies.Changes()
+			subCtx, cancel := context.WithCancel(ctx)
+			subscriber := relay.New(liveRelayURLs(policies, embeddedURL), handler, logger)
+			subscriber.Run(subCtx)
+			select {
+			case <-ctx.Done():
+				cancel()
+				subscriber.Wait()
+				return
+			case <-changes:
+				cancel()
+				subscriber.Wait()
+				logger.Info("relay subscriptions hot-reloaded", "relays", liveRelayURLs(policies, embeddedURL))
+			}
+		}
+	}()
+	return done
+}
+
+func reconcileHooksOnPolicyChange(ctx context.Context, policies *policy.Store, svc *provisioner.Service, logger *slog.Logger) {
+	lastHookRelay := policies.Current().HookRelayURL
+	for {
+		changes := policies.Changes()
+		select {
+		case <-ctx.Done():
+			return
+		case <-changes:
+			current := policies.Current().HookRelayURL
+			if current == lastHookRelay {
+				continue
+			}
+			if err := svc.ReconcileHooks(ctx); err != nil {
+				logger.Warn("hook relay policy hot-apply had errors", "error", err)
+			} else {
+				lastHookRelay = current
+				logger.Info("hook relay policy hot-applied")
+			}
+		}
+	}
+}
+
 func newServerSigner(ctx context.Context, cfg config.Config, st *store.SQLiteStore, relayURLs []string, logger *slog.Logger) (publisher.ServerSigner, error) {
 	if cfg.SignetBunkerURL != "" {
 		if cfg.Production() && len(cfg.SignerMasterKey) != 32 {
@@ -109,7 +166,16 @@ func main() {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
-	policies := policy.New(cfg)
+	policies, err := policy.Open(cfg.PolicyPath, cfg)
+	if err != nil {
+		logger.Error("failed to load persisted runtime policy", "path", cfg.PolicyPath, "error", err)
+		os.Exit(1)
+	}
+	policies.ApplyTo(&cfg)
+	if cfg.ConfigFabricEnabled {
+		logger.Error("GRASP_CONFIG_FABRIC_ENABLED is reserved; kind 30078 desired-state subscription remains TODO fp-cfg.4")
+		os.Exit(1)
+	}
 
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
@@ -120,6 +186,7 @@ func main() {
 
 	giteaClient := gitea.NewClient(cfg.GiteaURL, cfg.GiteaAdminToken).WithAdminUser(cfg.GiteaAdminUser)
 	hookInstaller := hooks.NewInstaller(cfg.GiteaRepositoriesDir, cfg.HookBinaryPath, cfg.HookRelayURL)
+	hookInstaller.SetPolicyStore(policies)
 	nip05Resolver := nip05resolve.NewResolver(5 * time.Minute)
 	provisionerSvc := provisioner.New(cfg, st, giteaClient, hookInstaller, nip05Resolver, logger)
 	provisionerSvc.SetPolicyStore(policies)
@@ -141,6 +208,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	go reconcileHooksOnPolicyChange(ctx, policies, provisionerSvc, logger)
 	reloadSignals := make(chan os.Signal, 1)
 	signal.Notify(reloadSignals, syscall.SIGHUP)
 	defer signal.Stop(reloadSignals)
@@ -150,16 +218,12 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-reloadSignals:
-				next, loadErr := config.Load()
-				if loadErr != nil {
+				if loadErr := policies.Reload(); loadErr != nil {
 					logger.Error("policy reload failed; keeping current policy", "error", loadErr)
 					continue
 				}
-				if relayEndpointsDiffer(cfg, next) {
-					logger.Warn("relay endpoint configuration changed on SIGHUP; relay changes require a restart")
-				}
-				policies.Store(next)
-				logger.Info("policy reloaded", "pubkey_allowlist_entries", len(next.PubkeyAllowlist), "ci_enabled", next.CIEnabled, "ci_trigger_repos", next.CITriggerRepos)
+				current := policies.Current()
+				logger.Info("persisted policy reloaded", "pubkey_allowlist_entries", len(current.PubkeyAllowlist), "ci_enabled", current.CIEnabled, "ci_trigger_repos", current.CITriggerRepos)
 			}
 		}
 	}()
@@ -171,7 +235,7 @@ func main() {
 	}
 	defer shutdownEmbedded(context.Background())
 
-	relayURLs := relaySubscriptionURLs(cfg.RelayURLs, embeddedRelayURL, cfg.GraspRelayURL)
+	relayURLs := liveRelayURLs(policies, embeddedRelayURL)
 	loomRelayURLs := append([]string(nil), cfg.LoomRelayURLs...)
 	if len(loomRelayURLs) == 0 {
 		loomRelayURLs = append(loomRelayURLs, cfg.RelayURLs...)
@@ -318,6 +382,7 @@ func main() {
 	}
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
+	apiServer.SetPolicyStore(policies)
 	var bridgeTokenSvc *auth.TokenService
 	var proxyNostrVerifier *auth.ProxyNIP98Verifier
 	if relayRootHandler != nil {
@@ -334,26 +399,23 @@ func main() {
 	// here so the auth block can attach it as an identity notifier.
 	var profileSyncSvc *profilesync.Service
 	profileSyncDone := make(chan struct{})
+	profileSyncSvc = profilesync.New(profilesync.Config{
+		Interval: cfg.ProfileSyncInterval,
+		Workers:  cfg.ProfileSyncWorkers,
+	}, st, giteaClient, relayURLs, logger)
+	profileSyncSvc.SetPolicyStore(policies)
+	go func() {
+		defer close(profileSyncDone)
+		profileSyncSvc.Run(ctx)
+	}()
 	if cfg.ProfileSyncEnabled {
-		profileSyncSvc = profilesync.New(profilesync.Config{
-			Interval: cfg.ProfileSyncInterval,
-			Workers:  cfg.ProfileSyncWorkers,
-		}, st, giteaClient, relayURLs, logger)
-		go func() {
-			defer close(profileSyncDone)
-			profileSyncSvc.Run(ctx)
-		}()
 		logger.Info("Nostr kind:0 profile sync enabled", "interval", cfg.ProfileSyncInterval.String(), "workers", cfg.ProfileSyncWorkers)
-	} else {
-		close(profileSyncDone)
 	}
 
 	if cfg.AuthEnabled {
 		authSvc := auth.NewService(cfg, st, logger)
 		identitySvc := auth.NewIdentityService(st, giteaClient, nip05Resolver, logger)
-		if profileSyncSvc != nil {
-			identitySvc.SetProfileSyncNotifier(profileSyncSvc)
-		}
+		identitySvc.SetProfileSyncNotifier(profileSyncSvc)
 		nip07Handler := auth.NewNIP07Handler(authSvc, identitySvc, relayURLs, logger)
 		nip46Handler := auth.NewNIP46Handler(st, identitySvc, relayURLs, cfg.BridgePublicURL, signerSvc, logger)
 		nip46Handler.SetTrustedProxyCIDRs(cfg.NIP46TrustedProxyCIDRs)
@@ -409,6 +471,7 @@ func main() {
 		giteaProxy.WithNostrVerifier(proxyNostrVerifier)
 		logger.Info("direct NIP-98 authentication enabled on proxied endpoints")
 	}
+	giteaProxy.SetPolicyStore(policies)
 	apiServer.SetGiteaProxy(giteaProxy)
 	if cfg.FullProxyEnabled {
 		// The bridge is now the only path to Gitea, so its readiness must
@@ -451,7 +514,7 @@ func main() {
 		if err != nil {
 			return err
 		}
-		if embeddedRelayURL != "" && sourceRelay != embeddedRelayURL {
+		if snapshot := policies.Current(); snapshot != nil && snapshot.EmbeddedRelay && embeddedRelayURL != "" && sourceRelay != embeddedRelayURL {
 			if ev.Kind == relay.KindRepositoryAnnouncement || ev.Kind == relay.KindRepositoryState {
 				if forwardErr := forwardEventToRelay(ctx, embeddedRelayURL, ev); forwardErr != nil {
 					logger.Warn("failed to forward event to embedded relay", "event", ev.ID, "error", forwardErr)
@@ -503,8 +566,7 @@ func main() {
 		return nil
 	}
 
-	subscriber := relay.New(relayURLs, handler, logger)
-	subscriber.Run(ctx)
+	subscriberDone := runLiveRelaySubscriber(ctx, policies, embeddedRelayURL, handler, logger)
 
 	// Loom rides a dedicated subscriber: the embedded repository relay rejects
 	// these canonical kinds, so an empty LOOM_RELAY_URLS falls back only to the
@@ -548,7 +610,7 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
-	subscriber.Wait()
+	<-subscriberDone
 	if loomSubscriber != nil {
 		loomSubscriber.Wait()
 	}

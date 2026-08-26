@@ -25,6 +25,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/nostrprofile"
+	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
@@ -84,6 +85,7 @@ type Service struct {
 	relayURLs []string
 	interval  time.Duration
 	workers   int
+	policy    *policy.Store
 	logger    *slog.Logger
 	now       func() time.Time
 
@@ -138,7 +140,11 @@ func New(cfg Config, st Store, gc Gitea, relayURLs []string, logger *slog.Logger
 		pending:   make(map[string]struct{}),
 	}
 	svc.fetch = func(ctx context.Context, pubkey string) (snapshot, error) {
-		snap, err := nostrprofile.FetchLatest(ctx, pubkey, svc.relayURLs)
+		relayURLs := svc.relayURLs
+		if snapshot := svc.policy.Current(); snapshot != nil {
+			relayURLs = snapshot.RelayURLs
+		}
+		snap, err := nostrprofile.FetchLatest(ctx, pubkey, relayURLs)
 		if err != nil {
 			return snapshot{}, err
 		}
@@ -150,6 +156,15 @@ func New(cfg Config, st Store, gc Gitea, relayURLs []string, logger *slog.Logger
 	}
 	svc.prepareImage = gitea.PrepareUserAvatarImage
 	return svc
+}
+
+func (s *Service) SetPolicyStore(store *policy.Store) { s.policy = store }
+
+func (s *Service) liveSettings() (bool, time.Duration, int) {
+	if snapshot := s.policy.Current(); snapshot != nil {
+		return snapshot.ProfileSyncEnabled, snapshot.ProfileSyncInterval, snapshot.ProfileSyncWorkers
+	}
+	return true, s.interval, s.workers
 }
 
 // Enqueue schedules a pubkey for sync, coalescing duplicates. Non-blocking:
@@ -181,12 +196,16 @@ func (s *Service) Enqueue(pubkey string) {
 // is cancelled.
 func (s *Service) Run(ctx context.Context) {
 	var wg sync.WaitGroup
-	for i := 0; i < s.workers; i++ {
+	workerCount := s.workers
+	if s.policy != nil {
+		workerCount = 32
+	}
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go func() {
+		go func(index int) {
 			defer wg.Done()
-			s.worker(ctx)
-		}()
+			s.worker(ctx, index)
+		}(i)
 	}
 	wg.Add(1)
 	go func() {
@@ -201,11 +220,23 @@ func (s *Service) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-func (s *Service) worker(ctx context.Context) {
+func (s *Service) worker(ctx context.Context, index int) {
 	for {
+		changes := s.policy.Changes()
+		enabled, _, workers := s.liveSettings()
+		if !enabled || index >= workers {
+			select {
+			case <-ctx.Done():
+				return
+			case <-changes:
+				continue
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
+		case <-changes:
+			continue
 		case pubkey := <-s.queue:
 			s.pendingMu.Lock()
 			delete(s.pending, pubkey)
@@ -226,17 +257,7 @@ func (s *Service) worker(ctx context.Context) {
 }
 
 func (s *Service) sweeper(ctx context.Context) {
-	s.sweep(ctx) // immediate startup sweep
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.sweep(ctx)
-		}
-	}
+	s.runPeriodic(ctx, s.sweep)
 }
 
 // sweep keyset-pages every linked identity and enqueues it with back-pressure:
@@ -286,16 +307,26 @@ func (s *Service) enqueueBlocking(ctx context.Context, pubkey string) bool {
 }
 
 func (s *Service) reconciler(ctx context.Context) {
-	// Reconcile at startup, then on the sync interval.
-	s.reconcilePATs(ctx)
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
+	s.runPeriodic(ctx, s.reconcilePATs)
+}
+
+func (s *Service) runPeriodic(ctx context.Context, action func(context.Context)) {
 	for {
+		changes := s.policy.Changes()
+		enabled, interval, _ := s.liveSettings()
+		if enabled {
+			action(ctx)
+		}
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			s.reconcilePATs(ctx)
+		case <-changes:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
 		}
 	}
 }

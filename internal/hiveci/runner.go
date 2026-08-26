@@ -287,7 +287,7 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 			handled, dispatchErr := r.remote.Dispatch(ctx, loom.DispatchRequest{
 				SourceEventID: ev.ID.Hex(), OwnerPubkey: mapping.Pubkey,
 				Owner: mapping.Owner, RepoName: mapping.RepoName, RepoID: mapping.RepoID,
-				CloneURL:  firstNonEmpty(mapping.AnnouncedCloneURL, mapping.CloneURL),
+				CloneURL:  r.cloneURL(mapping),
 				CommitSHA: commit, WorkflowPath: workflow,
 				Branch: branch, Trigger: trigger, TriggeredBy: ev.PubKey.Hex(),
 			})
@@ -375,7 +375,11 @@ func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, ev *nos
 		return rec
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, r.runTimeout)
+	runTimeout := r.runTimeout
+	if snapshot := r.policy.Current(); snapshot != nil {
+		runTimeout = snapshot.HiveCIJobTimeout
+	}
+	runCtx, cancel := context.WithTimeout(ctx, runTimeout)
 	defer cancel()
 	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
 	parent, err := os.MkdirTemp("", "hiveci-*")
@@ -397,7 +401,7 @@ func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, ev *nos
 
 	if out, err := exec.CommandContext(runCtx, "git", "--git-dir", repoPath, "worktree", "add", "--detach", worktree, commit).CombinedOutput(); err != nil {
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			rec.Reason = "HiveCI run timed out after " + r.runTimeout.String()
+			rec.Reason = "HiveCI run timed out after " + runTimeout.String()
 		} else {
 			rec.Reason = commandError("git worktree add", err, out)
 		}
@@ -409,13 +413,13 @@ func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, ev *nos
 
 	cmd := exec.Command(r.actPath, trigger, "-W", workflow, "--rm")
 	cmd.Dir = worktree
-	cmd.Env = append(os.Environ(), "CI=true")
+	cmd.Env = r.workflowEnvironment()
 	out, err := runBoundedCommand(runCtx, cmd, maxPublishedLogBytes)
 	rec.OutputTail = tailString(string(out), maxPublishedLogBytes)
 	rec.DurationMS = time.Since(start).Milliseconds()
 	if err != nil {
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			rec.Reason = "HiveCI run timed out after " + r.runTimeout.String()
+			rec.Reason = "HiveCI run timed out after " + runTimeout.String()
 		} else {
 			rec.Reason = commandError("act", err, out)
 		}
@@ -525,11 +529,15 @@ func (r *Runner) sign(ctx context.Context, ev *nostr.Event) error {
 }
 
 func (r *Runner) publishToRelays(ctx context.Context, ev *nostr.Event) error {
-	if len(r.relayURLs) == 0 {
+	relayURLs := r.relayURLs
+	if snapshot := r.policy.Current(); snapshot != nil {
+		relayURLs = snapshot.HiveCINostrRelays
+	}
+	if len(relayURLs) == 0 {
 		return fmt.Errorf("no relay URLs configured")
 	}
 	var succeeded int
-	for _, url := range r.relayURLs {
+	for _, url := range relayURLs {
 		pubCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		relayConn, err := nostr.RelayConnect(pubCtx, url, nostr.RelayOptions{})
 		if err != nil {
@@ -547,7 +555,7 @@ func (r *Runner) publishToRelays(ctx context.Context, ev *nostr.Event) error {
 		succeeded++
 	}
 	if succeeded == 0 {
-		return fmt.Errorf("event %s rejected by all %d relays", ev.ID.Hex(), len(r.relayURLs))
+		return fmt.Errorf("event %s rejected by all %d relays", ev.ID.Hex(), len(relayURLs))
 	}
 	return nil
 }
@@ -603,6 +611,43 @@ func (r *Runner) isRepoCIAllowed(owner, repoID string) bool {
 		}
 	}
 	return false
+}
+
+func (r *Runner) cloneURL(mapping store.Mapping) string {
+	fallback := firstNonEmpty(mapping.AnnouncedCloneURL, mapping.CloneURL)
+	snapshot := r.policy.Current()
+	if snapshot == nil || strings.TrimSpace(snapshot.HiveCICloneURLTemplate) == "" {
+		return fallback
+	}
+	return strings.NewReplacer(
+		"{owner}", mapping.Owner,
+		"{repo}", mapping.RepoName,
+		"{repo_id}", mapping.RepoID,
+		"{npub}", mapping.Npub,
+		"{pubkey}", mapping.Pubkey,
+	).Replace(snapshot.HiveCICloneURLTemplate)
+}
+
+func (r *Runner) workflowEnvironment() []string {
+	blocked := map[string]struct{}{"NOSTR_RELAYS": {}, "CASHU_MINT_URL": {}, "BLOSSOM_URL": {}, "JOB_TIMEOUT_MINUTES": {}, "HIVECI_CLONE_URL_TEMPLATE": {}}
+	env := make([]string, 0, len(os.Environ())+6)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, remove := blocked[key]; !remove {
+			env = append(env, entry)
+		}
+	}
+	env = append(env, "CI=true")
+	if snapshot := r.policy.Current(); snapshot != nil {
+		env = append(env,
+			"NOSTR_RELAYS="+strings.Join(snapshot.HiveCINostrRelays, ","),
+			"CASHU_MINT_URL="+snapshot.HiveCICashuMintURL,
+			"BLOSSOM_URL="+snapshot.HiveCIBlossomURL,
+			fmt.Sprintf("JOB_TIMEOUT_MINUTES=%d", int(snapshot.HiveCIJobTimeout/time.Minute)),
+			"HIVECI_CLONE_URL_TEMPLATE="+snapshot.HiveCICloneURLTemplate,
+		)
+	}
+	return env
 }
 
 func (r *Runner) workflowAuthorAuthorized(ctx context.Context, mapping store.Mapping, author string) (bool, error) {

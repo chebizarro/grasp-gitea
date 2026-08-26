@@ -127,10 +127,21 @@ AUTH_AUDIT_RETENTION=2160h
 SHUTDOWN_GRACE=5m
 ```
 
-Send `SIGHUP` to `grasp-bridge` to reload `PUBKEY_ALLOWLIST`, `CI_ENABLED`, and
-`CI_TRIGGER_REPOS` from the environment. Invalid configuration leaves the
-current policy active. Relay endpoint and all other configuration changes still
-require a restart.
+Mutable bridge and Hive-CI policy is persisted at `GRASP_CONFIG_PATH` (default
+`/data/config.json`). Legacy policy environment values seed that file only when
+it does not exist; they never override an existing projection. Send `SIGHUP` to
+validate and atomically hot-apply an externally edited file. Invalid policy
+leaves the current snapshot active.
+
+Authenticated administrators can inspect the complete effective document with
+`GET /admin/policy`, or get/replace one group at
+`GET|PUT /admin/policy/{access,ci,provision,relays,profile_sync,full_proxy,embedded_relay,hive_ci}`.
+Every successful PUT atomically persists before publishing the live snapshot.
+
+Kind-30078 desired-state consumption and kind-30900 applied/rejected status
+publishing are intentionally deferred under the reserved, fail-closed
+`GRASP_CONFIG_FABRIC_ENABLED=false` flag (TODO `fp-cfg.4`). Local persisted
+policy and the authenticated admin surface do not depend on relay availability.
 
 `SIGNER_MASTER_KEY` enables the persistent NIP-46 signer subsystem. With it set, owner and contributor events are unsigned templates until the outbound queue obtains the user's bunker signature. Without it, the bridge intentionally remains in legacy bridge-signed transition mode for bridge-originated owner state; contributor events from unlinked actors are skipped and counted as `unlinked_actor_skipped`.
 

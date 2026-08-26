@@ -182,10 +182,6 @@ func relayStateOwnerHints(ev *nostr.Event, repoID string) map[string]struct{} {
 }
 
 func startEmbeddedRelay(ctx context.Context, cfg config.Config, policies *policy.Store, logger *slog.Logger) (string, http.Handler, func(context.Context) error, error) {
-	if !cfg.EmbeddedRelay {
-		return "", nil, func(context.Context) error { return nil }, nil
-	}
-
 	r := khatru.NewRelay()
 	db := &lmdb.LMDBBackend{Path: cfg.EmbeddedRelayDB}
 	if err := db.Init(); err != nil {
@@ -478,6 +474,10 @@ func makeRepoPathResolver(cfg config.Config, mappings *store.SQLiteStore, stateR
 
 func graspNIP11Handler(relayHandler *khatru.Relay, cfg config.Config, policies *policy.Store) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if snapshot := policies.Current(); snapshot != nil && !snapshot.EmbeddedRelay {
+			http.NotFound(w, r)
+			return
+		}
 		if strings.Contains(r.Header.Get("Accept"), "application/nostr+json") {
 			writeGRASPNIP11(w, relayHandler, cfg, policies)
 			return
