@@ -1,8 +1,10 @@
 package policy
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,5 +109,82 @@ func TestReloadRejectsInvalidFileAndKeepsSnapshot(t *testing.T) {
 	}
 	if got := store.Current().CITriggerRepos[0]; got != "owner/seed" {
 		t.Fatalf("snapshot changed after failed reload: %q", got)
+	}
+}
+
+func TestConfigFabricTrustRootsSeedOnceAndLocalRecoveryPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	authorA := strings.Repeat("a", 64)
+	authorB := strings.Repeat("b", 64)
+	seed := validSeed()
+	seed.ConfigTrustedAuthors = []string{authorA}
+	seed.ConfigScope = "staging"
+	store, err := Open(path, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Current().ConfigTrustedAuthors; len(got) != 1 || got[0] != authorA {
+		t.Fatalf("seeded trust roots = %v", got)
+	}
+
+	replacement := validSeed()
+	replacement.ConfigTrustedAuthors = []string{authorB}
+	replacement.ConfigScope = "prod"
+	reopened, err := Open(path, replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.Current(); got.ConfigTrustedAuthors[0] != authorA || got.ConfigScope != "staging" {
+		t.Fatalf("persisted fabric state overridden by env: %#v", got)
+	}
+
+	body := []byte(`{"trusted_authors":["` + authorB + `"],"scope":"prod"}`)
+	if err := reopened.UpdateGroup("config_fabric", body); err != nil {
+		t.Fatal(err)
+	}
+	again, err := Open(path, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := again.Current(); got.ConfigTrustedAuthors[0] != authorB || got.ConfigScope != "prod" {
+		t.Fatalf("local recovery did not persist: %#v", got)
+	}
+}
+
+func TestLegacyProjectionMigrationDoesNotImportEnvTrustRoots(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	seed := validSeed()
+	seed.ConfigScope = "prod"
+	store, err := Open(path, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := store.Document()
+	data, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	delete(raw, "config_fabric")
+	data, _ = json.Marshal(raw)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyBoot := validSeed()
+	legacyBoot.ConfigScope = "staging"
+	legacyBoot.ConfigTrustedAuthors = []string{strings.Repeat("c", 64)}
+	migrated, err := Open(path, legacyBoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := migrated.Current(); got.ConfigScope != "staging" || len(got.ConfigTrustedAuthors) != 0 || got.EnvSeedImport != nil {
+		t.Fatalf("legacy metadata migration imported mutable env policy: %#v", got)
+	}
+	if _, seeded := migrated.SeedImport(); seeded {
+		t.Fatal("legacy persisted projection was reported as a new env import")
 	}
 }

@@ -15,11 +15,12 @@ type Handler func(ctx context.Context, ev *nostr.Event, relayURL string) error
 // Subscriber manages persistent WebSocket subscriptions to nostr relays
 // and dispatches received events to a Handler.
 type Subscriber struct {
-	relays  []string
-	handler Handler
-	logger  *slog.Logger
-	kinds   []nostr.Kind
-	wg      sync.WaitGroup
+	relays         []string
+	handler        Handler
+	logger         *slog.Logger
+	kinds          []nostr.Kind
+	filterOverride *nostr.Filter
+	wg             sync.WaitGroup
 }
 
 func subscriptionFilter() nostr.Filter {
@@ -67,7 +68,16 @@ func NewWithKinds(relays []string, kinds []nostr.Kind, handler Handler, logger *
 	return &Subscriber{relays: relays, kinds: append([]nostr.Kind(nil), kinds...), handler: handler, logger: logger}
 }
 
+// NewWithFilter creates a dedicated subscriber with an exact relay-side filter.
+func NewWithFilter(relays []string, filter nostr.Filter, handler Handler, logger *slog.Logger) *Subscriber {
+	copy := filter
+	return &Subscriber{relays: relays, filterOverride: &copy, handler: handler, logger: logger}
+}
+
 func (s *Subscriber) filter() nostr.Filter {
+	if s.filterOverride != nil {
+		return *s.filterOverride
+	}
 	if len(s.kinds) != 0 {
 		return nostr.Filter{Kinds: append([]nostr.Kind(nil), s.kinds...)}
 	}

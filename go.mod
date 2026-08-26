@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026
 	git.sharegap.net/cascadia/cascadia-go v1.2.1
+	git.sharegap.net/cascadia/cascadia-nips/generated/go v0.1.1-0.20260826052020-d767082d1803
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4
 	github.com/elnosh/gonuts v0.4.2
 	github.com/jackc/pgx/v5 v5.10.0

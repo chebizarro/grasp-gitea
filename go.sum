@@ -6,6 +6,8 @@ fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026 h1:5XJN60vWCPP0bcVbhCsjhohi
 fiatjaf.com/nostr v0.0.0-20260611214214-c4534c716026/go.mod h1:b1EIUDnd133Ie8Pg8O/biaKdFyCMz28aD4n64g1GqvM=
 git.sharegap.net/cascadia/cascadia-go v1.2.1 h1:Y6eORfMvzWJB6+Aznr2U9jMRaOTOZpEXmfSE4t9jUQs=
 git.sharegap.net/cascadia/cascadia-go v1.2.1/go.mod h1:gv8EroD6JykPs/26C8VEHgJjdtOXnMmWzIamSvb4GeY=
+git.sharegap.net/cascadia/cascadia-nips/generated/go v0.1.1-0.20260826052020-d767082d1803 h1:OW9nBtMlS77dfgOEXJZeTM4IUa+J/cDw5CxUPraR1/Q=
+git.sharegap.net/cascadia/cascadia-nips/generated/go v0.1.1-0.20260826052020-d767082d1803/go.mod h1:UQwk5ukN+UlP90Jx4BNJtZRhWW4QoQlKUuxBOcQsifU=
 github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 h1:L/gRVlceqvL25UVaW/CKtUDjefjrs0SPonmDGUVOYP0=
 github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
 github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3 h1:ClzzXMDDuUbWfNNZqGeYq4PnYOlwlOVIvSyNaIy0ykg=

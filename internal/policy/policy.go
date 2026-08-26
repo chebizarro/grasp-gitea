@@ -3,6 +3,8 @@ package policy
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,6 +56,36 @@ type EmbeddedRelayPolicy struct {
 	Enabled bool `json:"enabled"`
 }
 
+type AcceptedConfig struct {
+	Author    string    `json:"author"`
+	Scope     string    `json:"scope"`
+	DTag      string    `json:"d_tag"`
+	Schema    string    `json:"schema"`
+	Version   int64     `json:"version"`
+	EventID   string    `json:"event_id"`
+	AppliedAt time.Time `json:"applied_at"`
+}
+
+type EnvSeedImport struct {
+	AuditID             string    `json:"audit_id"`
+	AuthorizedBy        string    `json:"authorized_by"`
+	ConsideredVariables []string  `json:"considered_variables"`
+	ImportedAt          time.Time `json:"imported_at"`
+	StatusPublished     bool      `json:"status_published"`
+}
+
+type ConfigFabricSettings struct {
+	TrustedAuthors []string `json:"trusted_authors"`
+	Scope          string   `json:"scope"`
+}
+
+type ConfigFabricPolicy struct {
+	TrustedAuthors []string                  `json:"trusted_authors"`
+	Scope          string                    `json:"scope"`
+	Accepted       map[string]AcceptedConfig `json:"accepted"`
+	EnvSeed        *EnvSeedImport            `json:"env_seed_import,omitempty"`
+}
+
 type HiveCIPolicy struct {
 	NostrRelays       []string `json:"nostr_relays"`
 	CashuMintURL      string   `json:"cashu_mint_url"`
@@ -72,6 +105,7 @@ type Document struct {
 	FullProxy     FullProxyPolicy     `json:"full_proxy"`
 	EmbeddedRelay EmbeddedRelayPolicy `json:"embedded_relay"`
 	HiveCI        HiveCIPolicy        `json:"hive_ci"`
+	ConfigFabric  ConfigFabricPolicy  `json:"config_fabric"`
 }
 
 // Snapshot contains immutable policy values consulted by concurrent consumers.
@@ -93,15 +127,21 @@ type Snapshot struct {
 	HiveCIBlossomURL       string
 	HiveCIJobTimeout       time.Duration
 	HiveCICloneURLTemplate string
+	ConfigTrustedAuthors   []string
+	ConfigScope            string
+	AcceptedConfig         map[string]AcceptedConfig
+	EnvSeedImport          *EnvSeedImport
 }
 
 // Store owns persistence and atomically publishes validated snapshots.
 type Store struct {
-	current atomic.Pointer[Snapshot]
-	mu      sync.Mutex
-	path    string
-	boot    config.Config
-	changed chan struct{}
+	current  atomic.Pointer[Snapshot]
+	document atomic.Pointer[Document]
+	mu       sync.Mutex
+	path     string
+	boot     config.Config
+	changed  chan struct{}
+	seeded   bool
 }
 
 // New constructs an in-memory store for tests and compatibility callers.
@@ -125,11 +165,25 @@ func Open(path string, cfg config.Config) (*Store, error) {
 		if err := s.validate(doc); err != nil {
 			return nil, fmt.Errorf("validate environment policy seed: %w", err)
 		}
+		seed := newEnvSeedImport(doc)
+		doc.ConfigFabric.EnvSeed = &seed
 		if err := writeAtomic(path, doc); err != nil {
 			return nil, fmt.Errorf("persist environment policy seed: %w", err)
 		}
+		s.seeded = true
 	} else if err != nil {
 		return nil, err
+	} else if doc.ConfigFabric.Scope == "" {
+		doc.ConfigFabric.Scope = cfg.ConfigScope
+		if doc.ConfigFabric.Scope == "" {
+			doc.ConfigFabric.Scope = "prod"
+		}
+		if doc.ConfigFabric.Accepted == nil {
+			doc.ConfigFabric.Accepted = make(map[string]AcceptedConfig)
+		}
+		if err := writeAtomic(path, doc); err != nil {
+			return nil, fmt.Errorf("persist config-fabric metadata migration: %w", err)
+		}
 	}
 	if err := s.validate(doc); err != nil {
 		return nil, fmt.Errorf("validate persisted policy: %w", err)
@@ -138,11 +192,24 @@ func Open(path string, cfg config.Config) (*Store, error) {
 	return s, nil
 }
 
+var envSeedVariables = []string{"PUBKEY_ALLOWLIST", "CI_ENABLED", "CI_TRIGGER_REPOS", "PROVISION_RATE_LIMIT", "RELAY_URLS", "HOOK_RELAY_URL", "GRASP_RELAY_URL", "PROFILE_SYNC_ENABLED", "PROFILE_SYNC_INTERVAL", "PROFILE_SYNC_WORKERS", "GITEA_FULL_PROXY_ENABLED", "EMBEDDED_RELAY", "NOSTR_RELAYS", "CASHU_MINT_URL", "BLOSSOM_URL", "JOB_TIMEOUT_MINUTES", "HIVECI_CLONE_URL_TEMPLATE", "GRASP_CONFIG_TRUSTED_AUTHORS", "GRASP_CONFIG_SCOPE"}
+
+func newEnvSeedImport(doc Document) EnvSeedImport {
+	doc.ConfigFabric.EnvSeed = nil
+	b, _ := json.Marshal(doc)
+	sum := sha256.Sum256(b)
+	return EnvSeedImport{AuditID: fmt.Sprintf("%x", sum), AuthorizedBy: "local-bootstrap", ConsideredVariables: append([]string(nil), envSeedVariables...), ImportedAt: time.Now().UTC()}
+}
+
 func seedDocument(cfg config.Config) Document {
+	if strings.TrimSpace(cfg.ConfigScope) == "" {
+		cfg.ConfigScope = "prod"
+	}
 	allowlist := make([]string, 0, len(cfg.PubkeyAllowlist))
 	for pubkey := range cfg.PubkeyAllowlist {
 		allowlist = append(allowlist, pubkey)
 	}
+	sort.Strings(allowlist)
 	hiveRelays := append([]string(nil), cfg.HiveCINostrRelays...)
 	if len(hiveRelays) == 0 {
 		hiveRelays = append(hiveRelays, cfg.RelayURLs...)
@@ -164,6 +231,7 @@ func seedDocument(cfg config.Config) Document {
 		FullProxy:     FullProxyPolicy{Enabled: cfg.FullProxyEnabled},
 		EmbeddedRelay: EmbeddedRelayPolicy{Enabled: cfg.EmbeddedRelay},
 		HiveCI:        HiveCIPolicy{NostrRelays: hiveRelays, CashuMintURL: cfg.HiveCICashuMintURL, BlossomURL: cfg.HiveCIBlossomURL, JobTimeoutMinutes: jobMinutes, CloneURLTemplate: cfg.HiveCICloneURLTemplate},
+		ConfigFabric:  ConfigFabricPolicy{TrustedAuthors: append([]string(nil), cfg.ConfigTrustedAuthors...), Scope: cfg.ConfigScope, Accepted: make(map[string]AcceptedConfig)},
 	}
 }
 
@@ -188,6 +256,27 @@ func loadDocument(path string) (Document, error) {
 func (s *Store) validate(doc Document) error {
 	if doc.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("schema_version must be %d", SchemaVersion)
+	}
+	if !validScope(doc.ConfigFabric.Scope) {
+		return fmt.Errorf("config_fabric.scope %q is invalid", doc.ConfigFabric.Scope)
+	}
+	seenAuthors := make(map[string]struct{}, len(doc.ConfigFabric.TrustedAuthors))
+	for _, author := range doc.ConfigFabric.TrustedAuthors {
+		if !validHex32(author) || author != strings.ToLower(author) {
+			return fmt.Errorf("config_fabric.trusted_authors contains invalid pubkey %q", author)
+		}
+		if _, exists := seenAuthors[author]; exists {
+			return fmt.Errorf("config_fabric.trusted_authors contains duplicate pubkey %q", author)
+		}
+		seenAuthors[author] = struct{}{}
+	}
+	for coordinate, accepted := range doc.ConfigFabric.Accepted {
+		policyName := strings.TrimPrefix(accepted.DTag, "service:grasp-bridge:")
+		_, supported := supportedDesiredPolicies[policyName]
+		wantCoordinate := accepted.Author + "|" + accepted.Scope + "|" + accepted.DTag
+		if accepted.Version < 1 || !validHex32(accepted.EventID) || !validHex32(accepted.Author) || !validScope(accepted.Scope) || !supported || accepted.Schema != "cascadia.config."+policyName+".v1" || coordinate != wantCoordinate || accepted.AppliedAt.IsZero() {
+			return fmt.Errorf("config_fabric.accepted[%q] is invalid", coordinate)
+		}
 	}
 	if doc.Provision.RateLimitPerHour < 0 {
 		return errors.New("provision.rate_limit_per_hour must be non-negative")
@@ -256,6 +345,26 @@ func (s *Store) validate(doc Document) error {
 	return nil
 }
 
+func validHex32(value string) bool {
+	b, err := hex.DecodeString(value)
+	return err == nil && len(b) == 32
+}
+
+func validScope(scope string) bool {
+	if scope == "prod" || scope == "staging" || scope == "fleet" {
+		return true
+	}
+	if !strings.HasPrefix(scope, "host:") || len(scope) <= len("host:") {
+		return false
+	}
+	for _, r := range strings.TrimPrefix(scope, "host:") {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 func validateURL(raw string, schemes ...string) error {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || !u.IsAbs() || u.Host == "" || u.User != nil {
@@ -308,6 +417,8 @@ func writeAtomic(path string, doc Document) error {
 func (s *Store) Store(cfg config.Config) { s.publish(seedDocument(cfg)) }
 
 func (s *Store) publish(doc Document) {
+	docCopy := cloneDocument(doc)
+	s.document.Store(&docCopy)
 	interval, _ := time.ParseDuration(doc.ProfileSync.Interval)
 	allowlist := make(map[string]struct{}, len(doc.Access.PubkeyAllowlist))
 	for _, pubkey := range doc.Access.PubkeyAllowlist {
@@ -320,6 +431,7 @@ func (s *Store) publish(doc Document) {
 		FullProxyEnabled: doc.FullProxy.Enabled, EmbeddedRelay: doc.EmbeddedRelay.Enabled,
 		HiveCINostrRelays: append([]string(nil), doc.HiveCI.NostrRelays...), HiveCICashuMintURL: doc.HiveCI.CashuMintURL, HiveCIBlossomURL: doc.HiveCI.BlossomURL,
 		HiveCIJobTimeout: time.Duration(doc.HiveCI.JobTimeoutMinutes) * time.Minute, HiveCICloneURLTemplate: doc.HiveCI.CloneURLTemplate,
+		ConfigTrustedAuthors: append([]string(nil), doc.ConfigFabric.TrustedAuthors...), ConfigScope: doc.ConfigFabric.Scope, AcceptedConfig: cloneAccepted(doc.ConfigFabric.Accepted), EnvSeedImport: cloneEnvSeed(doc.ConfigFabric.EnvSeed),
 	})
 }
 
@@ -362,18 +474,43 @@ func (s *Store) Reload() error {
 	return nil
 }
 
-// Document returns a defensive copy of the effective projection.
-func (s *Store) Document() Document { return documentFromSnapshot(s.Current()) }
-
-func documentFromSnapshot(v *Snapshot) Document {
-	if v == nil {
+// Document returns a defensive copy of the effective projection and validation metadata.
+func (s *Store) Document() Document {
+	if s == nil || s.document.Load() == nil {
 		return Document{SchemaVersion: SchemaVersion}
 	}
-	allowlist := make([]string, 0, len(v.PubkeyAllowlist))
-	for key := range v.PubkeyAllowlist {
-		allowlist = append(allowlist, key)
+	return cloneDocument(*s.document.Load())
+}
+
+func cloneDocument(doc Document) Document {
+	b, _ := json.Marshal(doc)
+	var out Document
+	_ = json.Unmarshal(b, &out)
+	return out
+}
+
+func cloneAccepted(in map[string]AcceptedConfig) map[string]AcceptedConfig {
+	out := make(map[string]AcceptedConfig, len(in))
+	for k, v := range in {
+		out[k] = v
 	}
-	return Document{SchemaVersion: SchemaVersion, Access: AccessPolicy{allowlist}, CI: CIPolicy{v.CIEnabled, append([]string(nil), v.CITriggerRepos...)}, Provision: ProvisionPolicy{v.ProvisionRateLimit}, Relays: RelayPolicy{append([]string(nil), v.RelayURLs...), v.HookRelayURL, v.GraspRelayURL}, ProfileSync: ProfileSyncPolicy{v.ProfileSyncEnabled, v.ProfileSyncInterval.String(), v.ProfileSyncWorkers}, FullProxy: FullProxyPolicy{v.FullProxyEnabled}, EmbeddedRelay: EmbeddedRelayPolicy{v.EmbeddedRelay}, HiveCI: HiveCIPolicy{append([]string(nil), v.HiveCINostrRelays...), v.HiveCICashuMintURL, v.HiveCIBlossomURL, int(v.HiveCIJobTimeout / time.Minute), v.HiveCICloneURLTemplate}}
+	return out
+}
+
+func cloneEnvSeed(in *EnvSeedImport) *EnvSeedImport {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.ConsideredVariables = append([]string(nil), in.ConsideredVariables...)
+	return &out
+}
+
+func (s *Store) SeedImport() (*EnvSeedImport, bool) {
+	if s == nil {
+		return nil, false
+	}
+	return cloneEnvSeed(s.Current().EnvSeedImport), s.seeded
 }
 
 // Group returns one named policy group.
@@ -396,6 +533,8 @@ func (s *Store) Group(name string) (any, bool) {
 		return d.EmbeddedRelay, true
 	case "hive_ci":
 		return d.HiveCI, true
+	case "config_fabric":
+		return ConfigFabricSettings{TrustedAuthors: append([]string(nil), d.ConfigFabric.TrustedAuthors...), Scope: d.ConfigFabric.Scope}, true
 	}
 	return nil, false
 }
@@ -407,7 +546,7 @@ func (s *Store) UpdateGroup(name string, raw []byte) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	doc := documentFromSnapshot(s.Current())
+	doc := s.Document()
 	decode := func(dst any) error {
 		dec := json.NewDecoder(bytes.NewReader(raw))
 		dec.DisallowUnknownFields()
@@ -437,6 +576,13 @@ func (s *Store) UpdateGroup(name string, raw []byte) error {
 		err = decode(&doc.EmbeddedRelay)
 	case "hive_ci":
 		err = decode(&doc.HiveCI)
+	case "config_fabric":
+		var settings ConfigFabricSettings
+		err = decode(&settings)
+		if err == nil {
+			doc.ConfigFabric.TrustedAuthors = settings.TrustedAuthors
+			doc.ConfigFabric.Scope = settings.Scope
+		}
 	default:
 		return fmt.Errorf("unknown policy group %q", name)
 	}
@@ -475,4 +621,164 @@ func (s *Store) ApplyTo(cfg *config.Config) {
 	cfg.ProfileSyncWorkers = v.ProfileSyncWorkers
 	cfg.FullProxyEnabled = v.FullProxyEnabled
 	cfg.EmbeddedRelay = v.EmbeddedRelay
+}
+
+var ErrStaleVersion = errors.New("config version does not advance accepted coordinate")
+
+var supportedDesiredPolicies = map[string]string{
+	"access":         "access",
+	"ci":             "ci",
+	"provision":      "provision",
+	"relays":         "relays",
+	"profile-sync":   "profile_sync",
+	"full-proxy":     "full_proxy",
+	"embedded-relay": "embedded_relay",
+	"hive-ci":        "hive_ci",
+}
+
+func SupportedDesiredPolicies() []string {
+	out := make([]string, 0, len(supportedDesiredPolicies))
+	for name := range supportedDesiredPolicies {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+type DesiredUpdate struct {
+	Author     string
+	Scope      string
+	DTag       string
+	PolicyName string
+	Schema     string
+	Version    int64
+	EventID    string
+	AppliedAt  time.Time
+}
+
+// ApplyDesired validates a policy group, atomically persists it with its accepted
+// event coordinate, and only then publishes the hot snapshot.
+func (s *Store) ApplyDesired(update DesiredUpdate, raw []byte) error {
+	if s == nil || s.path == "" {
+		return errors.New("persistent policy store is not configured")
+	}
+	group, ok := supportedDesiredPolicies[update.PolicyName]
+	if !ok {
+		return fmt.Errorf("unsupported desired policy %q", update.PolicyName)
+	}
+	if update.Version < 1 {
+		return errors.New("version must be positive")
+	}
+	if update.EventID == "" {
+		return errors.New("event id is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	doc := s.Document()
+	coordinate := update.Author + "|" + update.Scope + "|" + update.DTag
+	if prior, exists := doc.ConfigFabric.Accepted[coordinate]; exists && update.Version <= prior.Version {
+		return fmt.Errorf("%w: got %d, accepted %d", ErrStaleVersion, update.Version, prior.Version)
+	}
+	if err := decodeDesiredGroup(&doc, group, raw); err != nil {
+		return err
+	}
+	if doc.ConfigFabric.Accepted == nil {
+		doc.ConfigFabric.Accepted = make(map[string]AcceptedConfig)
+	}
+	appliedAt := update.AppliedAt.UTC()
+	if appliedAt.IsZero() {
+		appliedAt = time.Now().UTC()
+	}
+	doc.ConfigFabric.Accepted[coordinate] = AcceptedConfig{
+		Author: update.Author, Scope: update.Scope, DTag: update.DTag, Schema: update.Schema,
+		Version: update.Version, EventID: update.EventID, AppliedAt: appliedAt,
+	}
+	if err := s.validate(doc); err != nil {
+		return err
+	}
+	if err := writeAtomic(s.path, doc); err != nil {
+		return err
+	}
+	s.publish(doc)
+	s.notifyLocked()
+	return nil
+}
+
+func decodeDesiredGroup(doc *Document, group string, raw []byte) error {
+	decode := func(dst any) error {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(dst); err != nil {
+			return err
+		}
+		if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			return errors.New("multiple JSON values")
+		}
+		return nil
+	}
+	var err error
+	switch group {
+	case "access":
+		err = decode(&doc.Access)
+	case "ci":
+		err = decode(&doc.CI)
+	case "provision":
+		err = decode(&doc.Provision)
+	case "relays":
+		err = decode(&doc.Relays)
+	case "profile_sync":
+		err = decode(&doc.ProfileSync)
+	case "full_proxy":
+		err = decode(&doc.FullProxy)
+	case "embedded_relay":
+		err = decode(&doc.EmbeddedRelay)
+	case "hive_ci":
+		err = decode(&doc.HiveCI)
+	default:
+		return fmt.Errorf("unknown policy group %q", group)
+	}
+	if err != nil {
+		return fmt.Errorf("decode %s policy: %w", group, err)
+	}
+	return nil
+}
+
+func (s *Store) EffectiveConfig(policyName string) (int64, string) {
+	if s == nil {
+		return 1, ""
+	}
+	var best AcceptedConfig
+	for _, accepted := range s.Current().AcceptedConfig {
+		if accepted.DTag == "service:grasp-bridge:"+policyName && accepted.AppliedAt.After(best.AppliedAt) {
+			best = accepted
+		}
+	}
+	if best.Version == 0 {
+		if seed := s.Current().EnvSeedImport; seed != nil {
+			return 1, seed.AuditID
+		}
+		return 1, ""
+	}
+	return best.Version, best.EventID
+}
+
+// MarkEnvSeedStatusPublished durably records successful publication so a relay outage retries on the next boot.
+func (s *Store) MarkEnvSeedStatusPublished() error {
+	if s == nil || s.path == "" {
+		return errors.New("persistent policy store is not configured")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	doc := s.Document()
+	if doc.ConfigFabric.EnvSeed == nil || doc.ConfigFabric.EnvSeed.StatusPublished {
+		return nil
+	}
+	doc.ConfigFabric.EnvSeed.StatusPublished = true
+	if err := writeAtomic(s.path, doc); err != nil {
+		return err
+	}
+	s.publish(doc)
+	s.notifyLocked()
+	return nil
 }

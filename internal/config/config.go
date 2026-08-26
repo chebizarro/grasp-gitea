@@ -20,7 +20,8 @@ type Config struct {
 	// PolicyPath is the immutable boot coordinate for the persisted mutable
 	// policy projection. Legacy policy env values only seed this file once.
 	PolicyPath             string
-	ConfigFabricEnabled    bool
+	ConfigTrustedAuthors   []string
+	ConfigScope            string
 	GiteaURL               string
 	GiteaAdminToken        string
 	ClonePrefix            string
@@ -157,7 +158,8 @@ func Load() (Config, error) {
 	cfg := Config{
 		GiteaURL:                envOrDefault("GITEA_URL", "http://gitea:3000"),
 		PolicyPath:              envOrDefault("GRASP_CONFIG_PATH", "/data/config.json"),
-		ConfigFabricEnabled:     boolEnv("GRASP_CONFIG_FABRIC_ENABLED", false),
+		ConfigTrustedAuthors:    csvEnv("GRASP_CONFIG_TRUSTED_AUTHORS"),
+		ConfigScope:             strings.TrimSpace(envOrDefault("GRASP_CONFIG_SCOPE", "prod")),
 		GiteaAdminToken:         strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
 		ClonePrefix:             strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
 		RelayURLs:               csvEnv("RELAY_URLS"),

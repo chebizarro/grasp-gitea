@@ -29,10 +29,11 @@ import (
 // Service republishes NIP-34 repository announcement and state events
 // to Nostr relays when Gitea mirror syncs complete.
 type Service struct {
-	store           *store.SQLiteStore
-	logger          *slog.Logger
-	repositoriesDir string
-	relayURLs       []string
+	store               *store.SQLiteStore
+	logger              *slog.Logger
+	repositoriesDir     string
+	relayURLs           []string
+	additionalRelayURLs []string
 
 	bridgeSigner      ServerSigner
 	bridgePrivKey     string // legacy dev/test fallback
@@ -477,11 +478,38 @@ func (s *Service) PublishSigned(ctx context.Context, ev *nostr.Event) error {
 	return s.publishToRelays(ctx, ev)
 }
 
+func (s *Service) SetAdditionalRelayURLs(urls ...string) {
+	s.additionalRelayURLs = append([]string(nil), urls...)
+}
+
 func (s *Service) currentRelayURLs() []string {
 	if snapshot := s.policy.Current(); snapshot != nil {
-		return snapshot.RelayURLs
+		urls := append([]string(nil), snapshot.RelayURLs...)
+		if snapshot.EmbeddedRelay {
+			urls = appendUnique(urls, s.additionalRelayURLs...)
+		}
+		return urls
 	}
-	return s.relayURLs
+	return appendUnique(append([]string(nil), s.relayURLs...), s.additionalRelayURLs...)
+}
+
+func appendUnique(urls []string, additions ...string) []string {
+	for _, addition := range additions {
+		if addition == "" {
+			continue
+		}
+		found := false
+		for _, existing := range urls {
+			if existing == addition {
+				found = true
+				break
+			}
+		}
+		if !found {
+			urls = append(urls, addition)
+		}
+	}
+	return urls
 }
 
 // FetchEvent retrieves a single event by ID from the configured relays.

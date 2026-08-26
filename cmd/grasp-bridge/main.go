@@ -20,6 +20,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/auth"
 	cashuwallet "github.com/sharegap/grasp-gitea/internal/cashu"
 	"github.com/sharegap/grasp-gitea/internal/config"
+	"github.com/sharegap/grasp-gitea/internal/configfabric"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/giteaproxy"
 	"github.com/sharegap/grasp-gitea/internal/hiveci"
@@ -112,6 +113,43 @@ func runLiveRelaySubscriber(ctx context.Context, policies *policy.Store, embedde
 	return done
 }
 
+func runLiveConfigSubscriber(ctx context.Context, policies *policy.Store, embeddedURL string, manager *configfabric.Manager, logger *slog.Logger) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			changes := policies.Changes()
+			filter := manager.Filter()
+			if len(filter.Authors) == 0 {
+				logger.Warn("config fabric has no trusted authors; waiting for persisted trust-root update")
+				select {
+				case <-ctx.Done():
+					return
+				case <-changes:
+					continue
+				}
+			}
+			subCtx, cancel := context.WithCancel(ctx)
+			handler := func(_ context.Context, ev *nostr.Event, sourceRelay string) error {
+				return manager.HandleEvent(ctx, ev, sourceRelay)
+			}
+			subscriber := relay.NewWithFilter(liveRelayURLs(policies, embeddedURL), filter, handler, logger)
+			subscriber.Run(subCtx)
+			logger.Info("config fabric subscriber enabled", "relays", liveRelayURLs(policies, embeddedURL), "trusted_authors", len(filter.Authors))
+			select {
+			case <-ctx.Done():
+				cancel()
+				subscriber.Wait()
+				return
+			case <-changes:
+				cancel()
+				subscriber.Wait()
+			}
+		}
+	}()
+	return done
+}
+
 func reconcileHooksOnPolicyChange(ctx context.Context, policies *policy.Store, svc *provisioner.Service, logger *slog.Logger) {
 	lastHookRelay := policies.Current().HookRelayURL
 	for {
@@ -172,9 +210,9 @@ func main() {
 		os.Exit(1)
 	}
 	policies.ApplyTo(&cfg)
-	if cfg.ConfigFabricEnabled {
-		logger.Error("GRASP_CONFIG_FABRIC_ENABLED is reserved; kind 30078 desired-state subscription remains TODO fp-cfg.4")
-		os.Exit(1)
+	seedImport, seededFromEnv := policies.SeedImport()
+	if seededFromEnv {
+		logger.Info("authorized environment policy seed persisted", "audit_id", seedImport.AuditID, "authorized_by", seedImport.AuthorizedBy, "considered_variables", seedImport.ConsideredVariables)
 	}
 
 	st, err := store.Open(cfg.DBPath)
@@ -288,6 +326,13 @@ func main() {
 	}
 	publisherSvc := publisher.NewWithServerSigner(serverSigner, st, relayURLs, cfg.GiteaRepositoriesDir, logger)
 	publisherSvc.SetPolicyStore(policies)
+	publisherSvc.SetAdditionalRelayURLs(embeddedRelayURL)
+	configManager := configfabric.New(policies, publisherSvc, logger)
+	if seedImport != nil && !seedImport.StatusPublished {
+		if statusErr := configManager.PublishEnvSeedStatus(ctx, seedImport); statusErr != nil {
+			logger.Warn("environment seed status publication deferred by relay/signer availability", "audit_id", seedImport.AuditID, "error", statusErr)
+		}
+	}
 	if cfg.CIEnabled && cfg.CIProtocol == "cascadia" && publisherSvc.Enabled() {
 		logger.Warn("legacy Cascadia CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
 	} else if cfg.CIEnabled && cfg.CIProtocol == "canonical" {
@@ -567,6 +612,7 @@ func main() {
 	}
 
 	subscriberDone := runLiveRelaySubscriber(ctx, policies, embeddedRelayURL, handler, logger)
+	configSubscriberDone := runLiveConfigSubscriber(ctx, policies, embeddedRelayURL, configManager, logger)
 
 	// Loom rides a dedicated subscriber: the embedded repository relay rejects
 	// these canonical kinds, so an empty LOOM_RELAY_URLS falls back only to the
@@ -611,6 +657,7 @@ func main() {
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
 	<-subscriberDone
+	<-configSubscriberDone
 	if loomSubscriber != nil {
 		loomSubscriber.Wait()
 	}

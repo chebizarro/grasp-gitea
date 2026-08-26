@@ -135,13 +135,17 @@ leaves the current snapshot active.
 
 Authenticated administrators can inspect the complete effective document with
 `GET /admin/policy`, or get/replace one group at
-`GET|PUT /admin/policy/{access,ci,provision,relays,profile_sync,full_proxy,embedded_relay,hive_ci}`.
+`GET|PUT /admin/policy/{access,ci,provision,relays,profile_sync,full_proxy,embedded_relay,hive_ci,config_fabric}`.
 Every successful PUT atomically persists before publishing the live snapshot.
 
-Kind-30078 desired-state consumption and kind-30900 applied/rejected status
-publishing are intentionally deferred under the reserved, fail-closed
-`GRASP_CONFIG_FABRIC_ENABLED=false` flag (TODO `fp-cfg.4`). Local persisted
-policy and the authenticated admin surface do not depend on relay availability.
+The bridge continuously subscribes to trusted-author kind-30078 desired-state
+events at `d=service:grasp-bridge:<policy-name>`. It verifies signatures, exact
+target/schema tags, and monotonic per-author versions, atomically persists the
+accepted event metadata and policy group, then hot-applies the snapshot. It
+publishes signed kind-30900 `cascadia.config.status.v1` applied/rejected events.
+`GRASP_CONFIG_TRUSTED_AUTHORS` and `GRASP_CONFIG_SCOPE` seed trust roots and the
+instance scope only when the policy file is first created; relay outages never
+replace or prevent serving the last valid local projection.
 
 `SIGNER_MASTER_KEY` enables the persistent NIP-46 signer subsystem. With it set, owner and contributor events are unsigned templates until the outbound queue obtains the user's bunker signature. Without it, the bridge intentionally remains in legacy bridge-signed transition mode for bridge-originated owner state; contributor events from unlinked actors are skipped and counted as `unlinked_actor_skipped`.
 
