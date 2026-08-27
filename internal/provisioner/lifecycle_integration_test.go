@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
@@ -340,6 +341,66 @@ func TestDuplicateEventIsIgnored(t *testing.T) {
 	mappings, _ := st.ListMappings(ctx)
 	if len(mappings) != 1 {
 		t.Errorf("expected 1 mapping after duplicate event, got %d", len(mappings))
+	}
+}
+
+func TestAnnouncementWithMultipleHistoricalOwnersUsesResolvedOwner(t *testing.T) {
+	svc, st, state, _ := newTestService(t)
+	ctx := context.Background()
+
+	ev1 := makeSignedAnnouncementEvent(t, "repo-one", "https://git.example.com/whatever/repo-one.git")
+	ev2 := makeSignedAnnouncementEvent(t, "repo-two", "https://git.example.com/whatever/repo-two.git")
+	pubkey := ev1.PubKey.Hex()
+	npub := nip19.EncodeNpub(ev1.PubKey)
+	resolvedOwner := pubkey[:39]
+
+	if err := st.UpsertMapping(ctx, store.Mapping{
+		Npub:          npub,
+		RepoID:        "old-resolved",
+		Pubkey:        pubkey,
+		Owner:         resolvedOwner,
+		RepoName:      "old-resolved",
+		GiteaRepoID:   100,
+		CloneURL:      "https://git.example.com/" + resolvedOwner + "/old-resolved.git",
+		SourceEvent:   "seed-resolved",
+		HookInstalled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertMapping(ctx, store.Mapping{
+		Npub:          npub,
+		RepoID:        "old-other",
+		Pubkey:        pubkey,
+		Owner:         "other-owner",
+		RepoName:      "old-other",
+		GiteaRepoID:   101,
+		CloneURL:      "https://git.example.com/other-owner/old-other.git",
+		SourceEvent:   "seed-other",
+		HookInstalled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.HandleAnnouncementEvent(ctx, ev1, "ws://relay"); err != nil {
+		t.Fatalf("first announcement with multiple historical owners: %v", err)
+	}
+	if err := svc.HandleAnnouncementEvent(ctx, ev2, "ws://relay"); err != nil {
+		t.Fatalf("second announcement with multiple historical owners: %v", err)
+	}
+
+	got, err := st.GetMapping(ctx, npub, "repo-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Owner != resolvedOwner {
+		t.Fatalf("expected resolved owner %q, got %q", resolvedOwner, got.Owner)
+	}
+
+	state.mu.Lock()
+	_, created := state.repos[resolvedOwner+"/repo-two"]
+	state.mu.Unlock()
+	if !created {
+		t.Fatalf("expected repo under resolved owner %s", resolvedOwner)
 	}
 }
 

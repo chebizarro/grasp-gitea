@@ -73,8 +73,11 @@ func (s *Service) lockRepo(npub, _ string) *sync.Mutex {
 }
 
 // linkedOwner returns the organization explicitly linked to this Nostr
-// identity by an existing repository mapping.
-func (s *Service) linkedOwner(ctx context.Context, npub, pubkey string) (string, bool, error) {
+// identity by an existing repository mapping. When preferredOwner is set, only
+// that namespace is selected; this lets identities with historical mappings in
+// multiple namespaces continue provisioning new repositories under their
+// currently resolved NIP-05 namespace.
+func (s *Service) linkedOwner(ctx context.Context, npub, pubkey, preferredOwner string) (string, bool, error) {
 	mappings, err := s.store.ListMappings(ctx)
 	if err != nil {
 		return "", false, fmt.Errorf("list ownership links: %w", err)
@@ -89,6 +92,9 @@ func (s *Service) linkedOwner(ctx context.Context, npub, pubkey string) (string,
 		}
 		if m.Owner == "" {
 			return "", false, fmt.Errorf("stored ownership link for %s has no organization", npub)
+		}
+		if preferredOwner != "" && !strings.EqualFold(m.Owner, preferredOwner) {
+			continue
 		}
 		if owner != "" && owner != m.Owner {
 			return "", false, fmt.Errorf("conflicting organization links for %s: %s and %s", npub, owner, m.Owner)
@@ -158,7 +164,7 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 				metrics.IncAnnouncementRejected()
 				return fmt.Errorf("refuse archive without a valid ownership link for %s/%s", npub, repoID)
 			}
-			linkedOwner, linked, linkErr := s.linkedOwner(ctx, npub, ev.PubKey.Hex())
+			linkedOwner, linked, linkErr := s.linkedOwner(ctx, npub, ev.PubKey.Hex(), mapping.Owner)
 			if linkErr != nil || !linked || !strings.EqualFold(linkedOwner, mapping.Owner) {
 				metrics.IncAnnouncementRejected()
 				return fmt.Errorf("refuse archive with ambiguous ownership link for %s/%s", npub, repoID)
@@ -277,7 +283,7 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 			return fmt.Errorf("stored mapping %s/%s does not match announcing identity", npub, repoID)
 		}
 		orgName = existing.Owner
-		linkedOwner, linked, linkErr := s.linkedOwner(ctx, npub, pubkey)
+		linkedOwner, linked, linkErr := s.linkedOwner(ctx, npub, pubkey, orgName)
 		if linkErr != nil {
 			return linkErr
 		}
@@ -286,15 +292,14 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		}
 		orgLinked = true
 	} else {
-		orgName, orgLinked, err = s.linkedOwner(ctx, npub, pubkey)
+		resolvedName := s.resolver.ResolveOrgName(ctx, pubkey, relayURLs)
+		orgName, orgLinked, err = s.linkedOwner(ctx, npub, pubkey, resolvedName)
 		if err != nil {
 			return err
 		}
-	}
-	if !orgLinked {
-		// Resolve a stable domain-qualified NIP-05 name, falling back to a
-		// collision-resistant hex prefix when no verified identifier exists.
-		orgName = s.resolver.ResolveOrgName(ctx, pubkey, relayURLs)
+		if !orgLinked {
+			orgName = resolvedName
+		}
 	}
 
 	s.logger.Info("resolved org ownership", "npub", npub, "org_name", orgName, "linked", orgLinked)
@@ -408,7 +413,7 @@ func (s *Service) ReconcileHooks(ctx context.Context) error {
 	for _, m := range pending {
 		// Reuse resources only after validating the durable identity link and
 		// exact Gitea repository ID.
-		linkedOwner, linked, linkErr := s.linkedOwner(ctx, m.Npub, m.Pubkey)
+		linkedOwner, linked, linkErr := s.linkedOwner(ctx, m.Npub, m.Pubkey, m.Owner)
 		if linkErr != nil || !linked || !strings.EqualFold(linkedOwner, m.Owner) {
 			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: invalid ownership link: %v", m.Owner, m.RepoID, linkErr))
 			continue
