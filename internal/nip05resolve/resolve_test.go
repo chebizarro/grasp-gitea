@@ -52,7 +52,7 @@ func TestResolverCacheHit(t *testing.T) {
 	r := NewResolver(1 * time.Minute)
 
 	// Pre-populate the cache.
-	r.cacheResult("pubkey1", "cached-org")
+	r.cacheResult("pubkey1", "cached-org", "cached-org@example.com")
 
 	// ResolveOrgName should return the cached value without trying any relays.
 	// (We pass no relay URLs, so if it tries to connect it will just fall through.)
@@ -65,7 +65,7 @@ func TestResolverCacheHit(t *testing.T) {
 func TestResolverCacheExpiry(t *testing.T) {
 	r := NewResolver(1 * time.Millisecond)
 
-	r.cacheResult("pubkey1", "cached-org")
+	r.cacheResult("pubkey1", "cached-org", "cached-org@example.com")
 	time.Sleep(5 * time.Millisecond)
 
 	// Cache should be expired. With no relays, falls back to hex.
