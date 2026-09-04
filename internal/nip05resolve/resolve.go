@@ -30,6 +30,7 @@ var nip05HTTPClient = safefetch.NewClient()
 // cacheEntry holds a cached org name resolution result.
 type cacheEntry struct {
 	orgName   string
+	nip05     string
 	expiresAt time.Time
 }
 
@@ -71,13 +72,13 @@ func (r *Resolver) ResolveOrgName(ctx context.Context, pubkey string, relayURLs 
 	// Try each relay in order until one succeeds with a real NIP-05 name.
 	var lastErr error
 	for _, relayURL := range relayURLs {
-		name, err := resolveFromRelay(ctx, pubkey, relayURL)
+		name, nip05, err := resolveFromRelay(ctx, pubkey, relayURL)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		if name != "" {
-			r.cacheResult(pubkey, name)
+			r.cacheResult(pubkey, name, nip05)
 			return name
 		}
 	}
@@ -85,8 +86,23 @@ func (r *Resolver) ResolveOrgName(ctx context.Context, pubkey string, relayURLs 
 	// All relays failed or returned no NIP-05. Use hex prefix fallback.
 	_ = lastErr // logged by caller if needed
 	fallback := hexFallback(pubkey)
-	r.cacheResult(pubkey, fallback)
+	r.cacheResult(pubkey, fallback, "")
 	return fallback
+}
+
+// ResolveNIP05 resolves the original NIP-05 identifier for a given pubkey.
+func (r *Resolver) ResolveNIP05(ctx context.Context, pubkey string, relayURLs []string) string {
+	// ResolveOrgName handles the heavy lifting and caching.
+	r.ResolveOrgName(ctx, pubkey, relayURLs)
+
+	// Return the cached NIP-05 identifier.
+	r.mu.RLock()
+	entry, ok := r.cache[pubkey]
+	r.mu.RUnlock()
+	if ok && time.Now().Before(entry.expiresAt) {
+		return entry.nip05
+	}
+	return ""
 }
 
 // CacheSize returns the number of entries in the cache (for testing/metrics).
@@ -96,25 +112,26 @@ func (r *Resolver) CacheSize() int {
 	return len(r.cache)
 }
 
-func (r *Resolver) cacheResult(pubkey string, orgName string) {
+func (r *Resolver) cacheResult(pubkey string, orgName string, nip05 string) {
 	if r.cacheTTL <= 0 {
 		return
 	}
 	r.mu.Lock()
 	r.cache[pubkey] = cacheEntry{
 		orgName:   orgName,
+		nip05:     nip05,
 		expiresAt: time.Now().Add(r.cacheTTL),
 	}
 	r.mu.Unlock()
 }
 
 // resolveFromRelay connects to a single relay and attempts NIP-05 resolution.
-// Returns ("", nil) if the profile exists but has no NIP-05 or it doesn't verify.
-// Returns ("", err) on connection/subscription failure.
-func resolveFromRelay(ctx context.Context, pubkey string, relayURL string) (string, error) {
+// Returns ("", "", nil) if the profile exists but has no NIP-05 or it doesn't verify.
+// Returns ("", "", err) on connection/subscription failure.
+func resolveFromRelay(ctx context.Context, pubkey string, relayURL string) (string, string, error) {
 	pk, err := nostr.PubKeyFromHex(pubkey)
 	if err != nil {
-		return "", fmt.Errorf("invalid pubkey %q: %w", pubkey, err)
+		return "", "", fmt.Errorf("invalid pubkey %q: %w", pubkey, err)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, resolveTimeout)
@@ -122,7 +139,7 @@ func resolveFromRelay(ctx context.Context, pubkey string, relayURL string) (stri
 
 	relay, err := nostr.RelayConnect(ctx, relayURL, nostr.RelayOptions{})
 	if err != nil {
-		return "", fmt.Errorf("connect to relay %s: %w", relayURL, err)
+		return "", "", fmt.Errorf("connect to relay %s: %w", relayURL, err)
 	}
 	defer relay.Close()
 
@@ -132,7 +149,7 @@ func resolveFromRelay(ctx context.Context, pubkey string, relayURL string) (stri
 		Limit:   1,
 	}, nostr.SubscriptionOptions{})
 	if err != nil {
-		return "", fmt.Errorf("subscribe for kind 0 on %s: %w", relayURL, err)
+		return "", "", fmt.Errorf("subscribe for kind 0 on %s: %w", relayURL, err)
 	}
 	defer sub.Unsub()
 
@@ -141,49 +158,49 @@ func resolveFromRelay(ctx context.Context, pubkey string, relayURL string) (stri
 	case e := <-sub.Events:
 		ev = &e
 	case <-ctx.Done():
-		return "", fmt.Errorf("timeout waiting for kind 0 from %s", relayURL)
+		return "", "", fmt.Errorf("timeout waiting for kind 0 from %s", relayURL)
 	}
 
 	if ev == nil {
-		return "", nil // no profile on this relay
+		return "", "", nil // no profile on this relay
 	}
 	if ev.Kind != 0 {
-		return "", fmt.Errorf("relay %s returned kind %d for kind-0 query", relayURL, ev.Kind)
+		return "", "", fmt.Errorf("relay %s returned kind %d for kind-0 query", relayURL, ev.Kind)
 	}
 	if ev.PubKey != pk {
-		return "", fmt.Errorf("relay %s returned kind-0 event for unexpected author %s", relayURL, ev.PubKey.Hex())
+		return "", "", fmt.Errorf("relay %s returned kind-0 event for unexpected author %s", relayURL, ev.PubKey.Hex())
 	}
 	if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
-		return "", fmt.Errorf("relay %s returned invalid kind-0 event: %w", relayURL, err)
+		return "", "", nil // verification failed, not a relay error
 	}
 
 	var profile struct {
 		NIP05 string `json:"nip05"`
 	}
 	if err := json.Unmarshal([]byte(ev.Content), &profile); err != nil {
-		return "", nil // malformed profile, not a connection error
+		return "", "", nil // malformed profile, not a connection error
 	}
 	if profile.NIP05 == "" {
-		return "", nil // profile exists but no NIP-05 set
+		return "", "", nil // profile exists but no NIP-05 set
 	}
 
 	localPart, domain, err := nip05.ParseIdentifier(profile.NIP05)
 	if err != nil {
-		return "", nil // invalid NIP-05 format
+		return "", "", nil // invalid NIP-05 format
 	}
 
 	// Verify the NIP-05 identifier resolves back to this pubkey. The domain is
 	// attacker-controlled profile content, so the well-known request must use
 	// the same guarded egress policy as avatar downloads.
 	if err := verifyIdentifier(ctx, localPart, domain, pk); err != nil {
-		return "", nil // verification failed, not a relay error
+		return "", "", nil // verification failed, not a relay error
 	}
 
 	name := qualifiedName(localPart, domain, pubkey)
 	if name == "" {
-		return "", nil
+		return "", "", nil
 	}
-	return name, nil
+	return name, profile.NIP05, nil
 }
 
 func verifyIdentifier(ctx context.Context, localPart, domain string, expected nostr.PubKey) error {
@@ -211,7 +228,7 @@ func verifyIdentifier(ctx context.Context, localPart, domain string, expected no
 		return err
 	}
 	if len(raw) > maxResponseSize {
-		return fmt.Errorf("NIP-05 response exceeds %d-byte limit", maxResponseSize)
+		return fmt.Errorf("NIP-05 response exceeds %d-byte limit", resp.StatusCode)
 	}
 
 	var result nip05.WellKnownResponse

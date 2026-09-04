@@ -54,6 +54,7 @@ func (s *IdentityService) notifyProfileSync(pubkey string) {
 // The existing nip05resolve.Resolver satisfies this interface.
 type OrgNameResolver interface {
 	ResolveOrgName(ctx context.Context, pubkey string, relayURLs []string) string
+	ResolveNIP05(ctx context.Context, pubkey string, relayURLs []string) string
 }
 
 // NewIdentityService creates a new identity resolution service.
@@ -116,17 +117,8 @@ func (s *IdentityService) ResolveOrCreate(ctx context.Context, pubkey string, re
 	}
 
 	// No existing link — resolve name and auto-create.
-	username := s.resolveUsername(ctx, pubkey, relayURLs)
-	nip05Addr := ""
-
-	// Check if this username came from NIP-05 resolution (not hex fallback).
-	if s.orgResolver != nil {
-		resolved := s.orgResolver.ResolveOrgName(ctx, pubkey, relayURLs)
-		if resolved == username && !isHexPrefix(resolved) {
-			nip05Addr = resolved
-		}
-	}
-
+	username, nip05Addr := s.resolveUsername(ctx, pubkey, relayURLs)
+	
 	// Generate a random password — the user will authenticate via Nostr,
 	// never via password.
 	password, err := generateRandomPassword()
@@ -174,18 +166,18 @@ func (s *IdentityService) ResolveOrCreate(ctx context.Context, pubkey string, re
 // resolveUsername determines the Gitea username for a pubkey using the same
 // naming policy as org provisioning: NIP-05 local-part if available, else
 // 39-char hex prefix fallback.
-func (s *IdentityService) resolveUsername(ctx context.Context, pubkey string, relayURLs []string) string {
+func (s *IdentityService) resolveUsername(ctx context.Context, pubkey string, relayURLs []string) (string, string) {
 	if s.orgResolver != nil {
 		name := s.orgResolver.ResolveOrgName(ctx, pubkey, relayURLs)
 		if name != "" {
-			return name
+			return name, s.orgResolver.ResolveNIP05(ctx, pubkey, relayURLs)
 		}
 	}
 	// Fallback: first 39 chars of hex pubkey (matches Gitea's 40-char limit).
 	if len(pubkey) > 39 {
-		return pubkey[:39]
+		return pubkey[:39], ""
 	}
-	return pubkey
+	return pubkey, ""
 }
 
 // isHexPrefix returns true if the string looks like a raw hex pubkey prefix.

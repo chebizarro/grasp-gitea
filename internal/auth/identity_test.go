@@ -35,6 +35,13 @@ func (r *stubOrgResolver) ResolveOrgName(_ context.Context, pubkey string, _ []s
 	return pubkey
 }
 
+func (r *stubOrgResolver) ResolveNIP05(_ context.Context, pubkey string, _ []string) string {
+	if _, ok := r.names[pubkey]; ok {
+		return "alice@example.com"
+	}
+	return ""
+}
+
 // fakeUserAPI is a minimal Gitea user API mock.
 type fakeUserAPI struct {
 	mu     sync.Mutex
@@ -258,8 +265,8 @@ func TestResolveOrCreateNIP05Detection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveOrCreate: %v", err)
 	}
-	if result.NIP05 != "alice" {
-		t.Errorf("expected NIP05='alice' (non-hex resolved name), got %q", result.NIP05)
+	if result.NIP05 != "alice@example.com" {
+		t.Errorf("expected NIP05='alice@example.com' (non-hex resolved name), got %q", result.NIP05)
 	}
 
 	// Verify persisted in store.
@@ -267,8 +274,8 @@ func TestResolveOrCreateNIP05Detection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIdentityLinkByPubkey: %v", err)
 	}
-	if link.NIP05 != "alice" {
-		t.Errorf("expected stored NIP05='alice', got %q", link.NIP05)
+	if link.NIP05 != "alice@example.com" {
+		t.Errorf("expected stored NIP05='alice@example.com', got %q", link.NIP05)
 	}
 }
 
