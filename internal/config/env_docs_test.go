@@ -19,26 +19,8 @@ import (
 // guard was added. Entries may be REMOVED as they get documented; adding to
 // the list requires a deliberate decision and should be rare.
 var undocumentedLegacyVars = map[string]bool{
-	// Environment detection aliases.
-	"APP_ENV": true, "ENVIRONMENT": true, "GRASP_ENV": true,
-	// Canonical GRASP origins (documented in deploy/grasp-canonical.env.example).
-	"GRASP_PUBLIC_URL": true, "GRASP_RELAY_URL": true,
-	// Embedded relay.
-	"EMBEDDED_RELAY": true, "EMBEDDED_RELAY_DB": true, "EMBEDDED_RELAY_PORT": true,
-	// Legacy CI trigger path.
-	"CI_ENABLED": true, "CI_PROTOCOL": true, "CI_TRIGGER_REPOS": true,
-	"HIVE_CI_MAX_CONCURRENT": true, "HIVE_CI_RUN_TIMEOUT": true,
-	// Loom dispatch subsystem.
-	"LOOM_CASHU_MAX_PAYMENT": true, "LOOM_CASHU_WALLET_PATH": true,
-	"LOOM_DISPATCH_MODE": true, "LOOM_ENABLED": true, "LOOM_FUTURE_SKEW": true,
-	"LOOM_JOB_CMD_TEMPLATE": true, "LOOM_JOB_MAX_DURATION": true,
-	"LOOM_JOB_TTL": true, "LOOM_LOG_MAX_BYTES": true, "LOOM_MAX_JOBS": true,
-	"LOOM_MINT_URL": true, "LOOM_PAYMENT_MODE": true, "LOOM_RELAY_URLS": true,
-	"LOOM_RESULT_GRACE": true, "LOOM_STATIC_PAYMENT_TOKEN": true,
-	"LOOM_STATUS_CONTEXT_PREFIX": true, "LOOM_WORKER_PUBKEYS": true,
-	// Misc.
-	"MIRROR_CALLBACK_TOKEN": true, "NIP34_STATUS_SYNC_ENABLED": true,
-	"NIP46_TRUSTED_PROXY_CIDRS": true,
+	// Environment detection aliases (ENVIRONMENT itself is documented).
+	"APP_ENV": true, "GRASP_ENV": true,
 }
 
 func TestEveryConfigEnvVarIsDocumented(t *testing.T) {
