@@ -2,7 +2,9 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,14 +30,23 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
+type tenantPlacementCoordinator interface {
+	WithPlacement(context.Context, string, func(context.Context, store.ManagedTenant) error) (bool, error)
+}
+
+var errTenantPlacementDeclined = errors.New("tenant placement declined")
+
 type Service struct {
-	cfg       config.Config
-	store     *store.SQLiteStore
-	gitea     *gitea.Client
-	logger    *slog.Logger
-	installer *hooks.Installer
-	resolver  *nip05resolve.Resolver
-	policy    *policy.Store
+	cfg               config.Config
+	store             *store.SQLiteStore
+	authStore         store.AuthStore
+	tenantPlacement   tenantPlacementCoordinator
+	gitea             *gitea.Client
+	logger            *slog.Logger
+	installer         *hooks.Installer
+	resolver          *nip05resolve.Resolver
+	policy            *policy.Store
+	verifyAffiliation func(context.Context, string, []string) nip05resolve.AffiliationVerification
 
 	// repoMu serializes provisioning per (npub, repoID) to prevent concurrent
 	// races when multiple events for the same repo arrive simultaneously.
@@ -56,11 +67,15 @@ type Result struct {
 	Event  string `json:"event"`
 }
 
-func New(cfg config.Config, st *store.SQLiteStore, g *gitea.Client, installer *hooks.Installer, resolver *nip05resolve.Resolver, logger *slog.Logger) *Service {
+func New(cfg config.Config, st *store.SQLiteStore, authStore store.AuthStore, tenantPlacement tenantPlacementCoordinator, g *gitea.Client, installer *hooks.Installer, resolver *nip05resolve.Resolver, logger *slog.Logger) *Service {
+	if authStore == nil {
+		authStore = st
+	}
 	return &Service{
-		cfg: cfg, store: st, gitea: g,
+		cfg: cfg, store: st, authStore: authStore, tenantPlacement: tenantPlacement, gitea: g,
 		installer: installer, resolver: resolver, logger: logger,
-		repoLocks: make(map[string]*sync.Mutex),
+		verifyAffiliation: nip05resolve.VerifyAffiliationFresh,
+		repoLocks:         make(map[string]*sync.Mutex),
 	}
 }
 
@@ -88,7 +103,7 @@ func (s *Service) linkedOwner(ctx context.Context, npub, pubkey string) (string,
 	}
 	owner := ""
 	for _, m := range mappings {
-		if m.Npub != npub {
+		if m.Npub != npub || m.TenantHost != "" {
 			continue
 		}
 		if m.Pubkey != pubkey {
@@ -104,7 +119,7 @@ func (s *Service) linkedOwner(ctx context.Context, npub, pubkey string) (string,
 	}
 	if owner != "" {
 		for _, m := range mappings {
-			if strings.EqualFold(m.Owner, owner) && m.Pubkey != pubkey {
+			if strings.EqualFold(m.Owner, owner) && m.TenantHost == "" && m.Pubkey != pubkey {
 				return "", false, fmt.Errorf("organization %s is linked to multiple Nostr identities", owner)
 			}
 		}
@@ -162,7 +177,7 @@ func (s *Service) HandleAnnouncementEvent(ctx context.Context, ev *nostr.Event, 
 		return fmt.Errorf("announcement %s does not list this service in relays tags", ev.ID)
 	}
 
-	if err := s.provisionFromAnnouncement(ctx, npub, ev.PubKey.Hex(), repoID, cloneURL, ev.ID.Hex(), relayURL); err != nil {
+	if err := s.provisionFromAnnouncement(ctx, npub, ev.PubKey.Hex(), repoID, cloneURL, ev.ID.Hex(), relayURL, tenantPlacementIntent(ev.Tags)); err != nil {
 		metrics.IncAnnouncementRejected()
 		return err
 	}
@@ -205,7 +220,7 @@ func (s *Service) ManualProvision(ctx context.Context, npub string, pubkey strin
 	if cloneURL == "" {
 		cloneURL = fmt.Sprintf("%s/%s/%s.git", s.cfg.ClonePrefix, npub, repoID)
 	}
-	err := s.provisionFromAnnouncement(ctx, npub, pubkey, repoID, cloneURL, "manual", "manual")
+	err := s.provisionFromAnnouncement(ctx, npub, pubkey, repoID, cloneURL, "manual", "manual", "")
 	if err != nil {
 		metrics.IncManualProvisionFailures()
 		return Result{}, err
@@ -220,7 +235,7 @@ func (s *Service) ManualProvision(ctx context.Context, npub string, pubkey strin
 	return Result{Npub: npub, RepoID: repoID, Owner: orgName, Repo: repoID, Event: "manual"}, nil
 }
 
-func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pubkey string, repoID string, cloneURL string, sourceEvent string, sourceRelay string) error {
+func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pubkey string, repoID string, cloneURL string, sourceEvent string, sourceRelay string, placementIntent string) error {
 	if err := s.validatePolicy(ctx, npub, pubkey); err != nil {
 		return err
 	}
@@ -247,21 +262,49 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		return fmt.Errorf("lookup ownership link: %w", err)
 	}
 
-	orgName := ""
-	orgLinked := false
+	orgName, repoName, tenantHost := "", repoID, ""
+	orgLinked, tenantPlaced := false, false
+	collaboratorUser := ""
+	var repo gitea.Repository
+	repoCreated := false
 	if exactLinked {
-		if existing.Pubkey != pubkey || existing.Owner == "" || existing.GiteaRepoID <= 0 {
+		if existing.Pubkey != pubkey || existing.Owner == "" || existing.RepoName == "" || existing.GiteaRepoID <= 0 {
 			return fmt.Errorf("stored mapping %s/%s does not match announcing identity", npub, repoID)
 		}
-		orgName = existing.Owner
-		linkedOwner, linked, linkErr := s.linkedOwner(ctx, npub, pubkey)
-		if linkErr != nil {
-			return linkErr
+		orgName, repoName, tenantHost, orgLinked = existing.Owner, existing.RepoName, existing.TenantHost, true
+		tenantPlaced = tenantHost != ""
+		if tenantPlaced {
+			if link, linkErr := s.authStore.GetIdentityLinkByPubkey(ctx, pubkey); linkErr == nil {
+				collaboratorUser = link.GiteaUser
+			} else if !errors.Is(linkErr, sql.ErrNoRows) {
+				return fmt.Errorf("lookup tenant repository owner: %w", linkErr)
+			}
 		}
-		if !linked || !strings.EqualFold(linkedOwner, orgName) {
-			return fmt.Errorf("stored mapping %s/%s has an inconsistent organization link", npub, repoID)
+	} else if placementIntent != "" && s.tenantPlacement != nil {
+		placed, placementErr := s.tenantPlacement.WithPlacement(ctx, placementIntent, func(lockedCtx context.Context, tenant store.ManagedTenant) error {
+			user, authorized := s.authorizeTenantPlacement(lockedCtx, pubkey, tenant, relayURLs)
+			if !authorized {
+				return errTenantPlacementDeclined
+			}
+			orgName, repoName, tenantHost = tenant.OrgName, tenantRepoName(repoID, pubkey), tenant.Host
+			orgLinked, tenantPlaced, collaboratorUser = true, true, user
+			var createErr error
+			repo, createErr = s.gitea.CreateRepo(lockedCtx, orgName, repoName)
+			if createErr != nil {
+				return fmt.Errorf("create tenant repo %s/%s: %w", orgName, repoName, createErr)
+			}
+			repoCreated = true
+			return nil
+		})
+		if placementErr != nil && !errors.Is(placementErr, errTenantPlacementDeclined) {
+			return placementErr
 		}
-		orgLinked = true
+		if !placed || errors.Is(placementErr, errTenantPlacementDeclined) {
+			orgName, orgLinked, err = s.linkedOwner(ctx, npub, pubkey)
+			if err != nil {
+				return err
+			}
+		}
 	} else {
 		orgName, orgLinked, err = s.linkedOwner(ctx, npub, pubkey)
 		if err != nil {
@@ -274,12 +317,12 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		orgName = s.resolver.ResolveOrgName(ctx, pubkey, relayURLs)
 	}
 
-	s.logger.Info("resolved org ownership", "npub", npub, "org_name", orgName, "linked", orgLinked)
+	s.logger.Info("resolved org ownership", "npub", npub, "org_name", orgName, "repo_name", repoName, "linked", orgLinked, "tenant_placed", tenantPlaced)
 
 	// Preserve the original announced clone URL for traceability.
-	// The actual Gitea clone URL uses the linked/resolved org name.
+	// The actual Gitea clone URL uses the mapped physical owner and name.
 	announcedCloneURL := cloneURL
-	giteaCloneURL := fmt.Sprintf("%s/%s/%s.git", s.cfg.ClonePrefix, orgName, repoID)
+	giteaCloneURL := fmt.Sprintf("%s/%s/%s.git", s.cfg.ClonePrefix, orgName, repoName)
 
 	if orgLinked {
 		if err := s.gitea.EnsureOrg(ctx, orgName); err != nil {
@@ -289,30 +332,32 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		return fmt.Errorf("create unlinked org %s: %w", orgName, err)
 	}
 
-	// Sync kind:0 profile into the Gitea org (non-fatal — don't block provisioning).
-	if profile, err := nostrprofile.Fetch(ctx, pubkey, relayURLs); err != nil {
-		s.logger.Debug("nostr profile fetch failed (non-fatal)", "pubkey", pubkey, "error", err)
-	} else if profile != nil && !profile.IsEmpty() {
-		if syncErr := s.gitea.SyncNostrProfile(ctx, "", orgName, *profile); syncErr != nil {
-			s.logger.Warn("nostr profile sync partial failure (non-fatal)", "org", orgName, "error", syncErr)
-		} else {
-			s.logger.Info("synced nostr profile to gitea org", "org", orgName, "display_name", profile.DisplayName)
+	// A tenant org represents the domain, not one member; never overwrite its
+	// managed profile with a repository owner's kind:0 metadata.
+	if !tenantPlaced {
+		if profile, err := nostrprofile.Fetch(ctx, pubkey, relayURLs); err != nil {
+			s.logger.Debug("nostr profile fetch failed (non-fatal)", "pubkey", pubkey, "error", err)
+		} else if profile != nil && !profile.IsEmpty() {
+			if syncErr := s.gitea.SyncNostrProfile(ctx, "", orgName, *profile); syncErr != nil {
+				s.logger.Warn("nostr profile sync partial failure (non-fatal)", "org", orgName, "error", syncErr)
+			} else {
+				s.logger.Info("synced nostr profile to gitea org", "org", orgName, "display_name", profile.DisplayName)
+			}
 		}
 	}
 
-	var repo gitea.Repository
 	if exactLinked {
-		repo, err = s.gitea.EnsureRepo(ctx, orgName, repoID)
+		repo, err = s.gitea.EnsureRepo(ctx, orgName, repoName)
 		if err != nil {
-			return fmt.Errorf("ensure linked repo %s/%s: %w", orgName, repoID, err)
+			return fmt.Errorf("ensure linked repo %s/%s: %w", orgName, repoName, err)
 		}
 		if repo.ID != existing.GiteaRepoID {
-			return fmt.Errorf("linked repo %s/%s has Gitea id %d, expected %d", orgName, repoID, repo.ID, existing.GiteaRepoID)
+			return fmt.Errorf("linked repo %s/%s has Gitea id %d, expected %d", orgName, repoName, repo.ID, existing.GiteaRepoID)
 		}
-	} else {
-		repo, err = s.gitea.CreateRepo(ctx, orgName, repoID)
+	} else if !repoCreated {
+		repo, err = s.gitea.CreateRepo(ctx, orgName, repoName)
 		if err != nil {
-			return fmt.Errorf("create unlinked repo %s/%s: %w", orgName, repoID, err)
+			return fmt.Errorf("create unlinked repo %s/%s: %w", orgName, repoName, err)
 		}
 	}
 
@@ -324,7 +369,8 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 		RepoID:            repoID,
 		Pubkey:            pubkey,
 		Owner:             orgName,
-		RepoName:          repoID,
+		RepoName:          repoName,
+		TenantHost:        tenantHost,
 		GiteaRepoID:       repo.ID,
 		CloneURL:          giteaCloneURL,
 		AnnouncedCloneURL: announcedCloneURL,
@@ -334,10 +380,18 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 	if err := s.store.UpsertMapping(ctx, mapping); err != nil {
 		return fmt.Errorf("save mapping: %w", err)
 	}
+	if tenantPlaced {
+		if collaboratorUser == "" {
+			return fmt.Errorf("tenant repository owner has no linked Gitea user")
+		}
+		if err := s.gitea.AddOrUpdateCollaborator(ctx, orgName, repoName, collaboratorUser, "write"); err != nil {
+			return fmt.Errorf("grant tenant repository owner collaborator access: %w", err)
+		}
+	}
 
 	// Phase 2: Install the pre-receive hook, then mark as complete.
 	if s.installer != nil {
-		if err := s.installer.Install(orgName, npub, repoID); err != nil {
+		if err := s.installer.InstallAt(orgName, repoName, npub, repoID); err != nil {
 			return fmt.Errorf("install pre-receive hook: %w", err)
 		}
 	}
@@ -383,23 +437,36 @@ func (s *Service) ReconcileHooks(ctx context.Context) error {
 
 	var reconcileErrors []error
 	for _, m := range pending {
-		// Reuse resources only after validating the durable identity link and
-		// exact Gitea repository ID.
-		linkedOwner, linked, linkErr := s.linkedOwner(ctx, m.Npub, m.Pubkey)
-		if linkErr != nil || !linked || !strings.EqualFold(linkedOwner, m.Owner) {
-			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: invalid ownership link: %v", m.Owner, m.RepoID, linkErr))
-			continue
-		}
+		// The exact mapping, including immutable repository ID below, is the
+		// durable ownership link. Tenant placement intentionally permits one
+		// pubkey to have repositories in more than one Gitea organization.
 		if err := s.gitea.EnsureOrg(ctx, m.Owner); err != nil {
 			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: ensure org: %w", m.Owner, m.RepoID, err))
 			continue
 		}
-		if _, err := s.gitea.EnsureRepo(ctx, m.Owner, m.RepoID); err != nil {
-			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: ensure repo: %w", m.Owner, m.RepoID, err))
+		if repo, err := s.gitea.EnsureRepo(ctx, m.Owner, m.RepoName); err != nil {
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: ensure repo: %w", m.Owner, m.RepoName, err))
+			continue
+		} else if repo.ID != m.GiteaRepoID {
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: Gitea id %d, expected %d", m.Owner, m.RepoName, repo.ID, m.GiteaRepoID))
 			continue
 		}
+		if m.TenantHost != "" {
+			link, err := s.authStore.GetIdentityLinkByPubkey(ctx, m.Pubkey)
+			if err != nil || link.GiteaUserID <= 0 || link.GiteaUser == "" {
+				if err == nil {
+					err = errors.New("identity link has no Gitea user")
+				}
+				reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: lookup owner collaborator: %w", m.Owner, m.RepoName, err))
+				continue
+			}
+			if err := s.gitea.AddOrUpdateCollaborator(ctx, m.Owner, m.RepoName, link.GiteaUser, "write"); err != nil {
+				reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: restore owner collaborator: %w", m.Owner, m.RepoName, err))
+				continue
+			}
+		}
 		if s.installer != nil {
-			if err := s.installer.Install(m.Owner, m.Npub, m.RepoID); err != nil {
+			if err := s.installer.InstallAt(m.Owner, m.RepoName, m.Npub, m.RepoID); err != nil {
 				reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile %s/%s: install hook: %w", m.Owner, m.RepoID, err))
 				continue
 			}
@@ -426,7 +493,7 @@ func (s *Service) EnsureUploadPackCapabilities(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := s.installer.ConfigureUploadPack(m.Owner, m.RepoID); err != nil {
+		if err := s.installer.ConfigureUploadPack(m.Owner, m.RepoName); err != nil {
 			errs = append(errs, fmt.Errorf("upload-pack config %s/%s: %w", m.Owner, m.RepoID, err))
 			continue
 		}
@@ -462,6 +529,77 @@ func (s *Service) validatePolicy(ctx context.Context, npub string, pubkey string
 	}
 
 	return nil
+}
+
+func tenantPlacementIntent(tags nostr.Tags) string {
+	intent := ""
+	for _, tag := range tags {
+		if len(tag) == 0 || tag[0] != "tenant" {
+			continue
+		}
+		if len(tag) != 2 || intent != "" {
+			return ""
+		}
+		host, err := nip05resolve.CanonicalizeHost(tag[1])
+		if err != nil {
+			return ""
+		}
+		intent = host
+	}
+	return intent
+}
+
+func tenantRepoName(repoID, pubkey string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(pubkey)))
+	return repoID + "-" + hex.EncodeToString(sum[:10])
+}
+
+// authorizeTenantPlacement performs member authorization while the tenant
+// coordinator holds the shared tenant lock. Every failed or ambiguous check
+// declines placement into the tenant namespace.
+func (s *Service) authorizeTenantPlacement(ctx context.Context, pubkey string, tenant store.ManagedTenant, relayURLs []string) (string, bool) {
+	verify := s.verifyAffiliation
+	if verify == nil {
+		verify = nip05resolve.VerifyAffiliationFresh
+	}
+	verification := verify(ctx, pubkey, relayURLs)
+	if !verification.Verified() || verification.Host != tenant.Host {
+		return "", false
+	}
+	if err := s.authStore.UpsertDomainAffiliation(ctx, store.DomainAffiliation{
+		CanonicalIdentifier: verification.CanonicalIdentifier,
+		LocalPart:           verification.LocalPart,
+		Host:                verification.Host,
+		Pubkey:              strings.ToLower(pubkey),
+		VerifiedAt:          verification.VerifiedAt,
+		CheckedAt:           verification.VerifiedAt,
+		Status:              store.DomainAffiliationVerified,
+	}); err != nil {
+		return "", false
+	}
+	link, err := s.authStore.GetIdentityLinkByPubkey(ctx, pubkey)
+	if err != nil || link.GiteaUserID <= 0 || link.GiteaUser == "" {
+		return "", false
+	}
+	if _, err := s.authStore.GetTenantSCIMToken(ctx, tenant.Host); err == nil {
+		authorized, listErr := s.authStore.ListSCIMAuthorizedUsers(ctx, tenant.Host)
+		if listErr != nil {
+			return "", false
+		}
+		allowed := false
+		for _, user := range authorized {
+			if strings.EqualFold(user.Pubkey, pubkey) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return "", false
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return "", false
+	}
+	return link.GiteaUser, true
 }
 
 func getTagValue(tags nostr.Tags, key string) string {

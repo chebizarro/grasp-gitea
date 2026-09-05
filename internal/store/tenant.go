@@ -21,6 +21,8 @@ const (
 type ManagedTenant struct {
 	Host               string    `json:"host"`
 	Policy             string    `json:"policy"`
+	PlacementEnabled   bool      `json:"placement_enabled"`
+	PlacementPending   bool      `json:"placement_pending"`
 	State              string    `json:"state"`
 	OrgName            string    `json:"org_name"`
 	ProvisioningMarker string    `json:"-"`
@@ -48,15 +50,16 @@ type TenantMembership struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
-const tenantSelect = `SELECT host,policy,state,org_name,provisioning_marker,gitea_org_id,reader_team_id,version,reconciled_version,last_reconciled_at,last_error,created_at,updated_at FROM managed_tenants`
+const tenantSelect = `SELECT host,policy,placement_enabled,placement_pending,state,org_name,provisioning_marker,gitea_org_id,reader_team_id,version,reconciled_version,last_reconciled_at,last_error,created_at,updated_at FROM managed_tenants`
 const membershipSelect = `SELECT host,pubkey,gitea_user_id,gitea_user,evidence_status,verified_at,checked_at,granted,tenant_orphaned,access_state,reconciled_at,updated_at FROM tenant_memberships`
 
 type tenantScanner interface{ Scan(...any) error }
 
 func scanTenant(s tenantScanner) (ManagedTenant, error) {
 	var t ManagedTenant
+	var placement, placementPending int
 	var lr, ca, ua string
-	if e := s.Scan(&t.Host, &t.Policy, &t.State, &t.OrgName, &t.ProvisioningMarker, &t.GiteaOrgID, &t.ReaderTeamID, &t.Version, &t.ReconciledVersion, &lr, &t.LastError, &ca, &ua); e != nil {
+	if e := s.Scan(&t.Host, &t.Policy, &placement, &placementPending, &t.State, &t.OrgName, &t.ProvisioningMarker, &t.GiteaOrgID, &t.ReaderTeamID, &t.Version, &t.ReconciledVersion, &lr, &t.LastError, &ca, &ua); e != nil {
 		return t, e
 	}
 	var e error
@@ -66,6 +69,8 @@ func scanTenant(s tenantScanner) (ManagedTenant, error) {
 			return t, e
 		}
 	}
+	t.PlacementEnabled = placement != 0
+	t.PlacementPending = placementPending != 0
 	t.CreatedAt, e = parseStoreTime(ca)
 	if e != nil {
 		return t, e
@@ -109,14 +114,14 @@ func tt(t time.Time) string {
 	return t.UTC().Format(storeTimeLayout)
 }
 func tenantArgs(t ManagedTenant) []any {
-	return []any{t.Host, t.Policy, t.State, t.OrgName, t.ProvisioningMarker, t.GiteaOrgID, t.ReaderTeamID, t.Version, t.ReconciledVersion, tt(t.LastReconciledAt), t.LastError, tt(t.CreatedAt), tt(t.UpdatedAt)}
+	return []any{t.Host, t.Policy, boolInt(t.PlacementEnabled), boolInt(t.PlacementPending), t.State, t.OrgName, t.ProvisioningMarker, t.GiteaOrgID, t.ReaderTeamID, t.Version, t.ReconciledVersion, tt(t.LastReconciledAt), t.LastError, tt(t.CreatedAt), tt(t.UpdatedAt)}
 }
 func (s *SQLiteStore) CreateManagedTenant(c context.Context, t ManagedTenant) error {
-	_, e := s.db.ExecContext(c, `INSERT INTO managed_tenants(host,policy,state,org_name,provisioning_marker,gitea_org_id,reader_team_id,version,reconciled_version,last_reconciled_at,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, tenantArgs(t)...)
+	_, e := s.db.ExecContext(c, `INSERT INTO managed_tenants(host,policy,placement_enabled,placement_pending,state,org_name,provisioning_marker,gitea_org_id,reader_team_id,version,reconciled_version,last_reconciled_at,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, tenantArgs(t)...)
 	return e
 }
 func (s *PostgresStore) CreateManagedTenant(c context.Context, t ManagedTenant) error {
-	_, e := s.db.ExecContext(c, `INSERT INTO managed_tenants(host,policy,state,org_name,provisioning_marker,gitea_org_id,reader_team_id,version,reconciled_version,last_reconciled_at,last_error,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, tenantArgs(t)...)
+	_, e := s.db.ExecContext(c, `INSERT INTO managed_tenants(host,policy,placement_enabled,placement_pending,state,org_name,provisioning_marker,gitea_org_id,reader_team_id,version,reconciled_version,last_reconciled_at,last_error,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, tenantArgs(t)...)
 	return e
 }
 func (s *SQLiteStore) GetManagedTenant(c context.Context, h string) (ManagedTenant, error) {
@@ -152,7 +157,7 @@ func (s *PostgresStore) ListManagedTenants(c context.Context) ([]ManagedTenant, 
 	return scanTenants(r)
 }
 func (s *SQLiteStore) UpdateManagedTenant(c context.Context, t ManagedTenant, v int64) (bool, error) {
-	r, e := s.db.ExecContext(c, `UPDATE managed_tenants SET policy=?,state=?,org_name=?,provisioning_marker=?,gitea_org_id=?,reader_team_id=?,version=?,reconciled_version=?,last_reconciled_at=?,last_error=?,created_at=?,updated_at=? WHERE host=? AND version=? AND org_name=? AND provisioning_marker=? AND (gitea_org_id=0 OR gitea_org_id=?) AND (reader_team_id=0 OR reader_team_id=?)`, t.Policy, t.State, t.OrgName, t.ProvisioningMarker, t.GiteaOrgID, t.ReaderTeamID, t.Version, t.ReconciledVersion, tt(t.LastReconciledAt), t.LastError, tt(t.CreatedAt), tt(t.UpdatedAt), t.Host, v, t.OrgName, t.ProvisioningMarker, t.GiteaOrgID, t.ReaderTeamID)
+	r, e := s.db.ExecContext(c, `UPDATE managed_tenants SET policy=?,placement_enabled=?,placement_pending=?,state=?,org_name=?,provisioning_marker=?,gitea_org_id=?,reader_team_id=?,version=?,reconciled_version=?,last_reconciled_at=?,last_error=?,created_at=?,updated_at=? WHERE host=? AND version=? AND org_name=? AND provisioning_marker=? AND (gitea_org_id=0 OR gitea_org_id=?) AND (reader_team_id=0 OR reader_team_id=?)`, t.Policy, boolInt(t.PlacementEnabled), boolInt(t.PlacementPending), t.State, t.OrgName, t.ProvisioningMarker, t.GiteaOrgID, t.ReaderTeamID, t.Version, t.ReconciledVersion, tt(t.LastReconciledAt), t.LastError, tt(t.CreatedAt), tt(t.UpdatedAt), t.Host, v, t.OrgName, t.ProvisioningMarker, t.GiteaOrgID, t.ReaderTeamID)
 	if e != nil {
 		return false, e
 	}
@@ -160,7 +165,7 @@ func (s *SQLiteStore) UpdateManagedTenant(c context.Context, t ManagedTenant, v 
 	return n == 1, e
 }
 func (s *PostgresStore) UpdateManagedTenant(c context.Context, t ManagedTenant, v int64) (bool, error) {
-	r, e := s.db.ExecContext(c, `UPDATE managed_tenants SET policy=$1,state=$2,org_name=$3,provisioning_marker=$4,gitea_org_id=$5,reader_team_id=$6,version=$7,reconciled_version=$8,last_reconciled_at=$9,last_error=$10,created_at=$11,updated_at=$12 WHERE host=$13 AND version=$14 AND org_name=$15 AND provisioning_marker=$16 AND (gitea_org_id=0 OR gitea_org_id=$17) AND (reader_team_id=0 OR reader_team_id=$18)`, t.Policy, t.State, t.OrgName, t.ProvisioningMarker, t.GiteaOrgID, t.ReaderTeamID, t.Version, t.ReconciledVersion, tt(t.LastReconciledAt), t.LastError, tt(t.CreatedAt), tt(t.UpdatedAt), t.Host, v, t.OrgName, t.ProvisioningMarker, t.GiteaOrgID, t.ReaderTeamID)
+	r, e := s.db.ExecContext(c, `UPDATE managed_tenants SET policy=$1,placement_enabled=$2,placement_pending=$3,state=$4,org_name=$5,provisioning_marker=$6,gitea_org_id=$7,reader_team_id=$8,version=$9,reconciled_version=$10,last_reconciled_at=$11,last_error=$12,created_at=$13,updated_at=$14 WHERE host=$15 AND version=$16 AND org_name=$17 AND provisioning_marker=$18 AND (gitea_org_id=0 OR gitea_org_id=$19) AND (reader_team_id=0 OR reader_team_id=$20)`, t.Policy, boolInt(t.PlacementEnabled), boolInt(t.PlacementPending), t.State, t.OrgName, t.ProvisioningMarker, t.GiteaOrgID, t.ReaderTeamID, t.Version, t.ReconciledVersion, tt(t.LastReconciledAt), t.LastError, tt(t.CreatedAt), tt(t.UpdatedAt), t.Host, v, t.OrgName, t.ProvisioningMarker, t.GiteaOrgID, t.ReaderTeamID)
 	if e != nil {
 		return false, e
 	}

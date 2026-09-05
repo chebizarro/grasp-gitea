@@ -16,8 +16,9 @@ type fakeTenantOperator struct{ killed bool }
 func (f *fakeTenantOperator) Get(context.Context, string) (store.ManagedTenant, error) {
 	return store.ManagedTenant{Host: "example.com"}, nil
 }
-func (f *fakeTenantOperator) Approve(_ context.Context, h, p string) (store.ManagedTenant, error) {
-	return store.ManagedTenant{Host: h, Policy: p, State: store.TenantStatePending}, nil
+func (f *fakeTenantOperator) Approve(_ context.Context, h, p string, placement *bool) (store.ManagedTenant, error) {
+	enabled := placement != nil && *placement
+	return store.ManagedTenant{Host: h, Policy: p, PlacementEnabled: enabled, State: store.TenantStatePending}, nil
 }
 func (f *fakeTenantOperator) Create(context.Context, string) (store.ManagedTenant, error) {
 	return store.ManagedTenant{Host: "example.com", State: store.TenantStateActive}, nil
@@ -60,6 +61,18 @@ func TestTenantAdminRequiresTokenAndKillIsPostOnly(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || !op.killed {
 		t.Fatalf("authorized kill status=%d killed=%v", w.Code, op.killed)
+	}
+}
+
+func TestTenantAdminSetsExplicitPlacementPolicy(t *testing.T) {
+	s := New(config.Config{AdminAPIToken: "secret"}, nil, nil, nil, nil)
+	s.SetTenantOperator(&fakeTenantOperator{})
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/example.com/approve", strings.NewReader(`{"policy":"directory-only","placement_enabled":true}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"placement_enabled":true`) {
+		t.Fatalf("approve status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 

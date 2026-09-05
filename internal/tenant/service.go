@@ -17,7 +17,10 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
-const ReaderTeamName = "grasp-domain-readers-v1"
+const (
+	ReaderTeamName                = "grasp-domain-readers-v1"
+	placementReconciliationMaxAge = 45 * time.Minute
+)
 
 var (
 	ErrNotFound       = errors.New("tenant not found")
@@ -85,7 +88,44 @@ func (s *Service) Get(ctx context.Context, raw string) (store.ManagedTenant, err
 	return t, e
 }
 
-func (s *Service) Approve(ctx context.Context, raw, policy string) (store.ManagedTenant, error) {
+// WithPlacement runs fn while holding the tenant's shared authorization lock.
+// A false result means placement is not currently safe and the caller must use
+// per-pubkey placement instead. Callback errors are returned to the caller.
+func (s *Service) WithPlacement(ctx context.Context, raw string, fn func(context.Context, store.ManagedTenant) error) (bool, error) {
+	h, err := CanonicalHost(raw)
+	if err != nil {
+		return false, nil
+	}
+	eligible := false
+	err = s.store.WithTenantLock(ctx, h, func(ctx context.Context) error {
+		t, getErr := s.store.GetManagedTenant(ctx, h)
+		if errors.Is(getErr, sql.ErrNoRows) {
+			return nil
+		}
+		if getErr != nil {
+			return getErr
+		}
+		now := s.now().UTC()
+		if t.State != store.TenantStateActive || !t.PlacementEnabled || t.PlacementPending ||
+			t.ReconciledVersion != t.Version || t.LastError != "" || t.LastReconciledAt.IsZero() ||
+			now.Sub(t.LastReconciledAt) > placementReconciliationMaxAge {
+			return nil
+		}
+		org, getErr := s.gitea.GetOrganization(ctx, t.OrgName)
+		if getErr != nil || org.ID != t.GiteaOrgID || org.UserName != t.OrgName || org.Visibility != "private" || org.Description != t.ProvisioningMarker {
+			return nil
+		}
+		team, getErr := s.gitea.GetTeam(ctx, t.ReaderTeamID)
+		if getErr != nil || !managedTeamMatches(team, t) {
+			return nil
+		}
+		eligible = true
+		return fn(ctx, t)
+	})
+	return eligible, err
+}
+
+func (s *Service) Approve(ctx context.Context, raw, policy string, placementEnabled *bool) (store.ManagedTenant, error) {
 	h, err := CanonicalHost(raw)
 	if err != nil {
 		return store.ManagedTenant{}, err
@@ -102,50 +142,96 @@ func (s *Service) Approve(ctx context.Context, raw, policy string) (store.Manage
 	var out store.ManagedTenant
 	err = s.store.WithTenantLock(ctx, h, func(ctx context.Context) error {
 		t, e := s.store.GetManagedTenant(ctx, h)
-		if e == nil {
-			if t.State == store.TenantStateKilled {
-				return ErrConflict
+		if errors.Is(e, sql.ErrNoRows) {
+			name, nameErr := ReservedOrgName(h)
+			if nameErr != nil {
+				return nameErr
 			}
-			if t.Policy == policy {
-				out = t
-				return nil
+			marker, markerErr := newProvisioningMarker()
+			if markerErr != nil {
+				return markerErr
 			}
-			t.Policy = policy
-			t.Version++
-			t.UpdatedAt = s.now().UTC()
-			ok, e := s.store.UpdateManagedTenant(ctx, t, t.Version-1)
-			if e != nil {
+			now := s.now().UTC()
+			t = store.ManagedTenant{Host: h, Policy: policy, State: store.TenantStatePending, OrgName: name, ProvisioningMarker: marker, Version: 1, CreatedAt: now, UpdatedAt: now}
+			if placementEnabled != nil && *placementEnabled {
+				t.PlacementPending = true
+			}
+			if e = s.store.CreateManagedTenant(ctx, t); e != nil {
 				return e
-			}
-			if !ok {
-				return ErrConflict
 			}
 			out = t
 			return nil
 		}
-		if !errors.Is(e, sql.ErrNoRows) {
-			return e
-		}
-		name, e := ReservedOrgName(h)
 		if e != nil {
 			return e
 		}
-		marker, e := newProvisioningMarker()
-		if e != nil {
-			return e
+		if t.State == store.TenantStateKilled {
+			return ErrConflict
 		}
-		now := s.now().UTC()
-		t = store.ManagedTenant{Host: h, Policy: policy, State: store.TenantStatePending, OrgName: name, ProvisioningMarker: marker, Version: 1, CreatedAt: now, UpdatedAt: now}
-		if e = s.store.CreateManagedTenant(ctx, t); e != nil {
-			return e
+		changed := t.Policy != policy
+		t.Policy = policy
+		if placementEnabled != nil {
+			if *placementEnabled {
+				if !t.PlacementEnabled {
+					t.PlacementPending = true
+					changed = true
+				}
+			} else if t.PlacementEnabled || t.PlacementPending {
+				t.PlacementEnabled = false
+				t.PlacementPending = false
+				changed = true
+			}
+		}
+		if changed {
+			t.Version++
+			t.UpdatedAt = s.now().UTC()
+			ok, updateErr := s.store.UpdateManagedTenant(ctx, t, t.Version-1)
+			if updateErr != nil {
+				return updateErr
+			}
+			if !ok {
+				return ErrConflict
+			}
+		}
+		if t.ReaderTeamID > 0 && (changed || t.PlacementPending) {
+			if reconcileErr := s.reconcileLocked(ctx, h, false); reconcileErr != nil {
+				return reconcileErr
+			}
+			t, e = s.store.GetManagedTenant(ctx, h)
+			if e != nil {
+				return e
+			}
+			if t.PlacementPending {
+				t, e = s.activatePendingPlacementLocked(ctx, t)
+				if e != nil {
+					return e
+				}
+			}
 		}
 		out = t
 		return nil
 	})
-	if err == nil && out.ReaderTeamID > 0 {
-		err = s.reconcileHost(ctx, h)
-	}
 	return out, err
+}
+
+func (s *Service) activatePendingPlacementLocked(ctx context.Context, t store.ManagedTenant) (store.ManagedTenant, error) {
+	if !t.PlacementPending {
+		return t, nil
+	}
+	if t.State != store.TenantStateActive || t.ReconciledVersion != t.Version || t.LastError != "" || t.LastReconciledAt.IsZero() {
+		return t, ErrConflict
+	}
+	t.PlacementEnabled = true
+	t.PlacementPending = false
+	t.UpdatedAt = s.now().UTC()
+	ok, err := s.store.UpdateManagedTenant(ctx, t, t.Version)
+	if err != nil {
+		return t, err
+	}
+	if !ok {
+		return t, ErrConflict
+	}
+	return t, nil
 }
 
 func (s *Service) Create(ctx context.Context, raw string) (store.ManagedTenant, error) {
@@ -166,6 +252,19 @@ func (s *Service) Create(ctx context.Context, raw string) (store.ManagedTenant, 
 			return ErrConflict
 		}
 		if t.GiteaOrgID > 0 && t.ReaderTeamID > 0 {
+			if t.PlacementPending {
+				if e := s.reconcileLocked(ctx, h, false); e != nil {
+					return e
+				}
+				t, e = s.store.GetManagedTenant(ctx, h)
+				if e != nil {
+					return e
+				}
+				t, e = s.activatePendingPlacementLocked(ctx, t)
+				if e != nil {
+					return e
+				}
+			}
 			out = t
 			return nil
 		}
@@ -233,15 +332,24 @@ func (s *Service) Create(ctx context.Context, raw string) (store.ManagedTenant, 
 			}
 			return e
 		}
+		if t.Policy == store.TenantPolicySharedRead || t.PlacementPending {
+			if e := s.reconcileLocked(ctx, h, false); e != nil {
+				return e
+			}
+			t, e = s.store.GetManagedTenant(ctx, h)
+			if e != nil {
+				return e
+			}
+			if t.PlacementPending {
+				t, e = s.activatePendingPlacementLocked(ctx, t)
+				if e != nil {
+					return e
+				}
+			}
+		}
 		out = t
 		return nil
 	})
-	if err == nil && out.Policy == store.TenantPolicySharedRead {
-		err = s.reconcileHost(ctx, h)
-		if err == nil {
-			out, _ = s.Get(ctx, h)
-		}
-	}
 	return out, err
 }
 
@@ -541,7 +649,7 @@ func (s *Service) reconcileLocked(ctx context.Context, host string, forceSCIM bo
 	grantEnabled := s.worker && orgValid && teamPolicyValid && !scimConflict && t.State == store.TenantStateActive && t.Policy == store.TenantPolicySharedRead
 	for id, m := range desired {
 		if grantEnabled {
-			ok, e := s.setAccess(ctx, t, m, store.TenantAccessPolicyRemoved, false, false, now)
+			ok, e := s.setAccess(ctx, t, m, store.TenantAccessPolicyRemoved, false, true, now)
 			if e != nil {
 				return e
 			}
@@ -562,7 +670,7 @@ func (s *Service) reconcileLocked(ctx context.Context, host string, forceSCIM bo
 				return ErrConflict
 			}
 		} else {
-			ok, e := s.setAccess(ctx, t, m, store.TenantAccessPolicyRemoved, false, false, now)
+			ok, e := s.setAccess(ctx, t, m, store.TenantAccessPolicyRemoved, false, true, now)
 			if e != nil {
 				return e
 			}
@@ -580,7 +688,7 @@ func (s *Service) reconcileLocked(ctx context.Context, host string, forceSCIM bo
 		}
 		state, orphaned := store.TenantAccessRevoked, true
 		if scimEnabled {
-			state, orphaned = store.TenantAccessPolicyRemoved, false
+			state, orphaned = store.TenantAccessPolicyRemoved, true
 		}
 		ok, e := s.setAccess(ctx, t, m, state, false, orphaned, now)
 		if e != nil {
@@ -611,7 +719,7 @@ func (s *Service) reconcileLocked(ctx context.Context, host string, forceSCIM bo
 		orphaned := true
 		if _, eligible := desired[id]; eligible || scimEnabled {
 			state = store.TenantAccessPolicyRemoved
-			orphaned = false
+			orphaned = true
 		}
 		ok, e := s.setAccess(ctx, t, m, state, false, orphaned, now)
 		if e != nil {

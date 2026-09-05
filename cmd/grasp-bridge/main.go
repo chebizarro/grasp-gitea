@@ -297,7 +297,8 @@ func main() {
 	hookInstaller := hooks.NewInstaller(cfg.GiteaRepositoriesDir, cfg.HookBinaryPath, cfg.HookRelayURL)
 	hookInstaller.SetPolicyStore(policies)
 	nip05Resolver := nip05resolve.NewResolver(5 * time.Minute)
-	provisionerSvc := provisioner.New(cfg, st, giteaClient, hookInstaller, nip05Resolver, logger)
+	tenantSvc := tenant.New(sharedStore, giteaClient, cfg.TenantReconciliationEnabled, logger)
+	provisionerSvc := provisioner.New(cfg, st, sharedStore, tenantSvc, giteaClient, hookInstaller, nip05Resolver, logger)
 	provisionerSvc.SetPolicyStore(policies)
 
 	// Reconcile any provisioning that was interrupted by a previous crash.
@@ -345,7 +346,6 @@ func main() {
 	defer shutdownEmbedded(context.Background())
 
 	relayURLs := liveRelayURLs(policies, embeddedRelayURL)
-	tenantSvc := tenant.New(sharedStore, giteaClient, cfg.TenantReconciliationEnabled, logger)
 	if err := tenantSvc.ValidateStartup(ctx); err != nil {
 		logger.Error("unsafe tenant configuration", "error", err)
 		os.Exit(1)

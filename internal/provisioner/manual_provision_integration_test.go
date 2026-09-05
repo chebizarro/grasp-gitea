@@ -117,7 +117,7 @@ func TestManualProvisionInstallsHookSelfContained(t *testing.T) {
 	hookInstaller := hooks.NewInstaller(reposDir, "/usr/local/bin/grasp-pre-receive", "ws://localhost:3334")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	nip05Resolver := nip05resolve.NewResolver(5 * time.Minute)
-	svc := New(cfg, st, giteaClient, hookInstaller, nip05Resolver, logger)
+	svc := New(cfg, st, st, nil, giteaClient, hookInstaller, nip05Resolver, logger)
 
 	result, err := svc.ManualProvision(ctx, "npub-test-owner", "owner-pubkey-hex", "repo1")
 	if err != nil {

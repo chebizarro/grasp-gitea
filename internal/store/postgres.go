@@ -220,13 +220,15 @@ func (s *PostgresStore) ensureSchema() error {
 		`CREATE INDEX IF NOT EXISTS idx_domain_affiliations_host_status ON domain_affiliations(host, status);`,
 		`CREATE INDEX IF NOT EXISTS idx_domain_affiliations_host_status_checked ON domain_affiliations(host, status, checked_at);`,
 		`CREATE TABLE IF NOT EXISTS managed_tenants (
-			host TEXT PRIMARY KEY, policy TEXT NOT NULL, state TEXT NOT NULL,
+			host TEXT PRIMARY KEY, policy TEXT NOT NULL, placement_enabled INTEGER NOT NULL DEFAULT 0, placement_pending INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL,
 			org_name TEXT NOT NULL UNIQUE, provisioning_marker TEXT NOT NULL UNIQUE,
 			gitea_org_id BIGINT NOT NULL DEFAULT 0,
 			reader_team_id BIGINT NOT NULL DEFAULT 0, version BIGINT NOT NULL,
 			reconciled_version BIGINT NOT NULL DEFAULT 0, last_reconciled_at TEXT NOT NULL DEFAULT '',
 			last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 		);`,
+		`ALTER TABLE managed_tenants ADD COLUMN IF NOT EXISTS placement_enabled INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE managed_tenants ADD COLUMN IF NOT EXISTS placement_pending INTEGER NOT NULL DEFAULT 0;`,
 		`CREATE TABLE IF NOT EXISTS tenant_memberships (
 			host TEXT NOT NULL REFERENCES managed_tenants(host), pubkey TEXT NOT NULL,
 			gitea_user_id BIGINT NOT NULL, gitea_user TEXT NOT NULL, evidence_status TEXT NOT NULL,

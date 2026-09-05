@@ -113,13 +113,22 @@ func testTenantPersistence(t *testing.T, st store.AuthStore) {
 	if err := st.CreateManagedTenant(ctx, tenant); err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}
+	created, err := st.GetManagedTenant(ctx, tenant.Host)
+	if err != nil || created.PlacementEnabled || created.PlacementPending {
+		t.Fatalf("placement policy default: tenant=%+v err=%v", created, err)
+	}
 	tenant.GiteaOrgID = 42
 	tenant.ReaderTeamID = 7
+	tenant.PlacementPending = true
 	tenant.State = store.TenantStateActive
 	tenant.Version = 2
 	tenant.UpdatedAt = now.Add(time.Second)
 	if ok, err := st.UpdateManagedTenant(ctx, tenant, 1); err != nil || !ok {
 		t.Fatalf("pin tenant: ok=%v err=%v", ok, err)
+	}
+	persisted, err := st.GetManagedTenant(ctx, tenant.Host)
+	if err != nil || persisted.PlacementEnabled || !persisted.PlacementPending {
+		t.Fatalf("staged placement policy not persisted: tenant=%+v err=%v", persisted, err)
 	}
 	changed := tenant
 	changed.ProvisioningMarker = "grasp-tenant-provisioning:attacker"

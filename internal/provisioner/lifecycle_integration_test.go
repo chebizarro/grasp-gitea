@@ -26,15 +26,18 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	tenantservice "github.com/sharegap/grasp-gitea/internal/tenant"
 )
 
 // testGiteaServer creates a mock Gitea API that tracks orgs, repos, and archive state.
 type testGiteaServer struct {
-	mu       sync.Mutex
-	orgs     map[string]bool
-	repos    map[string]testRepo
-	nextID   int64
-	reposDir string
+	mu            sync.Mutex
+	orgs          map[string]bool
+	orgIDs        map[string]int64
+	repos         map[string]testRepo
+	collaborators map[string]string
+	nextID        int64
+	reposDir      string
 }
 
 type testRepo struct {
@@ -47,10 +50,12 @@ type testRepo struct {
 func newTestGiteaServer(t *testing.T, reposDir string) (*httptest.Server, *testGiteaServer) {
 	t.Helper()
 	state := &testGiteaServer{
-		orgs:     map[string]bool{},
-		repos:    map[string]testRepo{},
-		nextID:   1,
-		reposDir: reposDir,
+		orgs:          map[string]bool{},
+		orgIDs:        map[string]int64{},
+		repos:         map[string]testRepo{},
+		collaborators: map[string]string{},
+		nextID:        1,
+		reposDir:      reposDir,
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -59,6 +64,16 @@ func newTestGiteaServer(t *testing.T, reposDir string) (*httptest.Server, *testG
 
 		path := r.URL.Path
 		switch {
+		// GET managed reader team used by tenant placement validation.
+		case r.Method == http.MethodGet && path == "/api/v1/teams/88":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 88, "name": tenantservice.ReaderTeamName,
+				"description": "grasp-tenant-provisioning:placement", "permission": "none",
+				"includes_all_repositories": true, "can_create_org_repo": false,
+				"units_map":    map[string]string{"repo.code": "read"},
+				"organization": map[string]any{"id": 77, "username": "grasp-t-placement"},
+			})
+
 		// GET org
 		case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v1/orgs/") && !strings.Contains(path[len("/api/v1/orgs/"):], "/"):
 			org := strings.TrimPrefix(path, "/api/v1/orgs/")
@@ -66,7 +81,13 @@ func newTestGiteaServer(t *testing.T, reposDir string) (*httptest.Server, *testG
 				http.NotFound(w, r)
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"username": org})
+			description := ""
+			visibility := "public"
+			if org == "grasp-t-placement" {
+				description = "grasp-tenant-provisioning:placement"
+				visibility = "private"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": state.orgIDs[org], "username": org, "description": description, "visibility": visibility})
 
 		// POST org
 		case r.Method == http.MethodPost && path == "/api/v1/orgs":
@@ -74,8 +95,25 @@ func newTestGiteaServer(t *testing.T, reposDir string) (*httptest.Server, *testG
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			org, _ := body["username"].(string)
 			state.orgs[org] = true
+			if state.orgIDs[org] == 0 {
+				state.orgIDs[org] = 1000 + int64(len(state.orgIDs))
+			}
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"username": org})
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": state.orgIDs[org], "username": org})
+
+		// PUT collaborator
+		case r.Method == http.MethodPut && strings.Contains(path, "/collaborators/"):
+			parts := strings.Split(strings.TrimPrefix(path, "/api/v1/repos/"), "/")
+			if len(parts) != 4 || parts[2] != "collaborators" {
+				http.NotFound(w, r)
+				return
+			}
+			var body struct {
+				Permission string `json:"permission"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			state.collaborators[parts[0]+"/"+parts[1]] = parts[3] + ":" + body.Permission
+			w.WriteHeader(http.StatusNoContent)
 
 		// GET repo
 		case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v1/repos/"):
@@ -171,7 +209,8 @@ func newTestService(t *testing.T) (*Service, *store.SQLiteStore, *testGiteaServe
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	nip05Resolver := nip05resolve.NewResolver(0) // disable cache for test isolation
 
-	svc := New(cfg, st, giteaClient, hookInstaller, nip05Resolver, logger)
+	tenantSvc := tenantservice.New(st, giteaClient, true, logger)
+	svc := New(cfg, st, st, tenantSvc, giteaClient, hookInstaller, nip05Resolver, logger)
 	return svc, st, state, reposDir
 }
 
@@ -410,7 +449,7 @@ func TestReconcileHooksReinstallsIncomplete(t *testing.T) {
 		Pubkey:        "pk-reconcile",
 		Owner:         orgName,
 		RepoName:      repoID,
-		GiteaRepoID:   99,
+		GiteaRepoID:   1,
 		CloneURL:      fmt.Sprintf("https://git.example.com/%s/%s.git", orgName, repoID),
 		SourceEvent:   "ev-reconcile",
 		HookInstalled: false,
@@ -499,7 +538,7 @@ func TestAllowlistBlocksUnauthorized(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	nip05Resolver := nip05resolve.NewResolver(0)
 
-	svc := New(cfg, st, giteaClient, hookInstaller, nip05Resolver, logger)
+	svc := New(cfg, st, st, nil, giteaClient, hookInstaller, nip05Resolver, logger)
 
 	ev := makeSignedAnnouncementEvent(t, "blockedrepo", "https://git.example.com/whatever/blockedrepo.git")
 
@@ -536,7 +575,7 @@ func TestRateLimitBlocksExcessive(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	nip05Resolver := nip05resolve.NewResolver(0)
 
-	svc := New(cfg, st, giteaClient, hookInstaller, nip05Resolver, logger)
+	svc := New(cfg, st, st, nil, giteaClient, hookInstaller, nip05Resolver, logger)
 
 	// First provision should succeed.
 	ev1 := makeSignedAnnouncementEvent(t, "repo1", "https://git.example.com/whatever/repo1.git")

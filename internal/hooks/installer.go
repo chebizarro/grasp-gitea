@@ -56,6 +56,12 @@ func NewInstaller(repositoriesPath string, hookBinaryPath string, hookRelayURL s
 // orgName is the Gitea org (may be a NIP-05 local-part or hex prefix).
 // npub is the canonical Nostr identity passed to the hook for state lookups.
 func (i *Installer) Install(orgName string, npub string, repoID string) error {
+	return i.InstallAt(orgName, repoID, npub, repoID)
+}
+
+// InstallAt installs a hook at the physical Gitea repository name while
+// preserving the canonical NIP-34 repository identifier in the hook environment.
+func (i *Installer) InstallAt(orgName, repoName, npub, repoID string) error {
 	hookRelayURL := i.relayURL()
 	// Validate all values that will be embedded in the shell script to
 	// prevent injection. Values should only contain alphanumeric, colon,
@@ -71,7 +77,7 @@ func (i *Installer) Install(orgName string, npub string, repoID string) error {
 		}
 	}
 
-	repoGitDir := filepath.Join(i.repositoriesPath, orgName, repoID+".git")
+	repoGitDir := filepath.Join(i.repositoriesPath, orgName, repoName+".git")
 	if st, err := os.Stat(repoGitDir); err != nil || !st.IsDir() {
 		return fmt.Errorf("repository path not found: %s", repoGitDir)
 	}

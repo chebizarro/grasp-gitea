@@ -188,7 +188,26 @@ name, or `NostrIdentityLink.NIP05` (which today stores the derived namespace,
 not the identifier — see `phase1-6dx`).
 
 Placement is prospective and opt-in: new repos may go to an approved tenant;
-existing repos never move automatically. Any later per-repo migration must
+existing repos never move automatically. Phase 3 expresses the two independent
+opt-ins as follows:
+
+- the operator sets `placement_enabled: true` on the tenant through
+  `POST /admin/tenants/<host>/approve` (default false; omission preserves the
+  current setting). Enabling is staged and becomes effective only after a
+  successful current reconciliation validates the pinned organization and
+  reader-team policy; a failed reconciliation leaves placement disabled, and
+- the owner-signed kind 30617 repository announcement contains exactly one
+  `["tenant", "<exact-host>"]` tag. Missing, malformed, or repeated tenant tags
+  mean no placement request.
+
+The bridge freshly verifies the announcing pubkey's NIP-05 affiliation before
+honoring that tag; stored naming metadata is never authority. Tenant repository
+names are always `<repo-id>-<20 lowercase hex chars>`, where the suffix is the
+first 80 bits of SHA-256 over the lowercase hex pubkey. `mapping.RepoID` remains
+the clean identifier while `mapping.Owner` and `mapping.RepoName` persist the
+physical tenant path and `mapping.TenantHost` records the exact tenant.
+
+Any later per-repo migration must
 key CI on an immutable identity first (owner pubkey + repo-id, not `Owner`),
 then: quiesce the mapping, transfer, verify the repo ID is unchanged, update
 `mapping.Owner`/`RepoName`, reinstall and verify the hook at the new path,

@@ -17,7 +17,7 @@ type SCIMTokenRotator interface {
 
 type TenantOperator interface {
 	Get(context.Context, string) (store.ManagedTenant, error)
-	Approve(context.Context, string, string) (store.ManagedTenant, error)
+	Approve(context.Context, string, string, *bool) (store.ManagedTenant, error)
 	Create(context.Context, string) (store.ManagedTenant, error)
 	Suspend(context.Context, string) (store.ManagedTenant, error)
 	Resume(context.Context, string) (store.ManagedTenant, error)
@@ -59,7 +59,8 @@ func (s *Server) tenantAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var body struct {
-			Policy string `json:"policy"`
+			Policy           string `json:"policy"`
+			PlacementEnabled *bool  `json:"placement_enabled"`
 		}
 		if r.Body != nil {
 			dec := json.NewDecoder(r.Body)
@@ -68,7 +69,7 @@ func (s *Server) tenantAction(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		out, err = s.tenantOperator.Approve(r.Context(), host, body.Policy)
+		out, err = s.tenantOperator.Approve(r.Context(), host, body.Policy, body.PlacementEnabled)
 	case "create":
 		out, err = s.tenantOperator.Create(r.Context(), host)
 	case "suspend":

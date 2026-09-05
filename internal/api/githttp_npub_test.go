@@ -62,7 +62,7 @@ func newGitProxyTestServer(t *testing.T, cfg config.Config, st *store.SQLiteStor
 // seeded mapping, which the proxy verifies before serving.
 func publicRepo(id int64) stubRepoInspector { return stubRepoInspector{id: id} }
 
-func TestGitHTTPNpubProxyRewritesToMappedGiteaRepo(t *testing.T) {
+func TestGitHTTPNpubProxyResolvesTenantPlacedRepoByCanonicalNpubURL(t *testing.T) {
 	ctx := context.Background()
 	backendRequests := make(chan observedGitBackendRequest, 1)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -76,10 +76,10 @@ func TestGitHTTPNpubProxyRewritesToMappedGiteaRepo(t *testing.T) {
 		Npub:        "npub1owner",
 		RepoID:      "repo one",
 		Pubkey:      "pubkey",
-		Owner:       "nip05-org",
-		RepoName:    "gitea-repo",
+		Owner:       "grasp-t-placement",
+		RepoName:    "repo-one-a1b2c3d4e5f607182930",
 		GiteaRepoID: 101,
-		CloneURL:    backend.URL + "/nip05-org/gitea-repo.git",
+		CloneURL:    backend.URL + "/grasp-t-placement/repo-one-a1b2c3d4e5f607182930.git",
 		SourceEvent: "event1",
 	})
 
@@ -100,7 +100,7 @@ func TestGitHTTPNpubProxyRewritesToMappedGiteaRepo(t *testing.T) {
 	if seen.method != http.MethodGet {
 		t.Fatalf("expected backend GET, got %s", seen.method)
 	}
-	if seen.path != "/nip05-org/gitea-repo.git/info/refs" {
+	if seen.path != "/grasp-t-placement/repo-one-a1b2c3d4e5f607182930.git/info/refs" {
 		t.Fatalf("expected rewritten backend path, got %q", seen.path)
 	}
 	if seen.rawQuery != "service=git-upload-pack" {
