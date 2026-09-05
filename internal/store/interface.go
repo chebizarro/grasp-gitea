@@ -91,6 +91,29 @@ type AuthStore interface {
 	UpdateTenantMembershipAccess(ctx context.Context, host, pubkey, accessState string, granted, orphaned bool, reconciledAt, expectedCheckedAt time.Time, expectedTenantVersion int64) (bool, error)
 	ListTenantMemberships(ctx context.Context, host string) ([]TenantMembership, error)
 
+	// Inbound SCIM declarations and per-tenant bearer credentials.
+	UpsertTenantSCIMToken(ctx context.Context, token TenantSCIMToken) error
+	StageTenantSCIMToken(ctx context.Context, token TenantSCIMToken) error
+	ActivateTenantSCIMToken(ctx context.Context, host string, pendingHash []byte, expectedTenantVersion int64, updatedAt time.Time) (bool, error)
+	ClearPendingTenantSCIMToken(ctx context.Context, host string, pendingHash []byte) error
+	GetTenantSCIMToken(ctx context.Context, host string) (TenantSCIMToken, error)
+	GetTenantSCIMTokenByHash(ctx context.Context, hash []byte) (TenantSCIMToken, error)
+	CreateSCIMUser(ctx context.Context, user SCIMUser) error
+	GetSCIMUser(ctx context.Context, host, id string) (SCIMUser, error)
+	GetSCIMUserHost(ctx context.Context, id string) (string, error)
+	ListSCIMUsers(ctx context.Context, host string, offset, limit int) ([]SCIMUser, int, error)
+	UpdateSCIMUser(ctx context.Context, user SCIMUser, expectedVersion int64) (bool, error)
+	ApplySCIMUserAndAdvanceTenant(ctx context.Context, user SCIMUser, expectedUserVersion, expectedTenantVersion int64, create bool) (bool, error)
+	CreateSCIMGroup(ctx context.Context, group SCIMGroup) error
+	GetSCIMGroup(ctx context.Context, host, id string) (SCIMGroup, error)
+	GetSCIMGroupHost(ctx context.Context, id string) (string, error)
+	ListSCIMGroups(ctx context.Context, host string, offset, limit int) ([]SCIMGroup, int, error)
+	UpdateSCIMGroup(ctx context.Context, group SCIMGroup, expectedVersion int64) (bool, error)
+	ApplySCIMGroupAndAdvanceTenant(ctx context.Context, group SCIMGroup, userIDs []string, expectedGroupVersion, expectedTenantVersion int64, create bool) (bool, error)
+	ListSCIMGroupMembers(ctx context.Context, host, groupID string) ([]string, error)
+	ReplaceSCIMGroupMembers(ctx context.Context, host, groupID string, userIDs []string, expectedVersion int64, updatedAt time.Time) (bool, error)
+	ListSCIMAuthorizedUsers(ctx context.Context, host string) ([]SCIMUser, error)
+
 	// Bridge tokens.
 	InsertBridgeToken(ctx context.Context, t BridgeToken, maxActive int) error
 	GetBridgeTokenByHash(ctx context.Context, hash []byte) (BridgeToken, error)

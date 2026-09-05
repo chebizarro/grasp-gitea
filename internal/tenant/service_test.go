@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ type fakeGitea struct {
 	team          gitea.Team
 	members       map[int64]gitea.User
 	collaborators map[string]bool
+	removeErr     error
 }
 
 func (f *fakeGitea) CreateManagedOrganization(_ context.Context, n, marker string) (gitea.Organization, error) {
@@ -53,6 +55,9 @@ func (f *fakeGitea) AddTeamMember(_ context.Context, _ int64, u string) error {
 	return nil
 }
 func (f *fakeGitea) RemoveTeamMember(_ context.Context, _ int64, _ string) error {
+	if f.removeErr != nil {
+		return f.removeErr
+	}
 	delete(f.members, 9)
 	return nil
 }
@@ -126,6 +131,94 @@ func TestConfirmedRevocationPreservesIdentityAndOwnerCollaborator(t *testing.T) 
 	ms, _ := st.ListTenantMemberships(ctx, "example.com")
 	if len(ms) != 1 || !ms[0].TenantOrphaned {
 		t.Fatalf("membership not orphaned: %+v", ms)
+	}
+}
+
+func TestRotateSCIMTokenDoesNotActivateWhenEnforcementFails(t *testing.T) {
+	svc, st, fg := setup(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	svc.now = func() time.Time { return now }
+	_ = st.UpsertIdentityLink(ctx, store.NostrIdentityLink{Pubkey: "pub", Npub: "npub", GiteaUserID: 9, GiteaUser: "alice", CreatedAt: now, UpdatedAt: now})
+	_ = st.UpsertDomainAffiliation(ctx, store.DomainAffiliation{Pubkey: "pub", Host: "example.com", Status: store.DomainAffiliationVerified, VerifiedAt: now, CheckedAt: now})
+	_, _ = svc.Approve(ctx, "example.com", store.TenantPolicySharedRead)
+	if _, err := svc.Create(ctx, "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if len(fg.members) != 1 {
+		t.Fatal("legacy member not granted")
+	}
+	fg.removeErr = errors.New("gitea unavailable")
+	_, plaintext, err := svc.RotateSCIMToken(ctx, "example.com")
+	if err == nil || plaintext != "" {
+		t.Fatalf("rotation token=%q err=%v", plaintext, err)
+	}
+	if _, err := st.GetTenantSCIMToken(ctx, "example.com"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("failed token activated: %v", err)
+	}
+	if len(fg.members) != 1 {
+		t.Fatal("failed staged transition changed prior membership semantics")
+	}
+}
+
+func TestSCIMDeprovisionPreservesOwnerAccessAndUsesPolicyRemoved(t *testing.T) {
+	svc, st, fg := setup(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	svc.now = func() time.Time { return now }
+	_ = st.UpsertIdentityLink(ctx, store.NostrIdentityLink{Pubkey: "pub", Npub: "npub", GiteaUserID: 9, GiteaUser: "alice", CreatedAt: now, UpdatedAt: now})
+	_ = st.UpsertDomainAffiliation(ctx, store.DomainAffiliation{Pubkey: "pub", Host: "example.com", CanonicalIdentifier: "alice@example.com", Status: store.DomainAffiliationVerified, VerifiedAt: now, CheckedAt: now})
+	_, _ = svc.Approve(ctx, "example.com", store.TenantPolicySharedRead)
+	if _, err := svc.Create(ctx, "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	_, plaintext, err := svc.RotateSCIMToken(ctx, "example.com")
+	if err != nil || plaintext == "" {
+		t.Fatalf("rotate token=%q err=%v", plaintext, err)
+	}
+	stored, err := st.GetTenantSCIMToken(ctx, "example.com")
+	if err != nil || string(stored.TokenHash) == plaintext {
+		t.Fatalf("token stored in plaintext: %+v err=%v", stored, err)
+	}
+	u := store.SCIMUser{Host: "example.com", ID: "u1", UserName: "alice@example.com", ExternalID: "pub", Pubkey: "pub", Active: true, Version: 1, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateSCIMUser(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	g := store.SCIMGroup{Host: "example.com", ID: "g1", DisplayName: "readers", Active: true, Version: 1, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateSCIMGroup(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := st.ReplaceSCIMGroupMembers(ctx, g.Host, g.ID, []string{u.ID}, 1, now); err != nil || !ok {
+		t.Fatalf("members ok=%v err=%v", ok, err)
+	}
+	if err := svc.ReconcileAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(fg.members) != 1 {
+		t.Fatal("SCIM member not granted")
+	}
+	now = now.Add(time.Minute)
+	u.Active = false
+	u.Version = 2
+	u.UpdatedAt = now
+	if ok, err := st.UpdateSCIMUser(ctx, u, 1); err != nil || !ok {
+		t.Fatalf("deactivate ok=%v err=%v", ok, err)
+	}
+	if err := svc.ReconcileAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(fg.members) != 0 {
+		t.Fatal("SCIM deprovision retained team access")
+	}
+	ms, _ := st.ListTenantMemberships(ctx, "example.com")
+	if len(ms) != 1 || ms[0].AccessState != store.TenantAccessPolicyRemoved || ms[0].TenantOrphaned {
+		t.Fatalf("deprovision membership=%+v", ms)
+	}
+	if _, err := st.GetIdentityLinkByPubkey(ctx, "pub"); err != nil {
+		t.Fatalf("identity removed: %v", err)
+	}
+	if !fg.collaborators["owned-repo/alice"] {
+		t.Fatal("owner collaborator removed")
 	}
 }
 

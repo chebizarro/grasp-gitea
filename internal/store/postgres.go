@@ -236,6 +236,32 @@ func (s *PostgresStore) ensureSchema() error {
 			updated_at TEXT NOT NULL, PRIMARY KEY(host,pubkey)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_tenant_memberships_host_granted ON tenant_memberships(host, granted);`,
+		`CREATE TABLE IF NOT EXISTS tenant_scim_tokens (
+			host TEXT PRIMARY KEY REFERENCES managed_tenants(host), token_hash BYTEA UNIQUE,
+			token_suffix TEXT NOT NULL DEFAULT '', generation BIGINT NOT NULL DEFAULT 0,
+			pending_token_hash BYTEA UNIQUE, pending_token_suffix TEXT NOT NULL DEFAULT '',
+			pending_generation BIGINT NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS scim_users (
+			host TEXT NOT NULL REFERENCES managed_tenants(host), id TEXT NOT NULL UNIQUE,
+			user_name TEXT NOT NULL, external_id TEXT NOT NULL, pubkey TEXT NOT NULL,
+			active INTEGER NOT NULL DEFAULT 1, profile_json TEXT NOT NULL DEFAULT '{}', version BIGINT NOT NULL,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY(host,id), UNIQUE(host,user_name), UNIQUE(host,pubkey)
+		);`,
+		`CREATE TABLE IF NOT EXISTS scim_groups (
+			host TEXT NOT NULL REFERENCES managed_tenants(host), id TEXT NOT NULL UNIQUE,
+			display_name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, version BIGINT NOT NULL,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY(host,id), UNIQUE(host,display_name)
+		);`,
+		`CREATE TABLE IF NOT EXISTS scim_group_members (
+			host TEXT NOT NULL, group_id TEXT NOT NULL, user_id TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY(host,group_id,user_id),
+			FOREIGN KEY(host,group_id) REFERENCES scim_groups(host,id) ON DELETE CASCADE,
+			FOREIGN KEY(host,user_id) REFERENCES scim_users(host,id) ON DELETE CASCADE
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_scim_group_members_user ON scim_group_members(host,user_id);`,
 		`CREATE TABLE IF NOT EXISTS bridge_tokens (
 			id TEXT PRIMARY KEY,
 			token_hash BYTEA NOT NULL UNIQUE,

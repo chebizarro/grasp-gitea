@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -305,6 +306,68 @@ func (s *Service) Kill(ctx context.Context, h string) (store.ManagedTenant, erro
 	return s.transition(ctx, h, store.TenantStateKilled)
 }
 
+// RotateSCIMToken mints the only credential accepted for a tenant's inbound
+// SCIM surface. Only its SHA-256 digest is persisted.
+func (s *Service) RotateSCIMToken(ctx context.Context, raw string) (store.ManagedTenant, string, error) {
+	h, err := CanonicalHost(raw)
+	if err != nil {
+		return store.ManagedTenant{}, "", err
+	}
+	var secret [32]byte
+	if _, err = rand.Read(secret[:]); err != nil {
+		return store.ManagedTenant{}, "", err
+	}
+	plaintext := "grasp_scim_" + base64.RawURLEncoding.EncodeToString(secret[:])
+	digest := sha256.Sum256([]byte(plaintext))
+	var out store.ManagedTenant
+	err = s.store.WithTenantLock(ctx, h, func(ctx context.Context) error {
+		t, e := s.store.GetManagedTenant(ctx, h)
+		if errors.Is(e, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if e != nil {
+			return e
+		}
+		if t.State == store.TenantStateSuspended || t.State == store.TenantStateKilled {
+			return ErrConflict
+		}
+		generation := int64(1)
+		if old, e := s.store.GetTenantSCIMToken(ctx, h); e == nil {
+			generation = old.Generation + 1
+		} else if !errors.Is(e, sql.ErrNoRows) {
+			return e
+		}
+		pending := store.TenantSCIMToken{Host: h, TokenHash: digest[:], TokenSuffix: plaintext[len(plaintext)-8:], Generation: generation, UpdatedAt: s.now().UTC()}
+		if e := s.store.StageTenantSCIMToken(ctx, pending); e != nil {
+			return e
+		}
+		if e := s.reconcileLocked(ctx, h, true); e != nil {
+			_ = s.store.ClearPendingTenantSCIMToken(ctx, h, digest[:])
+			_ = s.reconcileLocked(ctx, h, false)
+			return fmt.Errorf("enforce SCIM authorization before token activation: %w", e)
+		}
+		ok, e := s.store.ActivateTenantSCIMToken(ctx, h, digest[:], t.Version, s.now().UTC())
+		if e != nil || !ok {
+			_ = s.store.ClearPendingTenantSCIMToken(ctx, h, digest[:])
+			if e == nil {
+				e = ErrConflict
+			}
+			return e
+		}
+		out, e = s.store.GetManagedTenant(ctx, h)
+		return e
+	})
+	if err != nil {
+		return store.ManagedTenant{}, "", err
+	}
+	return out, plaintext, nil
+}
+
+// ReconcileHost applies declared authorization state through the pinned team.
+func (s *Service) ReconcileHost(ctx context.Context, host string) error {
+	return s.reconcileHost(ctx, host)
+}
+
 func (s *Service) Name() string { return "tenant_reconciliation" }
 func (s *Service) Check(ctx context.Context) error {
 	tenants, err := s.store.ListManagedTenants(ctx)
@@ -360,13 +423,13 @@ func (s *Service) ReconcileAll(ctx context.Context) error {
 }
 
 func (s *Service) reconcileHost(ctx context.Context, host string) error {
-	return s.store.WithTenantLock(ctx, host, func(ctx context.Context) error { return s.reconcileLocked(ctx, host) })
+	return s.store.WithTenantLock(ctx, host, func(ctx context.Context) error { return s.reconcileLocked(ctx, host, false) })
 }
 func (s *Service) setAccess(ctx context.Context, t store.ManagedTenant, m store.TenantMembership, state string, granted, orphaned bool, now time.Time) (bool, error) {
 	return s.store.UpdateTenantMembershipAccess(ctx, t.Host, m.Pubkey, state, granted, orphaned, now, m.CheckedAt, t.Version)
 }
 
-func (s *Service) reconcileLocked(ctx context.Context, host string) error {
+func (s *Service) reconcileLocked(ctx context.Context, host string, forceSCIM bool) error {
 	t, err := s.store.GetManagedTenant(ctx, host)
 	if err != nil {
 		return err
@@ -407,6 +470,24 @@ func (s *Service) reconcileLocked(ctx context.Context, host string) error {
 	}
 	desired := map[int64]store.TenantMembership{}
 	observed := map[int64]store.TenantMembership{}
+	scimEnabled := forceSCIM
+	scimAuthorized := map[string]bool{}
+	_, tokenErr := s.store.GetTenantSCIMToken(ctx, host)
+	if tokenErr == nil {
+		scimEnabled = true
+	}
+	if tokenErr != nil && !errors.Is(tokenErr, sql.ErrNoRows) {
+		return s.recordError(ctx, t, tokenErr)
+	}
+	if scimEnabled {
+		users, e := s.store.ListSCIMAuthorizedUsers(ctx, host)
+		if e != nil {
+			return s.recordError(ctx, t, e)
+		}
+		for _, u := range users {
+			scimAuthorized[u.Pubkey] = true
+		}
+	}
 	after := ""
 	for {
 		links, e := s.store.ListIdentityLinksAfter(ctx, after, 200)
@@ -438,7 +519,9 @@ func (s *Service) reconcileLocked(ctx context.Context, host string) error {
 				return e
 			}
 			observed[link.GiteaUserID] = m
-			if a.Host == host && (a.Status == store.DomainAffiliationVerified || (a.Status == store.DomainAffiliationStale && !a.VerifiedAt.IsZero() && now.Sub(a.VerifiedAt) < 24*time.Hour)) {
+			affiliationEligible := a.Host == host && (a.Status == store.DomainAffiliationVerified || (a.Status == store.DomainAffiliationStale && !a.VerifiedAt.IsZero() && now.Sub(a.VerifiedAt) < 24*time.Hour))
+			authorizationEligible := !scimEnabled || scimAuthorized[link.Pubkey]
+			if affiliationEligible && authorizationEligible {
 				desired[link.GiteaUserID] = m
 			}
 		}
@@ -446,7 +529,16 @@ func (s *Service) reconcileLocked(ctx context.Context, host string) error {
 			break
 		}
 	}
-	grantEnabled := s.worker && orgValid && teamPolicyValid && t.State == store.TenantStateActive && t.Policy == store.TenantPolicySharedRead
+	scimConflict := false
+	if scimEnabled {
+		for id := range actualByID {
+			if _, declared := desired[id]; !declared {
+				scimConflict = true
+				break
+			}
+		}
+	}
+	grantEnabled := s.worker && orgValid && teamPolicyValid && !scimConflict && t.State == store.TenantStateActive && t.Policy == store.TenantPolicySharedRead
 	for id, m := range desired {
 		if grantEnabled {
 			ok, e := s.setAccess(ctx, t, m, store.TenantAccessPolicyRemoved, false, false, now)
@@ -486,7 +578,11 @@ func (s *Service) reconcileLocked(ctx context.Context, host string) error {
 		if _, present := actualByID[id]; present {
 			continue
 		}
-		ok, e := s.setAccess(ctx, t, m, store.TenantAccessRevoked, false, true, now)
+		state, orphaned := store.TenantAccessRevoked, true
+		if scimEnabled {
+			state, orphaned = store.TenantAccessPolicyRemoved, false
+		}
+		ok, e := s.setAccess(ctx, t, m, state, false, orphaned, now)
 		if e != nil {
 			return e
 		}
@@ -513,7 +609,7 @@ func (s *Service) reconcileLocked(ctx context.Context, host string) error {
 		}
 		state := store.TenantAccessRevoked
 		orphaned := true
-		if _, eligible := desired[id]; eligible {
+		if _, eligible := desired[id]; eligible || scimEnabled {
 			state = store.TenantAccessPolicyRemoved
 			orphaned = false
 		}

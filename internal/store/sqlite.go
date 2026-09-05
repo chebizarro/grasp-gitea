@@ -340,6 +340,33 @@ func Open(path string) (*SQLiteStore, error) {
 			PRIMARY KEY(host,pubkey), FOREIGN KEY(host) REFERENCES managed_tenants(host)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_tenant_memberships_host_granted ON tenant_memberships(host, granted);`,
+		`CREATE TABLE IF NOT EXISTS tenant_scim_tokens (
+			host TEXT PRIMARY KEY, token_hash BLOB UNIQUE, token_suffix TEXT NOT NULL DEFAULT '',
+			generation INTEGER NOT NULL DEFAULT 0, pending_token_hash BLOB UNIQUE,
+			pending_token_suffix TEXT NOT NULL DEFAULT '', pending_generation INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL, FOREIGN KEY(host) REFERENCES managed_tenants(host)
+		);`,
+		`CREATE TABLE IF NOT EXISTS scim_users (
+			host TEXT NOT NULL, id TEXT NOT NULL UNIQUE, user_name TEXT NOT NULL,
+			external_id TEXT NOT NULL, pubkey TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+			profile_json TEXT NOT NULL DEFAULT '{}', version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY(host,id), UNIQUE(host,user_name), UNIQUE(host,pubkey),
+			FOREIGN KEY(host) REFERENCES managed_tenants(host)
+		);`,
+		`CREATE TABLE IF NOT EXISTS scim_groups (
+			host TEXT NOT NULL, id TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL,
+			active INTEGER NOT NULL DEFAULT 1, version INTEGER NOT NULL,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY(host,id), UNIQUE(host,display_name),
+			FOREIGN KEY(host) REFERENCES managed_tenants(host)
+		);`,
+		`CREATE TABLE IF NOT EXISTS scim_group_members (
+			host TEXT NOT NULL, group_id TEXT NOT NULL, user_id TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY(host,group_id,user_id),
+			FOREIGN KEY(host,group_id) REFERENCES scim_groups(host,id) ON DELETE CASCADE,
+			FOREIGN KEY(host,user_id) REFERENCES scim_users(host,id) ON DELETE CASCADE
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_scim_group_members_user ON scim_group_members(host,user_id);`,
 		// profile_sync_state records the last kind:0 event applied to a linked
 		// user's Gitea profile, for replaceable-event dedup (newest wins).
 		`CREATE TABLE IF NOT EXISTS profile_sync_state (

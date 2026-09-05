@@ -5,9 +5,17 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/sharegap/grasp-gitea/internal/api"
+	"github.com/sharegap/grasp-gitea/internal/config"
+	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
 type stubAuthStateInspector struct {
@@ -24,6 +32,33 @@ func (s *stubAuthStateInspector) HasAuthState(context.Context) (bool, error) {
 }
 func (s *stubAuthStateInspector) HasTenantState(context.Context) (bool, error) {
 	return s.hasTenantState, s.tenantErr
+}
+
+func TestProductionServerInstallsSCIMProvider(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/scim-wiring.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now().UTC()
+	managed := store.ManagedTenant{Host: "example.com", Policy: store.TenantPolicySharedRead, State: store.TenantStateActive, OrgName: "org-example", ProvisioningMarker: "marker-example", Version: 1, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateManagedTenant(context.Background(), managed); err != nil {
+		t.Fatal(err)
+	}
+	token := "production-scim-token"
+	digest := sha256.Sum256([]byte(token))
+	if err := st.UpsertTenantSCIMToken(context.Background(), store.TenantSCIMToken{Host: managed.Host, TokenHash: digest[:], TokenSuffix: "im-token", Generation: 1, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	server := api.New(config.Config{}, nil, nil, st, nil)
+	installSCIMProvider(server, st, nil)
+	req := httptest.NewRequest(http.MethodGet, "/scim/v2/ServiceProviderConfig", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	server.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("production handler SCIM status=%d body=%s", w.Code, w.Body.String())
+	}
 }
 
 func TestGuardPostgresTakeover(t *testing.T) {

@@ -40,6 +40,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/registrytoken"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/safefetch"
+	"github.com/sharegap/grasp-gitea/internal/scim"
 	"github.com/sharegap/grasp-gitea/internal/signer"
 	"github.com/sharegap/grasp-gitea/internal/store"
 	"github.com/sharegap/grasp-gitea/internal/tenant"
@@ -48,6 +49,10 @@ import (
 
 // mergeRelayURLs combines configured relay URLs with the embedded relay URL,
 // deduplicating if the embedded URL is already in the list.
+func installSCIMProvider(server *api.Server, st store.AuthStore, reconciler scim.Reconciler) {
+	server.SetSCIMHandler(scim.New(st, reconciler).Handler())
+}
+
 func mergeRelayURLs(configured []string, embeddedURL string) []string {
 	result := append([]string{}, configured...)
 	if embeddedURL != "" && !slices.Contains(result, embeddedURL) {
@@ -514,6 +519,7 @@ func main() {
 	apiServer.SetPolicyStore(policies)
 	apiServer.SetAffiliationStore(sharedStore)
 	apiServer.SetTenantOperator(tenantSvc)
+	installSCIMProvider(apiServer, sharedStore, tenantSvc)
 	if cfg.TenantReconciliationEnabled {
 		apiServer.AddReadinessProbe(tenantSvc)
 	}

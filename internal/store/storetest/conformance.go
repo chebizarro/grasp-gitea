@@ -39,6 +39,71 @@ func Run(t *testing.T, factory Factory) {
 	t.Run("MaintenanceLeaseIsSingleHolder", func(t *testing.T) { testMaintenanceLease(t, factory(t)) })
 	t.Run("DomainAffiliationPersistence", func(t *testing.T) { testDomainAffiliationPersistence(t, factory(t)) })
 	t.Run("TenantPersistence", func(t *testing.T) { testTenantPersistence(t, factory(t)) })
+	t.Run("SCIMPersistence", func(t *testing.T) { testSCIMPersistence(t, factory(t)) })
+}
+
+func testSCIMPersistence(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 5, 2, 3, 4, 0, time.UTC)
+	tn := store.ManagedTenant{Host: "scim.example", Policy: store.TenantPolicySharedRead, State: store.TenantStateActive, OrgName: "grasp-t-scim", ProvisioningMarker: "grasp-tenant-provisioning:scim", Version: 1, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateManagedTenant(ctx, tn); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte("secret"))
+	pending := store.TenantSCIMToken{Host: tn.Host, TokenHash: hash[:], TokenSuffix: "secret", Generation: 1, UpdatedAt: now}
+	if err := st.StageTenantSCIMToken(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetTenantSCIMToken(ctx, tn.Host); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("pending token authenticated: %v", err)
+	}
+	if ok, err := st.ActivateTenantSCIMToken(ctx, tn.Host, hash[:], 99, now); err != nil || ok {
+		t.Fatalf("stale activation ok=%v err=%v", ok, err)
+	}
+	if _, err := st.GetTenantSCIMTokenByHash(ctx, hash[:]); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("failed activation was not rolled back: %v", err)
+	}
+	if ok, err := st.ActivateTenantSCIMToken(ctx, tn.Host, hash[:], 1, now); err != nil || !ok {
+		t.Fatalf("activate ok=%v err=%v", ok, err)
+	}
+	tok, err := st.GetTenantSCIMTokenByHash(ctx, hash[:])
+	if err != nil || tok.Host != tn.Host {
+		t.Fatalf("token=%+v err=%v", tok, err)
+	}
+	u := store.SCIMUser{Host: tn.Host, ID: "u1", UserName: "alice@scim.example", ExternalID: "pub", Pubkey: "pub", Active: true, Version: 1, CreatedAt: now, UpdatedAt: now}
+	if ok, err := st.ApplySCIMUserAndAdvanceTenant(ctx, u, 0, 99, true); err != nil || ok {
+		t.Fatalf("stale user tx ok=%v err=%v", ok, err)
+	}
+	if _, err := st.GetSCIMUser(ctx, tn.Host, u.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("user survived rolled-back tenant bump: %v", err)
+	}
+	if ok, err := st.ApplySCIMUserAndAdvanceTenant(ctx, u, 0, 2, true); err != nil || !ok {
+		t.Fatalf("create user tx ok=%v err=%v", ok, err)
+	}
+	g := store.SCIMGroup{Host: tn.Host, ID: "g1", DisplayName: "readers", Active: true, Version: 1, CreatedAt: now, UpdatedAt: now}
+	if ok, err := st.ApplySCIMGroupAndAdvanceTenant(ctx, g, []string{u.ID}, 0, 99, true); err != nil || ok {
+		t.Fatalf("stale group tx ok=%v err=%v", ok, err)
+	}
+	if _, err := st.GetSCIMGroup(ctx, tn.Host, g.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("group survived rolled-back tenant bump: %v", err)
+	}
+	if ok, err := st.ApplySCIMGroupAndAdvanceTenant(ctx, g, []string{u.ID}, 0, 3, true); err != nil || !ok {
+		t.Fatalf("create group tx ok=%v err=%v", ok, err)
+	}
+	authorized, err := st.ListSCIMAuthorizedUsers(ctx, tn.Host)
+	if err != nil || len(authorized) != 1 {
+		t.Fatalf("authorized=%+v err=%v", authorized, err)
+	}
+	u.Active = false
+	u.Version = 2
+	u.UpdatedAt = now.Add(time.Second)
+	if ok, err := st.ApplySCIMUserAndAdvanceTenant(ctx, u, 1, 4, false); err != nil || !ok {
+		t.Fatalf("deactivate tx ok=%v err=%v", ok, err)
+	}
+	authorized, err = st.ListSCIMAuthorizedUsers(ctx, tn.Host)
+	if err != nil || len(authorized) != 0 {
+		t.Fatalf("inactive authorized=%+v err=%v", authorized, err)
+	}
 }
 
 func testTenantPersistence(t *testing.T, st store.AuthStore) {

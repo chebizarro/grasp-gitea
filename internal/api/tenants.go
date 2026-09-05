@@ -11,6 +11,10 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/tenant"
 )
 
+type SCIMTokenRotator interface {
+	RotateSCIMToken(context.Context, string) (store.ManagedTenant, string, error)
+}
+
 type TenantOperator interface {
 	Get(context.Context, string) (store.ManagedTenant, error)
 	Approve(context.Context, string, string) (store.ManagedTenant, error)
@@ -40,6 +44,7 @@ func (s *Server) tenantAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var out store.ManagedTenant
+	var plaintextToken string
 	var err error
 	switch action {
 	case "get":
@@ -72,6 +77,13 @@ func (s *Server) tenantAction(w http.ResponseWriter, r *http.Request) {
 		out, err = s.tenantOperator.Resume(r.Context(), host)
 	case "kill":
 		out, err = s.tenantOperator.Kill(r.Context(), host)
+	case "scim-token":
+		rotator, ok := s.tenantOperator.(SCIMTokenRotator)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "SCIM token service is not configured"})
+			return
+		}
+		out, plaintextToken, err = rotator.RotateSCIMToken(r.Context(), host)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown tenant action"})
 		return
@@ -88,6 +100,12 @@ func (s *Server) tenantAction(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusBadRequest
 		}
 		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	if plaintextToken != "" {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
+		writeJSON(w, http.StatusOK, map[string]any{"tenant": out, "token": plaintextToken})
 		return
 	}
 	writeJSON(w, http.StatusOK, out)

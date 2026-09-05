@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
@@ -26,6 +27,9 @@ func (f *fakeTenantOperator) Suspend(context.Context, string) (store.ManagedTena
 }
 func (f *fakeTenantOperator) Resume(context.Context, string) (store.ManagedTenant, error) {
 	return store.ManagedTenant{}, nil
+}
+func (f *fakeTenantOperator) RotateSCIMToken(_ context.Context, h string) (store.ManagedTenant, string, error) {
+	return store.ManagedTenant{Host: h, State: store.TenantStateActive}, "one-time-token", nil
 }
 func (f *fakeTenantOperator) Kill(context.Context, string) (store.ManagedTenant, error) {
 	f.killed = true
@@ -56,5 +60,20 @@ func TestTenantAdminRequiresTokenAndKillIsPostOnly(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || !op.killed {
 		t.Fatalf("authorized kill status=%d killed=%v", w.Code, op.killed)
+	}
+}
+
+func TestTenantAdminRotatesSCIMToken(t *testing.T) {
+	s := New(config.Config{AdminAPIToken: "secret"}, nil, nil, nil, nil)
+	s.SetTenantOperator(&fakeTenantOperator{})
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/example.com/scim-token", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "one-time-token") {
+		t.Fatalf("rotate status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("Pragma") != "no-cache" {
+		t.Fatalf("secret response cache headers=%v", w.Header())
 	}
 }

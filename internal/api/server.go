@@ -49,6 +49,7 @@ type Server struct {
 	signerAuthorizer        SignerAuthorizer
 	policyStore             *policy.Store
 	tenantOperator          TenantOperator
+	scimHandler             http.Handler
 }
 
 type SignerAuthorizer interface {
@@ -133,6 +134,7 @@ func (s *Server) SetPolicyStore(store *policy.Store) { s.policyStore = store }
 // Postgres-backed AuthStore here when POSTGRES_DSN is configured.
 func (s *Server) SetAffiliationStore(st store.AuthStore) { s.affiliationStore = st }
 func (s *Server) SetTenantOperator(op TenantOperator)    { s.tenantOperator = op }
+func (s *Server) SetSCIMHandler(h http.Handler)          { s.scimHandler = h }
 
 // AddRouteRegistrar lets optional subsystems register extra routes on the main mux.
 func (s *Server) AddRouteRegistrar(register func(*http.ServeMux)) {
@@ -155,6 +157,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/policy", s.requireAuth(s.policyDocument))
 	mux.HandleFunc("/admin/policy/", s.requireAuth(s.policyGroup))
 	mux.HandleFunc("/admin/tenants/", s.requireAuth(s.tenantAction))
+	if s.scimHandler != nil {
+		mux.Handle("/scim/v2/", s.scimHandler)
+	}
 	mux.HandleFunc("/internal/mirror-sync", method(http.MethodPost, s.requireMirrorAuth(s.mirrorSync)))
 	mux.HandleFunc("/domains/", method(http.MethodGet, s.domainCatalog))
 	mux.HandleFunc("/verified-badges/", method(http.MethodGet, s.verifiedBadge))
