@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"sync"
 	"time"
@@ -213,7 +214,8 @@ type SQLiteStore struct {
 	// userLocks implements WithUserLock for the single-node backend: an
 	// in-process striped mutex. Cross-node exclusion is the Postgres
 	// backend's job (advisory locks).
-	userLocks [64]sync.Mutex
+	userLocks   [64]sync.Mutex
+	tenantLocks [64]sync.Mutex
 }
 
 // WithUserLock runs fn while holding an exclusive per-Gitea-user lock.
@@ -228,6 +230,15 @@ func (s *SQLiteStore) WithUserLock(ctx context.Context, giteaUserID int64, fn fu
 // TryMaintenanceLease: a single-node store is always the maintenance leader.
 func (s *SQLiteStore) TryMaintenanceLease(ctx context.Context) (bool, func(), error) {
 	return true, func() {}, nil
+}
+
+func (s *SQLiteStore) WithTenantLock(ctx context.Context, host string, fn func(context.Context) error) error {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(host))
+	lock := &s.tenantLocks[h.Sum64()%uint64(len(s.tenantLocks))]
+	lock.Lock()
+	defer lock.Unlock()
+	return fn(ctx)
 }
 
 func Open(path string) (*SQLiteStore, error) {
@@ -312,6 +323,23 @@ func Open(path string) (*SQLiteStore, error) {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_domain_affiliations_host_status ON domain_affiliations(host, status);`,
 		`CREATE INDEX IF NOT EXISTS idx_domain_affiliations_host_status_checked ON domain_affiliations(host, status, checked_at);`,
+		`CREATE TABLE IF NOT EXISTS managed_tenants (
+			host TEXT PRIMARY KEY, policy TEXT NOT NULL, state TEXT NOT NULL,
+			org_name TEXT NOT NULL UNIQUE, provisioning_marker TEXT NOT NULL UNIQUE,
+			gitea_org_id INTEGER NOT NULL DEFAULT 0,
+			reader_team_id INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL,
+			reconciled_version INTEGER NOT NULL DEFAULT 0, last_reconciled_at TEXT NOT NULL DEFAULT '',
+			last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS tenant_memberships (
+			host TEXT NOT NULL, pubkey TEXT NOT NULL, gitea_user_id INTEGER NOT NULL,
+			gitea_user TEXT NOT NULL, evidence_status TEXT NOT NULL, verified_at TEXT NOT NULL DEFAULT '',
+			checked_at TEXT NOT NULL, granted INTEGER NOT NULL DEFAULT 0,
+			tenant_orphaned INTEGER NOT NULL DEFAULT 0, access_state TEXT NOT NULL DEFAULT '',
+			reconciled_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+			PRIMARY KEY(host,pubkey), FOREIGN KEY(host) REFERENCES managed_tenants(host)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_tenant_memberships_host_granted ON tenant_memberships(host, granted);`,
 		// profile_sync_state records the last kind:0 event applied to a linked
 		// user's Gitea profile, for replaceable-event dedup (newest wins).
 		`CREATE TABLE IF NOT EXISTS profile_sync_state (

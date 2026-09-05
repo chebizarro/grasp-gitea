@@ -42,6 +42,9 @@ type AuthStore interface {
 	// work). Always call release() when acquired is true. A single-node
 	// backend is always the leader.
 	TryMaintenanceLease(ctx context.Context) (acquired bool, release func(), err error)
+	// WithTenantLock serializes operator transitions and reconciliation for one
+	// canonical tenant host across all replicas.
+	WithTenantLock(ctx context.Context, host string, fn func(ctx context.Context) error) error
 
 	// NIP-98 replay ledger.
 	ClaimNIP98Event(ctx context.Context, eventID, pubkey, method string, targetHash []byte, now, expiresAt time.Time) (bool, error)
@@ -78,6 +81,15 @@ type AuthStore interface {
 	UpsertDomainAffiliation(ctx context.Context, affiliation DomainAffiliation) error
 	GetDomainAffiliation(ctx context.Context, pubkey string) (DomainAffiliation, error)
 	ListVerifiedDomainAffiliations(ctx context.Context, host string, checkedAfter time.Time, limit int) ([]DomainAffiliation, error)
+
+	// Operator-approved managed domain tenants and their domain-derived access.
+	CreateManagedTenant(ctx context.Context, tenant ManagedTenant) error
+	GetManagedTenant(ctx context.Context, host string) (ManagedTenant, error)
+	ListManagedTenants(ctx context.Context) ([]ManagedTenant, error)
+	UpdateManagedTenant(ctx context.Context, tenant ManagedTenant, expectedVersion int64) (bool, error)
+	UpsertTenantMembership(ctx context.Context, membership TenantMembership) error
+	UpdateTenantMembershipAccess(ctx context.Context, host, pubkey, accessState string, granted, orphaned bool, reconciledAt, expectedCheckedAt time.Time, expectedTenantVersion int64) (bool, error)
+	ListTenantMemberships(ctx context.Context, host string) ([]TenantMembership, error)
 
 	// Bridge tokens.
 	InsertBridgeToken(ctx context.Context, t BridgeToken, maxActive int) error

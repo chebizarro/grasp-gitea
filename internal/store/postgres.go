@@ -219,6 +219,23 @@ func (s *PostgresStore) ensureSchema() error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_domain_affiliations_host_status ON domain_affiliations(host, status);`,
 		`CREATE INDEX IF NOT EXISTS idx_domain_affiliations_host_status_checked ON domain_affiliations(host, status, checked_at);`,
+		`CREATE TABLE IF NOT EXISTS managed_tenants (
+			host TEXT PRIMARY KEY, policy TEXT NOT NULL, state TEXT NOT NULL,
+			org_name TEXT NOT NULL UNIQUE, provisioning_marker TEXT NOT NULL UNIQUE,
+			gitea_org_id BIGINT NOT NULL DEFAULT 0,
+			reader_team_id BIGINT NOT NULL DEFAULT 0, version BIGINT NOT NULL,
+			reconciled_version BIGINT NOT NULL DEFAULT 0, last_reconciled_at TEXT NOT NULL DEFAULT '',
+			last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS tenant_memberships (
+			host TEXT NOT NULL REFERENCES managed_tenants(host), pubkey TEXT NOT NULL,
+			gitea_user_id BIGINT NOT NULL, gitea_user TEXT NOT NULL, evidence_status TEXT NOT NULL,
+			verified_at TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL,
+			granted INTEGER NOT NULL DEFAULT 0, tenant_orphaned INTEGER NOT NULL DEFAULT 0,
+			access_state TEXT NOT NULL DEFAULT '', reconciled_at TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL, PRIMARY KEY(host,pubkey)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_tenant_memberships_host_granted ON tenant_memberships(host, granted);`,
 		`CREATE TABLE IF NOT EXISTS bridge_tokens (
 			id TEXT PRIMARY KEY,
 			token_hash BYTEA NOT NULL UNIQUE,
@@ -313,6 +330,21 @@ const maintenanceLeaseKey = int64(0x6772_6173_705f_6d74) // "grasp_mt"
 // connection. Non-blocking: a follower returns acquired=false at once. If the
 // leader's process dies, its session ends and Postgres frees the lock, so the
 // next tick re-elects. release() unlocks and returns the connection.
+func (s *PostgresStore) WithTenantLock(ctx context.Context, host string, fn func(context.Context) error) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire tenant lock connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, "tenant:"+host); err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, "tenant:"+host)
+	}()
+	return fn(ctx)
+}
+
 func (s *PostgresStore) TryMaintenanceLease(ctx context.Context) (bool, func(), error) {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {

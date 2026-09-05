@@ -42,6 +42,20 @@ func TestLoadMinimalValid(t *testing.T) {
 	if len(cfg.RelayURLs) != 1 || cfg.RelayURLs[0] != "wss://relay.example.com" {
 		t.Errorf("expected 1 relay URL, got %v", cfg.RelayURLs)
 	}
+	if cfg.TenantReconciliationEnabled {
+		t.Fatal("tenant reconciliation must default off")
+	}
+}
+
+func TestTenantReconciliationEnabled(t *testing.T) {
+	setEnvs(t, map[string]string{"GITEA_ADMIN_TOKEN": "tok123", "CLONE_PREFIX": "https://git.example.com", "RELAY_URLS": "wss://relay.example.com", "TENANT_RECONCILIATION_ENABLED": "true"})
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.TenantReconciliationEnabled {
+		t.Fatal("tenant reconciliation flag not loaded")
+	}
 }
 
 func TestLoadMissingToken(t *testing.T) {

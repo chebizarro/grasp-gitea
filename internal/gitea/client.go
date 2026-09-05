@@ -39,6 +39,33 @@ type User struct {
 	Email    string `json:"email"`
 }
 
+type Organization struct {
+	ID          int64  `json:"id"`
+	UserName    string `json:"username"`
+	Visibility  string `json:"visibility"`
+	Description string `json:"description"`
+}
+
+type Team struct {
+	ID                      int64             `json:"id"`
+	Name                    string            `json:"name"`
+	Description             string            `json:"description"`
+	Organization            *Organization     `json:"organization,omitempty"`
+	IncludesAllRepositories bool              `json:"includes_all_repositories"`
+	CanCreateOrgRepo        bool              `json:"can_create_org_repo"`
+	Permission              string            `json:"permission"`
+	UnitsMap                map[string]string `json:"units_map,omitempty"`
+}
+
+type TeamSpec struct {
+	Name                    string
+	Description             string
+	IncludesAllRepositories bool
+	CanCreateOrgRepo        bool
+	Permission              string
+	UnitsMap                map[string]string
+}
+
 type Repository struct {
 	ID       int64  `json:"id"`
 	Owner    string `json:"owner"`
@@ -208,6 +235,140 @@ func (c *Client) EnsureOrg(ctx context.Context, org string) error {
 		return nil
 	}
 	if isConflict(err) {
+		return nil
+	}
+	return err
+}
+
+// CreateManagedOrganization strictly creates a private tenant organization.
+// It never recovers a conflict by adopting the existing name.
+func (c *Client) CreateManagedOrganization(ctx context.Context, name, marker string) (Organization, error) {
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/orgs", map[string]any{"username": name, "visibility": "private", "description": marker})
+	if err != nil {
+		return Organization{}, fmt.Errorf("create managed organization %q: %w", name, err)
+	}
+	var org Organization
+	if err := json.Unmarshal(resp, &org); err != nil {
+		return org, fmt.Errorf("decode managed organization: %w", err)
+	}
+	if org.ID <= 0 || org.UserName != name || org.Visibility != "private" || org.Description != marker {
+		return Organization{}, fmt.Errorf("managed organization response did not match requested identity and marker")
+	}
+	return org, nil
+}
+
+func (c *Client) GetOrganization(ctx context.Context, name string) (Organization, error) {
+	resp, err := c.doJSON(ctx, http.MethodGet, "/api/v1/orgs/"+url.PathEscape(name), nil)
+	if err != nil {
+		return Organization{}, err
+	}
+	var org Organization
+	if err := json.Unmarshal(resp, &org); err != nil {
+		return org, err
+	}
+	return org, nil
+}
+
+func (c *Client) CreateTeam(ctx context.Context, org string, spec TeamSpec) (Team, error) {
+	units := make([]string, 0, len(spec.UnitsMap))
+	for unit := range spec.UnitsMap {
+		units = append(units, unit)
+	}
+	body := map[string]any{"name": spec.Name, "description": spec.Description, "includes_all_repositories": spec.IncludesAllRepositories, "can_create_org_repo": spec.CanCreateOrgRepo, "permission": spec.Permission, "units": units, "units_map": spec.UnitsMap}
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/orgs/"+url.PathEscape(org)+"/teams", body)
+	if err != nil {
+		return Team{}, err
+	}
+	var team Team
+	if err := json.Unmarshal(resp, &team); err != nil {
+		return team, err
+	}
+	validUnits := len(team.UnitsMap) == len(spec.UnitsMap)
+	for k, v := range spec.UnitsMap {
+		if team.UnitsMap[k] != v {
+			validUnits = false
+		}
+	}
+	if team.ID <= 0 || team.Name != spec.Name || team.Description != spec.Description || team.Organization == nil || team.Organization.UserName != org || team.Permission != spec.Permission || team.IncludesAllRepositories != spec.IncludesAllRepositories || team.CanCreateOrgRepo != spec.CanCreateOrgRepo || !validUnits {
+		return Team{}, fmt.Errorf("team response did not match requested identity and policy")
+	}
+	return team, nil
+}
+func (c *Client) ListTeams(ctx context.Context, org string) ([]Team, error) {
+	var out []Team
+	for page := 1; ; page++ {
+		resp, err := c.doJSON(ctx, http.MethodGet, "/api/v1/orgs/"+url.PathEscape(org)+"/teams?limit=50&page="+fmt.Sprint(page), nil)
+		if err != nil {
+			return nil, err
+		}
+		var batch []Team
+		if err := json.Unmarshal(resp, &batch); err != nil {
+			return nil, err
+		}
+		out = append(out, batch...)
+		if len(batch) < 50 {
+			return out, nil
+		}
+	}
+}
+func (c *Client) GetTeam(ctx context.Context, id int64) (Team, error) {
+	resp, err := c.doJSON(ctx, http.MethodGet, "/api/v1/teams/"+fmt.Sprint(id), nil)
+	if err != nil {
+		return Team{}, err
+	}
+	var out Team
+	err = json.Unmarshal(resp, &out)
+	return out, err
+}
+func (c *Client) ListTeamMembers(ctx context.Context, id int64) ([]User, error) {
+	var out []User
+	for page := 1; ; page++ {
+		resp, err := c.doJSON(ctx, http.MethodGet, "/api/v1/teams/"+fmt.Sprint(id)+"/members?limit=50&page="+fmt.Sprint(page), nil)
+		if err != nil {
+			return nil, err
+		}
+		var batch []User
+		if err := json.Unmarshal(resp, &batch); err != nil {
+			return nil, err
+		}
+		out = append(out, batch...)
+		if len(batch) < 50 {
+			return out, nil
+		}
+	}
+}
+func (c *Client) AddTeamMember(ctx context.Context, id int64, user string) error {
+	_, err := c.doJSON(ctx, http.MethodPut, "/api/v1/teams/"+fmt.Sprint(id)+"/members/"+url.PathEscape(user), nil)
+	return err
+}
+func (c *Client) RemoveTeamMember(ctx context.Context, id int64, user string) error {
+	_, err := c.doJSON(ctx, http.MethodDelete, "/api/v1/teams/"+fmt.Sprint(id)+"/members/"+url.PathEscape(user), nil)
+	if isNotFound(err) {
+		return nil
+	}
+	return err
+}
+func (c *Client) IsOrganizationMember(ctx context.Context, org, user string) (bool, error) {
+	_, err := c.doJSON(ctx, http.MethodGet, "/api/v1/orgs/"+url.PathEscape(org)+"/members/"+url.PathEscape(user), nil)
+	if isNotFound(err) {
+		return false, nil
+	}
+	return err == nil, err
+}
+func (c *Client) RemoveOrganizationMember(ctx context.Context, org, user string) error {
+	_, err := c.doJSON(ctx, http.MethodDelete, "/api/v1/orgs/"+url.PathEscape(org)+"/members/"+url.PathEscape(user), nil)
+	if isNotFound(err) {
+		return nil
+	}
+	return err
+}
+func (c *Client) AddOrUpdateCollaborator(ctx context.Context, owner, repo, user, permission string) error {
+	_, err := c.doJSON(ctx, http.MethodPut, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/collaborators/"+url.PathEscape(user), map[string]string{"permission": permission})
+	return err
+}
+func (c *Client) RemoveCollaborator(ctx context.Context, owner, repo, user string) error {
+	_, err := c.doJSON(ctx, http.MethodDelete, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/collaborators/"+url.PathEscape(user), nil)
+	if isNotFound(err) {
 		return nil
 	}
 	return err

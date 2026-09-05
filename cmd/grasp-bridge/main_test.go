@@ -11,14 +11,19 @@ import (
 )
 
 type stubAuthStateInspector struct {
-	hasState bool
-	err      error
-	calls    int
+	hasState       bool
+	hasTenantState bool
+	err            error
+	tenantErr      error
+	calls          int
 }
 
 func (s *stubAuthStateInspector) HasAuthState(context.Context) (bool, error) {
 	s.calls++
 	return s.hasState, s.err
+}
+func (s *stubAuthStateInspector) HasTenantState(context.Context) (bool, error) {
+	return s.hasTenantState, s.tenantErr
 }
 
 func TestGuardPostgresTakeover(t *testing.T) {
@@ -32,7 +37,9 @@ func TestGuardPostgresTakeover(t *testing.T) {
 		{name: "both empty"},
 		{name: "postgres populated", sqlite: stubAuthStateInspector{hasState: true}, postgres: stubAuthStateInspector{hasState: true}},
 		{name: "refuses empty takeover", sqlite: stubAuthStateInspector{hasState: true}, wantErr: "POSTGRES_ALLOW_EMPTY_TAKEOVER=true"},
-		{name: "explicit override", sqlite: stubAuthStateInspector{hasState: true}, allowEmpty: true},
+		{name: "tenant state migrated", sqlite: stubAuthStateInspector{hasTenantState: true}, postgres: stubAuthStateInspector{hasTenantState: true}},
+		{name: "refuses missing tenant state", sqlite: stubAuthStateInspector{hasTenantState: true}, postgres: stubAuthStateInspector{hasState: true}, wantErr: "tenant or affiliation state"},
+		{name: "explicit override", sqlite: stubAuthStateInspector{hasState: true, hasTenantState: true}, allowEmpty: true},
 		{name: "sqlite inspection fails closed", sqlite: stubAuthStateInspector{err: errors.New("read failed")}, wantErr: "inspect SQLite auth state"},
 		{name: "postgres inspection fails closed", sqlite: stubAuthStateInspector{hasState: true}, postgres: stubAuthStateInspector{err: errors.New("read failed")}, wantErr: "inspect Postgres auth state"},
 	}

@@ -22,15 +22,18 @@ const (
 
 type verifier func(context.Context, string, []string) nip05resolve.AffiliationVerification
 
+type Reconciler interface{ ReconcileAll(context.Context) error }
+
 // Service periodically refreshes directory-only NIP-05 affiliation evidence.
 // It never changes repository placement or any authorization state.
 type Service struct {
-	store     store.AuthStore
-	relays    func() []string
-	verify    verifier
-	interval  time.Duration
-	logger    *slog.Logger
-	randFloat func() float64
+	store      store.AuthStore
+	relays     func() []string
+	verify     verifier
+	interval   time.Duration
+	logger     *slog.Logger
+	randFloat  func() float64
+	reconciler Reconciler
 }
 
 func New(st store.AuthStore, relayURLs func() []string, logger *slog.Logger) *Service {
@@ -41,10 +44,27 @@ func New(st store.AuthStore, relayURLs func() []string, logger *slog.Logger) *Se
 		interval: DefaultInterval, logger: logger, randFloat: rand.Float64}
 }
 
+func (s *Service) SetReconciler(r Reconciler) { s.reconciler = r }
+
 func (s *Service) Run(ctx context.Context) {
 	for {
-		s.sweep(ctx)
-		delay := s.jitteredInterval()
+		acquired, release, err := s.store.TryMaintenanceLease(ctx)
+		if err != nil {
+			s.logger.Warn("NIP-05 maintenance lease failed", "error", err)
+		}
+		delay := time.Minute
+		if acquired {
+			func() {
+				defer release()
+				s.sweep(ctx)
+				if s.reconciler != nil {
+					if err := s.reconciler.ReconcileAll(ctx); err != nil {
+						s.logger.Warn("tenant reconciliation sweep failed", "error", err)
+					}
+				}
+			}()
+			delay = s.jitteredInterval()
+		}
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():

@@ -49,7 +49,7 @@ func (s *SQLiteStore) UpsertDomainAffiliation(ctx context.Context, a DomainAffil
 			failure_class=excluded.failure_class,
 			failure_code=excluded.failure_code,
 			failure_detail=excluded.failure_detail
-		WHERE domain_affiliations.checked_at <= excluded.checked_at
+		WHERE domain_affiliations.checked_at < excluded.checked_at
 	`, a.CanonicalIdentifier, a.LocalPart, a.Host, a.Pubkey, affiliationTime(a.VerifiedAt), affiliationTime(a.CheckedAt),
 		a.Status, a.FailureClass, a.FailureCode, a.FailureDetail)
 	return err
@@ -83,7 +83,7 @@ func (s *PostgresStore) UpsertDomainAffiliation(ctx context.Context, a DomainAff
 			failure_class=excluded.failure_class,
 			failure_code=excluded.failure_code,
 			failure_detail=excluded.failure_detail
-		WHERE domain_affiliations.checked_at <= excluded.checked_at
+		WHERE domain_affiliations.checked_at < excluded.checked_at
 	`, a.CanonicalIdentifier, a.LocalPart, a.Host, a.Pubkey, affiliationTime(a.VerifiedAt), affiliationTime(a.CheckedAt),
 		a.Status, a.FailureClass, a.FailureCode, a.FailureDetail)
 	return err
@@ -118,12 +118,12 @@ func scanDomainAffiliation(row affiliationScanner) (DomainAffiliation, error) {
 	}
 	var err error
 	if verifiedAt != "" {
-		a.VerifiedAt, err = time.Parse(time.RFC3339, verifiedAt)
+		a.VerifiedAt, err = parseStoreTime(verifiedAt)
 		if err != nil {
 			return DomainAffiliation{}, fmt.Errorf("parse domain affiliation verified_at: %w", err)
 		}
 	}
-	a.CheckedAt, err = time.Parse(time.RFC3339, checkedAt)
+	a.CheckedAt, err = parseStoreTime(checkedAt)
 	if err != nil {
 		return DomainAffiliation{}, fmt.Errorf("parse domain affiliation checked_at: %w", err)
 	}
@@ -142,9 +142,17 @@ func scanDomainAffiliations(rows *sql.Rows) ([]DomainAffiliation, error) {
 	return result, rows.Err()
 }
 
+const storeTimeLayout = "2006-01-02T15:04:05.000000000Z"
+
+func parseStoreTime(raw string) (time.Time, error) {
+	if t, err := time.Parse(storeTimeLayout, raw); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339Nano, raw)
+}
 func affiliationTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
-	return t.UTC().Format(time.RFC3339)
+	return t.UTC().Format(storeTimeLayout)
 }

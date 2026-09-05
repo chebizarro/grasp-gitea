@@ -38,6 +38,92 @@ func Run(t *testing.T, factory Factory) {
 	t.Run("UserLockIsMutuallyExclusive", func(t *testing.T) { testUserLockExclusion(t, factory(t)) })
 	t.Run("MaintenanceLeaseIsSingleHolder", func(t *testing.T) { testMaintenanceLease(t, factory(t)) })
 	t.Run("DomainAffiliationPersistence", func(t *testing.T) { testDomainAffiliationPersistence(t, factory(t)) })
+	t.Run("TenantPersistence", func(t *testing.T) { testTenantPersistence(t, factory(t)) })
+}
+
+func testTenantPersistence(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 5, 1, 2, 3, 0, time.UTC)
+	tenant := store.ManagedTenant{Host: "xn--bcher-kva.example", Policy: store.TenantPolicyDirectoryOnly, State: store.TenantStatePending, OrgName: "grasp-t-0123456789abcdef0123456789abcdef", ProvisioningMarker: "grasp-tenant-provisioning:test", Version: 1, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateManagedTenant(ctx, tenant); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	tenant.GiteaOrgID = 42
+	tenant.ReaderTeamID = 7
+	tenant.State = store.TenantStateActive
+	tenant.Version = 2
+	tenant.UpdatedAt = now.Add(time.Second)
+	if ok, err := st.UpdateManagedTenant(ctx, tenant, 1); err != nil || !ok {
+		t.Fatalf("pin tenant: ok=%v err=%v", ok, err)
+	}
+	changed := tenant
+	changed.ProvisioningMarker = "grasp-tenant-provisioning:attacker"
+	changed.Version = 3
+	if ok, err := st.UpdateManagedTenant(ctx, changed, 2); err != nil || ok {
+		t.Fatalf("immutable provisioning marker changed: ok=%v err=%v", ok, err)
+	}
+	changed = tenant
+	changed.GiteaOrgID = 43
+	changed.Version = 3
+	if ok, err := st.UpdateManagedTenant(ctx, changed, 2); err != nil || ok {
+		t.Fatalf("immutable org pin changed: ok=%v err=%v", ok, err)
+	}
+	m := store.TenantMembership{Host: tenant.Host, Pubkey: "pub", GiteaUserID: 9, GiteaUser: "alice", EvidenceStatus: store.DomainAffiliationVerified, VerifiedAt: now, CheckedAt: now, Granted: true, UpdatedAt: now}
+	if err := st.UpsertTenantMembership(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	older := m
+	older.CheckedAt = now.Add(-time.Minute)
+	older.Granted = false
+	older.TenantOrphaned = true
+	if err := st.UpsertTenantMembership(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+	members, err := st.ListTenantMemberships(ctx, tenant.Host)
+	if err != nil || len(members) != 1 || !members[0].Granted || members[0].TenantOrphaned {
+		t.Fatalf("monotonic membership = %+v err=%v", members, err)
+	}
+	reconciledAt := now.Add(2 * time.Minute)
+	if ok, err := st.UpdateTenantMembershipAccess(ctx, tenant.Host, m.Pubkey, store.TenantAccessPolicyRemoved, false, false, reconciledAt, m.CheckedAt, tenant.Version); err != nil || !ok {
+		t.Fatalf("access CAS ok=%v err=%v", ok, err)
+	}
+	if ok, err := st.UpdateTenantMembershipAccess(ctx, tenant.Host, m.Pubkey, store.TenantAccessGranted, true, false, reconciledAt, m.CheckedAt, tenant.Version+1); err != nil || ok {
+		t.Fatalf("stale tenant-version access CAS ok=%v err=%v", ok, err)
+	}
+	if err := st.UpsertDomainAffiliation(ctx, store.DomainAffiliation{Pubkey: m.Pubkey, Host: tenant.Host, Status: store.DomainAffiliationVerified, VerifiedAt: now, CheckedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := st.UpdateTenantMembershipAccess(ctx, tenant.Host, m.Pubkey, store.TenantAccessGranted, true, false, reconciledAt, m.CheckedAt.Add(-time.Nanosecond), tenant.Version); err != nil || ok {
+		t.Fatalf("stale evidence access CAS ok=%v err=%v", ok, err)
+	}
+	members, err = st.ListTenantMemberships(ctx, tenant.Host)
+	if err != nil || members[0].EvidenceStatus != store.DomainAffiliationVerified || !members[0].CheckedAt.Equal(now) || members[0].AccessState != store.TenantAccessPolicyRemoved || members[0].Granted || members[0].TenantOrphaned {
+		t.Fatalf("access update poisoned evidence: %+v err=%v", members, err)
+	}
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		_ = st.WithTenantLock(ctx, tenant.Host, func(context.Context) error { close(locked); <-release; return nil })
+		close(done)
+	}()
+	<-locked
+	entered := make(chan struct{})
+	go func() {
+		_ = st.WithTenantLock(ctx, tenant.Host, func(context.Context) error { close(entered); return nil })
+	}()
+	select {
+	case <-entered:
+		t.Fatal("tenant lock was not exclusive")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	<-done
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("tenant lock did not release")
+	}
 }
 
 // testMaintenanceLease proves at most one node holds the maintenance lease at
@@ -92,18 +178,24 @@ func testDomainAffiliationPersistence(t *testing.T, st store.AuthStore) {
 
 	newer := store.DomainAffiliation{
 		CanonicalIdentifier: "new@example.com", LocalPart: "new", Host: "example.com", Pubkey: "pubkey-monotonic",
-		VerifiedAt: verifiedAt.Add(3 * time.Minute), CheckedAt: checkedAt.Add(3 * time.Minute), Status: store.DomainAffiliationVerified,
+		VerifiedAt: verifiedAt.Add(3 * time.Minute), CheckedAt: checkedAt.Add(3*time.Minute + 500*time.Millisecond), Status: store.DomainAffiliationVerified,
 	}
 	older := newer
 	older.CanonicalIdentifier = "old@example.com"
 	older.LocalPart = "old"
-	older.CheckedAt = checkedAt.Add(2 * time.Minute)
+	older.CheckedAt = checkedAt.Add(3 * time.Minute)
 	older.Status = store.DomainAffiliationConfirmedAbsent
 	if err := st.UpsertDomainAffiliation(ctx, newer); err != nil {
 		t.Fatalf("upsert newer affiliation: %v", err)
 	}
 	if err := st.UpsertDomainAffiliation(ctx, older); err != nil {
 		t.Fatalf("upsert out-of-order older affiliation: %v", err)
+	}
+	equalTime := newer
+	equalTime.Status = store.DomainAffiliationConfirmedAbsent
+	equalTime.CanonicalIdentifier = "regressed@example.com"
+	if err := st.UpsertDomainAffiliation(ctx, equalTime); err != nil {
+		t.Fatalf("upsert equal-time affiliation: %v", err)
 	}
 	got, err = st.GetDomainAffiliation(ctx, newer.Pubkey)
 	if err != nil || got.Status != store.DomainAffiliationVerified || got.CanonicalIdentifier != newer.CanonicalIdentifier || !got.CheckedAt.Equal(newer.CheckedAt) {

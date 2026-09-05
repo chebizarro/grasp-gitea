@@ -42,6 +42,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/safefetch"
 	"github.com/sharegap/grasp-gitea/internal/signer"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/tenant"
 	"github.com/sharegap/grasp-gitea/internal/webhook"
 )
 
@@ -201,11 +202,25 @@ func newServerSigner(ctx context.Context, cfg config.Config, st store.AuthStore,
 
 type authStateInspector interface {
 	HasAuthState(ctx context.Context) (bool, error)
+	HasTenantState(ctx context.Context) (bool, error)
 }
 
 func guardPostgresTakeover(ctx context.Context, sqliteStore, postgresStore authStateInspector, allowEmptyTakeover bool) error {
 	if allowEmptyTakeover {
 		return nil
+	}
+	sqliteHasTenantState, err := sqliteStore.HasTenantState(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect SQLite tenant state: %w", err)
+	}
+	if sqliteHasTenantState {
+		postgresHasTenantState, err := postgresStore.HasTenantState(ctx)
+		if err != nil {
+			return fmt.Errorf("inspect Postgres tenant state: %w", err)
+		}
+		if !postgresHasTenantState {
+			return fmt.Errorf("SQLite contains tenant or affiliation state but Postgres does not; migrate tenant state or set POSTGRES_ALLOW_EMPTY_TAKEOVER=true")
+		}
 	}
 	sqliteHasState, err := sqliteStore.HasAuthState(ctx)
 	if err != nil {
@@ -325,9 +340,17 @@ func main() {
 	defer shutdownEmbedded(context.Background())
 
 	relayURLs := liveRelayURLs(policies, embeddedRelayURL)
+	tenantSvc := tenant.New(sharedStore, giteaClient, cfg.TenantReconciliationEnabled, logger)
+	if err := tenantSvc.ValidateStartup(ctx); err != nil {
+		logger.Error("unsafe tenant configuration", "error", err)
+		os.Exit(1)
+	}
 	affiliationSvc := nip05affiliation.New(sharedStore, func() []string {
 		return liveRelayURLs(policies, embeddedRelayURL)
 	}, logger)
+	if cfg.TenantReconciliationEnabled {
+		affiliationSvc.SetReconciler(tenantSvc)
+	}
 	affiliationDone := make(chan struct{})
 	go func() {
 		defer close(affiliationDone)
@@ -490,6 +513,10 @@ func main() {
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
 	apiServer.SetPolicyStore(policies)
 	apiServer.SetAffiliationStore(sharedStore)
+	apiServer.SetTenantOperator(tenantSvc)
+	if cfg.TenantReconciliationEnabled {
+		apiServer.AddReadinessProbe(tenantSvc)
+	}
 	if postgresStore != nil {
 		apiServer.AddReadinessProbe(postgresStore)
 	}

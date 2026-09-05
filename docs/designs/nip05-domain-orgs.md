@@ -139,7 +139,10 @@ pubkey.* It does **not** prove the user administers the domain. So
 with a `nostr.json` entry claim a branded tenant.
 
 - Tenants require **operator approval / an allowlist**.
-- The bridge creates the org and records the **immutable Gitea org ID**.
+- The bridge creates the org and records the **immutable Gitea org ID**. A random
+  provisioning marker is persisted before the create call and copied into the
+  org/team descriptions, so crash recovery may re-pin only the exact in-flight
+  resources created for that intent.
 - Never adopt an existing same-named org — this preserves the existing rule in
   `provisioner.go` that a same-named org is not an ownership proof.
 - Name tenants in a reserved, full-domain-hashed form (not raw `github-com`,
@@ -208,6 +211,15 @@ Estimates assume one engineer familiar with the bridge; frontend excluded.
 behaviour has a concrete user requirement.
 
 Phase 2 must not ship membership without revocation in the same deployment.
+
+### Future OwnAuth SCIM seam
+
+OwnAuth SCIM (phase `phase1-8qz`) will later become the membership source of
+truth. Source evaluation is therefore kept separate from the tenant
+membership-mutation/reconciliation boundary: SCIM will supply intended members
+to the same immutable-org/team-pinned, per-tenant-locked applicator. It must use
+the same deny reconciliation and tenant-orphan handling. This phase adds no
+SCIM endpoint, token, schema, or precedence behavior.
 
 ## Risks
 
