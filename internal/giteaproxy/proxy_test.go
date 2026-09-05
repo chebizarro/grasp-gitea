@@ -31,6 +31,7 @@ type stubAuthenticator struct {
 	patErr    error
 	patLogin  string
 	patSecret string
+	patCalls  int
 }
 
 func (s *stubAuthenticator) Enabled() bool { return s.enabled }
@@ -46,6 +47,7 @@ func (s *stubAuthenticator) Authenticate(_ context.Context, token string) (auth.
 }
 
 func (s *stubAuthenticator) DownstreamPAT(_ context.Context, _ int64, _ string) (string, string, error) {
+	s.patCalls++
 	if s.patErr != nil {
 		return "", "", s.patErr
 	}
@@ -728,8 +730,8 @@ func TestDockerTokenExchangeScopeEnforcement(t *testing.T) {
 	r.Header.Set("Authorization", basicHeader("npub1owner", testBridgeToken))
 	w = httptest.NewRecorder()
 	env.proxy.ServeHTTP(w, r)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("unknown docker action = %d, want 403 (fail closed)", w.Code)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown docker action = %d, want 400 (fail closed)", w.Code)
 	}
 	if env.seen.snapshot().hit {
 		t.Fatal("denied docker exchange reached Gitea")

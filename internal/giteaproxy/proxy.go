@@ -23,6 +23,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/gitea"
 	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/tenant"
 )
 
 // Authenticator resolves bridge tokens and their hidden downstream
@@ -49,6 +50,11 @@ type RepositoryInspector interface {
 // *auth.ProxyNIP98Verifier satisfies it.
 type NostrVerifier interface {
 	VerifyProxyNIP98(ctx context.Context, r *http.Request, body []byte) (auth.TokenPrincipal, error)
+}
+
+type TenantPackageAuthorizer interface {
+	AuthorizePackageRequest(context.Context, tenant.PackageAuthorizationRequest) (tenant.PackageAuthorizationDecision, error)
+	CompletePackageRequest(context.Context, tenant.PackageAuthorizationDecision, bool) error
 }
 
 // maxNIP98ProxyBody bounds the body a direct NIP-98 request may carry: the
@@ -95,18 +101,24 @@ type Proxy struct {
 	fullProxy       bool
 	policy          *policy.Store
 
-	proxy   *httputil.ReverseProxy
-	tokens  Authenticator
-	nostr   NostrVerifier
-	repos   RepositoryInspector
-	auditor Auditor
-	logger  *slog.Logger
+	proxy             *httputil.ReverseProxy
+	tokens            Authenticator
+	nostr             NostrVerifier
+	repos             RepositoryInspector
+	auditor           Auditor
+	packageAuthorizer TenantPackageAuthorizer
+	logger            *slog.Logger
 }
 
 // WithNostrVerifier enables direct NIP-98 authentication on proxied
 // endpoints. Without it, Authorization: Nostr is rejected locally.
 func (p *Proxy) WithNostrVerifier(v NostrVerifier) *Proxy {
 	p.nostr = v
+	return p
+}
+
+func (p *Proxy) WithTenantPackageAuthorizer(a TenantPackageAuthorizer) *Proxy {
+	p.packageAuthorizer = a
 	return p
 }
 
@@ -142,7 +154,8 @@ type plan struct {
 	npubSurface bool
 	// injectedHidden records that the bridge supplied the credential, so a
 	// downstream 401 is a bridge fault rather than a caller fault.
-	injectedHidden bool
+	injectedHidden  bool
+	packageDecision tenant.PackageAuthorizationDecision
 }
 
 // New builds the proxy. The upstream origin is validated here so a malformed
@@ -248,6 +261,11 @@ func (p *Proxy) SetPolicyStore(store *policy.Store) {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	class := Classify(r)
 	cred := p.extractCredential(r)
+	packageChecked := false
+	if class.PackageMalformed {
+		http.Error(w, "malformed package coordinate", http.StatusBadRequest)
+		return
+	}
 
 	// The LFS batch endpoint's read-vs-write nature lives in its JSON body.
 	// Resolve it only when a bridge credential needs authorizing; anonymous
@@ -274,6 +292,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case credentialNostrProof:
+		packageChecked = true
 		if !p.serveNostrProof(w, r, class, &pl) {
 			return
 		}
@@ -305,6 +324,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.rejectForbidden(w, r, class, "token is missing scope "+class.Scope)
 			return
 		}
+		packageChecked = true
+		if !p.authorizeTenantPackages(w, r, class, &principal, &pl) {
+			return
+		}
 		if isConanTokenExchange(r) {
 			// Echo the revocable, scope-checked bridge credential rather than
 			// allowing Gitea to mint a 24-hour union-scope package JWT.
@@ -327,8 +350,39 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		pl.injectedHidden = true
 		p.audit(r, class, "allowed", principal.TokenID, principal.Pubkey)
 	}
+	if !packageChecked && !p.authorizeTenantPackages(w, r, class, nil, &pl) {
+		return
+	}
 
 	p.proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), planKey{}, &pl)))
+}
+
+func (p *Proxy) authorizeTenantPackages(w http.ResponseWriter, r *http.Request, class Classification, principal *auth.TokenPrincipal, pl *plan) bool {
+	if p.packageAuthorizer == nil || len(class.PackageCoordinates) == 0 {
+		return true
+	}
+	var pp *tenant.PackagePrincipal
+	if principal != nil {
+		pp = &tenant.PackagePrincipal{Pubkey: principal.Pubkey, GiteaUserID: principal.GiteaUserID, GiteaUser: principal.GiteaUser}
+	}
+	decision, err := p.packageAuthorizer.AuthorizePackageRequest(r.Context(), tenant.PackageAuthorizationRequest{Coordinates: class.PackageCoordinates, Principal: pp, RegistryContinuation: class.RegistryContinuation})
+	if err == nil {
+		if pl != nil {
+			pl.packageDecision = decision
+		}
+		return true
+	}
+	if errors.Is(err, tenant.ErrPackageAuthRequired) {
+		p.rejectUnauthorized(w, r, class, "tenant package membership required")
+		return false
+	}
+	if errors.Is(err, tenant.ErrPackageDenied) {
+		p.rejectForbidden(w, r, class, "tenant package policy denied request")
+		return false
+	}
+	p.logger.Error("tenant package authorization unavailable", "error", err)
+	http.Error(w, "tenant package authorization unavailable", http.StatusServiceUnavailable)
+	return false
 }
 
 // serveNostrProof authenticates a direct NIP-98 request in place. It
@@ -419,6 +473,9 @@ func (p *Proxy) serveNostrProof(w http.ResponseWriter, r *http.Request, class Cl
 	}
 	if !principal.HasScope(class.Scope) {
 		p.rejectForbidden(w, r, class, "NIP-98 authentication does not grant scope "+class.Scope)
+		return false
+	}
+	if !p.authorizeTenantPackages(w, r, class, &principal, pl) {
 		return false
 	}
 	login, pat, err := p.tokens.DownstreamPAT(r.Context(), principal.GiteaUserID, class.Scope)
@@ -709,6 +766,14 @@ func (p *Proxy) sanitizeLFSBatchResponse(resp *http.Response, pl *plan) {
 
 func (p *Proxy) modifyResponse(resp *http.Response) error {
 	pl, _ := resp.Request.Context().Value(planKey{}).(*plan)
+	if pl != nil && p.packageAuthorizer != nil && len(pl.packageDecision.Reservations) > 0 {
+		success := resp.StatusCode >= 200 && resp.StatusCode < 400
+		if err := p.packageAuthorizer.CompletePackageRequest(resp.Request.Context(), pl.packageDecision, success); err != nil {
+			p.logger.Error("tenant package reservation completion failed", "error", err)
+			replaceWithPlainText(resp, http.StatusServiceUnavailable, "tenant package allocation unavailable\n")
+			return nil
+		}
+	}
 
 	if pl != nil && pl.cred.kind == credentialSessionProxy {
 		if resp.Request.URL.Path == "/user/logout" {
@@ -847,6 +912,11 @@ func (p *Proxy) rewriteBackendOrigin(resp *http.Response) {
 
 func (p *Proxy) handleProxyError(w http.ResponseWriter, r *http.Request, err error) {
 	pl, _ := r.Context().Value(planKey{}).(*plan)
+	if pl != nil && p.packageAuthorizer != nil && len(pl.packageDecision.Reservations) > 0 {
+		if cleanupErr := p.packageAuthorizer.CompletePackageRequest(context.WithoutCancel(r.Context()), pl.packageDecision, false); cleanupErr != nil {
+			p.logger.Error("tenant package reservation cleanup failed", "error", cleanupErr)
+		}
+	}
 	if pl != nil && pl.npubSurface {
 		setGitHTTPCORS(w.Header())
 	}

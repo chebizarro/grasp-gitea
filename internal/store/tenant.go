@@ -117,18 +117,44 @@ func tenantArgs(t ManagedTenant) []any {
 	return []any{t.Host, t.Policy, boolInt(t.PlacementEnabled), boolInt(t.PlacementPending), t.State, t.OrgName, t.ProvisioningMarker, t.GiteaOrgID, t.ReaderTeamID, t.Version, t.ReconciledVersion, tt(t.LastReconciledAt), t.LastError, tt(t.CreatedAt), tt(t.UpdatedAt)}
 }
 func (s *SQLiteStore) CreateManagedTenant(c context.Context, t ManagedTenant) error {
-	_, e := s.db.ExecContext(c, `INSERT INTO managed_tenants(host,policy,placement_enabled,placement_pending,state,org_name,provisioning_marker,gitea_org_id,reader_team_id,version,reconciled_version,last_reconciled_at,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, tenantArgs(t)...)
-	return e
+	tx, e := s.db.BeginTx(c, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if _, e = tx.ExecContext(c, `INSERT INTO managed_tenants(host,policy,placement_enabled,placement_pending,state,org_name,provisioning_marker,gitea_org_id,reader_team_id,version,reconciled_version,last_reconciled_at,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, tenantArgs(t)...); e != nil {
+		return e
+	}
+	if _, e = tx.ExecContext(c, `INSERT INTO tenant_package_policies(host,enabled,allowed_families,allocation_mode,version,created_at,updated_at) VALUES(?,0,'[]',?,1,?,?)`, t.Host, TenantPackageAllocationExplicit, tt(t.CreatedAt), tt(t.UpdatedAt)); e != nil {
+		return e
+	}
+	return tx.Commit()
 }
 func (s *PostgresStore) CreateManagedTenant(c context.Context, t ManagedTenant) error {
-	_, e := s.db.ExecContext(c, `INSERT INTO managed_tenants(host,policy,placement_enabled,placement_pending,state,org_name,provisioning_marker,gitea_org_id,reader_team_id,version,reconciled_version,last_reconciled_at,last_error,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, tenantArgs(t)...)
-	return e
+	tx, e := s.db.BeginTx(c, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if _, e = tx.ExecContext(c, `INSERT INTO managed_tenants(host,policy,placement_enabled,placement_pending,state,org_name,provisioning_marker,gitea_org_id,reader_team_id,version,reconciled_version,last_reconciled_at,last_error,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, tenantArgs(t)...); e != nil {
+		return e
+	}
+	if _, e = tx.ExecContext(c, `INSERT INTO tenant_package_policies(host,enabled,allowed_families,allocation_mode,version,created_at,updated_at) VALUES($1,0,'[]',$2,1,$3,$4)`, t.Host, TenantPackageAllocationExplicit, tt(t.CreatedAt), tt(t.UpdatedAt)); e != nil {
+		return e
+	}
+	return tx.Commit()
 }
 func (s *SQLiteStore) GetManagedTenant(c context.Context, h string) (ManagedTenant, error) {
 	return scanTenant(s.db.QueryRowContext(c, tenantSelect+` WHERE host=?`, h))
 }
 func (s *PostgresStore) GetManagedTenant(c context.Context, h string) (ManagedTenant, error) {
 	return scanTenant(s.db.QueryRowContext(c, tenantSelect+` WHERE host=$1`, h))
+}
+func (s *SQLiteStore) GetManagedTenantByOrgName(c context.Context, orgName string) (ManagedTenant, error) {
+	return scanTenant(s.db.QueryRowContext(c, tenantSelect+` WHERE org_name=? COLLATE NOCASE`, orgName))
+}
+func (s *PostgresStore) GetManagedTenantByOrgName(c context.Context, orgName string) (ManagedTenant, error) {
+	return scanTenant(s.db.QueryRowContext(c, tenantSelect+` WHERE lower(org_name)=lower($1)`, orgName))
 }
 func scanTenants(r *sql.Rows) ([]ManagedTenant, error) {
 	defer r.Close()

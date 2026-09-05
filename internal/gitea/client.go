@@ -78,6 +78,7 @@ type Repository struct {
 	// organization. Gitea computes it as !IsPrivate && owner is private, so
 	// Private alone does not imply the repository is publicly readable.
 	Internal bool `json:"internal"`
+	Archived bool `json:"archived"`
 }
 
 // PubliclyReadable reports whether unauthenticated users may read the
@@ -366,6 +367,37 @@ func (c *Client) AddOrUpdateCollaborator(ctx context.Context, owner, repo, user,
 	_, err := c.doJSON(ctx, http.MethodPut, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/collaborators/"+url.PathEscape(user), map[string]string{"permission": permission})
 	return err
 }
+
+func (c *Client) GetCollaboratorPermission(ctx context.Context, owner, repo, user string) (string, error) {
+	resp, err := c.doJSON(ctx, http.MethodGet, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/collaborators/"+url.PathEscape(user)+"/permission", nil)
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		Permission string `json:"permission"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return "", err
+	}
+	return result.Permission, nil
+}
+
+// TransferRepo moves an existing repository without changing its immutable ID.
+func (c *Client) TransferRepo(ctx context.Context, owner, repo, newOwner string) (Repository, error) {
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/transfer", map[string]string{"new_owner": newOwner})
+	if err != nil {
+		return Repository{}, err
+	}
+	return parseRepo(resp)
+}
+
+func (c *Client) RenameRepo(ctx context.Context, owner, repo, newName string) (Repository, error) {
+	resp, err := c.doJSON(ctx, http.MethodPatch, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo), map[string]string{"name": newName})
+	if err != nil {
+		return Repository{}, err
+	}
+	return parseRepo(resp)
+}
 func (c *Client) RemoveCollaborator(ctx context.Context, owner, repo, user string) error {
 	_, err := c.doJSON(ctx, http.MethodDelete, "/api/v1/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/collaborators/"+url.PathEscape(user), nil)
 	if isNotFound(err) {
@@ -431,8 +463,11 @@ func (c *Client) EnsureRepo(ctx context.Context, org string, repo string) (Repos
 }
 
 func (c *Client) ArchiveRepo(ctx context.Context, org string, repo string) error {
-	body := map[string]any{"archived": true}
-	_, err := c.doJSON(ctx, http.MethodPatch, "/api/v1/repos/"+url.PathEscape(org)+"/"+url.PathEscape(repo), body)
+	return c.SetRepoArchived(ctx, org, repo, true)
+}
+
+func (c *Client) SetRepoArchived(ctx context.Context, org, repo string, archived bool) error {
+	_, err := c.doJSON(ctx, http.MethodPatch, "/api/v1/repos/"+url.PathEscape(org)+"/"+url.PathEscape(repo), map[string]any{"archived": archived})
 	return err
 }
 
@@ -677,6 +712,7 @@ func parseRepo(resp []byte) (Repository, error) {
 		HTMLURL  string `json:"html_url"`
 		Private  bool   `json:"private"`
 		Internal bool   `json:"internal"`
+		Archived bool   `json:"archived"`
 		Owner    struct {
 			UserName string `json:"username"`
 		} `json:"owner"`
@@ -693,6 +729,7 @@ func parseRepo(resp []byte) (Repository, error) {
 		HTMLURL:  raw.HTMLURL,
 		Private:  raw.Private,
 		Internal: raw.Internal,
+		Archived: raw.Archived,
 	}, nil
 }
 

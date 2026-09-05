@@ -31,13 +31,15 @@ import (
 
 // testGiteaServer creates a mock Gitea API that tracks orgs, repos, and archive state.
 type testGiteaServer struct {
-	mu            sync.Mutex
-	orgs          map[string]bool
-	orgIDs        map[string]int64
-	repos         map[string]testRepo
-	collaborators map[string]string
-	nextID        int64
-	reposDir      string
+	mu                 sync.Mutex
+	orgs               map[string]bool
+	orgIDs             map[string]int64
+	repos              map[string]testRepo
+	collaborators      map[string]string
+	nextID             int64
+	reposDir           string
+	transferResponseID int64
+	afterRename        func()
 }
 
 type testRepo struct {
@@ -115,6 +117,50 @@ func newTestGiteaServer(t *testing.T, reposDir string) (*httptest.Server, *testG
 			state.collaborators[parts[0]+"/"+parts[1]] = parts[3] + ":" + body.Permission
 			w.WriteHeader(http.StatusNoContent)
 
+		// GET collaborator permission
+		case r.Method == http.MethodGet && strings.HasSuffix(path, "/permission") && strings.Contains(path, "/collaborators/"):
+			parts := strings.Split(strings.TrimPrefix(path, "/api/v1/repos/"), "/")
+			if len(parts) != 5 || parts[2] != "collaborators" || parts[4] != "permission" {
+				http.NotFound(w, r)
+				return
+			}
+			entry := state.collaborators[parts[0]+"/"+parts[1]]
+			fields := strings.SplitN(entry, ":", 2)
+			if len(fields) != 2 || fields[0] != parts[3] {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"permission": fields[1]})
+
+		// Transfer repository ownership.
+		case r.Method == http.MethodPost && strings.HasSuffix(path, "/transfer") && strings.HasPrefix(path, "/api/v1/repos/"):
+			parts := strings.Split(strings.TrimPrefix(strings.TrimSuffix(path, "/transfer"), "/api/v1/repos/"), "/")
+			if len(parts) != 2 {
+				http.NotFound(w, r)
+				return
+			}
+			var body struct {
+				NewOwner string `json:"new_owner"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			oldKey, newKey := parts[0]+"/"+parts[1], body.NewOwner+"/"+parts[1]
+			repo, ok := state.repos[oldKey]
+			if !ok || state.repos[newKey].ID != 0 {
+				http.Error(w, "cannot transfer", http.StatusConflict)
+				return
+			}
+			delete(state.repos, oldKey)
+			repo.Org = body.NewOwner
+			state.repos[newKey] = repo
+			_ = os.MkdirAll(filepath.Join(state.reposDir, body.NewOwner), 0o755)
+			_ = os.Rename(filepath.Join(state.reposDir, parts[0], parts[1]+".git"), filepath.Join(state.reposDir, body.NewOwner, parts[1]+".git"))
+			responseID := repo.ID
+			if state.transferResponseID != 0 {
+				responseID = state.transferResponseID
+				state.transferResponseID = 0
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": responseID, "name": repo.Name, "owner": map[string]any{"username": repo.Org}})
+
 		// GET repo
 		case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/v1/repos/"):
 			parts := strings.Split(strings.TrimPrefix(path, "/api/v1/repos/"), "/")
@@ -168,6 +214,20 @@ func newTestGiteaServer(t *testing.T, reposDir string) (*httptest.Server, *testG
 			if archived, ok := body["archived"].(bool); ok {
 				repo.Archived = archived
 				state.repos[key] = repo
+			}
+			if name, ok := body["name"].(string); ok && name != "" && name != repo.Name {
+				newKey := parts[0] + "/" + name
+				if state.repos[newKey].ID != 0 {
+					http.Error(w, "name conflict", http.StatusConflict)
+					return
+				}
+				delete(state.repos, key)
+				_ = os.Rename(filepath.Join(state.reposDir, parts[0], repo.Name+".git"), filepath.Join(state.reposDir, parts[0], name+".git"))
+				if state.afterRename != nil {
+					state.afterRename()
+				}
+				repo.Name = name
+				state.repos[newKey] = repo
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": repo.ID, "name": repo.Name, "archived": repo.Archived,

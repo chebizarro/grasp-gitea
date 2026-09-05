@@ -264,7 +264,7 @@ func (r *Runner) handlePullRequestEvent(ctx context.Context, ev *nostr.Event, so
 }
 
 func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *nostr.Event, sourceRelay, trigger, branch, commit string) error {
-	if !r.isRepoCIAllowed(mapping.Owner, mapping.RepoID) {
+	if !r.isRepoCIAllowed(mapping) {
 		return nil
 	}
 	authorized, authErr := r.workflowAuthorAuthorized(ctx, mapping, ev.PubKey.Hex())
@@ -598,15 +598,22 @@ func (r *Runner) mappingForAddress(ctx context.Context, ev *nostr.Event) (store.
 	return mapping, true, nil
 }
 
-func (r *Runner) isRepoCIAllowed(owner, repoID string) bool {
-	target := strings.TrimSpace(owner) + "/" + strings.TrimSpace(repoID)
+func (r *Runner) isRepoCIAllowed(mapping store.Mapping) bool {
+	// Tenant repositories must use the immutable owner-pubkey/repo-id key:
+	// their shared physical owner makes the legacy owner/repo-id form ambiguous.
+	// Preserve legacy compatibility only for unmigrated per-pubkey mappings.
+	immutable := strings.TrimSpace(mapping.Pubkey) + "/" + strings.TrimSpace(mapping.RepoID)
+	legacy := strings.TrimSpace(mapping.Owner) + "/" + strings.TrimSpace(mapping.RepoID)
+	legacyAllowed := strings.TrimSpace(mapping.TenantHost) == ""
 	triggerRepos := r.triggerRepos
-	if snapshot := r.policy.Current(); snapshot != nil {
-		triggerRepos = snapshot.CITriggerRepos
+	if r.policy != nil {
+		if snapshot := r.policy.Current(); snapshot != nil {
+			triggerRepos = snapshot.CITriggerRepos
+		}
 	}
 	for _, entry := range triggerRepos {
 		entry = strings.TrimSpace(entry)
-		if entry == "*" || entry == target {
+		if entry == "*" || entry == immutable || (legacyAllowed && entry == legacy) {
 			return true
 		}
 	}

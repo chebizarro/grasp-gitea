@@ -238,6 +238,30 @@ func (s *PostgresStore) ensureSchema() error {
 			updated_at TEXT NOT NULL, PRIMARY KEY(host,pubkey)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_tenant_memberships_host_granted ON tenant_memberships(host, granted);`,
+		`CREATE TABLE IF NOT EXISTS tenant_package_policies (
+			host TEXT PRIMARY KEY REFERENCES managed_tenants(host), enabled INTEGER NOT NULL DEFAULT 0,
+			allowed_families TEXT NOT NULL DEFAULT '[]', allocation_mode TEXT NOT NULL DEFAULT 'explicit',
+			version BIGINT NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS tenant_package_allocations (
+			host TEXT NOT NULL REFERENCES managed_tenants(host), family TEXT NOT NULL, name TEXT NOT NULL,
+			target_type TEXT NOT NULL, target_id TEXT NOT NULL, visibility TEXT NOT NULL DEFAULT 'private',
+			orphaned INTEGER NOT NULL DEFAULT 0, orphan_reason TEXT NOT NULL DEFAULT '',
+			pending INTEGER NOT NULL DEFAULT 0, reservation_id TEXT NOT NULL DEFAULT '', reservation_expires_at TEXT NOT NULL DEFAULT '',
+			version BIGINT NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(host,family,name)
+		);`,
+		`ALTER TABLE tenant_package_allocations ADD COLUMN IF NOT EXISTS pending INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE tenant_package_allocations ADD COLUMN IF NOT EXISTS reservation_id TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE tenant_package_allocations ADD COLUMN IF NOT EXISTS reservation_expires_at TEXT NOT NULL DEFAULT '';`,
+		`CREATE INDEX IF NOT EXISTS idx_tenant_package_allocations_target ON tenant_package_allocations(host,target_type,target_id,orphaned);`,
+		`INSERT INTO tenant_package_policies(host,enabled,allowed_families,allocation_mode,version,created_at,updated_at) SELECT host,0,'[]','explicit',1,created_at,updated_at FROM managed_tenants ON CONFLICT(host) DO NOTHING;`,
+		`CREATE TABLE IF NOT EXISTS repo_migrations (
+			npub TEXT NOT NULL, repo_id TEXT NOT NULL, pubkey TEXT NOT NULL,
+			tenant_host TEXT NOT NULL REFERENCES managed_tenants(host),
+			old_owner TEXT NOT NULL, old_repo_name TEXT NOT NULL, new_owner TEXT NOT NULL, new_repo_name TEXT NOT NULL,
+			gitea_repo_id BIGINT NOT NULL, collaborator TEXT NOT NULL, step TEXT NOT NULL,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(npub,repo_id)
+		);`,
 		`CREATE TABLE IF NOT EXISTS tenant_scim_tokens (
 			host TEXT PRIMARY KEY REFERENCES managed_tenants(host), token_hash BYTEA UNIQUE,
 			token_suffix TEXT NOT NULL DEFAULT '', generation BIGINT NOT NULL DEFAULT 0,

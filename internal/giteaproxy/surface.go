@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/sharegap/grasp-gitea/internal/auth"
+	"github.com/sharegap/grasp-gitea/internal/tenant"
 )
 
 // Surface is the closed set of Gitea HTTP surfaces the classifier recognizes.
@@ -42,9 +43,12 @@ const (
 // bridge token here; an empty Scope means bridge tokens are not yet supported
 // on this surface and must be rejected rather than forwarded.
 type Classification struct {
-	Surface Surface
-	Action  Action
-	Scope   string
+	Surface              Surface
+	Action               Action
+	Scope                string
+	PackageCoordinates   []tenant.PackageCoordinate
+	PackageMalformed     bool
+	RegistryContinuation bool
 }
 
 // BridgeTokensSupported reports whether a bridge token may be exchanged for a
@@ -72,14 +76,18 @@ func Classify(r *http.Request) Classification {
 		if class.Action == ActionTokenExchange {
 			// The docker token exchange is the only container endpoint where a
 			// bridge token may appear (as Basic auth). Everything after it
-			// carries Gitea's short-lived registry JWT, which passes through.
-			class.Scope = dockerTokenScope(r)
+			// carries Gitea's registry JWT, which passes through.
+			class.Scope, class.PackageCoordinates, class.PackageMalformed = dockerTokenRequest(r)
+		} else {
+			class.PackageCoordinates, class.PackageMalformed = dockerContinuationCoordinates(r)
+			class.RegistryContinuation = len(class.PackageCoordinates) > 0
 		}
 		return class
 	case strings.HasPrefix(path, "/api/packages/"):
 		class := Classification{Surface: SurfacePackages, Action: methodAction(r)}
 		if supportedPackageFamily(path) {
 			class.Scope = packagesScope(r)
+			class.PackageCoordinates, class.PackageMalformed = packageCoordinates(r)
 		}
 		return class
 	case strings.HasPrefix(path, "/api/v1/"):
@@ -259,9 +267,7 @@ func dockerTokenScope(r *http.Request) string {
 		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 			return ""
 		}
-		switch parts[0] {
-		case "repository", "registry":
-		default:
+		if parts[0] != "repository" {
 			return ""
 		}
 		for _, action := range strings.Split(parts[2], ",") {

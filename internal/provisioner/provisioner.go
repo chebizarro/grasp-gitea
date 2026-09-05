@@ -47,6 +47,7 @@ type Service struct {
 	resolver          *nip05resolve.Resolver
 	policy            *policy.Store
 	verifyAffiliation func(context.Context, string, []string) nip05resolve.AffiliationVerification
+	migrationStepHook func(string) error // test-only crash boundary injection
 
 	// repoMu serializes provisioning per (npub, repoID) to prevent concurrent
 	// races when multiple events for the same repo arrive simultaneously.
@@ -268,6 +269,9 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 	var repo gitea.Repository
 	repoCreated := false
 	if exactLinked {
+		if existing.Migrating {
+			return fmt.Errorf("repository migration in progress; provisioning is temporarily disabled")
+		}
 		if existing.Pubkey != pubkey || existing.Owner == "" || existing.RepoName == "" || existing.GiteaRepoID <= 0 {
 			return fmt.Errorf("stored mapping %s/%s does not match announcing identity", npub, repoID)
 		}

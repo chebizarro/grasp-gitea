@@ -90,6 +90,22 @@ type AuthStore interface {
 	UpsertTenantMembership(ctx context.Context, membership TenantMembership) error
 	UpdateTenantMembershipAccess(ctx context.Context, host, pubkey, accessState string, granted, orphaned bool, reconciledAt, expectedCheckedAt time.Time, expectedTenantVersion int64) (bool, error)
 	ListTenantMemberships(ctx context.Context, host string) ([]TenantMembership, error)
+	GetManagedTenantByOrgName(ctx context.Context, orgName string) (ManagedTenant, error)
+	GetTenantPackagePolicy(ctx context.Context, host string) (TenantPackagePolicy, error)
+	UpdateTenantPackagePolicy(ctx context.Context, policy TenantPackagePolicy, expectedVersion int64) (bool, error)
+	CreateTenantPackageAllocation(ctx context.Context, allocation TenantPackageAllocation) (bool, error)
+	GetTenantPackageAllocation(ctx context.Context, host, family, name string) (TenantPackageAllocation, error)
+	ListTenantPackageAllocations(ctx context.Context, host, family string) ([]TenantPackageAllocation, error)
+	UpdateTenantPackageAllocation(ctx context.Context, allocation TenantPackageAllocation, expectedVersion int64) (bool, error)
+	DeleteTenantPackageReservation(ctx context.Context, host, family, name, reservationID string) (bool, error)
+
+	// Existing-repository tenant migration journal. Rows remain until the
+	// physical move, mapping update, hook verification, and collaborator grant
+	// have all completed, so startup recovery can roll an interrupted move back.
+	CreateRepoMigration(ctx context.Context, migration RepoMigration) error
+	UpdateRepoMigrationStep(ctx context.Context, npub, repoID, step string, updatedAt time.Time) error
+	ListRepoMigrations(ctx context.Context) ([]RepoMigration, error)
+	DeleteRepoMigration(ctx context.Context, npub, repoID string) error
 
 	// Inbound SCIM declarations and per-tenant bearer credentials.
 	UpsertTenantSCIMToken(ctx context.Context, token TenantSCIMToken) error

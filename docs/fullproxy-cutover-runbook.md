@@ -42,7 +42,12 @@ support are rotated automatically on next use.
 
 Gitea 1.26.2 issues these package/registry JWTs with a hard-coded 24-hour
 lifetime (`services/packages/auth.go`) and exposes no `app.ini` setting to
-shorten it. A deployment on that release may perform the full-proxy cutover
+shorten it. Managed tenant Docker scopes are checked against live tenant state,
+membership, enabled-family policy, and explicit name allocation before this
+exchange. That promptly blocks issuance of a new JWT after suspension or
+revocation, but an already-issued JWT remains usable for up to the deployed
+24-hour bound; never advertise the Docker adapter as promptly revocable.
+A deployment on that release may perform the full-proxy cutover
 with `BRIDGE_TOKENS_ENABLED=false`, but must not enable bridge tokens for
 container traffic unless it explicitly accepts a 24-hour revocation bound or
 moves to a Gitea build/release with a suitably bounded token lifetime.

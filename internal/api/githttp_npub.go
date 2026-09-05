@@ -1,10 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -106,6 +109,13 @@ func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request, npub, 
 	}
 
 	mapping, err := s.store.GetMapping(r.Context(), npub, repoID)
+	if err == nil && mapping.Migrating && mappedRequestWrites(r, gitSubpath) {
+		if s.logger != nil {
+			s.logger.Info("refusing write while repository migration is in progress", "npub", npub, "repo_id", repoID)
+		}
+		http.Error(w, "repository migration in progress; writes are temporarily disabled", http.StatusLocked)
+		return
+	}
 	if err == nil && !mapping.HookInstalled {
 		// Provisioning did not finish, so grasp-pre-receive is not installed.
 		// Serving it would let a push bypass Nostr authority enforcement.
@@ -148,6 +158,31 @@ func (s *Server) gitHTTPNpubProxy(w http.ResponseWriter, r *http.Request, npub, 
 		Name:       mapping.RepoName,
 		ExpectedID: mapping.GiteaRepoID,
 	}, gitSubpath)
+}
+
+func mappedRequestWrites(r *http.Request, gitSubpath string) bool {
+	if strings.Contains(gitSubpath, "git-receive-pack") || r.URL.Query().Get("service") == "git-receive-pack" {
+		return true
+	}
+	if giteaproxy.IsLFSSubpath(gitSubpath) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			return false
+		}
+		if giteaproxy.IsLFSBatchPath(gitSubpath) && r.Method == http.MethodPost && r.Body != nil {
+			body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			if err == nil && len(body) <= maxRequestBodySize {
+				var batch struct {
+					Operation string `json:"operation"`
+				}
+				if json.Unmarshal(body, &batch) == nil && batch.Operation == "download" {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func parseNpubGitHTTPPath(r *http.Request) (npub string, repoID string, gitSubpath string, ok bool, err error) {

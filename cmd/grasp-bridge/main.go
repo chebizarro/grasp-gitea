@@ -297,9 +297,15 @@ func main() {
 	hookInstaller := hooks.NewInstaller(cfg.GiteaRepositoriesDir, cfg.HookBinaryPath, cfg.HookRelayURL)
 	hookInstaller.SetPolicyStore(policies)
 	nip05Resolver := nip05resolve.NewResolver(5 * time.Minute)
-	tenantSvc := tenant.New(sharedStore, giteaClient, cfg.TenantReconciliationEnabled, logger)
+	tenantSvc := tenant.New(sharedStore, giteaClient, cfg.TenantReconciliationEnabled, logger).WithDomainAffiliationMaxAge(cfg.DomainAffiliationMaxAge)
 	provisionerSvc := provisioner.New(cfg, st, sharedStore, tenantSvc, giteaClient, hookInstaller, nip05Resolver, logger)
 	provisionerSvc.SetPolicyStore(policies)
+
+	// Roll back any repository transfer interrupted by a previous crash before
+	// ordinary hook reconciliation observes its transient physical path.
+	if err := provisionerSvc.ReconcileMigrations(context.Background()); err != nil {
+		logger.Warn("repository migration reconciliation had errors", "error", err)
+	}
 
 	// Reconcile any provisioning that was interrupted by a previous crash.
 	// This re-installs hooks for mappings saved with hook_installed=false.
@@ -629,6 +635,7 @@ func main() {
 		giteaProxy.WithNostrVerifier(proxyNostrVerifier)
 		logger.Info("direct NIP-98 authentication enabled on proxied endpoints")
 	}
+	giteaProxy.WithTenantPackageAuthorizer(tenantSvc)
 	giteaProxy.SetPolicyStore(policies)
 	apiServer.SetGiteaProxy(giteaProxy)
 	apiServer.SetRepositoryInspector(giteaClient)

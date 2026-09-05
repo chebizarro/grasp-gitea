@@ -72,6 +72,27 @@ func TestInstallRejectsUnsafeValues(t *testing.T) {
 	}
 }
 
+func TestQuiesceRefusesUnmanagedReferenceTransactionHook(t *testing.T) {
+	reposDir := t.TempDir()
+	hooksDir := filepath.Join(reposDir, "org", "repo.git", "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(hooksDir, "reference-transaction")
+	const unmanaged = "#!/bin/sh\necho operator-hook\n"
+	if err := os.WriteFile(path, []byte(unmanaged), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installer := NewInstaller(reposDir, "/usr/local/bin/grasp-pre-receive", "ws://relay:3334")
+	if err := installer.QuiesceAt("org", "repo", "npub1abc", "repo"); err == nil || !strings.Contains(err.Error(), "unmanaged reference-transaction") {
+		t.Fatalf("QuiesceAt error=%v", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil || string(body) != unmanaged {
+		t.Fatalf("unmanaged hook changed: %q err=%v", body, err)
+	}
+}
+
 func TestInstallRejectsNonexistentRepoPath(t *testing.T) {
 	dir := t.TempDir()
 	installer := NewInstaller(dir, "/usr/local/bin/grasp-pre-receive", "ws://localhost:3334")

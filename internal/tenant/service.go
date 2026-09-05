@@ -40,18 +40,26 @@ type giteaAPI interface {
 }
 
 type Service struct {
-	store  store.AuthStore
-	gitea  giteaAPI
-	worker bool
-	log    *slog.Logger
-	now    func() time.Time
+	store             store.AuthStore
+	gitea             giteaAPI
+	worker            bool
+	log               *slog.Logger
+	now               func() time.Time
+	affiliationMaxAge time.Duration
 }
 
 func New(st store.AuthStore, client giteaAPI, worker bool, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{store: st, gitea: client, worker: worker, log: logger, now: time.Now}
+	return &Service{store: st, gitea: client, worker: worker, log: logger, now: time.Now, affiliationMaxAge: 24 * time.Hour}
+}
+
+func (s *Service) WithDomainAffiliationMaxAge(maxAge time.Duration) *Service {
+	if maxAge > 0 {
+		s.affiliationMaxAge = maxAge
+	}
+	return s
 }
 
 func CanonicalHost(raw string) (string, error) { return nip05resolve.CanonicalizeHost(raw) }
@@ -740,6 +748,9 @@ func (s *Service) reconcileLocked(ctx context.Context, host string, forceSCIM bo
 			return s.recordError(ctx, t, teamErr)
 		}
 		return s.recordError(ctx, t, fmt.Errorf("tenant reader team identity or unit policy drift"))
+	}
+	if err := s.reconcilePackageAllocations(ctx, host); err != nil {
+		return s.recordError(ctx, t, err)
 	}
 	t.ReconciledVersion = t.Version
 	t.LastReconciledAt = now

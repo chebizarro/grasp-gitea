@@ -108,6 +108,42 @@ func TestGitHTTPNpubProxyResolvesTenantPlacedRepoByCanonicalNpubURL(t *testing.T
 	}
 }
 
+func TestGitHTTPNpubProxyKeepsCanonicalReadsAndQuiescesWritesDuringMigration(t *testing.T) {
+	ctx := context.Background()
+	paths := make(chan string, 2)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	st := openGitHTTPProxyTestStore(t)
+	seedGitHTTPProxyMapping(t, ctx, st, store.Mapping{Npub: "npub1owner", RepoID: "repo", Pubkey: "pubkey", Owner: "old", RepoName: "repo", GiteaRepoID: 101, CloneURL: backend.URL, SourceEvent: "event", Migrating: true})
+	srv := newGitProxyTestServer(t, config.Config{GiteaURL: backend.URL}, st, publicRepo(101))
+
+	read := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(read, httptest.NewRequest(http.MethodGet, "/npub1owner/repo.git/info/refs?service=git-upload-pack", nil))
+	if read.Code != http.StatusOK || <-paths != "/old/repo.git/info/refs" {
+		t.Fatalf("canonical read during migration failed: %d %s", read.Code, read.Body.String())
+	}
+	write := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(write, httptest.NewRequest(http.MethodGet, "/npub1owner/repo.git/info/refs?service=git-receive-pack", nil))
+	if write.Code != http.StatusLocked || !strings.Contains(write.Body.String(), "migration in progress") {
+		t.Fatalf("canonical write during migration=%d %q", write.Code, write.Body.String())
+	}
+
+	if err := st.UpdateMappingPhysical(ctx, "npub1owner", "repo", "tenant", "repo-suffix", "example.com", backend.URL, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetMappingMigrating(ctx, "npub1owner", "repo", false); err != nil {
+		t.Fatal(err)
+	}
+	after := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(after, httptest.NewRequest(http.MethodGet, "/npub1owner/repo.git/info/refs?service=git-upload-pack", nil))
+	if after.Code != http.StatusOK || <-paths != "/tenant/repo-suffix.git/info/refs" {
+		t.Fatalf("canonical read after migration failed: %d %s", after.Code, after.Body.String())
+	}
+}
+
 func TestGitHTTPNpubProxyRoutesLFSToMappedRepo(t *testing.T) {
 	ctx := context.Background()
 	backendRequests := make(chan observedGitBackendRequest, 1)

@@ -7,12 +7,20 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/store"
 	"github.com/sharegap/grasp-gitea/internal/tenant"
 )
 
 type SCIMTokenRotator interface {
 	RotateSCIMToken(context.Context, string) (store.ManagedTenant, string, error)
+}
+
+type TenantPackageOperator interface {
+	GetPackagePolicy(context.Context, string) (store.TenantPackagePolicy, error)
+	UpdatePackagePolicy(context.Context, string, tenant.PackagePolicyPatch) (store.TenantPackagePolicy, error)
+	CreatePackageAllocation(context.Context, string, tenant.PackageAllocationRequest) (store.TenantPackageAllocation, error)
+	ListPackageAllocations(context.Context, string, string) ([]store.TenantPackageAllocation, error)
 }
 
 type TenantOperator interface {
@@ -39,7 +47,7 @@ func (s *Server) tenantAction(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 2 {
 		action = parts[1]
 	}
-	if action != "get" && r.Method != http.MethodPost {
+	if action != "get" && action != "package-policy" && action != "package-allocations" && r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
@@ -78,6 +86,73 @@ func (s *Server) tenantAction(w http.ResponseWriter, r *http.Request) {
 		out, err = s.tenantOperator.Resume(r.Context(), host)
 	case "kill":
 		out, err = s.tenantOperator.Kill(r.Context(), host)
+	case "package-policy":
+		packages, ok := s.tenantOperator.(TenantPackageOperator)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "tenant package service is not configured"})
+			return
+		}
+		if r.Method == http.MethodGet {
+			policy, e := packages.GetPackagePolicy(r.Context(), host)
+			if e != nil {
+				err = e
+				break
+			}
+			writeJSON(w, http.StatusOK, policy)
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var body struct {
+			ExpectedVersion int64     `json:"expected_version"`
+			Enabled         *bool     `json:"enabled"`
+			AllowedFamilies *[]string `json:"allowed_families"`
+			AllocationMode  *string   `json:"allocation_mode"`
+		}
+		if r.Body == nil || json.NewDecoder(r.Body).Decode(&body) != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+			return
+		}
+		policy, e := packages.UpdatePackagePolicy(r.Context(), host, tenant.PackagePolicyPatch{ExpectedVersion: body.ExpectedVersion, Enabled: body.Enabled, AllowedFamilies: body.AllowedFamilies, AllocationMode: body.AllocationMode})
+		if e != nil {
+			err = e
+			break
+		}
+		writeJSON(w, http.StatusOK, policy)
+		return
+	case "package-allocations":
+		packages, ok := s.tenantOperator.(TenantPackageOperator)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "tenant package service is not configured"})
+			return
+		}
+		if r.Method == http.MethodGet {
+			allocations, e := packages.ListPackageAllocations(r.Context(), host, r.URL.Query().Get("family"))
+			if e != nil {
+				err = e
+				break
+			}
+			writeJSON(w, http.StatusOK, allocations)
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var body tenant.PackageAllocationRequest
+		if r.Body == nil || json.NewDecoder(r.Body).Decode(&body) != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+			return
+		}
+		allocation, e := packages.CreatePackageAllocation(r.Context(), host, body)
+		if e != nil {
+			err = e
+			break
+		}
+		writeJSON(w, http.StatusCreated, allocation)
+		return
 	case "scim-token":
 		rotator, ok := s.tenantOperator.(SCIMTokenRotator)
 		if !ok {
@@ -85,6 +160,35 @@ func (s *Server) tenantAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out, plaintextToken, err = rotator.RotateSCIMToken(r.Context(), host)
+	case "migrate":
+		if s.provisioner == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "repository migration service is not configured"})
+			return
+		}
+		var body struct {
+			Npub   string `json:"npub"`
+			RepoID string `json:"repo_id"`
+		}
+		if r.Body == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+			return
+		}
+		dec := json.NewDecoder(r.Body)
+		if dec.Decode(&body) != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+			return
+		}
+		mapping, migrateErr := s.provisioner.MigrateExisting(r.Context(), host, body.Npub, body.RepoID)
+		if migrateErr != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(migrateErr, provisioner.ErrMigrationPreflight) {
+				status = http.StatusConflict
+			}
+			writeJSON(w, status, map[string]string{"error": migrateErr.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, mapping)
+		return
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown tenant action"})
 		return

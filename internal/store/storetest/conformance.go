@@ -39,7 +39,38 @@ func Run(t *testing.T, factory Factory) {
 	t.Run("MaintenanceLeaseIsSingleHolder", func(t *testing.T) { testMaintenanceLease(t, factory(t)) })
 	t.Run("DomainAffiliationPersistence", func(t *testing.T) { testDomainAffiliationPersistence(t, factory(t)) })
 	t.Run("TenantPersistence", func(t *testing.T) { testTenantPersistence(t, factory(t)) })
+	t.Run("TenantPackagePersistence", func(t *testing.T) { testTenantPackagePersistence(t, factory(t)) })
+	t.Run("RepoMigrationJournal", func(t *testing.T) { testRepoMigrationJournal(t, factory(t)) })
 	t.Run("SCIMPersistence", func(t *testing.T) { testSCIMPersistence(t, factory(t)) })
+}
+
+func testRepoMigrationJournal(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC)
+	tenant := store.ManagedTenant{Host: "migration.example", Policy: store.TenantPolicyDirectoryOnly, State: store.TenantStateActive, OrgName: "grasp-t-migration", ProvisioningMarker: "marker-migration", Version: 1, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateManagedTenant(ctx, tenant); err != nil {
+		t.Fatal(err)
+	}
+	journal := store.RepoMigration{Npub: "npub-owner", RepoID: "repo", Pubkey: "pubkey", TenantHost: tenant.Host, OldOwner: "old", OldRepoName: "repo", NewOwner: tenant.OrgName, NewRepoName: "repo-suffix", GiteaRepoID: 42, Collaborator: "alice", Step: store.MigrationStepPrepared, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateRepoMigration(ctx, journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateRepoMigration(ctx, journal); err == nil {
+		t.Fatal("duplicate migration journal accepted")
+	}
+	if err := st.UpdateRepoMigrationStep(ctx, journal.Npub, journal.RepoID, store.MigrationStepTransferred, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.ListRepoMigrations(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Step != store.MigrationStepTransferred || rows[0].GiteaRepoID != journal.GiteaRepoID {
+		t.Fatalf("journals=%+v err=%v", rows, err)
+	}
+	if err := st.DeleteRepoMigration(ctx, journal.Npub, journal.RepoID); err != nil {
+		t.Fatal(err)
+	}
+	if rows, err = st.ListRepoMigrations(ctx); err != nil || len(rows) != 0 {
+		t.Fatalf("journal remained after delete: %+v err=%v", rows, err)
+	}
 }
 
 func testSCIMPersistence(t *testing.T, st store.AuthStore) {
@@ -103,6 +134,85 @@ func testSCIMPersistence(t *testing.T, st store.AuthStore) {
 	authorized, err = st.ListSCIMAuthorizedUsers(ctx, tn.Host)
 	if err != nil || len(authorized) != 0 {
 		t.Fatalf("inactive authorized=%+v err=%v", authorized, err)
+	}
+}
+
+func testTenantPackagePersistence(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 5, 9, 0, 0, 0, time.UTC)
+	tn := store.ManagedTenant{Host: "packages.example", Policy: store.TenantPolicyDirectoryOnly, State: store.TenantStateActive, OrgName: "grasp-t-packages", ProvisioningMarker: "marker-packages", GiteaOrgID: 7, Version: 1, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateManagedTenant(ctx, tn); err != nil {
+		t.Fatal(err)
+	}
+	if byOrg, err := st.GetManagedTenantByOrgName(ctx, tn.OrgName); err != nil || byOrg.Host != tn.Host {
+		t.Fatalf("by org=%+v err=%v", byOrg, err)
+	}
+	if byOrg, err := st.GetManagedTenantByOrgName(ctx, "GRASP-T-PACKAGES"); err != nil || byOrg.Host != tn.Host {
+		t.Fatalf("case-insensitive org lookup=%+v err=%v", byOrg, err)
+	}
+	p, err := st.GetTenantPackagePolicy(ctx, tn.Host)
+	if err != nil || p.Enabled || p.AllocationMode != store.TenantPackageAllocationExplicit || len(p.AllowedFamilies) != 0 {
+		t.Fatalf("default policy=%+v err=%v", p, err)
+	}
+	p.Enabled = true
+	p.AllowedFamilies = []string{"npm", "docker", "npm"}
+	p.Version = 2
+	p.UpdatedAt = now.Add(time.Second)
+	if ok, err := st.UpdateTenantPackagePolicy(ctx, p, 1); err != nil || !ok {
+		t.Fatalf("policy update ok=%v err=%v", ok, err)
+	}
+	if ok, err := st.UpdateTenantPackagePolicy(ctx, p, 1); err != nil || ok {
+		t.Fatalf("stale policy update ok=%v err=%v", ok, err)
+	}
+	p, err = st.GetTenantPackagePolicy(ctx, tn.Host)
+	if err != nil || len(p.AllowedFamilies) != 3 || p.AllowedFamilies[0] != "docker" {
+		t.Fatalf("policy round trip=%+v err=%v", p, err)
+	}
+	a := store.TenantPackageAllocation{Host: tn.Host, Family: "docker", Name: "app", TargetType: "pubkey", TargetID: "alice", Visibility: "private", Version: 1, CreatedAt: now, UpdatedAt: now}
+	if created, err := st.CreateTenantPackageAllocation(ctx, a); err != nil || !created {
+		t.Fatalf("allocation create=%v err=%v", created, err)
+	}
+	foreign := a
+	foreign.TargetID = "mallory"
+	if created, err := st.CreateTenantPackageAllocation(ctx, foreign); err != nil || created {
+		t.Fatalf("foreign allocation create=%v err=%v", created, err)
+	}
+	got, err := st.GetTenantPackageAllocation(ctx, tn.Host, "docker", "app")
+	if err != nil || got.TargetID != "alice" {
+		t.Fatalf("allocation=%+v err=%v", got, err)
+	}
+	got.Orphaned = true
+	got.OrphanReason = "revoked"
+	got.Version = 2
+	got.UpdatedAt = now.Add(time.Second)
+	if ok, err := st.UpdateTenantPackageAllocation(ctx, got, 1); err != nil || !ok {
+		t.Fatalf("orphan ok=%v err=%v", ok, err)
+	}
+	list, err := st.ListTenantPackageAllocations(ctx, tn.Host, "docker")
+	if err != nil || len(list) != 1 || !list[0].Orphaned {
+		t.Fatalf("list=%+v err=%v", list, err)
+	}
+	pending := store.TenantPackageAllocation{Host: tn.Host, Family: "npm", Name: "reserved", TargetType: "pubkey", TargetID: "alice", Visibility: "private", Pending: true, ReservationID: "reservation", ReservationExpiresAt: now.Add(time.Minute), Version: 1, CreatedAt: now, UpdatedAt: now}
+	if created, err := st.CreateTenantPackageAllocation(ctx, pending); err != nil || !created {
+		t.Fatalf("pending create=%v err=%v", created, err)
+	}
+	gotPending, err := st.GetTenantPackageAllocation(ctx, tn.Host, "npm", "reserved")
+	if err != nil || !gotPending.Pending || gotPending.ReservationID != "reservation" || !gotPending.ReservationExpiresAt.Equal(pending.ReservationExpiresAt) {
+		t.Fatalf("pending=%+v err=%v", gotPending, err)
+	}
+	if deleted, err := st.DeleteTenantPackageReservation(ctx, tn.Host, "npm", "reserved", "wrong"); err != nil || deleted {
+		t.Fatalf("wrong reservation delete=%v err=%v", deleted, err)
+	}
+	if deleted, err := st.DeleteTenantPackageReservation(ctx, tn.Host, "npm", "reserved", "reservation"); err != nil || !deleted {
+		t.Fatalf("reservation delete=%v err=%v", deleted, err)
+	}
+	reassigned := list[0]
+	reassigned.TargetID = "bob"
+	reassigned.Orphaned = false
+	reassigned.OrphanReason = ""
+	reassigned.Version++
+	if ok, err := st.UpdateTenantPackageAllocation(ctx, reassigned, 2); err != nil || !ok {
+		t.Fatalf("reassign ok=%v err=%v", ok, err)
 	}
 }
 

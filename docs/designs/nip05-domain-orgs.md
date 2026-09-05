@@ -129,7 +129,14 @@ Two users at `example.com` both announce repo-id `dotfiles`. Options:
 
 **Packages do not inherit this fix.** Package coordinates expose owner and
 package name to clients, so an internal suffix would leak into the coordinate.
-A shared package namespace needs its own allocation policy; do not promise one.
+The implemented package namespace therefore has an independent per-family
+allocation policy. Docker/OCI, npm, and generic start disabled and default to
+explicit operator allocation of each name to a pubkey or active SCIM group ID.
+An operator may opt a tenant into open allocation, which creates a short-lived
+reservation only on a recognized publish route and finalizes the publisher's
+pubkey allocation only after the upstream publish succeeds. Revocation or team
+deactivation orphans rather than frees the allocation; it is never inferred
+from repository placement and never automatically reassigned.
 
 ### Who may claim a domain
 
@@ -211,7 +218,32 @@ Any later per-repo migration must
 key CI on an immutable identity first (owner pubkey + repo-id, not `Owner`),
 then: quiesce the mapping, transfer, verify the repo ID is unchanged, update
 `mapping.Owner`/`RepoName`, reinstall and verify the hook at the new path,
-re-enable.
+re-enable. Migration is requested by the operator with
+`POST /admin/tenants/<host>/migrate` and body
+`{"npub":"<owner-npub>","repo_id":"<repo-id>"}`. The independent owner
+consent is the latest cached, cryptographically verified kind 30617 announcement
+containing exactly one `["tenant","<exact-host>"]` tag. The endpoint rejects a
+missing, malformed, repeated, differently hosted, or differently signed tag;
+no existing repository is selected or moved automatically.
+
+`CI_TRIGGER_REPOS` now treats `<owner-pubkey>/<repo-id>` as its canonical,
+transfer-stable form. The former `<physical-owner>/<repo-id>` form remains
+accepted only for unmigrated per-pubkey mappings; tenant mappings never accept
+that ambiguous legacy form.
+
+Quiescing sets the durable mapping `migrating` flag (canonical reads continue;
+writes return HTTP 423), archives and verifies the Gitea repository as the
+outer read-only admission barrier, atomically installs migration-aware
+`pre-receive` and `reference-transaction` hooks, writes and fsyncs a repository
+marker, and checks Git transaction artifacts before transfer. The
+`reference-transaction` guard rejects a final ref update from a receive admitted
+before archival. It is installed with atomic no-replace semantics and remains
+inert after the marker is removed; an unknown operator/Gitea hook is never
+overwritten or deleted. Rollback verifies the immutable repository ID before
+every recovery mutation and verifies the original mapping and restored hook
+before removing any barrier. A failed recovery remains archived, migrating, and
+journaled for operator-visible startup retry; only a fully verified restore is
+made writable and cleared from durable migration state.
 
 ## Phasing and effort
 

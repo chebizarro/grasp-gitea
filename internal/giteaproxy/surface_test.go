@@ -202,7 +202,7 @@ func TestDockerTokenScopeMapping(t *testing.T) {
 		{"/v2/token?scope=repository:o/img:pull,push", auth.ScopePackagesWrite},
 		{"/v2/token?scope=repository:o/img:push", auth.ScopePackagesWrite},
 		{"/v2/token?scope=repository:o/img:delete", auth.ScopePackagesWrite},
-		{"/v2/token?scope=registry:catalog:*", auth.ScopePackagesWrite},
+		{"/v2/token?scope=registry:catalog:*", ""},
 		// Two scope params: the union decides.
 		{"/v2/token?scope=repository:a/x:pull&scope=repository:b/y:push", auth.ScopePackagesWrite},
 		// Unknown actions and malformed scopes fail closed.

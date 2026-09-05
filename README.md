@@ -194,6 +194,28 @@ may hard-code a long registry-JWT lifetime (24 h observed in production) —
 measure it with `scripts/z88-gitea-validate.sh` and treat it as the real
 revocation bound before enabling tokens for container traffic.
 
+**Managed tenant package namespaces.** Docker/OCI, npm, and generic packages
+may use the tenant's Gitea organization as their owner coordinate. This policy
+is disabled by default and uses `explicit` allocation by default: an operator
+must allocate each family/name to a tenant pubkey or active SCIM group ID before
+publication. A tenant may explicitly opt into `open-allocation`, where the
+first authorized tenant member to begin a recognized publish receives a short-lived
+pending reservation; it becomes a durable pubkey allocation only after the
+upstream publish succeeds (failed or expired reservations are released). Allocations are private by default. Private reads
+require `packages:read` and current tenant membership; public reads follow the
+allocation/Gitea visibility. Revoked owners and inactive teams leave orphaned
+allocations for operator review; names are never automatically freed or
+deleted. Suspension or kill denies new publishes and private reads immediately.
+
+Configure the policy with `GET|POST /admin/tenants/<host>/package-policy` and
+create/list allocations with `GET|POST
+/admin/tenants/<host>/package-allocations`. Docker repository scopes are
+checked against these allocations before Gitea PAT/token exchange. This makes
+revocation prompt at the bridge token exchange, but does **not** revoke an
+already-issued registry JWT; on the deployed Gitea bound it can remain usable
+for up to 24 hours. The Docker adapter must not be advertised as promptly
+revocable.
+
 The REST API (`/api/v1/`) accepts bridge tokens under `api:read`/`api:write`
 by method. `/api/v1/admin` and every credential-management family — user
 PATs (`/users/{u}/tokens`), SSH/GPG keys, deploy keys, OAuth applications,

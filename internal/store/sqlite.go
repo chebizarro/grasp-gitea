@@ -168,6 +168,7 @@ type Mapping struct {
 	AnnouncedCloneURL string    `json:"announced_clone_url,omitempty"`
 	SourceEvent       string    `json:"source_event"`
 	HookInstalled     bool      `json:"hook_installed"`
+	Migrating         bool      `json:"migrating"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 
@@ -341,7 +342,30 @@ func Open(path string) (*SQLiteStore, error) {
 			reconciled_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
 			PRIMARY KEY(host,pubkey), FOREIGN KEY(host) REFERENCES managed_tenants(host)
 		);`,
+		`CREATE TABLE IF NOT EXISTS repo_migrations (
+			npub TEXT NOT NULL, repo_id TEXT NOT NULL, pubkey TEXT NOT NULL, tenant_host TEXT NOT NULL,
+			old_owner TEXT NOT NULL, old_repo_name TEXT NOT NULL, new_owner TEXT NOT NULL, new_repo_name TEXT NOT NULL,
+			gitea_repo_id INTEGER NOT NULL, collaborator TEXT NOT NULL, step TEXT NOT NULL,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY(npub,repo_id), FOREIGN KEY(tenant_host) REFERENCES managed_tenants(host)
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_tenant_memberships_host_granted ON tenant_memberships(host, granted);`,
+		`CREATE TABLE IF NOT EXISTS tenant_package_policies (
+			host TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0,
+			allowed_families TEXT NOT NULL DEFAULT '[]', allocation_mode TEXT NOT NULL DEFAULT 'explicit',
+			version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			FOREIGN KEY(host) REFERENCES managed_tenants(host)
+		);`,
+		`CREATE TABLE IF NOT EXISTS tenant_package_allocations (
+			host TEXT NOT NULL, family TEXT NOT NULL, name TEXT NOT NULL,
+			target_type TEXT NOT NULL, target_id TEXT NOT NULL, visibility TEXT NOT NULL DEFAULT 'private',
+			orphaned INTEGER NOT NULL DEFAULT 0, orphan_reason TEXT NOT NULL DEFAULT '',
+			pending INTEGER NOT NULL DEFAULT 0, reservation_id TEXT NOT NULL DEFAULT '', reservation_expires_at TEXT NOT NULL DEFAULT '',
+			version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY(host,family,name), FOREIGN KEY(host) REFERENCES managed_tenants(host)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_tenant_package_allocations_target ON tenant_package_allocations(host,target_type,target_id,orphaned);`,
+		`INSERT OR IGNORE INTO tenant_package_policies(host,enabled,allowed_families,allocation_mode,version,created_at,updated_at) SELECT host,0,'[]','explicit',1,created_at,updated_at FROM managed_tenants;`,
 		`CREATE TABLE IF NOT EXISTS tenant_scim_tokens (
 			host TEXT PRIMARY KEY, token_hash BLOB UNIQUE, token_suffix TEXT NOT NULL DEFAULT '',
 			generation INTEGER NOT NULL DEFAULT 0, pending_token_hash BLOB UNIQUE,
@@ -548,10 +572,21 @@ func Open(path string) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate staged tenant placement policy: %w", err)
 	}
+	for _, column := range []struct{ name, definition string }{
+		{"pending", "INTEGER NOT NULL DEFAULT 0"},
+		{"reservation_id", "TEXT NOT NULL DEFAULT ''"},
+		{"reservation_expires_at", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := ensureSQLiteColumn(db, "tenant_package_allocations", column.name, column.definition); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate tenant package reservations: %w", err)
+		}
+	}
 
 	// Migration: add hook_installed column to track provisioning completion.
 	// Existing rows default to 1 (true) since they were fully provisioned.
 	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN hook_installed INTEGER NOT NULL DEFAULT 1`)
+	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN migrating INTEGER NOT NULL DEFAULT 0`)
 
 	// Migration: add mirror republish tracking columns.
 	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN announcement_event_json TEXT NOT NULL DEFAULT ''`)
@@ -1379,13 +1414,11 @@ func (s *SQLiteStore) ProvisionCountSince(ctx context.Context, pubkey string, si
 
 func (s *SQLiteStore) UpsertMapping(ctx context.Context, m Mapping) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	hookVal := 0
-	if m.HookInstalled {
-		hookVal = 1
-	}
+	hookVal := boolInt(m.HookInstalled)
+	migratingVal := boolInt(m.Migrating)
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO mappings(npub, repo_id, pubkey, owner, repo_name, tenant_host, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO mappings(npub, repo_id, pubkey, owner, repo_name, tenant_host, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed, migrating, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(npub, repo_id) DO UPDATE SET
 			pubkey = excluded.pubkey,
 			owner = excluded.owner,
@@ -1397,7 +1430,7 @@ func (s *SQLiteStore) UpsertMapping(ctx context.Context, m Mapping) error {
 			source_event = excluded.source_event,
 			hook_installed = excluded.hook_installed,
 			updated_at = excluded.updated_at
-	`, m.Npub, m.RepoID, m.Pubkey, m.Owner, m.RepoName, m.TenantHost, m.GiteaRepoID, m.CloneURL, m.AnnouncedCloneURL, m.SourceEvent, hookVal, now, now)
+	`, m.Npub, m.RepoID, m.Pubkey, m.Owner, m.RepoName, m.TenantHost, m.GiteaRepoID, m.CloneURL, m.AnnouncedCloneURL, m.SourceEvent, hookVal, migratingVal, now, now)
 	return err
 }
 
@@ -1437,9 +1470,35 @@ func (s *SQLiteStore) SetHookInstalled(ctx context.Context, npub string, repoID 
 	return err
 }
 
+func (s *SQLiteStore) SetMappingMigrating(ctx context.Context, npub, repoID string, migrating bool) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE mappings SET migrating=?, updated_at=? WHERE npub=? AND repo_id=?`, boolInt(migrating), time.Now().UTC().Format(time.RFC3339), npub, repoID)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *SQLiteStore) UpdateMappingPhysical(ctx context.Context, npub, repoID, owner, repoName, tenantHost, cloneURL string, hookInstalled bool) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE mappings SET owner=?,repo_name=?,tenant_host=?,clone_url=?,hook_installed=?,updated_at=? WHERE npub=? AND repo_id=?`, owner, repoName, tenantHost, cloneURL, boolInt(hookInstalled), time.Now().UTC().Format(time.RFC3339), npub, repoID)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string, limit int, args ...any) ([]Mapping, error) {
 	query := `
-		SELECT npub, repo_id, pubkey, owner, repo_name, tenant_host, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed,
+		SELECT npub, repo_id, pubkey, owner, repo_name, tenant_host, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed, migrating,
 			announcement_event_json, announcement_event_id, announcement_created_at,
 			last_republished_announcement_id, last_republished_announcement_at,
 			last_state_digest, last_state_event_id, last_state_published_at,
@@ -1460,12 +1519,12 @@ func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string, limit
 	out := make([]Mapping, 0)
 	for rows.Next() {
 		var m Mapping
-		var hookVal int
+		var hookVal, migratingVal int
 		var createdAt, updatedAt string
 		var lastRepubAnnAt, lastStatePubAt string
 		if err := rows.Scan(
 			&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.TenantHost, &m.GiteaRepoID,
-			&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal,
+			&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal, &migratingVal,
 			&m.AnnouncementEventJSON, &m.AnnouncementEventID, &m.AnnouncementCreatedAt,
 			&m.LastRepublishedAnnouncementID, &lastRepubAnnAt,
 			&m.LastStateDigest, &m.LastStateEventID, &lastStatePubAt,
@@ -1474,6 +1533,7 @@ func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string, limit
 			return nil, err
 		}
 		m.HookInstalled = hookVal != 0
+		m.Migrating = migratingVal != 0
 		var parseErr error
 		m.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
 		if parseErr != nil {
@@ -1558,16 +1618,16 @@ func (s *SQLiteStore) GetMapping(ctx context.Context, npub string, repoID string
 // GetProvisionedMappingByRepoAddr looks up a fully provisioned repository by
 // the components of a NIP-34 repo coordinate: 30617:<pubkey>:<repo-id>.
 func (s *SQLiteStore) GetProvisionedMappingByRepoAddr(ctx context.Context, pubkey string, repoID string) (Mapping, error) {
-	return s.getMappingWhere(ctx, "pubkey = ? AND repo_id = ? AND hook_installed = 1", pubkey, repoID)
+	return s.getMappingWhere(ctx, "pubkey = ? AND repo_id = ? AND hook_installed = 1 AND migrating = 0", pubkey, repoID)
 }
 
 func (s *SQLiteStore) getMappingWhere(ctx context.Context, where string, args ...any) (Mapping, error) {
 	var m Mapping
-	var hookVal int
+	var hookVal, migratingVal int
 	var createdAt, updatedAt string
 	var lastRepubAnnAt, lastStatePubAt string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT npub, repo_id, pubkey, owner, repo_name, tenant_host, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed,
+		SELECT npub, repo_id, pubkey, owner, repo_name, tenant_host, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed, migrating,
 			announcement_event_json, announcement_event_id, announcement_created_at,
 			last_republished_announcement_id, last_republished_announcement_at,
 			last_state_digest, last_state_event_id, last_state_published_at,
@@ -1575,7 +1635,7 @@ func (s *SQLiteStore) getMappingWhere(ctx context.Context, where string, args ..
 		FROM mappings WHERE `+where+` LIMIT 1
 	`, args...).Scan(
 		&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.TenantHost, &m.GiteaRepoID,
-		&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal,
+		&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal, &migratingVal,
 		&m.AnnouncementEventJSON, &m.AnnouncementEventID, &m.AnnouncementCreatedAt,
 		&m.LastRepublishedAnnouncementID, &lastRepubAnnAt,
 		&m.LastStateDigest, &m.LastStateEventID, &lastStatePubAt,
@@ -1585,6 +1645,7 @@ func (s *SQLiteStore) getMappingWhere(ctx context.Context, where string, args ..
 		return Mapping{}, err
 	}
 	m.HookInstalled = hookVal != 0
+	m.Migrating = migratingVal != 0
 	var parseErr error
 	m.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
 	if parseErr != nil {
@@ -1851,11 +1912,11 @@ func (s *SQLiteStore) RecordUserGraspListRepublished(ctx context.Context, pubkey
 // Returns sql.ErrNoRows if not found.
 func (s *SQLiteStore) GetMappingByGiteaRepoID(ctx context.Context, giteaRepoID int64) (Mapping, error) {
 	var m Mapping
-	var hookVal int
+	var hookVal, migratingVal int
 	var createdAt, updatedAt string
 	var lastRepubAnnAt, lastStatePubAt string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT npub, repo_id, pubkey, owner, repo_name, tenant_host, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed,
+		SELECT npub, repo_id, pubkey, owner, repo_name, tenant_host, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed, migrating,
 			announcement_event_json, announcement_event_id, announcement_created_at,
 			last_republished_announcement_id, last_republished_announcement_at,
 			last_state_digest, last_state_event_id, last_state_published_at,
@@ -1863,7 +1924,7 @@ func (s *SQLiteStore) GetMappingByGiteaRepoID(ctx context.Context, giteaRepoID i
 		FROM mappings WHERE gitea_repo_id = ? LIMIT 1
 	`, giteaRepoID).Scan(
 		&m.Npub, &m.RepoID, &m.Pubkey, &m.Owner, &m.RepoName, &m.TenantHost, &m.GiteaRepoID,
-		&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal,
+		&m.CloneURL, &m.AnnouncedCloneURL, &m.SourceEvent, &hookVal, &migratingVal,
 		&m.AnnouncementEventJSON, &m.AnnouncementEventID, &m.AnnouncementCreatedAt,
 		&m.LastRepublishedAnnouncementID, &lastRepubAnnAt,
 		&m.LastStateDigest, &m.LastStateEventID, &lastStatePubAt,
@@ -1873,6 +1934,7 @@ func (s *SQLiteStore) GetMappingByGiteaRepoID(ctx context.Context, giteaRepoID i
 		return Mapping{}, err
 	}
 	m.HookInstalled = hookVal != 0
+	m.Migrating = migratingVal != 0
 	var parseErr error
 	m.CreatedAt, parseErr = time.Parse(time.RFC3339, createdAt)
 	if parseErr != nil {
