@@ -146,9 +146,10 @@ type Config struct {
 
 	// ProfileSyncEnabled turns on live kind:0 -> Gitea user profile sync
 	// (display name, bio, website, avatar). Independent of bridge tokens.
-	ProfileSyncEnabled  bool
-	ProfileSyncInterval time.Duration
-	ProfileSyncWorkers  int
+	ProfileSyncEnabled      bool
+	ProfileSyncInterval     time.Duration
+	ProfileSyncWorkers      int
+	DomainAffiliationMaxAge time.Duration
 }
 
 // CredentialKey is one entry of the credential-encryption key ring.
@@ -194,6 +195,7 @@ func Load() (Config, error) {
 		ProfileSyncEnabled:      boolEnv("PROFILE_SYNC_ENABLED", false),
 		ProfileSyncInterval:     durationEnv("PROFILE_SYNC_INTERVAL", 10*time.Minute),
 		ProfileSyncWorkers:      intEnv("PROFILE_SYNC_WORKERS", 4),
+		DomainAffiliationMaxAge: durationEnv("DOMAIN_AFFILIATION_MAX_AGE", 24*time.Hour),
 		SignerMasterKey:         nil,
 		SignetBunkerURL:         strings.TrimSpace(os.Getenv("SIGNET_BUNKER_URL")),
 		BridgeNsec:              strings.TrimSpace(os.Getenv("BRIDGE_NSEC")),
@@ -348,6 +350,9 @@ func Load() (Config, error) {
 
 	if cfg.TokenTTLMin <= 0 || cfg.TokenTTLMin > cfg.TokenTTLMax {
 		return Config{}, fmt.Errorf("BRIDGE_TOKEN_TTL_MIN must be positive and not exceed BRIDGE_TOKEN_TTL_MAX")
+	}
+	if cfg.DomainAffiliationMaxAge <= 0 {
+		return Config{}, fmt.Errorf("DOMAIN_AFFILIATION_MAX_AGE must be positive")
 	}
 	if cfg.TokenTTLDefault < cfg.TokenTTLMin || cfg.TokenTTLDefault > cfg.TokenTTLMax {
 		return Config{}, fmt.Errorf("BRIDGE_TOKEN_TTL_DEFAULT must be within [BRIDGE_TOKEN_TTL_MIN, BRIDGE_TOKEN_TTL_MAX]")

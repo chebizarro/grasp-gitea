@@ -37,12 +37,92 @@ func Run(t *testing.T, factory Factory) {
 	t.Run("ConcurrentReservationsGetDistinctGenerations", func(t *testing.T) { testConcurrentReserve(t, factory(t)) })
 	t.Run("UserLockIsMutuallyExclusive", func(t *testing.T) { testUserLockExclusion(t, factory(t)) })
 	t.Run("MaintenanceLeaseIsSingleHolder", func(t *testing.T) { testMaintenanceLease(t, factory(t)) })
+	t.Run("DomainAffiliationPersistence", func(t *testing.T) { testDomainAffiliationPersistence(t, factory(t)) })
 }
 
 // testMaintenanceLease proves at most one node holds the maintenance lease at
 // a time, and that a released lease can be re-acquired. On Postgres each
 // acquirer uses a distinct pooled session, so this exercises real advisory-
 // lock leadership; SQLite is trivially always-leader.
+func testDomainAffiliationPersistence(t *testing.T, st store.AuthStore) {
+	ctx := context.Background()
+	verifiedAt := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	checkedAt := verifiedAt.Add(time.Minute)
+	a := store.DomainAffiliation{
+		CanonicalIdentifier: "alice@team.example.com", LocalPart: "alice", Host: "team.example.com",
+		Pubkey: "pubkey-affiliation", VerifiedAt: verifiedAt, CheckedAt: checkedAt,
+		Status: store.DomainAffiliationVerified,
+	}
+	if err := st.UpsertDomainAffiliation(ctx, a); err != nil {
+		t.Fatalf("upsert verified affiliation: %v", err)
+	}
+	got, err := st.GetDomainAffiliation(ctx, a.Pubkey)
+	if err != nil {
+		t.Fatalf("get affiliation: %v", err)
+	}
+	if got.CanonicalIdentifier != a.CanonicalIdentifier || got.LocalPart != a.LocalPart || got.Host != a.Host ||
+		got.Pubkey != a.Pubkey || !got.VerifiedAt.Equal(verifiedAt) || !got.CheckedAt.Equal(checkedAt) || got.Status != store.DomainAffiliationVerified {
+		t.Fatalf("persisted affiliation = %+v, want %+v", got, a)
+	}
+	listed, err := st.ListVerifiedDomainAffiliations(ctx, "team.example.com", time.Time{}, 100)
+	if err != nil || len(listed) != 1 || listed[0].Pubkey != a.Pubkey {
+		t.Fatalf("exact-host list = %+v, err=%v", listed, err)
+	}
+	parent, err := st.ListVerifiedDomainAffiliations(ctx, "example.com", time.Time{}, 100)
+	if err != nil || len(parent) != 0 {
+		t.Fatalf("parent host must not include subdomain affiliation: %+v, err=%v", parent, err)
+	}
+
+	a.Status = store.DomainAffiliationStale
+	a.CheckedAt = checkedAt.Add(time.Minute)
+	a.FailureClass = store.DomainFailureIndeterminate
+	a.FailureCode = "transport"
+	a.FailureDetail = "timeout"
+	if err := st.UpsertDomainAffiliation(ctx, a); err != nil {
+		t.Fatalf("upsert stale affiliation: %v", err)
+	}
+	got, err = st.GetDomainAffiliation(ctx, a.Pubkey)
+	if err != nil || got.Status != store.DomainAffiliationStale || got.FailureClass != store.DomainFailureIndeterminate || !got.VerifiedAt.Equal(verifiedAt) {
+		t.Fatalf("stale affiliation = %+v, err=%v", got, err)
+	}
+	listed, err = st.ListVerifiedDomainAffiliations(ctx, "team.example.com", time.Time{}, 100)
+	if err != nil || len(listed) != 0 {
+		t.Fatalf("stale affiliation must not receive a verified badge: %+v, err=%v", listed, err)
+	}
+
+	newer := store.DomainAffiliation{
+		CanonicalIdentifier: "new@example.com", LocalPart: "new", Host: "example.com", Pubkey: "pubkey-monotonic",
+		VerifiedAt: verifiedAt.Add(3 * time.Minute), CheckedAt: checkedAt.Add(3 * time.Minute), Status: store.DomainAffiliationVerified,
+	}
+	older := newer
+	older.CanonicalIdentifier = "old@example.com"
+	older.LocalPart = "old"
+	older.CheckedAt = checkedAt.Add(2 * time.Minute)
+	older.Status = store.DomainAffiliationConfirmedAbsent
+	if err := st.UpsertDomainAffiliation(ctx, newer); err != nil {
+		t.Fatalf("upsert newer affiliation: %v", err)
+	}
+	if err := st.UpsertDomainAffiliation(ctx, older); err != nil {
+		t.Fatalf("upsert out-of-order older affiliation: %v", err)
+	}
+	got, err = st.GetDomainAffiliation(ctx, newer.Pubkey)
+	if err != nil || got.Status != store.DomainAffiliationVerified || got.CanonicalIdentifier != newer.CanonicalIdentifier || !got.CheckedAt.Equal(newer.CheckedAt) {
+		t.Fatalf("older evidence overwrote newer evidence: %+v, err=%v", got, err)
+	}
+
+	oldVerified := store.DomainAffiliation{
+		CanonicalIdentifier: "expired@example.com", LocalPart: "expired", Host: "example.com", Pubkey: "pubkey-expired",
+		VerifiedAt: verifiedAt, CheckedAt: checkedAt, Status: store.DomainAffiliationVerified,
+	}
+	if err := st.UpsertDomainAffiliation(ctx, oldVerified); err != nil {
+		t.Fatalf("upsert expired affiliation: %v", err)
+	}
+	listed, err = st.ListVerifiedDomainAffiliations(ctx, "example.com", newer.CheckedAt, 1)
+	if err != nil || len(listed) != 1 || listed[0].Pubkey != newer.Pubkey {
+		t.Fatalf("fresh bounded affiliation list = %+v, err=%v", listed, err)
+	}
+}
+
 func testMaintenanceLease(t *testing.T, st store.AuthStore) {
 	ctx := context.Background()
 

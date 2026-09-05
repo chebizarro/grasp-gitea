@@ -73,6 +73,12 @@ type AuthStore interface {
 	UpsertIdentityLink(ctx context.Context, link NostrIdentityLink) error
 	UpdateLastLogin(ctx context.Context, pubkey string) error
 
+	// Verified NIP-05 domain affiliation. This state is shared across nodes and
+	// remains separate from identity-link naming metadata.
+	UpsertDomainAffiliation(ctx context.Context, affiliation DomainAffiliation) error
+	GetDomainAffiliation(ctx context.Context, pubkey string) (DomainAffiliation, error)
+	ListVerifiedDomainAffiliations(ctx context.Context, host string, checkedAfter time.Time, limit int) ([]DomainAffiliation, error)
+
 	// Bridge tokens.
 	InsertBridgeToken(ctx context.Context, t BridgeToken, maxActive int) error
 	GetBridgeTokenByHash(ctx context.Context, hash []byte) (BridgeToken, error)

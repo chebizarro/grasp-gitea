@@ -205,6 +205,20 @@ func (s *PostgresStore) ensureSchema() error {
 			updated_at TEXT NOT NULL,
 			last_login_at TEXT NOT NULL DEFAULT ''
 		);`,
+		`CREATE TABLE IF NOT EXISTS domain_affiliations (
+			canonical_identifier TEXT NOT NULL DEFAULT '',
+			local_part TEXT NOT NULL DEFAULT '',
+			host TEXT NOT NULL DEFAULT '',
+			pubkey TEXT PRIMARY KEY,
+			verified_at TEXT NOT NULL DEFAULT '',
+			checked_at TEXT NOT NULL,
+			status TEXT NOT NULL,
+			failure_class TEXT NOT NULL DEFAULT '',
+			failure_code TEXT NOT NULL DEFAULT '',
+			failure_detail TEXT NOT NULL DEFAULT ''
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_domain_affiliations_host_status ON domain_affiliations(host, status);`,
+		`CREATE INDEX IF NOT EXISTS idx_domain_affiliations_host_status_checked ON domain_affiliations(host, status, checked_at);`,
 		`CREATE TABLE IF NOT EXISTS bridge_tokens (
 			id TEXT PRIMARY KEY,
 			token_hash BYTEA NOT NULL UNIQUE,

@@ -3,15 +3,20 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/giteaproxy"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
+	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/provisioner"
 	"github.com/sharegap/grasp-gitea/internal/publisher"
@@ -19,23 +24,30 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/store"
 )
 
-// maxRequestBodySize limits POST request bodies to 1 MB.
-const maxRequestBodySize = 1 << 20
+const (
+	// maxRequestBodySize limits POST request bodies to 1 MB.
+	maxRequestBodySize             = 1 << 20
+	defaultDomainAffiliationMaxAge = 24 * time.Hour
+	domainCatalogLimit             = 100
+)
 
 type Server struct {
-	provisioner         *provisioner.Service
-	publisher           *publisher.Service
-	store               *store.SQLiteStore
-	logger              *slog.Logger
-	apiToken            string
-	mirrorCallbackToken string
-	webhookHandler      http.Handler // Gitea webhook handler for NIP-34 events
-	routeRegistrars     []func(*http.ServeMux)
-	readinessProbes     []ReadinessProbe
-	giteaProxy          *giteaproxy.Proxy
-	rootRelayHandler    http.Handler
-	signerAuthorizer    SignerAuthorizer
-	policyStore         *policy.Store
+	provisioner             *provisioner.Service
+	publisher               *publisher.Service
+	store                   *store.SQLiteStore
+	affiliationStore        store.AuthStore
+	logger                  *slog.Logger
+	apiToken                string
+	mirrorCallbackToken     string
+	webhookHandler          http.Handler // Gitea webhook handler for NIP-34 events
+	routeRegistrars         []func(*http.ServeMux)
+	readinessProbes         []ReadinessProbe
+	giteaProxy              *giteaproxy.Proxy
+	repositoryInspector     giteaproxy.RepositoryInspector
+	domainAffiliationMaxAge time.Duration
+	rootRelayHandler        http.Handler
+	signerAuthorizer        SignerAuthorizer
+	policyStore             *policy.Store
 }
 
 type SignerAuthorizer interface {
@@ -48,16 +60,23 @@ func New(cfg config.Config, provisionerSvc *provisioner.Service, publisherSvc *p
 		logger = slog.New(slog.DiscardHandler)
 	}
 	s := &Server{
-		provisioner:         provisionerSvc,
-		publisher:           publisherSvc,
-		store:               st,
-		logger:              logger,
-		apiToken:            cfg.AdminAPIToken,
-		mirrorCallbackToken: cfg.MirrorCallbackToken,
+		provisioner:             provisionerSvc,
+		publisher:               publisherSvc,
+		store:                   st,
+		logger:                  logger,
+		apiToken:                cfg.AdminAPIToken,
+		mirrorCallbackToken:     cfg.MirrorCallbackToken,
+		domainAffiliationMaxAge: cfg.DomainAffiliationMaxAge,
+	}
+	if s.domainAffiliationMaxAge <= 0 {
+		s.domainAffiliationMaxAge = defaultDomainAffiliationMaxAge
 	}
 	// A proxy without a token authenticator or repository inspector still
 	// serves anonymous public traffic; main injects the fully wired one.
 	// An unset GiteaURL simply means this Server does not proxy git.
+	if st != nil {
+		s.affiliationStore = st
+	}
 	if cfg.GiteaURL != "" {
 		proxy, err := giteaproxy.New(giteaproxy.Config{
 			GiteaURL:           cfg.GiteaURL,
@@ -84,6 +103,12 @@ func (s *Server) SetGiteaProxy(p *giteaproxy.Proxy) {
 	}
 }
 
+// SetRepositoryInspector installs the live Gitea repository metadata source
+// used to fail closed when building public domain catalogs.
+func (s *Server) SetRepositoryInspector(inspector giteaproxy.RepositoryInspector) {
+	s.repositoryInspector = inspector
+}
+
 // SetRootRelayHandler serves a Nostr relay (WebSocket upgrade + NIP-11
 // content negotiation) at the service root, per GRASP-01 single-endpoint
 // requirements.
@@ -102,6 +127,10 @@ func (s *Server) SetSignerAuthorizer(authorizer SignerAuthorizer) {
 }
 
 func (s *Server) SetPolicyStore(store *policy.Store) { s.policyStore = store }
+
+// SetAffiliationStore selects the shared affiliation backend. Main wires the
+// Postgres-backed AuthStore here when POSTGRES_DSN is configured.
+func (s *Server) SetAffiliationStore(st store.AuthStore) { s.affiliationStore = st }
 
 // AddRouteRegistrar lets optional subsystems register extra routes on the main mux.
 func (s *Server) AddRouteRegistrar(register func(*http.ServeMux)) {
@@ -124,6 +153,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/policy", s.requireAuth(s.policyDocument))
 	mux.HandleFunc("/admin/policy/", s.requireAuth(s.policyGroup))
 	mux.HandleFunc("/internal/mirror-sync", method(http.MethodPost, s.requireMirrorAuth(s.mirrorSync)))
+	mux.HandleFunc("/domains/", method(http.MethodGet, s.domainCatalog))
+	mux.HandleFunc("/verified-badges/", method(http.MethodGet, s.verifiedBadge))
 
 	// Gitea webhook endpoint for NIP-34 events (PRs, issues, patches, labels)
 	if s.webhookHandler != nil {
@@ -224,6 +255,119 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"metrics": metrics.Snapshot()})
+}
+
+func (s *Server) domainCatalog(w http.ResponseWriter, r *http.Request) {
+	const prefix = "/domains/"
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	if !strings.HasSuffix(rest, "/repositories") {
+		http.NotFound(w, r)
+		return
+	}
+	rawHost := strings.TrimSuffix(rest, "/repositories")
+	if rawHost == "" || strings.Contains(rawHost, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	host, err := nip05resolve.CanonicalizeHost(rawHost)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid domain host"})
+		return
+	}
+	if s.affiliationStore == nil || s.store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "domain catalog unavailable"})
+		return
+	}
+	affiliations, err := s.affiliationStore.ListVerifiedDomainAffiliations(
+		r.Context(), host, time.Now().UTC().Add(-s.domainAffiliationMaxAge), domainCatalogLimit,
+	)
+	if err != nil {
+		s.logger.Error("list verified domain affiliations failed", "host", host, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list domain affiliations"})
+		return
+	}
+	if len(affiliations) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"host": host, "repositories": []any{}})
+		return
+	}
+	pubkeys := make([]string, 0, len(affiliations))
+	for _, affiliation := range affiliations {
+		pubkeys = append(pubkeys, affiliation.Pubkey)
+	}
+	mappings, err := s.store.ListMappingsByPubkeys(r.Context(), pubkeys, domainCatalogLimit)
+	if err != nil {
+		s.logger.Error("list mappings for domain catalog failed", "host", host, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list repositories"})
+		return
+	}
+	type catalogRepository struct {
+		Npub   string `json:"npub"`
+		Pubkey string `json:"pubkey"`
+		RepoID string `json:"repo_id"`
+		URL    string `json:"url"`
+	}
+	repositories := make([]catalogRepository, 0)
+	for _, mapping := range mappings {
+		if !mapping.HookInstalled || s.repositoryInspector == nil {
+			continue
+		}
+		repo, err := s.repositoryInspector.GetRepo(r.Context(), mapping.Owner, mapping.RepoName)
+		if err != nil || repo.ID != mapping.GiteaRepoID || !repo.PubliclyReadable() {
+			continue
+		}
+		repositories = append(repositories, catalogRepository{
+			Npub: mapping.Npub, Pubkey: mapping.Pubkey, RepoID: mapping.RepoID,
+			URL: "/" + url.PathEscape(mapping.Npub) + "/" + url.PathEscape(mapping.RepoID) + ".git",
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"host": host, "repositories": repositories})
+}
+
+type publicDomainAffiliation struct {
+	Identifier string    `json:"identifier,omitempty"`
+	Host       string    `json:"host,omitempty"`
+	Status     string    `json:"status"`
+	VerifiedAt time.Time `json:"verified_at,omitempty"`
+	CheckedAt  time.Time `json:"checked_at"`
+}
+
+func (s *Server) verifiedBadge(w http.ResponseWriter, r *http.Request) {
+	pubkey := strings.TrimPrefix(r.URL.Path, "/verified-badges/")
+	if pubkey == "" || strings.Contains(pubkey, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	if s.affiliationStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "verified badge unavailable"})
+		return
+	}
+	affiliation, err := s.affiliationStore.GetDomainAffiliation(r.Context(), strings.ToLower(pubkey))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, http.StatusOK, map[string]any{"pubkey": strings.ToLower(pubkey), "verified": false})
+		return
+	}
+	if err != nil {
+		s.logger.Error("verified badge lookup failed", "pubkey", pubkey, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to lookup verified badge"})
+		return
+	}
+	status := affiliation.Status
+	verified := status == store.DomainAffiliationVerified
+	if verified && affiliation.CheckedAt.Before(time.Now().UTC().Add(-s.domainAffiliationMaxAge)) {
+		status = store.DomainAffiliationStale
+		verified = false
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pubkey":   affiliation.Pubkey,
+		"verified": verified,
+		"affiliation": publicDomainAffiliation{
+			Identifier: affiliation.CanonicalIdentifier,
+			Host:       affiliation.Host,
+			Status:     status,
+			VerifiedAt: affiliation.VerifiedAt,
+			CheckedAt:  affiliation.CheckedAt,
+		},
+	})
 }
 
 func (s *Server) mappings(w http.ResponseWriter, r *http.Request) {

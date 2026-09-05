@@ -525,6 +525,18 @@ func TestListMappings(t *testing.T) {
 	if len(mappings) != 2 {
 		t.Fatalf("expected 2 mappings, got %d", len(mappings))
 	}
+
+	if err := st.UpsertMapping(ctx, Mapping{Npub: "npub1other", RepoID: "other", Pubkey: "pk-other", Owner: "org2", RepoName: "other", GiteaRepoID: 3, CloneURL: "url", SourceEvent: "ev", HookInstalled: true}); err != nil {
+		t.Fatal(err)
+	}
+	mappings, err = st.ListMappingsByPubkeys(ctx, []string{"pk1"}, 1)
+	if err != nil || len(mappings) != 1 || mappings[0].Pubkey != "pk1" {
+		t.Fatalf("bounded pubkey mapping lookup = %+v, err=%v", mappings, err)
+	}
+	mappings, err = st.ListMappingsByPubkeys(ctx, []string{"missing"}, 10)
+	if err != nil || len(mappings) != 0 {
+		t.Fatalf("unknown pubkey mapping lookup = %+v, err=%v", mappings, err)
+	}
 }
 
 func TestHookInstalledTracking(t *testing.T) {

@@ -12,6 +12,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/crypto v0.51.0
+	golang.org/x/net v0.55.0
 	golang.org/x/sys v0.45.0
 	golang.org/x/term v0.43.0
 )
@@ -95,7 +96,6 @@ require (
 	go.etcd.io/bbolt v1.4.2 // indirect
 	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394 // indirect
 	golang.org/x/mod v0.35.0 // indirect
-	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect

@@ -298,6 +298,20 @@ func Open(path string) (*SQLiteStore, error) {
 			last_login_at TEXT NOT NULL DEFAULT '',
 			UNIQUE (gitea_user_id)
 		);`,
+		`CREATE TABLE IF NOT EXISTS domain_affiliations (
+			canonical_identifier TEXT NOT NULL DEFAULT '',
+			local_part TEXT NOT NULL DEFAULT '',
+			host TEXT NOT NULL DEFAULT '',
+			pubkey TEXT PRIMARY KEY,
+			verified_at TEXT NOT NULL DEFAULT '',
+			checked_at TEXT NOT NULL,
+			status TEXT NOT NULL,
+			failure_class TEXT NOT NULL DEFAULT '',
+			failure_code TEXT NOT NULL DEFAULT '',
+			failure_detail TEXT NOT NULL DEFAULT ''
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_domain_affiliations_host_status ON domain_affiliations(host, status);`,
+		`CREATE INDEX IF NOT EXISTS idx_domain_affiliations_host_status_checked ON domain_affiliations(host, status, checked_at);`,
 		// profile_sync_state records the last kind:0 event applied to a linked
 		// user's Gitea profile, for replaceable-event dedup (newest wins).
 		`CREATE TABLE IF NOT EXISTS profile_sync_state (
@@ -546,6 +560,7 @@ func Open(path string) (*SQLiteStore, error) {
 
 	// Index for looking up mappings by Gitea repo ID (used by mirror sync callback).
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_mappings_gitea_repo_id ON mappings(gitea_repo_id)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_mappings_pubkey ON mappings(pubkey)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_pending_nostr_refs_first_seen_at ON pending_nostr_refs(first_seen_at)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_reflected_events_gitea_object ON reflected_events(gitea_repo_id, gitea_index, kind)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_reflected_events_echo_guard ON reflected_events(echo_pending, echo_armed_at)`)
@@ -1316,13 +1331,28 @@ func (s *SQLiteStore) UpsertMapping(ctx context.Context, m Mapping) error {
 }
 
 func (s *SQLiteStore) ListMappings(ctx context.Context) ([]Mapping, error) {
-	return s.listMappingsWhere(ctx, "1=1")
+	return s.listMappingsWhere(ctx, "1=1", 0)
+}
+
+// ListMappingsByPubkeys returns at most limit mappings owned by one of the
+// supplied pubkeys. The bounded indexed lookup is used by public catalogs.
+func (s *SQLiteStore) ListMappingsByPubkeys(ctx context.Context, pubkeys []string, limit int) ([]Mapping, error) {
+	if len(pubkeys) == 0 || limit <= 0 {
+		return []Mapping{}, nil
+	}
+	placeholders := make([]string, len(pubkeys))
+	args := make([]any, len(pubkeys))
+	for i, pubkey := range pubkeys {
+		placeholders[i] = "?"
+		args[i] = pubkey
+	}
+	return s.listMappingsWhere(ctx, "pubkey IN ("+strings.Join(placeholders, ",")+")", limit, args...)
 }
 
 // ListUnhookedMappings returns mappings where hook installation was not completed.
 // These represent interrupted provisioning that needs reconciliation on startup.
 func (s *SQLiteStore) ListUnhookedMappings(ctx context.Context) ([]Mapping, error) {
-	return s.listMappingsWhere(ctx, "hook_installed = 0")
+	return s.listMappingsWhere(ctx, "hook_installed = 0", 0)
 }
 
 // SetHookInstalled marks a mapping's hook as installed (or not).
@@ -1336,17 +1366,21 @@ func (s *SQLiteStore) SetHookInstalled(ctx context.Context, npub string, repoID 
 	return err
 }
 
-func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string) ([]Mapping, error) {
-	rows, err := s.db.QueryContext(ctx, `
+func (s *SQLiteStore) listMappingsWhere(ctx context.Context, where string, limit int, args ...any) ([]Mapping, error) {
+	query := `
 		SELECT npub, repo_id, pubkey, owner, repo_name, gitea_repo_id, clone_url, announced_clone_url, source_event, hook_installed,
 			announcement_event_json, announcement_event_id, announcement_created_at,
 			last_republished_announcement_id, last_republished_announcement_at,
 			last_state_digest, last_state_event_id, last_state_published_at,
 			created_at, updated_at
 		FROM mappings
-		WHERE `+where+`
-		ORDER BY updated_at DESC
-	`)
+		WHERE ` + where + `
+		ORDER BY updated_at DESC`
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

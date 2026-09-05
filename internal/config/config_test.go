@@ -274,6 +274,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ProactiveSyncInterval != time.Hour {
 		t.Errorf("default ProactiveSyncInterval: got %v", cfg.ProactiveSyncInterval)
 	}
+	if cfg.DomainAffiliationMaxAge != 24*time.Hour {
+		t.Errorf("default DomainAffiliationMaxAge: got %v", cfg.DomainAffiliationMaxAge)
+	}
 	if cfg.HiveCIEnabled {
 		t.Error("default HiveCIEnabled should be false")
 	}

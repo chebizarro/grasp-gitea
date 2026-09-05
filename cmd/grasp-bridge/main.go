@@ -27,6 +27,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/hiveci"
 	"github.com/sharegap/grasp-gitea/internal/hooks"
 	"github.com/sharegap/grasp-gitea/internal/loom"
+	"github.com/sharegap/grasp-gitea/internal/nip05affiliation"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/outbox"
 	"github.com/sharegap/grasp-gitea/internal/policy"
@@ -324,6 +325,16 @@ func main() {
 	defer shutdownEmbedded(context.Background())
 
 	relayURLs := liveRelayURLs(policies, embeddedRelayURL)
+	affiliationSvc := nip05affiliation.New(sharedStore, func() []string {
+		return liveRelayURLs(policies, embeddedRelayURL)
+	}, logger)
+	affiliationDone := make(chan struct{})
+	go func() {
+		defer close(affiliationDone)
+		affiliationSvc.Run(ctx)
+	}()
+	logger.Info("NIP-05 affiliation freshness worker started", "interval", nip05affiliation.DefaultInterval.String())
+
 	loomRelayURLs := append([]string(nil), cfg.LoomRelayURLs...)
 	if len(loomRelayURLs) == 0 {
 		loomRelayURLs = append(loomRelayURLs, cfg.RelayURLs...)
@@ -478,6 +489,7 @@ func main() {
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
 	apiServer.SetPolicyStore(policies)
+	apiServer.SetAffiliationStore(sharedStore)
 	if postgresStore != nil {
 		apiServer.AddReadinessProbe(postgresStore)
 	}
@@ -586,6 +598,7 @@ func main() {
 	}
 	giteaProxy.SetPolicyStore(policies)
 	apiServer.SetGiteaProxy(giteaProxy)
+	apiServer.SetRepositoryInspector(giteaClient)
 	if cfg.FullProxyEnabled {
 		// The bridge is now the only path to Gitea, so its readiness must
 		// include upstream reachability.
@@ -733,6 +746,11 @@ func main() {
 	case <-proactiveSyncDone:
 	case <-shutdownCtx.Done():
 		logger.Warn("proactive sync scheduler did not stop before shutdown timeout")
+	}
+	select {
+	case <-affiliationDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("NIP-05 affiliation worker did not stop before shutdown timeout")
 	}
 	select {
 	case <-profileSyncDone:
