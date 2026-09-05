@@ -492,13 +492,13 @@ func writeGRASPNIP11(w http.ResponseWriter, relayHandler *khatru.Relay, cfg conf
 
 	info := *relayHandler.Info
 	if relayHandler.DeleteEvent != nil {
-		info.AddSupportedNIP(9)
+		info.AddSupportedNIP("9")
 	}
 	if relayHandler.Count != nil {
-		info.AddSupportedNIP(45)
+		info.AddSupportedNIP("45")
 	}
 	if relayHandler.Negentropy {
-		info.AddSupportedNIP(77)
+		info.AddSupportedNIP("77")
 	}
 
 	raw, err := json.Marshal(info)
