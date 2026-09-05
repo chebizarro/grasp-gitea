@@ -59,9 +59,17 @@ type AuthStore interface {
 	UpdateNIP46SessionState(ctx context.Context, token string, state string, resultPubkey string, errMsg string) error
 	DeleteExpiredNIP46Sessions(ctx context.Context) (int64, error)
 	GetSignerGrant(ctx context.Context, pubkey string) (SignerGrant, error)
+	UpsertSignerGrant(ctx context.Context, grant SignerGrant) error
+	RevokeSignerGrant(ctx context.Context, pubkey string, at time.Time) error
+	RecordSignerGrantOK(ctx context.Context, pubkey string, at time.Time) error
+	GetBridgeSignerSession(ctx context.Context, bunkerURI string) (BridgeSignerSession, error)
+	UpsertBridgeSignerSession(ctx context.Context, sess BridgeSignerSession) error
+	TouchBridgeSignerSession(ctx context.Context, bunkerURI string, at time.Time) error
 
 	// Identity links.
 	GetIdentityLinkByPubkey(ctx context.Context, pubkey string) (NostrIdentityLink, error)
+	GetIdentityLinkByGiteaUserID(ctx context.Context, userID int64) (NostrIdentityLink, error)
+	ListIdentityLinksAfter(ctx context.Context, afterPubkey string, limit int) ([]NostrIdentityLink, error)
 	UpsertIdentityLink(ctx context.Context, link NostrIdentityLink) error
 	UpdateLastLogin(ctx context.Context, pubkey string) error
 

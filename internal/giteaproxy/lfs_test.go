@@ -4,6 +4,7 @@
 package giteaproxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,7 +27,7 @@ func lfsEnv(t *testing.T, principal auth.TokenPrincipal) *proxyEnv {
 		enabled: true, principal: principal,
 		patLogin: "npub1owner-login", patSecret: "hidden-pat",
 	}
-	return newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+	return newProxyEnv(t, Config{FullProxy: true, PublicURL: "https://git.example.com"}, tokens, stubInspector{})
 }
 
 func TestLFSScopeClassification(t *testing.T) {
@@ -187,7 +188,8 @@ func TestMappedLFSAnonymousWritesDenied(t *testing.T) {
 	newEnv := func() *proxyEnv {
 		tokens := &stubAuthenticator{enabled: true}
 		return newProxyEnv(t, Config{
-			FullProxy: true, GitBackendUser: "svc", GitBackendPassword: "svc-pw",
+			FullProxy: true, PublicURL: "https://git.example.com",
+			GitBackendUser: "svc", GitBackendPassword: "svc-pw",
 		}, tokens, stubInspector{id: 7})
 	}
 
@@ -244,11 +246,106 @@ func TestLFSRejectsDirectNIP98(t *testing.T) {
 	}
 }
 
+func TestLFSBatchUnsafeResponsesFailClosed(t *testing.T) {
+	tests := []struct {
+		name            string
+		contentEncoding string
+		body            string
+	}{
+		{
+			name:            "compressed body",
+			contentEncoding: "gzip",
+			body:            `{"objects":[{"actions":{"download":{"href":"https://git.example.com/o/r.git/info/lfs/objects/abc","header":{"Authorization":"Basic hidden-pat"}}}}]}`,
+		},
+		{
+			name: "oversized body",
+			body: strings.Repeat("x", maxLFSBatchResponseBody+1),
+		},
+		{
+			name: "invalid JSON",
+			body: `{"objects":[{"header":{"Authorization":"Basic hidden-pat"}}]`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Accept-Encoding"); got != "identity" {
+					t.Errorf("upstream Accept-Encoding = %q, want identity", got)
+				}
+				w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
+				if tc.contentEncoding != "" {
+					w.Header().Set("Content-Encoding", tc.contentEncoding)
+				}
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(backend.Close)
+
+			p, err := New(Config{
+				GiteaURL: backend.URL, PublicURL: "https://git.example.com", FullProxy: true,
+			}, &stubAuthenticator{
+				enabled: true, principal: lfsPrincipal(auth.ScopeLFSRead),
+				patLogin: "l", patSecret: "hidden-pat",
+			}, stubInspector{}, nil, discardLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			r := httptest.NewRequest(http.MethodPost, "/o/r.git/info/lfs/objects/batch",
+				strings.NewReader(`{"operation":"download"}`))
+			r.Header.Set("Authorization", "Bearer "+testBridgeToken)
+			w := httptest.NewRecorder()
+			p.ServeHTTP(w, r)
+			if w.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502: %s", w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), "hidden-pat") {
+				t.Fatalf("raw unsafe response forwarded: %s", w.Body.String())
+			}
+			if got := w.Header().Get("Content-Encoding"); got != "" {
+				t.Fatalf("502 retained Content-Encoding %q", got)
+			}
+		})
+	}
+}
+
+func TestMappedLFSAnonymousBatchStripsAuthorization(t *testing.T) {
+	var backendURL string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
+		fmt.Fprintf(w, `{"objects":[{"oid":"abc","actions":{"download":{"href":"%s/org/repo.git/info/lfs/objects/abc","header":{"Authorization":"Basic hidden-service-credential","X-Keep":"yes"}}}}]}`, backendURL)
+	}))
+	t.Cleanup(backend.Close)
+	backendURL = backend.URL
+
+	p, err := New(Config{
+		GiteaURL: backend.URL, PublicURL: "https://git.example.com", FullProxy: true,
+		GitBackendUser: "svc", GitBackendPassword: "svc-pw",
+	}, &stubAuthenticator{enabled: true}, stubInspector{id: 7}, nil, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := httptest.NewRequest(http.MethodPost, "/npub1x/repo.git/info/lfs/objects/batch",
+		strings.NewReader(`{"operation":"download"}`))
+	w := httptest.NewRecorder()
+	p.ServeMappedGit(w, r, mapped(7), "info/lfs/objects/batch")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(strings.ToLower(w.Body.String()), "authorization") {
+		t.Fatalf("anonymous action retained authorization: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"X-Keep":"yes"`) {
+		t.Fatalf("unrelated action header was removed: %s", w.Body.String())
+	}
+}
+
 func TestLFSBatchResponseOriginRewrite(t *testing.T) {
 	var backendURL string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
-		fmt.Fprintf(w, `{"objects":[{"oid":"abc","actions":{"download":{"href":"%s/o/r.git/info/lfs/objects/abc"}}}],"other":"https://elsewhere.example/x"}`, backendURL)
+		fmt.Fprintf(w, `{"objects":[{"oid":"abc","actions":{"download":{"href":"%s/o/r.git/info/lfs/objects/abc","header":{"Authorization":"Basic hidden-pat","X-Keep":"yes"}},"upload":{"href":"https://objects.example.com/presigned","header":{"Authorization":"AWS4-HMAC-SHA256 external-signature"}},"verify":{"href":"https://objects.example.com/verify","header":{"Authorization":%q}}}}],"other":"https://elsewhere.example/x"}`, backendURL, basicHeader("l", "p"))
 	}))
 	t.Cleanup(backend.Close)
 	backendURL = backend.URL
@@ -279,6 +376,32 @@ func TestLFSBatchResponseOriginRewrite(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "https://elsewhere.example/x") {
 		t.Fatalf("foreign origin altered: %s", body)
+	}
+	if strings.Contains(string(body), "hidden-pat") {
+		t.Fatalf("hidden PAT leaked in batch action: %s", body)
+	}
+	var envelope struct {
+		Objects []struct {
+			Actions map[string]struct {
+				Header map[string]string `json:"header"`
+			} `json:"actions"`
+		} `json:"objects"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("decode batch response: %v", err)
+	}
+	actions := envelope.Objects[0].Actions
+	if got := actions["download"].Header["Authorization"]; got != "Bearer "+testBridgeToken {
+		t.Fatalf("internal action authorization = %q", got)
+	}
+	if got := actions["download"].Header["X-Keep"]; got != "yes" {
+		t.Fatalf("internal action X-Keep = %q", got)
+	}
+	if got := actions["upload"].Header["Authorization"]; got != "AWS4-HMAC-SHA256 external-signature" {
+		t.Fatalf("external action authorization = %q", got)
+	}
+	if got := actions["verify"].Header["Authorization"]; got != "" {
+		t.Fatalf("bridge-injected credential retained on external action: %q", got)
 	}
 	if got := w.Header().Get("Content-Length"); got != fmt.Sprint(len(body)) {
 		t.Fatalf("Content-Length %s != body %d", got, len(body))

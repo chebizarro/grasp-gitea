@@ -77,7 +77,11 @@ func Classify(r *http.Request) Classification {
 		}
 		return class
 	case strings.HasPrefix(path, "/api/packages/"):
-		return Classification{Surface: SurfacePackages, Action: methodAction(r), Scope: packagesScope(r)}
+		class := Classification{Surface: SurfacePackages, Action: methodAction(r)}
+		if supportedPackageFamily(path) {
+			class.Scope = packagesScope(r)
+		}
+		return class
 	case strings.HasPrefix(path, "/api/v1/"):
 		return Classification{Surface: SurfaceAPI, Action: methodAction(r), Scope: apiScope(r)}
 	}
@@ -172,8 +176,27 @@ func restrictedAPIPath(path string) bool {
 	return false
 }
 
-// packagesScope maps a package-registry request to the bridge scope it
-// requires. Reads (download, metadata) need packages:read; anything mutating
+// supportedPackageFamily is the package catalog served by Gitea 1.24.6 under
+// /api/packages/{owner}/{family}. Keeping this set explicit makes a bridge
+// token fail closed on an unknown package path instead of forwarding the
+// hidden PAT to a route the bridge has not reviewed.
+func supportedPackageFamily(path string) bool {
+	parts := strings.Split(strings.TrimPrefix(path, "/api/packages/"), "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return false
+	}
+	switch parts[1] {
+	case "alpine", "arch", "cargo", "chef", "composer", "conan", "conda",
+		"cran", "debian", "generic", "go", "helm", "maven", "npm", "nuget",
+		"pub", "pypi", "rpm", "rubygems", "swift", "vagrant":
+		return true
+	default:
+		return false
+	}
+}
+
+// packagesScope maps a supported package-registry request to the bridge scope
+// it requires. Reads (download, metadata) need packages:read; anything mutating
 // (publish, delete, and any unrecognized method) needs packages:write, so an
 // unknown verb fails toward the stronger requirement rather than the weaker.
 func packagesScope(r *http.Request) string {
@@ -181,6 +204,21 @@ func packagesScope(r *http.Request) string {
 		return auth.ScopePackagesRead
 	}
 	return auth.ScopePackagesWrite
+}
+
+// isConanTokenExchange identifies Conan's credential bootstrap. Gitea normally
+// returns a 24-hour package JWT derived from the hidden PAT, which would both
+// outlive bridge-token revocation and inherit the PAT's unioned package scope.
+// The bridge instead returns the already-present bridge token; Conan presents
+// it as Bearer on later requests, where normal per-request scope and revocation
+// checks remain authoritative.
+func isConanTokenExchange(r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/packages/"), "/")
+	return len(parts) == 5 && parts[0] != "" && parts[1] == "conan" &&
+		(parts[2] == "v1" || parts[2] == "v2") && parts[3] == "users" && parts[4] == "authenticate"
 }
 
 func containerAction(r *http.Request) Action {

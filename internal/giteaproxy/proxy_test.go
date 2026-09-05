@@ -128,6 +128,11 @@ func newProxyEnv(t *testing.T, cfg Config, tokens *stubAuthenticator, repos Repo
 			body:          string(body),
 		}
 		seen.mu.Unlock()
+		if IsLFSBatchPath(r.URL.Path) {
+			w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
+			_, _ = w.Write([]byte(`{"objects":[]}`))
+			return
+		}
 		_, _ = w.Write([]byte("backend ok"))
 	}))
 	t.Cleanup(backend.Close)
@@ -493,11 +498,11 @@ func TestServeHTTPBridgeTokenOnUnsupportedSurfaceFailsClosed(t *testing.T) {
 	}
 }
 
-// TestPackageRegistryCredentialFamilies exercises the credential shapes the
-// package clients actually send: npm (Bearer), PyPI/Maven/Composer/Generic
-// (Basic, token as password), Cargo (raw token, no scheme), and token-in-
-// username Basic. Every family must exchange the bridge token for the hidden
-// PAT as downstream Basic auth.
+// TestPackageRegistryCredentialFamilies exercises every Gitea 1.24.6 package
+// family through its usable bridge-token credential shape: Bearer, Basic
+// (token as password or username), Cargo's raw token, and NuGet's separately
+// tested API-key header. Every family must exchange the bridge token for the
+// hidden PAT as downstream Basic auth.
 func TestPackageRegistryCredentialFamilies(t *testing.T) {
 	pkgPrincipal := linkedPrincipal()
 	pkgPrincipal.Scopes = []string{auth.ScopePackagesRead, auth.ScopePackagesWrite}
@@ -516,6 +521,20 @@ func TestPackageRegistryCredentialFamilies(t *testing.T) {
 		{"generic basic upload", http.MethodPut, "/api/packages/owner/generic/pkg/1.0/file.bin", basicHeader("npub1owner", testBridgeToken)},
 		{"maven token in username", http.MethodPut, "/api/packages/owner/maven/g/a/1.0/a-1.0.jar", basicHeader(testBridgeToken, "")},
 		{"nuget delete", http.MethodDelete, "/api/packages/owner/nuget/pkg/1.0.0", basicHeader("npub1owner", testBridgeToken)},
+		{"alpine basic", http.MethodPut, "/api/packages/owner/alpine/v3.20/main", basicHeader("npub1owner", testBridgeToken)},
+		{"arch basic", http.MethodPut, "/api/packages/owner/arch/main", basicHeader("npub1owner", testBridgeToken)},
+		{"chef basic", http.MethodPost, "/api/packages/owner/chef/api/v1/cookbooks", basicHeader("npub1owner", testBridgeToken)},
+		{"composer basic", http.MethodGet, "/api/packages/owner/composer/packages.json", basicHeader("npub1owner", testBridgeToken)},
+		{"conda basic", http.MethodPut, "/api/packages/owner/conda/pkg-1.0.tar.bz2", basicHeader("npub1owner", testBridgeToken)},
+		{"cran basic", http.MethodPut, "/api/packages/owner/cran/src", basicHeader("npub1owner", testBridgeToken)},
+		{"debian basic", http.MethodPut, "/api/packages/owner/debian/pool/stable/main/upload", basicHeader("npub1owner", testBridgeToken)},
+		{"go basic", http.MethodPut, "/api/packages/owner/go/upload", basicHeader("npub1owner", testBridgeToken)},
+		{"helm basic", http.MethodPost, "/api/packages/owner/helm/api/charts", basicHeader("npub1owner", testBridgeToken)},
+		{"pub bearer", http.MethodGet, "/api/packages/owner/pub/api/packages/versions/new", "Bearer " + testBridgeToken},
+		{"rpm basic", http.MethodPut, "/api/packages/owner/rpm/stable/upload", basicHeader("npub1owner", testBridgeToken)},
+		{"rubygems basic", http.MethodPost, "/api/packages/owner/rubygems/api/v1/gems", basicHeader("npub1owner", testBridgeToken)},
+		{"swift basic", http.MethodPost, "/api/packages/owner/swift/login", basicHeader("npub1owner", testBridgeToken)},
+		{"vagrant bearer", http.MethodGet, "/api/packages/owner/vagrant/authenticate", "Bearer " + testBridgeToken},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -541,6 +560,40 @@ func TestPackageRegistryCredentialFamilies(t *testing.T) {
 				t.Fatal("bridge token leaked downstream")
 			}
 		})
+	}
+}
+
+func TestConanTokenExchangeKeepsBridgeTokenBoundaries(t *testing.T) {
+	readOnly := linkedPrincipal()
+	readOnly.Scopes = []string{auth.ScopePackagesRead}
+	tokens := &stubAuthenticator{
+		enabled: true, principal: readOnly, patLogin: "login", patSecret: "hidden-pat",
+	}
+
+	for _, version := range []string{"v1", "v2"} {
+		t.Run(version, func(t *testing.T) {
+			env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+			path := "/api/packages/owner/conan/" + version + "/users/authenticate"
+			r := httptest.NewRequest(http.MethodGet, path, nil)
+			r.Header.Set("Authorization", basicHeader("npub1owner", testBridgeToken))
+			w := httptest.NewRecorder()
+			env.proxy.ServeHTTP(w, r)
+			if w.Code != http.StatusOK || w.Body.String() != testBridgeToken {
+				t.Fatalf("exchange = %d %q, want bridge token", w.Code, w.Body.String())
+			}
+			if env.seen.snapshot().hit {
+				t.Fatal("Conan exchange reached Gitea and could mint a long-lived package JWT")
+			}
+		})
+	}
+
+	env := newProxyEnv(t, Config{FullProxy: true}, tokens, stubInspector{})
+	r := httptest.NewRequest(http.MethodPut, "/api/packages/owner/conan/v2/conans/pkg/1/usr/stable/revisions/r/files/conanfile.py", strings.NewReader("x"))
+	r.Header.Set("Authorization", "Bearer "+testBridgeToken)
+	w := httptest.NewRecorder()
+	env.proxy.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden || env.seen.snapshot().hit {
+		t.Fatalf("read-only Conan publish = %d, forwarded=%v; want local 403", w.Code, env.seen.snapshot().hit)
 	}
 }
 
@@ -775,6 +828,28 @@ func TestBearerChallengeRealmRewrite(t *testing.T) {
 	}
 }
 
+// TestUnknownPackageFamilyRefusesBridgeToken proves a package-looking path
+// outside Gitea 1.24.6's reviewed catalog fails locally and never receives the
+// hidden PAT.
+func TestUnknownPackageFamilyRefusesBridgeToken(t *testing.T) {
+	principal := linkedPrincipal()
+	principal.Scopes = []string{auth.ScopePackagesRead, auth.ScopePackagesWrite}
+	env := newProxyEnv(t, Config{FullProxy: true}, &stubAuthenticator{
+		enabled: true, principal: principal, patLogin: "login", patSecret: "hidden-pat",
+	}, stubInspector{})
+
+	r := httptest.NewRequest(http.MethodGet, "/api/packages/owner/unknown/file", nil)
+	r.Header.Set("Authorization", "Bearer "+testBridgeToken)
+	w := httptest.NewRecorder()
+	env.proxy.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("unknown package family status = %d, want 403", w.Code)
+	}
+	if env.seen.snapshot().hit {
+		t.Fatal("unknown package family reached Gitea")
+	}
+}
+
 // TestPackageWriteRequiresWriteScope ensures a read-only package token cannot
 // publish or delete.
 func TestPackageWriteRequiresWriteScope(t *testing.T) {
@@ -889,7 +964,7 @@ func TestDirectNIP98OnAPIEndpoints(t *testing.T) {
 	}
 	seen := env.seen.snapshot()
 	if seen.authorization != basicHeader("login", "hidden-pat") {
-		t.Fatalf("downstream authorization = %q, want hidden PAT", seen.authorization)
+		t.Fatalf("downstream authorization = %q, want hidden PAT Basic auth", seen.authorization)
 	}
 
 	// POST with a bounded body: the verifier sees the exact bytes and the

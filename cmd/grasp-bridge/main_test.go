@@ -4,8 +4,50 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 )
+
+type stubAuthStateInspector struct {
+	hasState bool
+	err      error
+	calls    int
+}
+
+func (s *stubAuthStateInspector) HasAuthState(context.Context) (bool, error) {
+	s.calls++
+	return s.hasState, s.err
+}
+
+func TestGuardPostgresTakeover(t *testing.T) {
+	tests := []struct {
+		name       string
+		sqlite     stubAuthStateInspector
+		postgres   stubAuthStateInspector
+		allowEmpty bool
+		wantErr    string
+	}{
+		{name: "both empty"},
+		{name: "postgres populated", sqlite: stubAuthStateInspector{hasState: true}, postgres: stubAuthStateInspector{hasState: true}},
+		{name: "refuses empty takeover", sqlite: stubAuthStateInspector{hasState: true}, wantErr: "POSTGRES_ALLOW_EMPTY_TAKEOVER=true"},
+		{name: "explicit override", sqlite: stubAuthStateInspector{hasState: true}, allowEmpty: true},
+		{name: "sqlite inspection fails closed", sqlite: stubAuthStateInspector{err: errors.New("read failed")}, wantErr: "inspect SQLite auth state"},
+		{name: "postgres inspection fails closed", sqlite: stubAuthStateInspector{hasState: true}, postgres: stubAuthStateInspector{err: errors.New("read failed")}, wantErr: "inspect Postgres auth state"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := guardPostgresTakeover(context.Background(), &tt.sqlite, &tt.postgres, tt.allowEmpty)
+			if tt.wantErr == "" && err != nil {
+				t.Fatalf("guardPostgresTakeover() error: %v", err)
+			}
+			if tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
+				t.Fatalf("guardPostgresTakeover() error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
 
 func TestMergeRelayURLsEmpty(t *testing.T) {
 	result := mergeRelayURLs(nil, "")

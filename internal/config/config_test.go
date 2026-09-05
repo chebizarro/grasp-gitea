@@ -414,6 +414,7 @@ func TestLoadOverridesAllFields(t *testing.T) {
 		"RELAY_URLS":              "wss://r1.test, wss://r2.test",
 		"LISTEN":                  ":9090",
 		"DB_PATH":                 "/tmp/test.db",
+		"POSTGRES_DSN":            "postgres://grasp:secret@db/grasp",
 		"PUBKEY_ALLOWLIST":        "pk1,pk2",
 		"PROVISION_RATE_LIMIT":    "10",
 		"HOOK_RELAY_URL":          "ws://hook:1234",
@@ -429,6 +430,7 @@ func TestLoadOverridesAllFields(t *testing.T) {
 		"HIVE_CI_ACT_PATH":        "/opt/bin/act",
 		"CI_TRIGGER_REPOS":        "*",
 	})
+	t.Setenv("POSTGRES_ALLOW_EMPTY_TAKEOVER", "true")
 
 	cfg, err := Load()
 	if err != nil {
@@ -446,6 +448,12 @@ func TestLoadOverridesAllFields(t *testing.T) {
 	}
 	if cfg.RelayURLs[1] != "wss://r2.test" {
 		t.Errorf("RelayURLs[1]: got %q", cfg.RelayURLs[1])
+	}
+	if cfg.PostgresDSN != "postgres://grasp:secret@db/grasp" {
+		t.Errorf("PostgresDSN: got %q", cfg.PostgresDSN)
+	}
+	if !cfg.PostgresAllowEmptyTakeover {
+		t.Error("PostgresAllowEmptyTakeover should be true")
 	}
 	if cfg.ProvisionRateLimit != 10 {
 		t.Errorf("ProvisionRateLimit: got %d", cfg.ProvisionRateLimit)

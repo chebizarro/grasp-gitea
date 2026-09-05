@@ -48,13 +48,25 @@ limit_req_zone $binary_remote_addr zone=grasp_push_ip:10m rate=30r/m;
 limit_req_zone $grasp_repo_quota_key zone=grasp_push_repo:10m rate=60r/m;
 limit_conn_zone $binary_remote_addr zone=grasp_push_connections:10m;
 
-# The bridge is the only public application upstream.
+# The bridge replicas are the only public application upstreams. nginx OSS
+# performs passive health checks: after two connection/response failures a
+# replica is avoided for 10 seconds, while least_conn spreads concurrent work
+# across the healthy replicas. Add/remove server lines with the deployment's
+# bridge replica set; do not point any public location directly at Gitea.
 upstream grasp_bridge_backend {
-    server grasp-bridge:8090;
+    least_conn;
+    server grasp-bridge-a:8090 max_fails=2 fail_timeout=10s;
+    server grasp-bridge-b:8090 max_fails=2 fail_timeout=10s;
     keepalive 32;
 }
+# Relay WebSocket subscription state is connection-local: nginx pins each
+# upgraded TCP connection to one replica for its lifetime, so cookie/IP
+# affinity is neither required nor desirable. A reconnect may select either
+# healthy replica, using the same least-connection/passive-failover policy.
 upstream grasp_relay_backend {
-    server grasp-bridge:3334;
+    least_conn;
+    server grasp-bridge-a:3334 max_fails=2 fail_timeout=10s;
+    server grasp-bridge-b:3334 max_fails=2 fail_timeout=10s;
     keepalive 16;
 }
 

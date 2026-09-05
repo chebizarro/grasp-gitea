@@ -46,6 +46,8 @@ services:
       GITEA__server__DOMAIN: grasp.test
       GITEA__server__ROOT_URL: https://grasp.test/
       GITEA__server__HTTP_PORT: "3000"
+      GITEA__server__LFS_START_SERVER: "true"
+      GITEA__server__LFS_JWT_SECRET: phase1-e2e-lfs-jwt-secret
       GITEA__security__INSTALL_LOCK: "true"
       GITEA__security__SECRET_KEY: phase1-e2e-secret-key
       GITEA__security__INTERNAL_TOKEN: 5f1fd22d1d8db62617a250eb77e5e326f33de7289965d45cf9ab94ef13649991

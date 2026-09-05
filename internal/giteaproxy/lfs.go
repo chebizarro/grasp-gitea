@@ -21,8 +21,7 @@ import (
 const maxLFSBatchBody = 1 << 20
 
 // maxLFSBatchResponseBody bounds the batch response the proxy will buffer
-// to rewrite backend-origin transfer URLs. Larger responses pass through
-// unmodified rather than being truncated.
+// to rewrite backend-origin transfer URLs and sanitize action credentials.
 const maxLFSBatchResponseBody = 8 << 20
 
 // IsLFSSubpath recognizes LFS endpoints below a mapped repository's .git/
@@ -61,32 +60,29 @@ func resolveLFSBatchScope(r *http.Request) (string, bool) {
 }
 
 // rewriteLFSBatchBody rewrites backend-origin transfer URLs in a batch
-// response to the canonical public origin. With ROOT_URL set to the public
-// origin Gitea already emits public hrefs; this is defense in depth so the
-// private upstream address can never leak to an LFS client. The body is
-// parsed and only `objects[*].actions[*].href` values whose scheme and host
-// exactly equal the configured upstream are touched — a substring
-// substitution would also rewrite hostile look-alikes and could mutate
-// unrelated fields. Compressed, oversized, or unparsable responses pass
-// through unmodified.
-func (p *Proxy) rewriteLFSBatchBody(resp *http.Response) {
+// response to the canonical public origin and sanitizes action credentials.
+// When requireSanitization is true, an unsafe response must not be forwarded:
+// the caller replaces it with a 502 rather than risking disclosure of the
+// bridge-injected credential.
+func (p *Proxy) rewriteLFSBatchBody(resp *http.Response, publicAuthorization, hiddenAuthorization string, requireSanitization bool) bool {
 	if p.publicURL == "" || resp.Body == nil {
-		return
+		return !requireSanitization
 	}
-	if resp.Header.Get("Content-Encoding") != "" {
-		return
+	if encoding := resp.Header.Get("Content-Encoding"); encoding != "" && !strings.EqualFold(encoding, "identity") {
+		return !requireSanitization
 	}
-	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "json") {
-		return
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(strings.ToLower(ct), "json") {
+		return !requireSanitization
 	}
 	if resp.ContentLength > maxLFSBatchResponseBody {
-		return
+		return !requireSanitization
 	}
+
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxLFSBatchResponseBody+1))
 	closeErr := resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(data))
 	if err != nil || closeErr != nil || len(data) > maxLFSBatchResponseBody {
-		return
+		return !requireSanitization
 	}
 
 	// UseNumber preserves large integers (object size) and unknown numeric
@@ -95,14 +91,23 @@ func (p *Proxy) rewriteLFSBatchBody(resp *http.Response) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	if dec.Decode(&envelope) != nil {
-		return
+		return !requireSanitization
 	}
-	if !p.rewriteLFSActionHrefs(envelope) {
-		return // nothing changed; keep the original bytes
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return !requireSanitization
+	}
+
+	changed, safe := p.rewriteLFSActions(envelope, publicAuthorization, hiddenAuthorization)
+	if !safe {
+		return !requireSanitization
+	}
+	if !changed {
+		return true
 	}
 	rewritten, err := json.Marshal(envelope)
 	if err != nil {
-		return
+		return !requireSanitization
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(rewritten))
 	resp.ContentLength = int64(len(rewritten))
@@ -111,33 +116,96 @@ func (p *Proxy) rewriteLFSBatchBody(resp *http.Response) {
 	resp.Header.Del("ETag")
 	resp.Header.Del("Digest")
 	resp.Header.Del("Content-MD5")
+	return true
 }
 
-// rewriteLFSActionHrefs walks objects[*].actions[*].href, rewriting exact
-// backend-origin URLs to the public origin. Reports whether anything changed.
-func (p *Proxy) rewriteLFSActionHrefs(envelope map[string]any) bool {
-	objects, _ := envelope["objects"].([]any)
-	changed := false
+// rewriteLFSActions walks objects[*].actions[*]. Backend-origin hrefs are
+// rewritten to the public origin. Authorization is changed only for actions
+// targeting that public origin or the exact backend origin: authenticated
+// transfers receive the caller's bridge token and anonymous transfers have
+// authorization removed. External action headers are left intact except when
+// they exactly match the credential injected by the bridge.
+func (p *Proxy) rewriteLFSActions(envelope map[string]any, publicAuthorization, hiddenAuthorization string) (changed, safe bool) {
+	objectsValue, exists := envelope["objects"]
+	if !exists {
+		return false, false
+	}
+	objects, ok := objectsValue.([]any)
+	if !ok {
+		return false, false
+	}
+
 	for _, o := range objects {
-		object, _ := o.(map[string]any)
-		actions, _ := object["actions"].(map[string]any)
+		object, ok := o.(map[string]any)
+		if !ok {
+			return changed, false
+		}
+		actionsValue, exists := object["actions"]
+		if !exists || actionsValue == nil {
+			continue
+		}
+		actions, ok := actionsValue.(map[string]any)
+		if !ok {
+			return changed, false
+		}
 		for _, a := range actions {
-			action, _ := a.(map[string]any)
-			href, _ := action["href"].(string)
-			if href == "" {
-				continue
+			action, ok := a.(map[string]any)
+			if !ok {
+				return changed, false
+			}
+			href, ok := action["href"].(string)
+			if !ok || href == "" {
+				return changed, false
 			}
 			parsed, err := url.Parse(href)
 			if err != nil || !parsed.IsAbs() {
+				return changed, false
+			}
+
+			backendOrigin := strings.EqualFold(parsed.Scheme, p.target.Scheme) &&
+				strings.EqualFold(parsed.Host, p.target.Host)
+			publicOrigin := strings.EqualFold(parsed.Scheme, p.publicScheme) &&
+				strings.EqualFold(parsed.Host, p.publicHost)
+
+			headersValue, hasHeaders := action["header"]
+			var headers map[string]any
+			if hasHeaders {
+				headers, ok = headersValue.(map[string]any)
+				if !ok {
+					return changed, false
+				}
+			}
+			if !backendOrigin && !publicOrigin {
+				// Preserve credentials meant for the external host, but never
+				// forward the exact Basic credential injected by the bridge.
+				for key, value := range headers {
+					if strings.EqualFold(key, "Authorization") && value == hiddenAuthorization && hiddenAuthorization != "" {
+						delete(headers, key)
+						changed = true
+					}
+				}
 				continue
 			}
-			if !strings.EqualFold(parsed.Scheme, p.target.Scheme) ||
-				!strings.EqualFold(parsed.Host, p.target.Host) {
-				continue
+			if backendOrigin {
+				action["href"] = p.publicURL + strings.TrimPrefix(href, parsed.Scheme+"://"+parsed.Host)
+				changed = true
 			}
-			action["href"] = p.publicURL + strings.TrimPrefix(href, parsed.Scheme+"://"+parsed.Host)
-			changed = true
+
+			for key := range headers {
+				if strings.EqualFold(key, "Authorization") {
+					delete(headers, key)
+					changed = true
+				}
+			}
+			if publicAuthorization != "" {
+				if headers == nil {
+					headers = make(map[string]any)
+					action["header"] = headers
+				}
+				headers["Authorization"] = publicAuthorization
+				changed = true
+			}
 		}
 	}
-	return changed
+	return changed, true
 }

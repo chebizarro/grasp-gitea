@@ -22,11 +22,17 @@ import (
 // Signet authorization is one-time: the client key authorized at first
 // connect is encrypted and persisted, and every restart reconnects with the
 // stored identity instead of generating a fresh key.
+type bridgeSessionStore interface {
+	GetBridgeSignerSession(ctx context.Context, bunkerURI string) (store.BridgeSignerSession, error)
+	UpsertBridgeSignerSession(ctx context.Context, sess store.BridgeSignerSession) error
+	TouchBridgeSignerSession(ctx context.Context, bunkerURI string, at time.Time) error
+}
+
 type DurableSignetSigner struct {
 	bunker    BunkerSigner
 	pubKey    string
 	bunkerURI string
-	st        *store.SQLiteStore
+	st        bridgeSessionStore
 	logger    *slog.Logger
 }
 
@@ -82,7 +88,7 @@ func (d *DurableSignetSigner) NIP44Encrypt(ctx context.Context, target nostr.Pub
 // The client secret key is sealed with the signer master key (NaCl
 // secretbox) when one is configured; without a master key it is stored
 // unsealed and a warning is logged.
-func ConnectDurableSignetSigner(ctx context.Context, st *store.SQLiteStore, masterKey []byte, bunkerURL string, relays []string, logger *slog.Logger) (*DurableSignetSigner, error) {
+func ConnectDurableSignetSigner(ctx context.Context, st bridgeSessionStore, masterKey []byte, bunkerURL string, relays []string, logger *slog.Logger) (*DurableSignetSigner, error) {
 	if st == nil {
 		return nil, fmt.Errorf("store is required for durable signet signer")
 	}
@@ -126,7 +132,7 @@ func ConnectDurableSignetSigner(ctx context.Context, st *store.SQLiteStore, mast
 // bunkerConnectFn is swappable in tests.
 var bunkerConnectFn = connectBunkerDetached
 
-func connectSignetSession(ctx context.Context, st *store.SQLiteStore, clientKey nostr.SecretKey, connectURL string, durableURI string, masterKey []byte, logger *slog.Logger) (*DurableSignetSigner, error) {
+func connectSignetSession(ctx context.Context, st bridgeSessionStore, clientKey nostr.SecretKey, connectURL string, durableURI string, masterKey []byte, logger *slog.Logger) (*DurableSignetSigner, error) {
 	client, err := bunkerConnectFn(ctx, clientKey, connectURL)
 	if err != nil {
 		return nil, err

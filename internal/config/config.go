@@ -19,15 +19,20 @@ import (
 type Config struct {
 	// PolicyPath is the immutable boot coordinate for the persisted mutable
 	// policy projection. Legacy policy env values only seed this file once.
-	PolicyPath             string
-	ConfigTrustedAuthors   []string
-	ConfigScope            string
-	GiteaURL               string
-	GiteaAdminToken        string
-	ClonePrefix            string
-	RelayURLs              []string
-	Listen                 string
-	DBPath                 string
+	PolicyPath           string
+	ConfigTrustedAuthors []string
+	ConfigScope          string
+	GiteaURL             string
+	GiteaAdminToken      string
+	ClonePrefix          string
+	RelayURLs            []string
+	Listen               string
+	DBPath               string
+	// PostgresDSN selects the shared transactional auth/identity backend.
+	// Empty preserves the single-node SQLite fallback.
+	PostgresDSN                string
+	PostgresAllowEmptyTakeover bool
+
 	PubkeyAllowlist        map[string]struct{}
 	ProvisionRateLimit     int
 	HookRelayURL           string
@@ -158,15 +163,19 @@ const minEdgeSecretLength = 43
 
 func Load() (Config, error) {
 	cfg := Config{
-		GiteaURL:                envOrDefault("GITEA_URL", "http://gitea:3000"),
-		PolicyPath:              envOrDefault("GRASP_CONFIG_PATH", "/data/config.json"),
-		ConfigTrustedAuthors:    csvEnv("GRASP_CONFIG_TRUSTED_AUTHORS"),
-		ConfigScope:             strings.TrimSpace(envOrDefault("GRASP_CONFIG_SCOPE", "prod")),
-		GiteaAdminToken:         strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
-		ClonePrefix:             strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
-		RelayURLs:               csvEnv("RELAY_URLS"),
-		Listen:                  envOrDefault("LISTEN", ":8090"),
-		DBPath:                  envOrDefault("DB_PATH", "./mappings.db"),
+		GiteaURL:             envOrDefault("GITEA_URL", "http://gitea:3000"),
+		PolicyPath:           envOrDefault("GRASP_CONFIG_PATH", "/data/config.json"),
+		ConfigTrustedAuthors: csvEnv("GRASP_CONFIG_TRUSTED_AUTHORS"),
+		ConfigScope:          strings.TrimSpace(envOrDefault("GRASP_CONFIG_SCOPE", "prod")),
+		GiteaAdminToken:      strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
+		ClonePrefix:          strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
+		RelayURLs:            csvEnv("RELAY_URLS"),
+		Listen:               envOrDefault("LISTEN", ":8090"),
+		DBPath:               envOrDefault("DB_PATH", "./mappings.db"),
+
+		PostgresDSN:                strings.TrimSpace(os.Getenv("POSTGRES_DSN")),
+		PostgresAllowEmptyTakeover: boolEnv("POSTGRES_ALLOW_EMPTY_TAKEOVER", false),
+
 		PubkeyAllowlist:         parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
 		ProvisionRateLimit:      intEnv("PROVISION_RATE_LIMIT", 0),
 		HookRelayURL:            envOrDefault("HOOK_RELAY_URL", "ws://localhost:3334"),

@@ -169,6 +169,50 @@ func TestFullProxyConfigRoutesEverythingToTheBridge(t *testing.T) {
 	}
 }
 
+// The canonical application upstream must spread traffic across at least two
+// bridge replicas and configure nginx OSS passive failure detection.
+func TestFullProxyConfigLoadBalancesBridgeReplicasWithPassiveFailover(t *testing.T) {
+	raw, err := os.ReadFile(fullProxyConfPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	text := string(raw)
+	blockMatch := regexp.MustCompile(`(?s)upstream\s+grasp_bridge_backend\s*\{(.*?)\}`).FindStringSubmatch(text)
+	if len(blockMatch) != 2 {
+		t.Fatal("missing grasp_bridge_backend upstream block")
+	}
+	block := blockMatch[1]
+	if !strings.Contains(block, "least_conn;") {
+		t.Error("bridge upstream does not load-balance concurrent traffic with least_conn")
+	}
+	servers := regexp.MustCompile(`(?m)^\s*server\s+\S+:8090\s+max_fails=\d+\s+fail_timeout=\S+;`).FindAllString(block, -1)
+	if len(servers) < 2 {
+		t.Fatalf("bridge upstream has %d replicas with passive failover settings, want at least 2", len(servers))
+	}
+}
+
+func TestFullProxyConfigLoadBalancesRelayReplicasWithoutRequestAffinity(t *testing.T) {
+	raw, err := os.ReadFile(fullProxyConfPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	blockMatch := regexp.MustCompile(`(?s)upstream\s+grasp_relay_backend\s*\{(.*?)\}`).FindStringSubmatch(string(raw))
+	if len(blockMatch) != 2 {
+		t.Fatal("missing grasp_relay_backend upstream block")
+	}
+	block := blockMatch[1]
+	if !strings.Contains(block, "least_conn;") {
+		t.Error("relay upstream does not load-balance WebSocket connections with least_conn")
+	}
+	servers := regexp.MustCompile(`(?m)^\s*server\s+grasp-bridge-[^:]+:3334\s+max_fails=\d+\s+fail_timeout=\S+;`).FindAllString(block, -1)
+	if len(servers) < 2 {
+		t.Fatalf("relay upstream has %d replicas with passive failover settings, want at least 2", len(servers))
+	}
+	if strings.Contains(block, "ip_hash") || strings.Contains(block, "hash ") || strings.Contains(block, "sticky") {
+		t.Error("relay upstream configures request affinity even though WebSocket state is connection-local")
+	}
+}
+
 // After the cutover no location may contact Gitea directly: that path would
 // bypass every bridge scope check.
 func TestFullProxyConfigNeverProxiesDirectlyToGitea(t *testing.T) {
@@ -277,6 +321,7 @@ func TestFullProxyConfigDisablesBufferingOnStreamingSurfaces(t *testing.T) {
 	for _, uri := range []string{
 		"/npub1abc/repo.git/git-receive-pack",
 		"/owner/repo.git/git-upload-pack",
+		"/owner/repo.git/info/lfs/objects/abc123",
 		"/api/packages/owner/generic/file",
 		"/v2/owner/image/blobs/uploads/abc",
 	} {

@@ -47,10 +47,16 @@ const (
 // back-pressure, logged quietly, not an outage.
 var ErrCleanupPending = errors.New("profile sync deferred: ephemeral PAT cleanup pending")
 
-// Store is the persistence the service needs. *store.SQLiteStore satisfies it.
-type Store interface {
+// IdentityStore is the shared identity-link projection every replica must read.
+type IdentityStore interface {
 	GetIdentityLinkByPubkey(ctx context.Context, pubkey string) (store.NostrIdentityLink, error)
 	ListIdentityLinksAfter(ctx context.Context, afterPubkey string, limit int) ([]store.NostrIdentityLink, error)
+}
+
+// Store is the local profile-sync cursor and cleanup persistence. SQLiteStore
+// satisfies it; identity reads can be redirected to the shared AuthStore.
+type Store interface {
+	IdentityStore
 	GetProfileSyncCursor(ctx context.Context, pubkey string, giteaUserID int64) (store.ProfileSyncCursor, error)
 	MarkNostrProfileSynced(ctx context.Context, pubkey string, giteaUserID int64, eventID string, eventCreatedAt int64, syncedAt time.Time) (bool, error)
 	ReserveProfileSyncPATCleanup(ctx context.Context, rec store.ProfileSyncPATCleanup, now time.Time) error
@@ -80,14 +86,15 @@ type Config struct {
 
 // Service runs the profile-sync sweeps, worker pool, and PAT reconciler.
 type Service struct {
-	store     Store
-	gitea     Gitea
-	relayURLs []string
-	interval  time.Duration
-	workers   int
-	policy    *policy.Store
-	logger    *slog.Logger
-	now       func() time.Time
+	store         Store
+	identityStore IdentityStore
+	gitea         Gitea
+	relayURLs     []string
+	interval      time.Duration
+	workers       int
+	policy        *policy.Store
+	logger        *slog.Logger
+	now           func() time.Time
 
 	queue     chan string
 	pendingMu sync.Mutex
@@ -129,15 +136,16 @@ func New(cfg Config, st Store, gc Gitea, relayURLs []string, logger *slog.Logger
 		cfg.Interval = 10 * time.Minute
 	}
 	svc := &Service{
-		store:     st,
-		gitea:     gc,
-		relayURLs: relayURLs,
-		interval:  cfg.Interval,
-		workers:   cfg.Workers,
-		logger:    logger.With("component", "profilesync"),
-		now:       func() time.Time { return time.Now() },
-		queue:     make(chan string, 1024),
-		pending:   make(map[string]struct{}),
+		store:         st,
+		identityStore: st,
+		gitea:         gc,
+		relayURLs:     relayURLs,
+		interval:      cfg.Interval,
+		workers:       cfg.Workers,
+		logger:        logger.With("component", "profilesync"),
+		now:           func() time.Time { return time.Now() },
+		queue:         make(chan string, 1024),
+		pending:       make(map[string]struct{}),
 	}
 	svc.fetch = func(ctx context.Context, pubkey string) (snapshot, error) {
 		relayURLs := svc.relayURLs
@@ -158,7 +166,15 @@ func New(cfg Config, st Store, gc Gitea, relayURLs []string, logger *slog.Logger
 	return svc
 }
 
-func (s *Service) SetPolicyStore(store *policy.Store) { s.policy = store }
+// SetIdentityStore directs identity reads to the shared transactional backend.
+// Call before Run; nil preserves the constructor's store.
+func (s *Service) SetIdentityStore(identityStore IdentityStore) {
+	if identityStore != nil {
+		s.identityStore = identityStore
+	}
+}
+
+func (s *Service) SetPolicyStore(policies *policy.Store) { s.policy = policies }
 
 func (s *Service) liveSettings() (bool, time.Duration, int) {
 	if snapshot := s.policy.Current(); snapshot != nil {
@@ -267,7 +283,7 @@ func (s *Service) sweeper(ctx context.Context) {
 func (s *Service) sweep(ctx context.Context) {
 	after := ""
 	for {
-		links, err := s.store.ListIdentityLinksAfter(ctx, after, sweepPageSize)
+		links, err := s.identityStore.ListIdentityLinksAfter(ctx, after, sweepPageSize)
 		if err != nil {
 			s.logger.Warn("profile sync sweep page failed", "error", err)
 			return
@@ -338,7 +354,7 @@ func (s *Service) userLock(giteaUserID int64) *sync.Mutex {
 // SyncPubkey synchronizes one linked pubkey's Gitea profile from its latest
 // kind:0. It is idempotent and safe to call repeatedly.
 func (s *Service) SyncPubkey(ctx context.Context, pubkey string) error {
-	link, err := s.store.GetIdentityLinkByPubkey(ctx, pubkey)
+	link, err := s.identityStore.GetIdentityLinkByPubkey(ctx, pubkey)
 	if err != nil {
 		if isNoRows(err) {
 			return nil // no longer linked
@@ -351,7 +367,7 @@ func (s *Service) SyncPubkey(ctx context.Context, pubkey string) error {
 	defer lock.Unlock()
 
 	// Re-read under the lock: the link is authoritative for the cursor and id.
-	link, err = s.store.GetIdentityLinkByPubkey(ctx, pubkey)
+	link, err = s.identityStore.GetIdentityLinkByPubkey(ctx, pubkey)
 	if err != nil {
 		if isNoRows(err) {
 			return nil

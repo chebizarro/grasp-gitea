@@ -19,6 +19,7 @@ export GRASP_EDGE_SECRET_FILE="$tmp/grasp-edge-shared-secret"
 export E2E_ADMIN_TOKEN="$admin_token"
 export E2E_EDGE_SECRET="$edge_secret"
 export GITEA_ADMIN_USER=e2e-admin
+export BRIDGE_TOKENS_ENABLED=true
 export GITEA_IMAGE="${GITEA_IMAGE:-gitea/gitea:1.24.6}"
 export GRASP_BRIDGE_IMAGE="${GRASP_BRIDGE_IMAGE:-grasp-bridge:phase1-e2e}"
 export E2E_GOPROXY="${E2E_GOPROXY:-$(go env GOPROXY)}"

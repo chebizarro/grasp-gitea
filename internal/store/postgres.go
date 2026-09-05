@@ -112,7 +112,40 @@ func (s *PostgresStore) Close() error { return s.db.Close() }
 // Ping verifies connectivity.
 func (s *PostgresStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
+// Name and Check let the shared auth backend participate in API readiness.
+func (s *PostgresStore) Name() string                    { return "postgres_auth_store" }
+func (s *PostgresStore) Check(ctx context.Context) error { return s.Ping(ctx) }
+
+// HasAuthState reports whether the store contains durable auth state.
+func (s *PostgresStore) HasAuthState(ctx context.Context) (bool, error) {
+	var present int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT CASE WHEN
+			EXISTS(SELECT 1 FROM nostr_identity_links) OR
+			EXISTS(SELECT 1 FROM bridge_tokens) OR
+			EXISTS(SELECT 1 FROM signer_grants)
+		THEN 1 ELSE 0 END
+	`).Scan(&present)
+	return present != 0, err
+}
+
+const schemaMigrationLeaseKey = int64(0x6772_6173_705f_6464) // "grasp_dd"
+
 func (s *PostgresStore) ensureSchema() error {
+	// CREATE TABLE IF NOT EXISTS is not race-free in Postgres system catalogs
+	// when two fresh replicas initialize the same schema concurrently. Serialize
+	// bootstrap DDL across every process using one session advisory lock.
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres schema connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, schemaMigrationLeaseKey); err != nil {
+		return fmt.Errorf("postgres schema lock: %w", err)
+	}
+	defer func() { _, _ = conn.ExecContext(ctx, `SELECT pg_advisory_unlock($1)`, schemaMigrationLeaseKey) }()
+
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS nip98_replay_claims (
 			event_id TEXT PRIMARY KEY,
@@ -142,6 +175,14 @@ func (s *PostgresStore) ensureSchema() error {
 			error TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			expires_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS bridge_signer_sessions (
+			bunker_uri TEXT PRIMARY KEY,
+			client_seckey_enc BYTEA NOT NULL,
+			client_pubkey TEXT NOT NULL,
+			signer_pubkey TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			last_ok_at TEXT NOT NULL DEFAULT ''
 		);`,
 		`CREATE TABLE IF NOT EXISTS signer_grants (
 			pubkey TEXT PRIMARY KEY,
@@ -215,7 +256,7 @@ func (s *PostgresStore) ensureSchema() error {
 		);`,
 	}
 	for _, stmt := range stmts {
-		if _, err := s.db.Exec(stmt); err != nil {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("postgres schema: %w", err)
 		}
 	}
@@ -409,6 +450,30 @@ func (s *PostgresStore) DeleteExpiredNIP46Sessions(ctx context.Context) (int64, 
 	return res.RowsAffected()
 }
 
+func (s *PostgresStore) UpsertSignerGrant(ctx context.Context, grant SignerGrant) error {
+	if grant.GrantedAt.IsZero() {
+		grant.GrantedAt = time.Now().UTC()
+	}
+	if grant.Status == "" {
+		grant.Status = "active"
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO signer_grants(pubkey, client_seckey_enc, bunker_uri_enc, relays, permissions, granted_at, revoked_at, last_ok_at, status)
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT(pubkey) DO UPDATE SET
+			client_seckey_enc = excluded.client_seckey_enc,
+			bunker_uri_enc = excluded.bunker_uri_enc,
+			relays = excluded.relays,
+			permissions = excluded.permissions,
+			granted_at = excluded.granted_at,
+			revoked_at = excluded.revoked_at,
+			last_ok_at = excluded.last_ok_at,
+			status = excluded.status
+	`, grant.Pubkey, grant.ClientSeckeyEnc, grant.BunkerURIEnc, grant.Relays, grant.Permissions,
+		ts(grant.GrantedAt), formatOptionalTime(grant.RevokedAt), formatOptionalTime(grant.LastOKAt), grant.Status)
+	return err
+}
+
 func (s *PostgresStore) GetSignerGrant(ctx context.Context, pubkey string) (SignerGrant, error) {
 	var grant SignerGrant
 	var grantedAt, revokedAt, lastOKAt string
@@ -430,6 +495,73 @@ func (s *PostgresStore) GetSignerGrant(ctx context.Context, pubkey string) (Sign
 		return SignerGrant{}, fmt.Errorf("parse last_ok_at for signer grant %s: %w", pubkey, err)
 	}
 	return grant, nil
+}
+
+func (s *PostgresStore) RevokeSignerGrant(ctx context.Context, pubkey string, at time.Time) error {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE signer_grants SET revoked_at = $1, status = 'revoked' WHERE pubkey = $2`, ts(at), pubkey)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *PostgresStore) RecordSignerGrantOK(ctx context.Context, pubkey string, at time.Time) error {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE signer_grants SET last_ok_at = $1 WHERE pubkey = $2`, ts(at), pubkey)
+	return err
+}
+
+func (s *PostgresStore) GetBridgeSignerSession(ctx context.Context, bunkerURI string) (BridgeSignerSession, error) {
+	var sess BridgeSignerSession
+	var createdAt, lastOKAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT bunker_uri, client_seckey_enc, client_pubkey, signer_pubkey, created_at, last_ok_at
+		FROM bridge_signer_sessions WHERE bunker_uri = $1`, bunkerURI).
+		Scan(&sess.BunkerURI, &sess.ClientSeckeyEnc, &sess.ClientPubkey, &sess.SignerPubkey, &createdAt, &lastOKAt)
+	if err != nil {
+		return BridgeSignerSession{}, err
+	}
+	if sess.CreatedAt, err = time.Parse(time.RFC3339, createdAt); err != nil {
+		return BridgeSignerSession{}, fmt.Errorf("parse created_at for bridge signer session: %w", err)
+	}
+	if sess.LastOKAt, err = parseOptionalTime(lastOKAt); err != nil {
+		return BridgeSignerSession{}, fmt.Errorf("parse last_ok_at for bridge signer session: %w", err)
+	}
+	return sess, nil
+}
+
+func (s *PostgresStore) UpsertBridgeSignerSession(ctx context.Context, sess BridgeSignerSession) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO bridge_signer_sessions(bunker_uri, client_seckey_enc, client_pubkey, signer_pubkey, created_at, last_ok_at)
+		VALUES($1, $2, $3, $4, $5, $6)
+		ON CONFLICT(bunker_uri) DO UPDATE SET
+			client_seckey_enc = excluded.client_seckey_enc,
+			client_pubkey = excluded.client_pubkey,
+			signer_pubkey = excluded.signer_pubkey,
+			last_ok_at = excluded.last_ok_at
+	`, sess.BunkerURI, sess.ClientSeckeyEnc, sess.ClientPubkey, sess.SignerPubkey,
+		ts(sess.CreatedAt), formatOptionalTime(sess.LastOKAt))
+	if err != nil {
+		return fmt.Errorf("upsert bridge signer session: %w", err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) TouchBridgeSignerSession(ctx context.Context, bunkerURI string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE bridge_signer_sessions SET last_ok_at = $1 WHERE bunker_uri = $2`, ts(at), bunkerURI)
+	return err
 }
 
 // --- Identity links ---
@@ -457,6 +589,67 @@ func (s *PostgresStore) GetIdentityLinkByPubkey(ctx context.Context, pubkey stri
 		}
 	}
 	return link, nil
+}
+
+func (s *PostgresStore) GetIdentityLinkByGiteaUserID(ctx context.Context, userID int64) (NostrIdentityLink, error) {
+	var link NostrIdentityLink
+	var createdAt, updatedAt, lastLoginAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT pubkey, npub, gitea_user_id, gitea_user, nip05, created_at, updated_at, last_login_at
+		FROM nostr_identity_links WHERE gitea_user_id = $1
+	`, userID).Scan(&link.Pubkey, &link.Npub, &link.GiteaUserID, &link.GiteaUser,
+		&link.NIP05, &createdAt, &updatedAt, &lastLoginAt)
+	if err != nil {
+		return NostrIdentityLink{}, err
+	}
+	if link.CreatedAt, err = time.Parse(time.RFC3339, createdAt); err != nil {
+		return NostrIdentityLink{}, fmt.Errorf("parse created_at for Gitea user %d: %w", userID, err)
+	}
+	if link.UpdatedAt, err = time.Parse(time.RFC3339, updatedAt); err != nil {
+		return NostrIdentityLink{}, fmt.Errorf("parse updated_at for Gitea user %d: %w", userID, err)
+	}
+	if lastLoginAt != "" {
+		if link.LastLoginAt, err = time.Parse(time.RFC3339, lastLoginAt); err != nil {
+			return NostrIdentityLink{}, fmt.Errorf("parse last_login_at for Gitea user %d: %w", userID, err)
+		}
+	}
+	return link, nil
+}
+
+func (s *PostgresStore) ListIdentityLinksAfter(ctx context.Context, afterPubkey string, limit int) ([]NostrIdentityLink, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT pubkey, npub, gitea_user_id, gitea_user, nip05, created_at, updated_at, last_login_at
+		FROM nostr_identity_links WHERE pubkey > $1 ORDER BY pubkey LIMIT $2
+	`, afterPubkey, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	links := make([]NostrIdentityLink, 0)
+	for rows.Next() {
+		var link NostrIdentityLink
+		var createdAt, updatedAt, lastLoginAt string
+		if err := rows.Scan(&link.Pubkey, &link.Npub, &link.GiteaUserID, &link.GiteaUser,
+			&link.NIP05, &createdAt, &updatedAt, &lastLoginAt); err != nil {
+			return nil, err
+		}
+		if link.CreatedAt, err = time.Parse(time.RFC3339, createdAt); err != nil {
+			return nil, fmt.Errorf("parse created_at for link %s: %w", link.Pubkey, err)
+		}
+		if link.UpdatedAt, err = time.Parse(time.RFC3339, updatedAt); err != nil {
+			return nil, fmt.Errorf("parse updated_at for link %s: %w", link.Pubkey, err)
+		}
+		if lastLoginAt != "" {
+			if link.LastLoginAt, err = time.Parse(time.RFC3339, lastLoginAt); err != nil {
+				return nil, fmt.Errorf("parse last_login_at for link %s: %w", link.Pubkey, err)
+			}
+		}
+		links = append(links, link)
+	}
+	return links, rows.Err()
 }
 
 func (s *PostgresStore) UpsertIdentityLink(ctx context.Context, link NostrIdentityLink) error {

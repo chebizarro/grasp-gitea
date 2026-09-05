@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -173,7 +174,7 @@ func reconcileHooksOnPolicyChange(ctx context.Context, policies *policy.Store, s
 	}
 }
 
-func newServerSigner(ctx context.Context, cfg config.Config, st *store.SQLiteStore, relayURLs []string, logger *slog.Logger) (publisher.ServerSigner, error) {
+func newServerSigner(ctx context.Context, cfg config.Config, st store.AuthStore, relayURLs []string, logger *slog.Logger) (publisher.ServerSigner, error) {
 	if cfg.SignetBunkerURL != "" {
 		if cfg.Production() && len(cfg.SignerMasterKey) != 32 {
 			return nil, errors.New("SIGNER_MASTER_KEY is required for production durable signing")
@@ -195,6 +196,31 @@ func newServerSigner(ctx context.Context, cfg config.Config, st *store.SQLiteSto
 	}
 	logger.Warn("using BRIDGE_NSEC development fallback for server signing; configure SIGNET_BUNKER_URL for production")
 	return publisher.NewLocalServerSigner(cfg.BridgeNsec)
+}
+
+type authStateInspector interface {
+	HasAuthState(ctx context.Context) (bool, error)
+}
+
+func guardPostgresTakeover(ctx context.Context, sqliteStore, postgresStore authStateInspector, allowEmptyTakeover bool) error {
+	if allowEmptyTakeover {
+		return nil
+	}
+	sqliteHasState, err := sqliteStore.HasAuthState(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect SQLite auth state: %w", err)
+	}
+	if !sqliteHasState {
+		return nil
+	}
+	postgresHasState, err := postgresStore.HasAuthState(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect Postgres auth state: %w", err)
+	}
+	if postgresHasState {
+		return nil
+	}
+	return errors.New("refusing empty Postgres auth-store takeover: SQLite contains identities, tokens, or signer grants; migrate the SQLite auth state before setting POSTGRES_DSN, or set POSTGRES_ALLOW_EMPTY_TAKEOVER=true to intentionally start fresh")
 }
 
 func main() {
@@ -222,6 +248,29 @@ func main() {
 		os.Exit(1)
 	}
 	defer st.Close()
+
+	// SQLite remains the store for repository/CI state. Auth, signer sessions,
+	// identity links, profile-sync identity reads, webhook actor lookup, and
+	// proxy audit/token state converge on Postgres when configured.
+	var sharedStore store.AuthStore = st
+	var postgresStore *store.PostgresStore
+	if cfg.PostgresDSN != "" {
+		postgresStore, err = store.OpenPostgres(cfg.PostgresDSN)
+		if err != nil {
+			logger.Error("failed to open shared Postgres auth store", "error", err)
+			os.Exit(1)
+		}
+		defer postgresStore.Close()
+		if err := guardPostgresTakeover(context.Background(), st, postgresStore, cfg.PostgresAllowEmptyTakeover); err != nil {
+			logger.Error("unsafe Postgres auth-store takeover", "sqlite_path", cfg.DBPath, "error", err)
+			os.Exit(1)
+		}
+		if cfg.PostgresAllowEmptyTakeover {
+			logger.Warn("empty Postgres auth-store takeover override enabled; SQLite auth-state migration guard bypassed")
+		}
+		sharedStore = postgresStore
+		logger.Info("shared Postgres auth store enabled")
+	}
 
 	giteaClient := gitea.NewClient(cfg.GiteaURL, cfg.GiteaAdminToken).WithAdminUser(cfg.GiteaAdminUser)
 	hookInstaller := hooks.NewInstaller(cfg.GiteaRepositoriesDir, cfg.HookBinaryPath, cfg.HookRelayURL)
@@ -282,7 +331,7 @@ func main() {
 
 	var signerSvc *signer.Service
 	if cfg.SignerEnabled() {
-		signerSvc, err = signer.NewService(st, cfg.SignerMasterKey, signer.WithTrustedMultiplexedBunkerURI(cfg.SignetBunkerURL))
+		signerSvc, err = signer.NewService(sharedStore, cfg.SignerMasterKey, signer.WithTrustedMultiplexedBunkerURI(cfg.SignetBunkerURL))
 		if err != nil {
 			logger.Error("failed to create signer service", "error", err)
 			os.Exit(1)
@@ -317,7 +366,7 @@ func main() {
 	// so the bridge does not hold an nsec. BRIDGE_NSEC remains only as an
 	// explicit dev fallback and is rejected when GRASP_ENV/APP_ENV/ENVIRONMENT
 	// is production.
-	serverSigner, err := newServerSigner(ctx, cfg, st, relayURLs, logger)
+	serverSigner, err := newServerSigner(ctx, cfg, sharedStore, relayURLs, logger)
 	if err != nil {
 		logger.Error("failed to create server signer", "error", err)
 		os.Exit(1)
@@ -429,6 +478,9 @@ func main() {
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
 	apiServer.SetPolicyStore(policies)
+	if postgresStore != nil {
+		apiServer.AddReadinessProbe(postgresStore)
+	}
 	if cfg.BridgeTokensEnabled {
 		registryTokenMonitor, monitorErr := registrytoken.New(
 			cfg.GiteaURL, cfg.GiteaAdminUser, cfg.GiteaAdminToken,
@@ -463,6 +515,7 @@ func main() {
 		Interval: cfg.ProfileSyncInterval,
 		Workers:  cfg.ProfileSyncWorkers,
 	}, st, giteaClient, relayURLs, logger)
+	profileSyncSvc.SetIdentityStore(sharedStore)
 	profileSyncSvc.SetPolicyStore(policies)
 	go func() {
 		defer close(profileSyncDone)
@@ -473,11 +526,11 @@ func main() {
 	}
 
 	if cfg.AuthEnabled {
-		authSvc := auth.NewService(cfg, st, logger)
-		identitySvc := auth.NewIdentityService(st, giteaClient, nip05Resolver, logger)
+		authSvc := auth.NewService(cfg, sharedStore, logger)
+		identitySvc := auth.NewIdentityService(sharedStore, giteaClient, nip05Resolver, logger)
 		identitySvc.SetProfileSyncNotifier(profileSyncSvc)
 		nip07Handler := auth.NewNIP07Handler(authSvc, identitySvc, relayURLs, logger)
-		nip46Handler := auth.NewNIP46Handler(st, identitySvc, relayURLs, cfg.BridgePublicURL, signerSvc, logger)
+		nip46Handler := auth.NewNIP46Handler(sharedStore, identitySvc, relayURLs, cfg.BridgePublicURL, signerSvc, logger)
 		nip46Handler.SetTrustedProxyCIDRs(cfg.NIP46TrustedProxyCIDRs)
 		go nip46Handler.RunCleanup(ctx)
 		if actorBackfiller != nil {
@@ -492,7 +545,7 @@ func main() {
 		logger.Info("Nostr auth routes enabled", "bridge_public_url", cfg.BridgePublicURL)
 
 		if cfg.BridgeTokensEnabled {
-			tokenSvc, err := auth.NewTokenService(cfg, st, identitySvc, giteaClient, logger)
+			tokenSvc, err := auth.NewTokenService(cfg, sharedStore, identitySvc, giteaClient, logger)
 			if err != nil {
 				logger.Error("failed to initialize bridge token service", "error", err)
 				os.Exit(1)
@@ -522,7 +575,7 @@ func main() {
 		GitBackendUser:     cfg.GitBackendUser,
 		GitBackendPassword: cfg.GitBackendPassword,
 		FullProxy:          cfg.FullProxyEnabled,
-	}, proxyAuthenticator, giteaClient, st, logger)
+	}, proxyAuthenticator, giteaClient, sharedStore, logger)
 	if err != nil {
 		logger.Error("failed to initialize Gitea proxy", "error", err)
 		os.Exit(1)
@@ -546,7 +599,7 @@ func main() {
 		webhookHandler.SetGraspPublicURL(cfg.GraspPublicURL)
 		webhookHandler.SetRepositoriesDir(cfg.GiteaRepositoriesDir)
 		if signerSvc != nil && signerSvc.Enabled() {
-			webhookHandler.SetActorSigning(signerSvc, outboxWorker, st)
+			webhookHandler.SetActorSigning(signerSvc, outboxWorker, sharedStore)
 		}
 		apiServer.SetWebhookHandler(webhookHandler)
 		logger.Info("Gitea webhook handler enabled for NIP-34 events")

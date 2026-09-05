@@ -6,6 +6,7 @@ package giteaproxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -304,6 +305,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.rejectForbidden(w, r, class, "token is missing scope "+class.Scope)
 			return
 		}
+		if isConanTokenExchange(r) {
+			// Echo the revocable, scope-checked bridge credential rather than
+			// allowing Gitea to mint a 24-hour union-scope package JWT.
+			p.audit(r, class, "allowed", principal.TokenID, principal.Pubkey)
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, cred.token)
+			return
+		}
 		login, pat, err := p.tokens.DownstreamPAT(r.Context(), principal.GiteaUserID, class.Scope)
 		if err != nil {
 			p.logger.Error("downstream credential unavailable",
@@ -328,6 +338,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) serveNostrProof(w http.ResponseWriter, r *http.Request, class Classification, pl *plan) bool {
 	if p.nostr == nil || !p.tokens.Enabled() {
 		p.rejectUnauthorized(w, r, class, "direct NIP-98 authentication is not enabled")
+		return false
+	}
+	if isConanTokenExchange(r) {
+		// Conan needs a reusable credential in the response. A one-shot NIP-98
+		// proof cannot safely be converted into one without bypassing bridge
+		// revocation or scope checks.
+		p.rejectForbidden(w, r, class, "NIP-98 authentication is not supported for Conan token exchange; use a bridge token")
 		return false
 	}
 	if class.Surface == SurfaceLFS {
@@ -609,6 +626,11 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 
 	// Defense in depth: no client-supplied internal header ever reaches Gitea.
 	stripInternalHeaders(pr.Out.Header)
+	if pl != nil && pl.class.Surface == SurfaceLFS && IsLFSBatchPath(pr.In.URL.Path) {
+		// Batch responses must be inspectable before any bridge-injected
+		// credential can be removed from their action headers.
+		pr.Out.Header.Set("Accept-Encoding", "identity")
+	}
 
 	if pl == nil {
 		stripCallerCredentials(pr.Out.Header)
@@ -656,6 +678,35 @@ func trustedPeer(remoteAddr string) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
+func lfsPublicAuthorization(pl *plan) string {
+	if pl != nil && pl.cred.kind == credentialBridgeToken {
+		return "Bearer " + pl.cred.token
+	}
+	return ""
+}
+
+func (p *Proxy) lfsHiddenAuthorization(pl *plan) string {
+	if pl == nil || !pl.injectedHidden {
+		return ""
+	}
+	user, password := pl.downstreamUser, pl.downstreamPAT
+	if password == "" && pl.npubSurface {
+		user, password = p.serviceUser, p.servicePassword
+	}
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+password))
+}
+
+func (p *Proxy) sanitizeLFSBatchResponse(resp *http.Response, pl *plan) {
+	if p.rewriteLFSBatchBody(resp, lfsPublicAuthorization(pl), p.lfsHiddenAuthorization(pl), pl.injectedHidden) {
+		return
+	}
+	replaceWithPlainText(resp, http.StatusBadGateway, "unsafe LFS batch response\n")
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("ETag")
+	resp.Header.Del("Digest")
+	resp.Header.Del("Content-MD5")
+}
+
 func (p *Proxy) modifyResponse(resp *http.Response) error {
 	pl, _ := resp.Request.Context().Value(planKey{}).(*plan)
 
@@ -675,7 +726,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 		// a public client.
 		if pl.class.Surface == SurfaceLFS && IsLFSBatchPath(resp.Request.URL.Path) &&
 			resp.StatusCode == http.StatusOK {
-			p.rewriteLFSBatchBody(resp)
+			p.sanitizeLFSBatchResponse(resp, pl)
 		}
 		// Mapped responses can still carry backend-origin redirects, which
 		// would leak the private Gitea address to public clients.
@@ -696,7 +747,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 
 	if pl != nil && pl.class.Surface == SurfaceLFS && IsLFSBatchPath(resp.Request.URL.Path) &&
 		resp.StatusCode == http.StatusOK {
-		p.rewriteLFSBatchBody(resp)
+		p.sanitizeLFSBatchResponse(resp, pl)
 	}
 
 	p.rewriteBackendOrigin(resp)

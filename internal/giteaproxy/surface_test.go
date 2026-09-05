@@ -103,6 +103,35 @@ func TestClassifyNonGitSurfaces(t *testing.T) {
 	}
 }
 
+func TestGitea124PackageCatalog(t *testing.T) {
+	families := []string{
+		"alpine", "arch", "cargo", "chef", "composer", "conan", "conda",
+		"cran", "debian", "generic", "go", "helm", "maven", "npm", "nuget",
+		"pub", "pypi", "rpm", "rubygems", "swift", "vagrant",
+	}
+	for _, family := range families {
+		path := "/api/packages/owner/" + family
+		if got := Classify(httptest.NewRequest(http.MethodGet, path, nil)).Scope; got != auth.ScopePackagesRead {
+			t.Errorf("GET %s scope = %q, want packages:read", path, got)
+		}
+		if got := Classify(httptest.NewRequest(http.MethodPut, path, nil)).Scope; got != auth.ScopePackagesWrite {
+			t.Errorf("PUT %s scope = %q, want packages:write", path, got)
+		}
+	}
+
+	for _, path := range []string{
+		"/api/packages/owner/unknown/file",
+		"/api/packages/owner/terraform/module", // not served by Gitea 1.24.6
+		"/api/packages/owner",
+		"/api/packages//npm/pkg",
+	} {
+		class := Classify(httptest.NewRequest(http.MethodGet, path, nil))
+		if class.Surface != SurfacePackages || class.Scope != "" {
+			t.Errorf("GET %s = surface %s scope %q, want packages with no bridge scope", path, class.Surface, class.Scope)
+		}
+	}
+}
+
 // TestRestrictedAPIPathsRefuseBridgeCredentials: endpoints that can mint or
 // manage durable credentials (or reveal the hidden PAT) never accept a
 // bridge credential, and non-canonical path spellings fail closed.

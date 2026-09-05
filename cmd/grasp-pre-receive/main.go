@@ -79,6 +79,9 @@ func main() {
 			if proposedErr == nil {
 				state = proposed
 			} else if err != nil {
+				if ctx.Err() != nil {
+					reject("push verification timed out")
+				}
 				reject("no valid NIP-34 state event found; publish kind 30618 before pushing")
 			}
 		}

@@ -17,6 +17,8 @@
 #   PKG_OWNER         owner for package upload tests (default: TEST_USER)
 #   PUBLIC_URL        the bridge's canonical public origin, to compare the
 #                     docker realm against ROOT_URL
+#   REGISTRY_JWT_MAX_LIFETIME_SECONDS
+#                     accepted registry JWT lifetime bound (default: 600)
 #
 # The script mints PATs for TEST_USER and uploads a scratch generic package;
 # both are deleted before exit.
@@ -28,6 +30,7 @@ set -u -o pipefail
 : "${GITEA_ADMIN_PAT:?set GITEA_ADMIN_PAT}"
 : "${TEST_USER:?set TEST_USER}"
 PKG_OWNER="${PKG_OWNER:-${TEST_USER}}"
+REGISTRY_JWT_MAX_LIFETIME_SECONDS="${REGISTRY_JWT_MAX_LIFETIME_SECONDS:-600}"
 GITEA_URL="${GITEA_URL%/}"
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
@@ -234,10 +237,10 @@ if [[ -n "${realm}" && -n "${USER_PAT}" ]]; then
     exp="$(jq -r '.exp // empty' <<<"${decoded}")"
     if [[ -n "${issued}" && -n "${exp}" ]]; then
       lifetime=$(( exp - issued ))
-      if (( lifetime <= 600 )); then
-        ok "registry JWT lifetime = ${lifetime}s (revocation bound; <= 600s)"
+      if (( lifetime <= REGISTRY_JWT_MAX_LIFETIME_SECONDS )); then
+        ok "registry JWT lifetime = ${lifetime}s (accepted bound; <= ${REGISTRY_JWT_MAX_LIFETIME_SECONDS}s)"
       else
-        bad "registry JWT lifetime = ${lifetime}s — exceeds the intended ~5min revocation bound; document or reduce before enabling tokens for docker"
+        bad "registry JWT lifetime = ${lifetime}s — exceeds the accepted ${REGISTRY_JWT_MAX_LIFETIME_SECONDS}s revocation bound; document or reduce before enabling tokens for docker"
       fi
     else
       note "could not decode JWT exp/(iat or nbf); inspect manually: ${tok_resp:0:120}..."
@@ -256,8 +259,8 @@ cat <<'EOF'
   [ ] app.ini: ROOT_URL equals the bridge's canonical public origin
   [ ] Gitea is unreachable from outside the private network (verify from an
       EXTERNAL host; docker compose config | grep -i published shows nothing)
-  [ ] Registry token lifetime: if step 7 exceeded 600s, check whether the
-      deployed Gitea version exposes a setting for it, or record the actual
+  [ ] Registry token lifetime: if step 7 exceeded the configured bound, check
+      whether the deployed Gitea version exposes a setting for it, or record the actual
       lifetime as the accepted revocation bound in the runbook
 EOF
 

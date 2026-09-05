@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"fiatjaf.com/nostr"
 
@@ -214,6 +215,32 @@ func TestSignWithGrantSignsViaPooledSigner(t *testing.T) {
 	}
 	if !event.VerifySignature() {
 		t.Fatal("signed event signature did not verify")
+	}
+}
+
+func TestSignWithGrantRefusesCachedSignerAfterGrantRevocation(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	signerSecret := nostr.Generate().Hex()
+	signerPubkey := mustPubkey(t, signerSecret)
+	fake := &fakeBunkerSigner{pubkey: signerPubkey, secret: signerSecret}
+	svc := newTestService(t, st, func(context.Context, string, string) (BunkerSigner, error) {
+		return fake, nil
+	})
+
+	if _, err := svc.CreateGrant(ctx, "bunker://"+signerPubkey+"?relay=wss://relay.example"); err != nil {
+		t.Fatalf("CreateGrant() error: %v", err)
+	}
+	if err := st.RevokeSignerGrant(ctx, signerPubkey, time.Now().UTC()); err != nil {
+		t.Fatalf("RevokeSignerGrant() error: %v", err)
+	}
+
+	err := svc.SignWithGrant(ctx, signerPubkey, &nostr.Event{Kind: nostr.KindTextNote, CreatedAt: nostr.Now()})
+	if !errors.Is(err, ErrNoGrant) {
+		t.Fatalf("SignWithGrant() error = %v, want ErrNoGrant after shared-store revocation", err)
+	}
+	if fake.signCount != 0 {
+		t.Fatalf("cached signer sign count = %d, want 0 after revocation", fake.signCount)
 	}
 }
 

@@ -593,6 +593,20 @@ func (s *SQLiteStore) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
+// HasAuthState reports whether the store contains durable state that must be
+// migrated before selecting a different auth backend.
+func (s *SQLiteStore) HasAuthState(ctx context.Context) (bool, error) {
+	var present int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT CASE WHEN
+			EXISTS(SELECT 1 FROM nostr_identity_links) OR
+			EXISTS(SELECT 1 FROM bridge_tokens) OR
+			EXISTS(SELECT 1 FROM signer_grants)
+		THEN 1 ELSE 0 END
+	`).Scan(&present)
+	return present != 0, err
+}
+
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }

@@ -1,8 +1,9 @@
 # Phase 6b — Active-active shared transactional store (design)
 
-Status: **design** (beads `phase1-09c`). This scopes the work; it is not yet
-implemented. The single-node reconciliation subsystem (`phase1-u11`) shipped
-independently and does not depend on this.
+Status: **implemented and locally verified** (beads `phase1-09c`). The
+single-node reconciliation subsystem (`phase1-u11`) shipped independently and
+does not depend on this. Production multi-node rollout remains a deploy-time
+task.
 
 ## Problem
 
@@ -212,8 +213,20 @@ backend swap covers.
    auth alone to Postgres would split-brain identity data. DSN wiring
    belongs with the consumer convergence in step 5.
 4. Advisory-lock maintenance leadership.
-5. Deploy two replicas behind the existing nginx; run the `phase1-fww`
-   load/chaos suite (needs real infra — that issue owns it).
+5. ✅ **SHIPPED / LOCALLY VERIFIED** — `POSTGRES_DSN` selects the shared
+   transactional auth store in `cmd/grasp-bridge/main.go`. Auth, signer and
+   bridge-signer sessions, identity resolution, profile-sync identity scans,
+   webhook actor lookup, proxy audit/token state, replay claims, and
+   maintenance leadership all use it. On an existing deployment, migrate the
+   SQLite `nostr_identity_links`, `bridge_tokens`, and `signer_grants` state
+   before enabling `POSTGRES_DSN`. Startup refuses an empty Postgres takeover
+   when any of those SQLite tables contain rows; operators intentionally
+   starting fresh may acknowledge the abandonment with
+   `POSTGRES_ALLOW_EMPTY_TAKEOVER=true`. `scripts/phase6-active-active-e2e.sh`
+   starts Postgres plus two bridge replicas behind nginx and proves cross-node
+   replay single-use, session handoff, maintenance single-holder behavior, and
+   identity/signer convergence. Production rollout and the broader load/chaos
+   suite remain owned by `phase1-fww`.
 
 ## Explicitly out of scope here
 
@@ -223,10 +236,12 @@ backend swap covers.
 - Anything that can only be validated on the deployed stack is gated behind
   live verification, exactly as the earlier phases were.
 
-## Why this is a design, not code, right now
+## Verification
 
-Steps 2–5 require a running Postgres and a two-node deployment to verify the
-distributed invariants — none of which exists in the dev environment, and
-each of which is a correctness-critical property that must be *tested*, not
-assumed. Step 1 (the interface extraction) is mechanical and safe to do now
-whenever we choose to start; it is filed as the first sub-PR.
+Run `scripts/phase6-active-active-e2e.sh`. It builds the bridge image, starts a
+fresh Postgres database and two independently persisted bridge replicas behind
+nginx, checks both replicas selected Postgres, and executes the distributed
+store invariants through two independent clients. The script always removes
+its containers and volumes. This is local deployment proof; production
+capacity, failover, and chaos validation remain deploy-time work in
+`phase1-fww`.

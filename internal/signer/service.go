@@ -1,6 +1,7 @@
 package signer
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -87,15 +88,27 @@ type GrantInfo struct {
 	GrantedAt    time.Time
 }
 
+type grantStore interface {
+	UpsertSignerGrant(ctx context.Context, grant store.SignerGrant) error
+	GetSignerGrant(ctx context.Context, pubkey string) (store.SignerGrant, error)
+	RecordSignerGrantOK(ctx context.Context, pubkey string, at time.Time) error
+}
+
+type cachedGrantSigner struct {
+	signer          BunkerSigner
+	clientSeckeyEnc []byte
+	bunkerURIEnc    []byte
+}
+
 type Service struct {
-	store                *store.SQLiteStore
+	store                grantStore
 	enabled              bool
 	masterKey            [32]byte
 	connector            BunkerConnector
 	trustedBunkerPubkeys map[string]struct{}
 
 	mu   sync.Mutex
-	pool map[string]BunkerSigner
+	pool map[string]cachedGrantSigner
 }
 
 type Option func(*Service)
@@ -125,11 +138,11 @@ func WithTrustedMultiplexedBunkerURI(bunkerURI string) Option {
 // NewService creates the persistent signer service. A nil/empty master key is a
 // safe disabled mode; callers can construct the service unconditionally and
 // check Enabled before exposing signer-dependent features.
-func NewService(st *store.SQLiteStore, masterKey []byte, opts ...Option) (*Service, error) {
+func NewService(st grantStore, masterKey []byte, opts ...Option) (*Service, error) {
 	svc := &Service{
 		store:                st,
 		connector:            connectNIP46Bunker,
-		pool:                 make(map[string]BunkerSigner),
+		pool:                 make(map[string]cachedGrantSigner),
 		trustedBunkerPubkeys: make(map[string]struct{}),
 	}
 	if len(masterKey) == 0 {
@@ -160,8 +173,8 @@ func (s *Service) Close() error {
 	}
 	s.mu.Lock()
 	pooled := make([]BunkerSigner, 0, len(s.pool))
-	for pubkey, bunker := range s.pool {
-		pooled = append(pooled, bunker)
+	for pubkey, cached := range s.pool {
+		pooled = append(pooled, cached.signer)
 		delete(s.pool, pubkey)
 	}
 	s.mu.Unlock()
@@ -252,7 +265,7 @@ func (s *Service) CreateGrant(ctx context.Context, bunkerURI string) (GrantInfo,
 		return GrantInfo{}, fmt.Errorf("store signer grant: %w", err)
 	}
 
-	s.cacheSigner(signerPubkey, bunker)
+	s.cacheSigner(signerPubkey, bunker, grant)
 	retained = true
 	return GrantInfo{Pubkey: signerPubkey, ClientPubkey: clientPubkey, Relays: relays, GrantedAt: now}, nil
 }
@@ -350,14 +363,9 @@ func (s *Service) signerForGrant(ctx context.Context, pubkey string) (BunkerSign
 		return nil, fmt.Errorf("%w: empty pubkey", ErrNoGrant)
 	}
 
-	if cached := s.cachedSigner(pubkey); cached != nil {
-		if err := cached.Ping(ctx); err == nil {
-			_ = s.store.RecordSignerGrantOK(ctx, pubkey, time.Now().UTC())
-			return cached, nil
-		}
-		s.evictSigner(pubkey)
-	}
-
+	// Re-read the shared grant before every signing operation. A healthy cached
+	// bunker connection is not proof that another replica has not revoked or
+	// replaced the durable authorization.
 	grant, err := s.store.GetSignerGrant(ctx, pubkey)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%w for pubkey %s", ErrNoGrant, pubkey)
@@ -366,7 +374,18 @@ func (s *Service) signerForGrant(ctx context.Context, pubkey string) (BunkerSign
 		return nil, fmt.Errorf("get signer grant: %w", err)
 	}
 	if grant.Status != grantStatusActive || grant.RevokedAt != nil {
+		s.evictSigner(pubkey)
 		return nil, fmt.Errorf("%w for pubkey %s: status=%s", ErrNoGrant, pubkey, grant.Status)
+	}
+
+	if cached, ok := s.cachedSigner(pubkey); ok {
+		if cached.matches(grant) {
+			if err := cached.signer.Ping(ctx); err == nil {
+				_ = s.store.RecordSignerGrantOK(ctx, pubkey, time.Now().UTC())
+				return cached.signer, nil
+			}
+		}
+		s.evictSigner(pubkey)
 	}
 
 	clientSecretKey, err := s.decryptSecret(grant.ClientSeckeyEnc)
@@ -400,34 +419,47 @@ func (s *Service) signerForGrant(ctx context.Context, pubkey string) (BunkerSign
 		return nil, fmt.Errorf("%w: ping signer %s: %v", ErrSignerOffline, pubkey, err)
 	}
 
-	s.cacheSigner(pubkey, bunker)
+	s.cacheSigner(pubkey, bunker, grant)
 	retained = true
 	_ = s.store.RecordSignerGrantOK(ctx, pubkey, time.Now().UTC())
 	return bunker, nil
 }
 
-func (s *Service) cachedSigner(pubkey string) BunkerSigner {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.pool[pubkey]
+func (c cachedGrantSigner) matches(grant store.SignerGrant) bool {
+	return bytes.Equal(c.clientSeckeyEnc, grant.ClientSeckeyEnc) &&
+		bytes.Equal(c.bunkerURIEnc, grant.BunkerURIEnc)
 }
 
-func (s *Service) cacheSigner(pubkey string, signer BunkerSigner) {
+func (s *Service) cachedSigner(pubkey string) (cachedGrantSigner, bool) {
 	s.mu.Lock()
-	previous := s.pool[pubkey]
-	s.pool[pubkey] = signer
+	defer s.mu.Unlock()
+	cached, ok := s.pool[pubkey]
+	return cached, ok
+}
+
+func (s *Service) cacheSigner(pubkey string, signer BunkerSigner, grant store.SignerGrant) {
+	cached := cachedGrantSigner{
+		signer:          signer,
+		clientSeckeyEnc: append([]byte(nil), grant.ClientSeckeyEnc...),
+		bunkerURIEnc:    append([]byte(nil), grant.BunkerURIEnc...),
+	}
+	s.mu.Lock()
+	previous, hadPrevious := s.pool[pubkey]
+	s.pool[pubkey] = cached
 	s.mu.Unlock()
-	if previous != signer {
-		closeBunkerSigner(previous)
+	if hadPrevious && previous.signer != signer {
+		closeBunkerSigner(previous.signer)
 	}
 }
 
 func (s *Service) evictSigner(pubkey string) {
 	s.mu.Lock()
-	previous := s.pool[pubkey]
+	previous, ok := s.pool[pubkey]
 	delete(s.pool, pubkey)
 	s.mu.Unlock()
-	closeBunkerSigner(previous)
+	if ok {
+		closeBunkerSigner(previous.signer)
+	}
 }
 
 func (s *Service) encryptSecret(plaintext string) ([]byte, error) {
