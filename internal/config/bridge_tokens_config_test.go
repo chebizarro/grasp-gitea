@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+	"time"
 )
 
 func setBridgeBaseEnv(t *testing.T) {
@@ -24,6 +25,8 @@ func setBridgeBaseEnv(t *testing.T) {
 	t.Setenv("BRIDGE_TOKEN_TTL_DEFAULT", "")
 	t.Setenv("BRIDGE_TOKEN_TTL_MIN", "")
 	t.Setenv("BRIDGE_TOKEN_TTL_MAX", "")
+	t.Setenv("REGISTRY_TOKEN_MAX_LIFETIME", "")
+	t.Setenv("REGISTRY_TOKEN_PROBE_INTERVAL", "")
 	t.Setenv("GRASP_ENV", "")
 	t.Setenv("AUTH_ENABLED", "")
 	t.Setenv("ADMIN_API_TOKEN", "")
@@ -111,6 +114,24 @@ func TestBridgeTokensConfigValidation(t *testing.T) {
 	}
 	if len(cfg.CredentialKeys) != 1 || cfg.CredentialKeys[0].ID != "current" {
 		t.Fatalf("credential keys = %+v", cfg.CredentialKeys)
+	}
+	if cfg.RegistryTokenMaxTTL != 24*time.Hour || cfg.RegistryTokenProbeEvery != 5*time.Minute {
+		t.Fatalf("registry monitor defaults = (%s, %s)", cfg.RegistryTokenMaxTTL, cfg.RegistryTokenProbeEvery)
+	}
+}
+
+func TestRegistryTokenMonitorConfigValidation(t *testing.T) {
+	setBridgeBaseEnv(t)
+	t.Setenv("BRIDGE_TOKENS_ENABLED", "true")
+	t.Setenv("REGISTRY_TOKEN_MAX_LIFETIME", "0s")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REGISTRY_TOKEN_MAX_LIFETIME") {
+		t.Fatalf("non-positive maximum lifetime accepted: %v", err)
+	}
+
+	t.Setenv("REGISTRY_TOKEN_MAX_LIFETIME", "10m")
+	t.Setenv("REGISTRY_TOKEN_PROBE_INTERVAL", "-1s")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REGISTRY_TOKEN_PROBE_INTERVAL") {
+		t.Fatalf("non-positive probe interval accepted: %v", err)
 	}
 }
 

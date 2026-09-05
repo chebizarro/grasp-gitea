@@ -44,6 +44,8 @@ var patStuckProvisioning atomic.Int64
 var profileSynced atomic.Int64
 var profileSyncPATCleanupFailures atomic.Int64
 var profileSyncRelayFailures atomic.Int64
+var registryTokenLifetimeSeconds atomic.Int64
+var registryTokenRevocationBoundExceeded atomic.Int64
 
 func IncAnnouncementReceived() {
 	announcementEventsReceived.Add(1)
@@ -215,6 +217,25 @@ func IncProfileSyncPATCleanupFailures() { profileSyncPATCleanupFailures.Add(1) }
 // unreachable, so a relay outage stays observable.
 func IncProfileSyncRelayFailure() { profileSyncRelayFailures.Add(1) }
 
+// SetRegistryTokenLifetimeSeconds records the exp-iat lifetime from the most
+// recently issued Gitea container-registry JWT.
+func SetRegistryTokenLifetimeSeconds(seconds int64) {
+	if seconds < 0 {
+		seconds = 0
+	}
+	registryTokenLifetimeSeconds.Store(seconds)
+}
+
+// SetRegistryTokenRevocationBoundExceeded reports whether the most recently
+// measured registry JWT lifetime exceeds the configured revocation bound.
+func SetRegistryTokenRevocationBoundExceeded(exceeded bool) {
+	if exceeded {
+		registryTokenRevocationBoundExceeded.Store(1)
+		return
+	}
+	registryTokenRevocationBoundExceeded.Store(0)
+}
+
 func Snapshot() map[string]int64 {
 	return map[string]int64{
 		"announcement_events_received":      announcementEventsReceived.Load(),
@@ -259,5 +280,7 @@ func Snapshot() map[string]int64 {
 		"profile_synced":                    profileSynced.Load(),
 		"profile_sync_pat_cleanup_failures": profileSyncPATCleanupFailures.Load(),
 		"profile_sync_relay_failures":       profileSyncRelayFailures.Load(),
+		"registry_token_lifetime_seconds":   registryTokenLifetimeSeconds.Load(),
+		"registry_token_bound_exceeded":     registryTokenRevocationBoundExceeded.Load(),
 	}
 }

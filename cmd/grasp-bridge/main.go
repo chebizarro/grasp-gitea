@@ -35,6 +35,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/publisher"
 	"github.com/sharegap/grasp-gitea/internal/reflector"
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
+	"github.com/sharegap/grasp-gitea/internal/registrytoken"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/safefetch"
 	"github.com/sharegap/grasp-gitea/internal/signer"
@@ -428,6 +429,20 @@ func main() {
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
 	apiServer.SetPolicyStore(policies)
+	if cfg.BridgeTokensEnabled {
+		registryTokenMonitor, monitorErr := registrytoken.New(
+			cfg.GiteaURL, cfg.GiteaAdminUser, cfg.GiteaAdminToken,
+			cfg.RegistryTokenMaxTTL, cfg.RegistryTokenProbeEvery,
+			nil, logger,
+		)
+		if monitorErr != nil {
+			logger.Error("failed to initialize registry token revocation-bound monitor", "error", monitorErr)
+			os.Exit(1)
+		}
+		apiServer.AddReadinessProbe(registryTokenMonitor)
+		go registryTokenMonitor.Run(ctx)
+		logger.Info("registry token revocation-bound monitor enabled", "accepted_bound", cfg.RegistryTokenMaxTTL.String(), "interval", cfg.RegistryTokenProbeEvery.String())
+	}
 	var bridgeTokenSvc *auth.TokenService
 	var proxyNostrVerifier *auth.ProxyNIP98Verifier
 	if relayRootHandler != nil {

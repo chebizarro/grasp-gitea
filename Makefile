@@ -1,10 +1,10 @@
 BRIDGE=grasp-bridge
 HOOK=grasp-pre-receive
 
-.PHONY: help build build-sidecar build-full run fmt lint-go test selftest phase3-e2e
+.PHONY: help build build-sidecar build-full run fmt lint-go test selftest phase1-deployment-e2e phase3-e2e
 
 help:
-	@echo "Targets: build build-sidecar build-full run fmt lint-go test selftest phase3-e2e"
+	@echo "Targets: build build-sidecar build-full run fmt lint-go test selftest phase1-deployment-e2e phase3-e2e"
 
 build: build-sidecar
 
@@ -31,6 +31,9 @@ test:
 selftest:
 	docker build -f Dockerfile.selftest -t grasp-gitea-selftest .
 	docker run --rm grasp-gitea-selftest
+
+phase1-deployment-e2e:
+	bash ./scripts/phase1-deployment-e2e.sh
 
 phase3-e2e:
 	bash ./scripts/phase3-e2e.sh

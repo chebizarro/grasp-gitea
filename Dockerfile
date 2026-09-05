@@ -1,5 +1,6 @@
 FROM golang:1.25-alpine AS build
 ARG BUILD_TAGS=""
+ARG GOPROXY=""
 RUN apk add --no-cache build-base git ca-certificates
 WORKDIR /src
 COPY go.mod go.sum ./

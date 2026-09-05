@@ -128,11 +128,13 @@ type Config struct {
 	EdgeSharedSecret string
 	// FullProxyEnabled routes ALL unmatched HTTP traffic through the bridge to
 	// Gitea (full reverse proxy mode) instead of only canonical npub paths.
-	FullProxyEnabled   bool
-	TokenTTLDefault    time.Duration
-	TokenTTLMin        time.Duration
-	TokenTTLMax        time.Duration
-	AuthAuditRetention time.Duration
+	FullProxyEnabled        bool
+	TokenTTLDefault         time.Duration
+	TokenTTLMin             time.Duration
+	TokenTTLMax             time.Duration
+	AuthAuditRetention      time.Duration
+	RegistryTokenMaxTTL     time.Duration
+	RegistryTokenProbeEvery time.Duration
 	// ShutdownGrace bounds graceful HTTP shutdown; long enough for active
 	// streaming git/package uploads to complete.
 	ShutdownGrace time.Duration
@@ -231,6 +233,8 @@ func Load() (Config, error) {
 		TokenTTLMin:             durationEnv("BRIDGE_TOKEN_TTL_MIN", time.Hour),
 		TokenTTLMax:             durationEnv("BRIDGE_TOKEN_TTL_MAX", 90*24*time.Hour),
 		AuthAuditRetention:      boundedDurationEnv("AUTH_AUDIT_RETENTION", 90*24*time.Hour, 24*time.Hour, 365*24*time.Hour),
+		RegistryTokenMaxTTL:     durationEnv("REGISTRY_TOKEN_MAX_LIFETIME", 24*time.Hour),
+		RegistryTokenProbeEvery: durationEnv("REGISTRY_TOKEN_PROBE_INTERVAL", 5*time.Minute),
 		ShutdownGrace:           boundedDurationEnv("SHUTDOWN_GRACE", 5*time.Minute, time.Second, 30*time.Minute),
 	}
 	_, policyStatErr := os.Stat(cfg.PolicyPath)
@@ -340,6 +344,12 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("BRIDGE_TOKEN_TTL_DEFAULT must be within [BRIDGE_TOKEN_TTL_MIN, BRIDGE_TOKEN_TTL_MAX]")
 	}
 	if cfg.BridgeTokensEnabled {
+		if cfg.RegistryTokenMaxTTL <= 0 {
+			return Config{}, fmt.Errorf("REGISTRY_TOKEN_MAX_LIFETIME must be positive")
+		}
+		if cfg.RegistryTokenProbeEvery <= 0 {
+			return Config{}, fmt.Errorf("REGISTRY_TOKEN_PROBE_INTERVAL must be positive")
+		}
 		if !cfg.AuthEnabled {
 			return Config{}, fmt.Errorf("AUTH_ENABLED=true is required when BRIDGE_TOKENS_ENABLED=true; token minting is NIP-98 authenticated")
 		}

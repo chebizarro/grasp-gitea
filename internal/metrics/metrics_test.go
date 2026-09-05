@@ -35,6 +35,8 @@ func TestSnapshotInitiallyZero(t *testing.T) {
 	bridgeSignedFallback.Store(0)
 	unlinkedActorSkipped.Store(0)
 	actorEventsBackfilled.Store(0)
+	registryTokenLifetimeSeconds.Store(0)
+	registryTokenRevocationBoundExceeded.Store(0)
 
 	snap := Snapshot()
 	for key, val := range snap {
@@ -115,6 +117,8 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 	IncActorEventsBackfilled()
 	IncActorEventsBackfilled()
 	IncActorEventsBackfilled()
+	SetRegistryTokenLifetimeSeconds(300)
+	SetRegistryTokenRevocationBoundExceeded(true)
 
 	snap := Snapshot()
 	expected := map[string]int64{
@@ -146,6 +150,8 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 		"bridge_signed_fallback":          1,
 		"unlinked_actor_skipped":          2,
 		"actor_events_backfilled":         3,
+		"registry_token_lifetime_seconds": 300,
+		"registry_token_bound_exceeded":   1,
 	}
 	for key, want := range expected {
 		if got := snap[key]; got != want {
@@ -185,6 +191,8 @@ func TestSnapshotReturnsAllKeys(t *testing.T) {
 		"bridge_signed_fallback",
 		"unlinked_actor_skipped",
 		"actor_events_backfilled",
+		"registry_token_lifetime_seconds",
+		"registry_token_bound_exceeded",
 	}
 	for _, key := range requiredKeys {
 		if _, ok := snap[key]; !ok {
