@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -109,11 +110,20 @@ type Issue struct {
 
 type PullRequest struct {
 	ID      int64  `json:"id"`
+	User    User   `json:"user"`
 	Index   int64  `json:"index"`
 	Number  int64  `json:"number,omitempty"`
 	Title   string `json:"title"`
+	Body    string `json:"body,omitempty"`
 	State   string `json:"state"`
 	HTMLURL string `json:"html_url"`
+	Head    struct {
+		Ref string `json:"ref"`
+		SHA string `json:"sha"`
+	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
 }
 
 type IssueComment struct {
@@ -515,6 +525,58 @@ func (c *Client) CreatePullRequest(ctx context.Context, owner string, repo strin
 		return PullRequest{}, err
 	}
 	return parsePullRequest(resp)
+}
+
+// FindPullRequestsByHead lists open and closed pull requests whose source
+// branch exactly matches head. Filtering is client-side because Gitea's head
+// query syntax varies across supported releases.
+func (c *Client) FindPullRequestsByHead(ctx context.Context, owner, repo, head string) ([]PullRequest, error) {
+	var out []PullRequest
+	for page := 1; ; page++ {
+		path := "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repo) + "/pulls?state=all&limit=50&page=" + strconv.Itoa(page)
+		resp, err := c.doJSON(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			if IsNotFound(err) {
+				return out, nil
+			}
+			return nil, err
+		}
+		var batch []PullRequest
+		if err := json.Unmarshal(resp, &batch); err != nil {
+			return nil, fmt.Errorf("decode Gitea pull request list: %w", err)
+		}
+		for _, pr := range batch {
+			if pr.Head.Ref == head {
+				out = append(out, pr)
+			}
+		}
+		if len(batch) < 50 {
+			return out, nil
+		}
+	}
+}
+
+// ListIssueComments lists every comment on an issue or pull request.
+func (c *Client) ListIssueComments(ctx context.Context, owner, repo string, index int64) ([]IssueComment, error) {
+	var out []IssueComment
+	for page := 1; ; page++ {
+		path := "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repo) + "/issues/" + fmt.Sprint(index) + "/comments?limit=50&page=" + strconv.Itoa(page)
+		resp, err := c.doJSON(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			if IsNotFound(err) {
+				return out, nil
+			}
+			return nil, err
+		}
+		var batch []IssueComment
+		if err := json.Unmarshal(resp, &batch); err != nil {
+			return nil, fmt.Errorf("decode Gitea issue comments: %w", err)
+		}
+		out = append(out, batch...)
+		if len(batch) < 50 {
+			return out, nil
+		}
+	}
 }
 
 // CreateIssueComment creates a comment on a Gitea issue or pull request index.

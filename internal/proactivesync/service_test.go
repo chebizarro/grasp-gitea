@@ -488,29 +488,26 @@ func TestSyncOnceIgnoresStateEventThatOnlyTagsOwner(t *testing.T) {
 	}
 }
 
-func TestQueryRelayHistoryPaginatesWithUntil(t *testing.T) {
+func TestQueryRelayHistoryEnforcesTotalCap(t *testing.T) {
 	svc := New(t.TempDir(), nil, testLogger())
 	var calls int
 	svc.queryRelay = func(_ context.Context, _ string, filter nostr.Filter) ([]*nostr.Event, error) {
 		calls++
-		if filter.Until == 0 {
-			return []*nostr.Event{{CreatedAt: 30}, {CreatedAt: 20}}, nil
+		if filter.Limit != 2 {
+			t.Fatalf("relay query limit = %d, want 2", filter.Limit)
 		}
-		if filter.Until == 19 {
-			return []*nostr.Event{{CreatedAt: 10}}, nil
-		}
-		return nil, nil
+		return []*nostr.Event{{CreatedAt: 30}, {CreatedAt: 20}, {CreatedAt: 10}}, nil
 	}
 
 	events, err := svc.queryRelayHistory(context.Background(), "wss://relay.example.com", nostr.Filter{}, 2)
 	if err != nil {
 		t.Fatalf("queryRelayHistory() error: %v", err)
 	}
-	if len(events) != 3 {
-		t.Fatalf("events = %d, want 3", len(events))
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want hard cap 2", len(events))
 	}
-	if calls != 2 {
-		t.Fatalf("query calls = %d, want 2", calls)
+	if calls != 1 {
+		t.Fatalf("query calls = %d, want 1", calls)
 	}
 }
 
@@ -802,5 +799,16 @@ func TestSyncOnceAcceptsMaintainerSignedState(t *testing.T) {
 	defer git.mu.Unlock()
 	if got := git.updates[repoPath+"|refs/heads/main"]; got != stateSHA {
 		t.Fatalf("expected maintainer-signed state to update main to %s, got %q", stateSHA, got)
+	}
+}
+
+func TestOrderProposalEventsParentsBeforeReplies(t *testing.T) {
+	rootID := strings.Repeat("1", 64)
+	replyID := strings.Repeat("2", 64)
+	root := &nostr.Event{ID: nostr.MustIDFromHex(rootID), Kind: relay.KindPatch, CreatedAt: 20}
+	reply := &nostr.Event{ID: nostr.MustIDFromHex(replyID), Kind: relay.KindPatch, CreatedAt: 10, Tags: nostr.Tags{{"e", rootID, "", "reply"}}}
+	ordered := orderProposalEvents([]*nostr.Event{reply, root})
+	if len(ordered) != 2 || ordered[0].ID.Hex() != rootID || ordered[1].ID.Hex() != replyID {
+		t.Fatalf("proposal order = %v, want root then reply", []string{ordered[0].ID.Hex(), ordered[1].ID.Hex()})
 	}
 }

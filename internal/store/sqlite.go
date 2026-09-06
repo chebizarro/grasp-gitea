@@ -216,8 +216,9 @@ type SQLiteStore struct {
 	// userLocks implements WithUserLock for the single-node backend: an
 	// in-process striped mutex. Cross-node exclusion is the Postgres
 	// backend's job (advisory locks).
-	userLocks   [64]sync.Mutex
-	tenantLocks [64]sync.Mutex
+	userLocks     [64]sync.Mutex
+	tenantLocks   [64]sync.Mutex
+	proposalLocks [64]sync.Mutex
 }
 
 // WithUserLock runs fn while holding an exclusive per-Gitea-user lock.
@@ -283,6 +284,33 @@ func Open(path string) (*SQLiteStore, error) {
 			echo_armed_at TEXT NOT NULL DEFAULT '',
 			echo_fingerprint TEXT NOT NULL DEFAULT ''
 		);`,
+		`CREATE TABLE IF NOT EXISTS nip34_proposals (
+			repository_address TEXT NOT NULL,
+			root_event_id TEXT NOT NULL,
+			gitea_repo_id INTEGER NOT NULL,
+			root_submitter_pubkey TEXT NOT NULL DEFAULT '',
+			recovery_nonce TEXT NOT NULL DEFAULT '',
+			gitea_creator TEXT NOT NULL DEFAULT '',
+			gitea_pr_id INTEGER NOT NULL DEFAULT 0,
+			gitea_pr_number INTEGER NOT NULL,
+			head_branch TEXT NOT NULL,
+			head_ref_sha TEXT NOT NULL DEFAULT '',
+			base_branch TEXT NOT NULL,
+			latest_event_id TEXT NOT NULL,
+			latest_created_at INTEGER NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (repository_address, root_event_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS nip34_proposal_events (
+			event_id TEXT PRIMARY KEY,
+			repository_address TEXT NOT NULL,
+			root_event_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			failure_class TEXT NOT NULL DEFAULT '',
+			failure_detail TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_nip34_proposal_events_root ON nip34_proposal_events(repository_address, root_event_id);`,
 		`CREATE TABLE IF NOT EXISTS pending_nostr_refs (
 			event_id TEXT NOT NULL,
 			tip_sha TEXT NOT NULL,
@@ -596,6 +624,17 @@ func Open(path string) (*SQLiteStore, error) {
 	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_state_digest TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_state_event_id TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE mappings ADD COLUMN last_state_published_at TEXT NOT NULL DEFAULT ''`)
+
+	for _, column := range []struct{ name, definition string }{
+		{"root_submitter_pubkey", "TEXT NOT NULL DEFAULT ''"},
+		{"recovery_nonce", "TEXT NOT NULL DEFAULT ''"},
+		{"gitea_creator", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := ensureSQLiteColumn(db, "nip34_proposals", column.name, column.definition); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate proposal recovery metadata: %w", err)
+		}
+	}
 
 	// Migration: add reflected-event head branch and echo guard columns. Existing
 	// rows keep an empty head branch and are treated as pending bridge-origin

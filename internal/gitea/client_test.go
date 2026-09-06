@@ -571,3 +571,29 @@ func TestIssueAPIs(t *testing.T) {
 		t.Fatalf("state = %q", updated.State)
 	}
 }
+
+func TestProposalRecoveryQueries(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls"):
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 1, "index": 1, "body": "other", "head": map[string]any{"ref": "other"}, "base": map[string]any{"ref": "main"}},
+				{"id": 2, "index": 2, "body": "marker", "head": map[string]any{"ref": "proposal"}, "base": map[string]any{"ref": "main"}},
+			})
+		case strings.HasSuffix(r.URL.Path, "/comments"):
+			_ = json.NewEncoder(w).Encode([]IssueComment{{ID: 3, Body: "proposal update marker"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+	c := NewClient(ts.URL, "tok")
+	prs, err := c.FindPullRequestsByHead(context.Background(), "org", "repo", "proposal")
+	if err != nil || len(prs) != 1 || prs[0].Index != 2 || prs[0].Body != "marker" {
+		t.Fatalf("pull lookup=%+v err=%v", prs, err)
+	}
+	comments, err := c.ListIssueComments(context.Background(), "org", "repo", 2)
+	if err != nil || len(comments) != 1 || comments[0].ID != 3 {
+		t.Fatalf("comment lookup=%+v err=%v", comments, err)
+	}
+}

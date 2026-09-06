@@ -147,6 +147,36 @@ func (s *PostgresStore) ensureSchema() error {
 	defer func() { _, _ = conn.ExecContext(ctx, `SELECT pg_advisory_unlock($1)`, schemaMigrationLeaseKey) }()
 
 	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS nip34_proposals (
+			repository_address TEXT NOT NULL,
+			root_event_id TEXT NOT NULL,
+			gitea_repo_id BIGINT NOT NULL,
+			root_submitter_pubkey TEXT NOT NULL DEFAULT '',
+			recovery_nonce TEXT NOT NULL DEFAULT '',
+			gitea_creator TEXT NOT NULL DEFAULT '',
+			gitea_pr_id BIGINT NOT NULL DEFAULT 0,
+			gitea_pr_number BIGINT NOT NULL,
+			head_branch TEXT NOT NULL,
+			head_ref_sha TEXT NOT NULL DEFAULT '',
+			base_branch TEXT NOT NULL,
+			latest_event_id TEXT NOT NULL,
+			latest_created_at BIGINT NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (repository_address, root_event_id)
+		);`,
+		`ALTER TABLE nip34_proposals ADD COLUMN IF NOT EXISTS root_submitter_pubkey TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE nip34_proposals ADD COLUMN IF NOT EXISTS recovery_nonce TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE nip34_proposals ADD COLUMN IF NOT EXISTS gitea_creator TEXT NOT NULL DEFAULT '';`,
+		`CREATE TABLE IF NOT EXISTS nip34_proposal_events (
+			event_id TEXT PRIMARY KEY,
+			repository_address TEXT NOT NULL,
+			root_event_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			failure_class TEXT NOT NULL DEFAULT '',
+			failure_detail TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_nip34_proposal_events_root ON nip34_proposal_events(repository_address, root_event_id);`,
 		`CREATE TABLE IF NOT EXISTS nip98_replay_claims (
 			event_id TEXT PRIMARY KEY,
 			pubkey TEXT NOT NULL,

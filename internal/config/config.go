@@ -32,6 +32,11 @@ type Config struct {
 	// Empty preserves the single-node SQLite fallback.
 	PostgresDSN                string
 	PostgresAllowEmptyTakeover bool
+	// BridgeReplicaCount makes the SQLite single-process restriction explicit.
+	// Multi-replica bridge deployments require Postgres coordination.
+	BridgeReplicaCount           int
+	MaxProposalPatchBytes        int
+	ProposalSubmitterConcurrency int
 
 	PubkeyAllowlist        map[string]struct{}
 	ProvisionRateLimit     int
@@ -180,8 +185,11 @@ func Load() (Config, error) {
 		Listen:               envOrDefault("LISTEN", ":8090"),
 		DBPath:               envOrDefault("DB_PATH", "./mappings.db"),
 
-		PostgresDSN:                strings.TrimSpace(os.Getenv("POSTGRES_DSN")),
-		PostgresAllowEmptyTakeover: boolEnv("POSTGRES_ALLOW_EMPTY_TAKEOVER", false),
+		PostgresDSN:                  strings.TrimSpace(os.Getenv("POSTGRES_DSN")),
+		PostgresAllowEmptyTakeover:   boolEnv("POSTGRES_ALLOW_EMPTY_TAKEOVER", false),
+		BridgeReplicaCount:           boundedIntEnv("BRIDGE_REPLICA_COUNT", 1, 1, 1024),
+		MaxProposalPatchBytes:        boundedIntEnv("MAX_PROPOSAL_PATCH_BYTES", 8<<20, 1024, 128<<20),
+		ProposalSubmitterConcurrency: boundedIntEnv("PROPOSAL_SUBMITTER_CONCURRENCY", 2, 1, 64),
 
 		PubkeyAllowlist:             parseAllowlist(os.Getenv("PUBKEY_ALLOWLIST")),
 		ProvisionRateLimit:          intEnv("PROVISION_RATE_LIMIT", 0),
@@ -300,6 +308,9 @@ func Load() (Config, error) {
 
 	if cfg.GiteaAdminToken == "" {
 		return Config{}, fmt.Errorf("GITEA_ADMIN_TOKEN is required")
+	}
+	if cfg.PostgresDSN == "" && cfg.BridgeReplicaCount > 1 {
+		return Config{}, fmt.Errorf("POSTGRES_DSN is required when BRIDGE_REPLICA_COUNT is greater than 1; SQLite supports a single bridge process only")
 	}
 
 	if cfg.ClonePrefix == "" {

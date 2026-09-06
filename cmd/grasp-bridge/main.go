@@ -281,6 +281,7 @@ func main() {
 	// identity links, profile-sync identity reads, webhook actor lookup, and
 	// proxy audit/token state converge on Postgres when configured.
 	var sharedStore store.AuthStore = st
+	var proposalStore store.ProposalStore = st
 	var postgresStore *store.PostgresStore
 	if cfg.PostgresDSN != "" {
 		postgresStore, err = store.OpenPostgres(cfg.PostgresDSN)
@@ -297,7 +298,8 @@ func main() {
 			logger.Warn("empty Postgres auth-store takeover override enabled; SQLite auth-state migration guard bypassed")
 		}
 		sharedStore = postgresStore
-		logger.Info("shared Postgres auth store enabled")
+		proposalStore = postgresStore
+		logger.Info("shared Postgres auth and proposal store enabled")
 	}
 
 	giteaClient := gitea.NewClient(cfg.GiteaURL, cfg.GiteaAdminToken).WithAdminUser(cfg.GiteaAdminUser)
@@ -402,11 +404,6 @@ func main() {
 	}
 
 	proactiveSyncDone := make(chan struct{})
-	go func() {
-		defer close(proactiveSyncDone)
-		proactiveSyncSvc.Run(ctx, cfg.ProactiveSyncInterval)
-	}()
-	logger.Info("GRASP-02 proactive sync scheduler started", "interval", cfg.ProactiveSyncInterval.String())
 
 	refsNostrReaper := refsnostr.NewReaper(
 		st,
@@ -681,11 +678,20 @@ func main() {
 	}
 
 	reflectorSvc := reflector.New(st, giteaClient, cfg.GiteaRepositoriesDir, logger)
+	reflectorSvc.SetProposalStore(proposalStore)
+	reflectorSvc.SetGiteaCreator(cfg.GiteaAdminUser)
+	reflectorSvc.SetProposalSecurityLimits(cfg.MaxProposalPatchBytes, cfg.ProposalSubmitterConcurrency)
 	reflectorSvc.SetOwnershipDiagnoser(ownershipMonitor.Diagnose)
 	reflectorSvc.SetStatusSyncEnabled(cfg.NIP34StatusSyncEnabled)
 	if publisherSvc != nil && publisherSvc.Enabled() {
 		reflectorSvc.SetPatchRejectionPublisher(publisherSvc)
 	}
+	proactiveSyncSvc.SetCollaborationHandler(reflectorSvc.HandleEvent)
+	go func() {
+		defer close(proactiveSyncDone)
+		proactiveSyncSvc.Run(ctx, cfg.ProactiveSyncInterval)
+	}()
+	logger.Info("GRASP-02 proactive sync scheduler started", "interval", cfg.ProactiveSyncInterval.String())
 
 	// A fixed set of striped locks serialises state-event processing (CI +
 	// proactive sync) without retaining attacker-controlled repository keys.

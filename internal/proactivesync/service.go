@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -71,15 +72,20 @@ type realTicker struct {
 func (t realTicker) C() <-chan time.Time { return t.Ticker.C }
 
 type Service struct {
-	repositoriesDir    string
-	orgResolver        OrgResolver
-	mappingLister      MappingLister
-	logger             *slog.Logger
-	git                gitRunner
-	queryRelay         relayQueryFunc
-	newTicker          func(time.Duration) syncTicker
-	ownershipDiagnoser func(repoPath string) string
+	repositoriesDir      string
+	orgResolver          OrgResolver
+	mappingLister        MappingLister
+	logger               *slog.Logger
+	git                  gitRunner
+	queryRelay           relayQueryFunc
+	newTicker            func(time.Duration) syncTicker
+	ownershipDiagnoser   func(repoPath string) string
+	collaborationHandler relay.Handler
 }
+
+// SetCollaborationHandler routes historical collaboration events through the
+// same idempotent materializer used by the live subscriber.
+func (s *Service) SetCollaborationHandler(handler relay.Handler) { s.collaborationHandler = handler }
 
 // SetOwnershipDiagnoser attaches refs/objects ownership details to Git
 // permission failures without coupling synchronization to a repair policy.
@@ -463,7 +469,13 @@ func (s *Service) syncMapping(ctx context.Context, mapping store.Mapping) error 
 		}
 
 		prEvents := s.fetchPREvents(ctx, mapping, relayURLs)
-		for _, ev := range prEvents {
+		for _, ev := range orderProposalEvents(prEvents) {
+			if ev.Kind == relay.KindPatch && s.collaborationHandler != nil {
+				if err := s.collaborationHandler(ctx, ev, "historical"); err != nil {
+					s.logRepositoryFailure("proactive sync proposal materialization failed", mapping, repoPath, ev.ID.Hex(), err)
+				}
+				continue
+			}
 			if err := s.fetchPRTip(ctx, repoPath, ev); err != nil {
 				s.logRepositoryFailure("proactive sync PR tip fetch failed", mapping, repoPath, ev.ID.Hex(), err)
 			}
@@ -565,14 +577,20 @@ func (s *Service) fetchLatestStateEvent(ctx context.Context, mapping store.Mappi
 func (s *Service) fetchPREvents(ctx context.Context, mapping store.Mapping, relayURLs []string) []*nostr.Event {
 	coord := repoCoordinate(mapping)
 	filter := nostr.Filter{
-		Kinds: []nostr.Kind{relay.KindPROpen, relay.KindPRUpdate},
+		Kinds: []nostr.Kind{relay.KindPatch, relay.KindPROpen, relay.KindPRUpdate},
 		Tags:  nostr.TagMap{"a": []string{coord}},
 		Limit: prQueryLimit,
 	}
 	seen := map[string]bool{}
 	var out []*nostr.Event
+	queried := 0
 	for _, relayURL := range relayURLs {
-		events, err := s.queryRelayHistory(ctx, relayURL, filter, prQueryLimit)
+		remaining := prQueryLimit - queried
+		if remaining <= 0 {
+			break
+		}
+		events, err := s.queryRelayHistory(ctx, relayURL, filter, remaining)
+		queried += len(events)
 		if err != nil {
 			s.logger.Warn("proactive sync PR relay query failed", "relay", relayURL, "repo_id", mapping.RepoID, "error", err)
 			continue
@@ -591,15 +609,85 @@ func (s *Service) fetchPREvents(ctx context.Context, mapping store.Mapping, rela
 	return out
 }
 
-func (s *Service) queryRelayHistory(ctx context.Context, relayURL string, base nostr.Filter, pageLimit int) ([]*nostr.Event, error) {
-	if pageLimit <= 0 {
-		pageLimit = 100
+func orderProposalEvents(events []*nostr.Event) []*nostr.Event {
+	less := func(a, b *nostr.Event) bool {
+		if a.CreatedAt != b.CreatedAt {
+			return a.CreatedAt < b.CreatedAt
+		}
+		return a.ID.Hex() < b.ID.Hex()
+	}
+	patches := make(map[string]*nostr.Event)
+	var legacy []*nostr.Event
+	for _, ev := range events {
+		if ev.Kind == relay.KindPatch {
+			patches[ev.ID.Hex()] = ev
+		} else {
+			legacy = append(legacy, ev)
+		}
+	}
+	indegree := make(map[string]int, len(patches))
+	children := make(map[string][]string, len(patches))
+	for id, ev := range patches {
+		seenParent := map[string]bool{}
+		for _, tag := range ev.Tags {
+			if len(tag) < 2 || tag[0] != "e" || seenParent[tag[1]] {
+				continue
+			}
+			if _, ok := patches[tag[1]]; ok {
+				indegree[id]++
+				children[tag[1]] = append(children[tag[1]], id)
+				seenParent[tag[1]] = true
+			}
+		}
+	}
+	var ready []*nostr.Event
+	for id, ev := range patches {
+		if indegree[id] == 0 {
+			ready = append(ready, ev)
+		}
+	}
+	sort.Slice(ready, func(i, j int) bool { return less(ready[i], ready[j]) })
+	out := make([]*nostr.Event, 0, len(events))
+	emitted := map[string]bool{}
+	for len(ready) > 0 {
+		ev := ready[0]
+		ready = ready[1:]
+		out = append(out, ev)
+		emitted[ev.ID.Hex()] = true
+		for _, child := range children[ev.ID.Hex()] {
+			indegree[child]--
+			if indegree[child] == 0 {
+				ready = append(ready, patches[child])
+			}
+		}
+		sort.Slice(ready, func(i, j int) bool { return less(ready[i], ready[j]) })
+	}
+	var leftovers []*nostr.Event
+	for id, ev := range patches {
+		if !emitted[id] {
+			leftovers = append(leftovers, ev)
+		}
+	}
+	sort.Slice(leftovers, func(i, j int) bool { return less(leftovers[i], leftovers[j]) })
+	sort.Slice(legacy, func(i, j int) bool { return less(legacy[i], legacy[j]) })
+	out = append(out, leftovers...)
+	return append(out, legacy...)
+}
+
+func (s *Service) queryRelayHistory(ctx context.Context, relayURL string, base nostr.Filter, totalLimit int) ([]*nostr.Event, error) {
+	if totalLimit <= 0 {
+		totalLimit = 100
 	}
 	var all []*nostr.Event
 	var until nostr.Timestamp // 0 means no upper bound
-	for {
+	for len(all) < totalLimit {
+		remaining := totalLimit - len(all)
+		batchLimit := remaining
+		if batchLimit > 100 {
+			batchLimit = 100
+		}
 		filter := base.Clone()
-		filter.Limit = pageLimit
+		filter.Limit = batchLimit
 		filter.Until = until
 		events, err := s.queryRelay(ctx, relayURL, filter)
 		if err != nil {
@@ -611,8 +699,11 @@ func (s *Service) queryRelayHistory(ctx context.Context, relayURL string, base n
 		if len(events) == 0 {
 			break
 		}
+		if len(events) > remaining {
+			events = events[:remaining]
+		}
 		all = append(all, events...)
-		if len(events) < pageLimit {
+		if len(events) < batchLimit || len(all) >= totalLimit {
 			break
 		}
 		var oldest nostr.Timestamp
@@ -897,10 +988,16 @@ func stateEventMatchesMapping(ev *nostr.Event, mapping store.Mapping) bool {
 }
 
 func prEventMatchesRepo(ev *nostr.Event, coord string) bool {
-	if ev == nil || (ev.Kind != relay.KindPROpen && ev.Kind != relay.KindPRUpdate) {
+	if ev == nil || tagValue(ev.Tags, "a") != coord {
 		return false
 	}
-	return tagValue(ev.Tags, "a") == coord && tagValue(ev.Tags, "c") != "" && len(tagValues(ev.Tags, "clone")) > 0
+	if ev.Kind == relay.KindPatch {
+		return true
+	}
+	if ev.Kind != relay.KindPROpen && ev.Kind != relay.KindPRUpdate {
+		return false
+	}
+	return tagValue(ev.Tags, "c") != "" && len(tagValues(ev.Tags, "clone")) > 0
 }
 
 func repoCoordinate(mapping store.Mapping) string {
@@ -1028,10 +1125,17 @@ func queryRelaySync(ctx context.Context, relayURL string, filter nostr.Filter) (
 		return nil, err
 	}
 	defer r.Close()
-	var events []*nostr.Event
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	events := make([]*nostr.Event, 0, limit)
 	for ev := range r.QueryEvents(filter) {
 		e := ev
 		events = append(events, &e)
+		if len(events) >= limit {
+			break
+		}
 	}
 	return events, nil
 }

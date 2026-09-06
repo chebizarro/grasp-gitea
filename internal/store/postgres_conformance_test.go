@@ -34,16 +34,15 @@ func TestPostgresStoreConformance(t *testing.T) {
 		t.Skip("GRASP_TEST_POSTGRES_DSN not set; skipping Postgres conformance")
 	}
 
-	storetest.Run(t, func(t *testing.T) store.AuthStore {
+	open := func(t *testing.T) *store.PostgresStore {
 		schema := fmt.Sprintf("conf_%d", pgSchemaCounter.Add(1))
 		st, err := store.OpenPostgresInSchema(dsn, schema)
 		if err != nil {
 			t.Fatalf("open postgres: %v", err)
 		}
-		t.Cleanup(func() {
-			_ = st.DropSchema(context.Background(), schema)
-			st.Close()
-		})
+		t.Cleanup(func() { _ = st.DropSchema(context.Background(), schema); st.Close() })
 		return st
-	})
+	}
+	storetest.Run(t, func(t *testing.T) store.AuthStore { return open(t) })
+	storetest.RunProposal(t, func(t *testing.T) store.ProposalStore { return open(t) })
 }

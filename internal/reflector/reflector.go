@@ -7,7 +7,9 @@ package reflector
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,9 +20,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 
 	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/gitea"
@@ -57,6 +61,8 @@ type GiteaClient interface {
 	AddIssueLabel(ctx context.Context, owner string, repo string, index int64, label string) error
 	RemoveIssueLabel(ctx context.Context, owner string, repo string, index int64, label string) error
 	CreatePullRequest(ctx context.Context, owner string, repo string, head string, base string, title string, body string) (gitea.PullRequest, error)
+	FindPullRequestsByHead(ctx context.Context, owner, repo, head string) ([]gitea.PullRequest, error)
+	ListIssueComments(ctx context.Context, owner, repo string, index int64) ([]gitea.IssueComment, error)
 }
 
 type PatchRejectionPublisher interface {
@@ -66,6 +72,7 @@ type PatchRejectionPublisher interface {
 // Reflector reflects verified Nostr collaboration events into Gitea.
 type Reflector struct {
 	store                   Store
+	proposalStore           store.ProposalStore
 	gitea                   GiteaClient
 	repositoriesDir         string
 	logger                  *slog.Logger
@@ -73,18 +80,78 @@ type Reflector struct {
 	patchRejectionPublisher PatchRejectionPublisher
 	validateGitCloneURL     func(context.Context, string) error
 	ownershipDiagnoser      func(repoPath string) string
+	maxProposalPatchBytes   int
+	giteaCreator            string
+	submitterMu             sync.Mutex
+	submitterActive         map[string]int
+	maxPerSubmitter         int
 }
 
 func New(st Store, g GiteaClient, repositoriesDir string, logger *slog.Logger) *Reflector {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	var proposals store.ProposalStore
+	if candidate, ok := st.(store.ProposalStore); ok {
+		proposals = candidate
+	}
 	return &Reflector{
-		store:               st,
-		gitea:               g,
-		repositoriesDir:     repositoriesDir,
-		logger:              logger,
-		validateGitCloneURL: safefetch.ValidateGitCloneURL,
+		store:                 st,
+		proposalStore:         proposals,
+		gitea:                 g,
+		repositoriesDir:       repositoriesDir,
+		logger:                logger,
+		validateGitCloneURL:   safefetch.ValidateGitCloneURL,
+		maxProposalPatchBytes: 8 << 20,
+		submitterActive:       make(map[string]int),
+		maxPerSubmitter:       2,
+	}
+}
+
+// SetProposalStore selects the durable proposal backend. Postgres-backed
+// deployments use this to coordinate proposal identity across replicas.
+func (r *Reflector) SetProposalStore(st store.ProposalStore) {
+	if r != nil {
+		r.proposalStore = st
+	}
+}
+
+// SetOwnershipDiagnoser attaches current refs/objects ownership details to
+// proposal materialization permission failures.
+func (r *Reflector) SetProposalSecurityLimits(maxPatchBytes int, maxPerSubmitter int) {
+	if r == nil {
+		return
+	}
+	if maxPatchBytes > 0 {
+		r.maxProposalPatchBytes = maxPatchBytes
+	}
+	if maxPerSubmitter > 0 {
+		r.maxPerSubmitter = maxPerSubmitter
+	}
+}
+
+func (r *Reflector) SetGiteaCreator(login string) {
+	if r != nil {
+		r.giteaCreator = strings.TrimSpace(login)
+	}
+}
+
+func (r *Reflector) acquireProposalSubmitter(pubkey string) bool {
+	r.submitterMu.Lock()
+	defer r.submitterMu.Unlock()
+	if r.submitterActive[pubkey] >= r.maxPerSubmitter {
+		return false
+	}
+	r.submitterActive[pubkey]++
+	return true
+}
+
+func (r *Reflector) releaseProposalSubmitter(pubkey string) {
+	r.submitterMu.Lock()
+	defer r.submitterMu.Unlock()
+	r.submitterActive[pubkey]--
+	if r.submitterActive[pubkey] <= 0 {
+		delete(r.submitterActive, pubkey)
 	}
 }
 
@@ -119,11 +186,55 @@ func (r *Reflector) HandleEvent(ctx context.Context, ev *nostr.Event, relayURL s
 		return fmt.Errorf("reflector not configured")
 	}
 
+	if ev.Kind == relay.KindPatch && r.proposalStore != nil {
+		failure, failureErr := r.proposalStore.GetProposalFailure(ctx, ev.ID.Hex())
+		if failureErr == nil && !proposalFailureRetryable(failure.FailureClass) {
+			return nil
+		}
+		if failureErr != nil && !errors.Is(failureErr, sql.ErrNoRows) {
+			return fmt.Errorf("check terminal proposal event state: %w", failureErr)
+		}
+	}
+
 	processed, err := r.store.EventProcessed(ctx, ev.ID.Hex())
 	if err != nil {
 		return fmt.Errorf("check processed event: %w", err)
 	}
 	if processed {
+		return nil
+	}
+
+	if ev.Kind == relay.KindPatch {
+		if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
+			return fmt.Errorf("collaboration event cryptographic validation failed: %w", err)
+		}
+		mapping, ok, err := r.mappingForEvent(ctx, ev)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			r.logger.Debug("reflector: ignoring proposal for unknown repo", "event", ev.ID.Hex(), "repo_addr", tagValue(ev.Tags, "a"), "failure_class", "missing-mapping", "relay", relayURL)
+			return nil
+		}
+		if !r.acquireProposalSubmitter(ev.PubKey.Hex()) {
+			return r.proposalFailure(ctx, mapping, proposalRepositoryAddress(mapping), proposalRootReference(ev), ev, "submitter-rate-limit", fmt.Errorf("proposal submitter concurrency limit exceeded"))
+		}
+		defer r.releaseProposalSubmitter(ev.PubKey.Hex())
+		success, err := r.reflectProposal(ctx, mapping, ev)
+		if err != nil {
+			var materializationErr *MaterializationError
+			if errors.As(err, &materializationErr) && !materializationErr.Retryable {
+				if markErr := r.store.MarkEventProcessed(ctx, ev.ID.Hex(), ev.PubKey.Hex(), int(ev.Kind)); markErr != nil {
+					return fmt.Errorf("%w; mark terminal proposal failure: %v", err, markErr)
+				}
+			}
+			return err
+		}
+		if success {
+			if err := r.store.MarkEventProcessed(ctx, ev.ID.Hex(), ev.PubKey.Hex(), int(ev.Kind)); err != nil {
+				return fmt.Errorf("mark event processed: %w", err)
+			}
+		}
 		return nil
 	}
 
@@ -172,7 +283,7 @@ func (r *Reflector) HandleEvent(ctx context.Context, ev *nostr.Event, relayURL s
 		success, err = r.reflectIssueStatus(ctx, mapping, ev, relayURL)
 	case relay.KindNIP32Label:
 		success, err = r.reflectLabel(ctx, mapping, ev)
-	case relay.KindPatch, relay.KindPROpen:
+	case relay.KindPROpen:
 		success, err = r.reflectPatch(ctx, mapping, ev)
 	case relay.KindPRUpdate:
 		success, err = r.reflectPRUpdate(ctx, mapping, ev)
@@ -498,6 +609,489 @@ func labelEchoFingerprint(label string, remove bool) string {
 	return action + "\x00" + strings.TrimSpace(label)
 }
 
+// MaterializationError is returned for actionable proposal failures.
+type MaterializationError struct {
+	FailureClass      string
+	Operation         string
+	RepositoryAddress string
+	RootEventID       string
+	LatestEventID     string
+	RepoPath          string
+	Retryable         bool
+	Cause             error
+}
+
+func (e *MaterializationError) Error() string {
+	return fmt.Sprintf("NIP-34 proposal materialization failed (%s) repo=%s root=%s event=%s: %v", e.FailureClass, e.RepositoryAddress, e.RootEventID, e.LatestEventID, e.Cause)
+}
+func (e *MaterializationError) Unwrap() error { return e.Cause }
+
+func proposalFailureRetryable(class string) bool {
+	return class == "missing-dependency" || class == "ref-write-fail" || class == "gitea-api-fail" || class == "persistence-fail" || class == "submitter-rate-limit"
+}
+
+func (r *Reflector) proposalFailure(ctx context.Context, mapping store.Mapping, addr, rootID string, ev *nostr.Event, class string, cause error) error {
+	if addr == "" && mapping.Pubkey != "" {
+		addr = fmt.Sprintf("30617:%s:%s", mapping.Pubkey, mapping.RepoID)
+	}
+	retryable := proposalFailureRetryable(class)
+	repoPath := ""
+	if mapping.Owner != "" && r.repositoriesDir != "" {
+		repoPath = filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
+	}
+	failure := store.ProposalFailure{RepositoryAddress: addr, RootEventID: rootID, EventID: ev.ID.Hex(), FailureClass: class, FailureDetail: cause.Error(), UpdatedAt: time.Now().UTC()}
+	if r.proposalStore != nil {
+		if err := r.proposalStore.RecordProposalFailure(ctx, failure); err != nil {
+			cause = fmt.Errorf("%w; persist diagnostic: %v", cause, err)
+		}
+	}
+	r.logger.Warn("reflector: NIP-34 proposal materialization failed", "repo_addr", addr, "repo_path", repoPath, "root_event_id", rootID, "latest_event_id", ev.ID.Hex(), "failure_class", class, "retryable", retryable, "error", cause)
+	return &MaterializationError{FailureClass: class, Operation: class, RepositoryAddress: addr, RootEventID: rootID, LatestEventID: ev.ID.Hex(), RepoPath: repoPath, Retryable: retryable, Cause: cause}
+}
+
+func proposalReplyReference(ev *nostr.Event) string {
+	if ev == nil {
+		return ""
+	}
+	for _, tag := range ev.Tags {
+		if len(tag) >= 4 && tag[0] == "e" && tag[3] == "reply" {
+			return tag[1]
+		}
+	}
+	return ""
+}
+
+func proposalRootReference(ev *nostr.Event) string {
+	if ev == nil {
+		return ""
+	}
+	if hasTagValue(ev.Tags, "t", "root-revision") {
+		return proposalReplyReference(ev)
+	}
+	for _, tag := range ev.Tags {
+		if len(tag) >= 2 && tag[0] == "t" && tag[1] == "root" {
+			return ev.ID.Hex()
+		}
+	}
+	for _, marker := range []string{"reply", "root", ""} {
+		for _, tag := range ev.Tags {
+			if len(tag) < 2 || tag[0] != "e" {
+				continue
+			}
+			got := ""
+			if len(tag) >= 4 {
+				got = tag[3]
+			}
+			if got == marker {
+				return tag[1]
+			}
+		}
+	}
+	return ""
+}
+
+func proposalRepositoryAddress(mapping store.Mapping) string {
+	return fmt.Sprintf("30617:%s:%s", mapping.Pubkey, mapping.RepoID)
+}
+
+func proposalLinks(mapping store.Mapping, ev *nostr.Event) string {
+	eventLink := ev.ID.Hex()
+	if encoded := nip19.EncodeNevent(ev.ID, nil, ev.PubKey); encoded != "" {
+		eventLink = "nostr:" + encoded
+	}
+	repoLink := proposalRepositoryAddress(mapping)
+	if pk, err := nostr.PubKeyFromHex(mapping.Pubkey); err == nil {
+		if encoded := nip19.EncodeNaddr(pk, nostr.Kind(relay.KindRepositoryAnnouncement), mapping.RepoID, nil); encoded != "" {
+			repoLink = "nostr:" + encoded
+		}
+	}
+	return fmt.Sprintf("[Nostr event](%s) (`%s`) · [repository](%s) (`%s`)", eventLink, ev.ID.Hex(), repoLink, proposalRepositoryAddress(mapping))
+}
+
+func newProposalRecoveryNonce() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate proposal recovery nonce: %w", err)
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func proposalBody(mapping store.Mapping, ev *nostr.Event, rootID, nonce string) string {
+	body := strings.TrimSpace(ev.Content)
+	footer := proposalLinks(mapping, ev) + "\n\n<!-- grasp:nip34-proposal-root:" + rootID + ":" + nonce + " -->"
+	if body == "" {
+		return footer
+	}
+	return body + "\n\n---\n" + footer
+}
+
+func proposalUpdateBody(mapping store.Mapping, ev *nostr.Event, tip string) string {
+	subject := strings.TrimSpace(tagValue(ev.Tags, "subject"))
+	if subject == "" {
+		subject = "Applied NIP-34 proposal update"
+	}
+	return fmt.Sprintf("%s\n\nMaterialized head: `%s`\n\n%s\n\n<!-- grasp:nip34-proposal-event:%s -->", subject, tip, proposalLinks(mapping, ev), ev.ID.Hex())
+}
+
+func (r *Reflector) reflectProposal(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {
+	addr := proposalRepositoryAddress(mapping)
+	if r.proposalStore == nil {
+		return false, r.proposalFailure(ctx, mapping, addr, ev.ID.Hex(), ev, "persistence-fail", fmt.Errorf("proposal store is not configured"))
+	}
+	rootID := proposalRootReference(ev)
+	if rootID == "" {
+		if hasTagValue(ev.Tags, "t", "root-revision") {
+			return false, r.proposalFailure(ctx, mapping, addr, "", ev, "missing-dependency", fmt.Errorf("root revision has no proposal reference"))
+		}
+		rootID = ev.ID.Hex()
+	} else if rootID != ev.ID.Hex() {
+		current, err := r.proposalStore.GetProposalByEventID(ctx, rootID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "missing-dependency", fmt.Errorf("referenced proposal event %s has not been materialized", rootID))
+		}
+		if err != nil {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "persistence-fail", err)
+		}
+		rootID = current.RootEventID
+	}
+	opCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	var success bool
+	err := r.proposalStore.WithProposalLock(opCtx, addr, rootID, func(lockCtx context.Context) error {
+		var err error
+		success, err = r.reflectProposalLocked(lockCtx, mapping, ev)
+		return err
+	})
+	return success, err
+}
+
+func (r *Reflector) reflectProposalLocked(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {
+	addr := proposalRepositoryAddress(mapping)
+	if r.maxProposalPatchBytes > 0 && len(ev.Content) > r.maxProposalPatchBytes {
+		return false, r.proposalFailure(ctx, mapping, addr, proposalRootReference(ev), ev, "patch-decode-fail", fmt.Errorf("proposal patch is %d bytes; maximum is %d", len(ev.Content), r.maxProposalPatchBytes))
+	}
+	if r.proposalStore == nil {
+		return false, r.proposalFailure(ctx, mapping, addr, ev.ID.Hex(), ev, "persistence-fail", fmt.Errorf("proposal store is not configured"))
+	}
+	if existing, err := r.proposalStore.GetProposalByEventID(ctx, ev.ID.Hex()); err == nil && existing.GiteaPRNumber > 0 && existing.LatestEventID != "" {
+		if ev.ID.Hex() == existing.RootEventID {
+			body := proposalBody(mapping, ev, existing.RootEventID, existing.RecoveryNonce)
+			if _, recordErr := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{NostrEventID: ev.ID.Hex(), GiteaRepoID: existing.GiteaRepoID, GiteaIndex: existing.GiteaPRNumber, HeadBranch: existing.HeadBranch, Kind: relay.KindPROpen, EchoFingerprint: echofp.PROpen(patchTitle(ev), body)}); recordErr != nil {
+				return false, recordErr
+			}
+			if rootErr := r.store.UpsertThreadRoot(ctx, store.ThreadRoot{ObjectType: "pr", GiteaRepoID: existing.GiteaRepoID, GiteaIndex: existing.GiteaPRNumber, NostrEventID: existing.RootEventID, Pubkey: ev.PubKey.Hex(), Kind: relay.KindPROpen}); rootErr != nil {
+				return false, rootErr
+			}
+		} else {
+			body := proposalUpdateBody(mapping, ev, existing.HeadRefSHA)
+			comments, lookupErr := r.gitea.ListIssueComments(ctx, mapping.Owner, mapping.RepoName, existing.GiteaPRNumber)
+			if lookupErr != nil {
+				return false, r.proposalFailure(ctx, mapping, addr, existing.RootEventID, ev, "gitea-api-fail", lookupErr)
+			}
+			marker := "grasp:nip34-proposal-event:" + ev.ID.Hex()
+			commented := false
+			for _, comment := range comments {
+				if strings.Contains(comment.Body, marker) {
+					commented = true
+					break
+				}
+			}
+			if !commented {
+				if _, commentErr := r.gitea.CreateIssueComment(ctx, mapping.Owner, mapping.RepoName, existing.GiteaPRNumber, body); commentErr != nil {
+					return false, r.proposalFailure(ctx, mapping, addr, existing.RootEventID, ev, "gitea-api-fail", commentErr)
+				}
+			}
+			if _, recordErr := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{NostrEventID: ev.ID.Hex(), GiteaRepoID: existing.GiteaRepoID, GiteaIndex: existing.GiteaPRNumber, HeadBranch: existing.HeadBranch, Kind: relay.KindNIP22Comment, EchoFingerprint: echofp.Comment(body)}); recordErr != nil {
+				return false, recordErr
+			}
+		}
+		return true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, r.proposalFailure(ctx, mapping, addr, ev.ID.Hex(), ev, "persistence-fail", err)
+	}
+
+	rootID := proposalRootReference(ev)
+	isRoot := rootID == "" || rootID == ev.ID.Hex()
+	var current store.ProposalState
+	if isRoot {
+		rootID = ev.ID.Hex()
+		var err error
+		current, err = r.proposalStore.GetProposal(ctx, addr, rootID)
+		if err == nil && current.GiteaPRNumber > 0 && current.LatestEventID != "" {
+			return true, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "persistence-fail", err)
+		}
+	} else {
+		var err error
+		current, err = r.proposalStore.GetProposalByEventID(ctx, rootID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "missing-dependency", fmt.Errorf("referenced proposal event %s has not been materialized", rootID))
+		}
+		if err != nil {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "persistence-fail", err)
+		}
+		rootID = current.RootEventID
+		for _, tag := range ev.Tags {
+			if len(tag) < 2 || tag[0] != "e" || !validEventID.MatchString(tag[1]) {
+				continue
+			}
+			linked, linkErr := r.proposalStore.GetProposalByEventID(ctx, tag[1])
+			if errors.Is(linkErr, sql.ErrNoRows) {
+				return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "missing-dependency", fmt.Errorf("referenced proposal event %s has not been materialized", tag[1]))
+			}
+			if linkErr != nil {
+				return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "persistence-fail", linkErr)
+			}
+			if linked.RootEventID != rootID || linked.RepositoryAddress != addr {
+				return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "invalid-thread", fmt.Errorf("proposal references resolve to conflicting threads"))
+			}
+		}
+		if current.RepositoryAddress != addr || current.GiteaRepoID != mapping.GiteaRepoID {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "invalid-thread", fmt.Errorf("proposal reference belongs to another repository"))
+		}
+		if current.RootSubmitterPubkey == "" || ev.PubKey.Hex() != current.RootSubmitterPubkey {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "unauthorized-author", fmt.Errorf("proposal revision signer does not match root submitter"))
+		}
+		directReply := proposalReplyReference(ev) == current.LatestEventID
+		if int64(ev.CreatedAt) < current.LatestCreatedAt || (!directReply && int64(ev.CreatedAt) == current.LatestCreatedAt && ev.ID.Hex() >= current.LatestEventID) {
+			r.logger.Info("reflector: ignored stale NIP-34 proposal revision", "repo_addr", addr, "root_event_id", rootID, "latest_event_id", ev.ID.Hex())
+			return true, nil
+		}
+	}
+	if r.repositoriesDir == "" {
+		return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "ref-write-fail", fmt.Errorf("repository directory unavailable"))
+	}
+	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
+	base := current.BaseBranch
+	branch := current.HeadBranch
+	if !isRoot && !hasTagValue(ev.Tags, "t", "root-revision") {
+		base = current.HeadBranch
+	}
+	if isRoot {
+		var err error
+		if current.BaseBranch == "" {
+			base, err = resolveBaseBranch(ctx, repoPath)
+			if err != nil {
+				return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "ref-write-fail", err)
+			}
+			branch = "nostr-proposal-" + rootID
+			nonce, nonceErr := newProposalRecoveryNonce()
+			if nonceErr != nil {
+				return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "persistence-fail", nonceErr)
+			}
+			candidate := store.ProposalState{
+				RepositoryAddress: addr, RootEventID: rootID, GiteaRepoID: mapping.GiteaRepoID,
+				RootSubmitterPubkey: ev.PubKey.Hex(), RecoveryNonce: nonce, GiteaCreator: r.giteaCreator,
+				HeadBranch: branch, BaseBranch: base, LatestCreatedAt: -1, UpdatedAt: time.Now().UTC(),
+			}
+			reserved, _, reserveErr := r.proposalStore.ReserveProposal(ctx, candidate)
+			if reserveErr != nil {
+				return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "persistence-fail", reserveErr)
+			}
+			current = reserved
+		} else {
+			base = current.BaseBranch
+			branch = current.HeadBranch
+		}
+		if current.RootSubmitterPubkey != ev.PubKey.Hex() || current.RecoveryNonce == "" || current.HeadBranch != branch || current.BaseBranch != base {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "materialization-conflict", fmt.Errorf("proposal reservation metadata does not match root event"))
+		}
+	}
+	previousTip := current.HeadRefSHA
+	tip, err := r.materializeProposalHead(ctx, mapping, ev, repoPath, base, branch)
+	if err != nil {
+		class := "patch-decode-fail"
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "parent-commit unavailable") {
+			class = "missing-dependency"
+		}
+		if isPermissionError(err) || strings.Contains(message, "update-ref") || strings.Contains(message, "git fetch") || strings.Contains(message, "unsafe clone") || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			class = "ref-write-fail"
+		}
+		return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, class, err)
+	}
+
+	if isRoot {
+		body := proposalBody(mapping, ev, rootID, current.RecoveryNonce)
+		var pr gitea.PullRequest
+		matches, lookupErr := r.gitea.FindPullRequestsByHead(ctx, mapping.Owner, mapping.RepoName, branch)
+		if lookupErr != nil {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "gitea-api-fail", lookupErr)
+		}
+		marker := "<!-- grasp:nip34-proposal-root:" + rootID + ":" + current.RecoveryNonce + " -->"
+		matchCount := 0
+		for _, candidate := range matches {
+			if current.GiteaCreator != "" && strings.Contains(candidate.Body, marker) && candidate.User.Login == current.GiteaCreator && candidate.Head.Ref == branch && candidate.Head.SHA == tip && candidate.Base.Ref == base {
+				pr = candidate
+				matchCount++
+			}
+		}
+		if matchCount > 1 {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "materialization-conflict", fmt.Errorf("multiple pull requests match proposal root"))
+		}
+		if matchCount == 0 && len(matches) > 0 {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "materialization-conflict", fmt.Errorf("proposal branch is already attached to an unrelated pull request"))
+		}
+		createdPR := false
+		if pr.ID == 0 && pr.Index == 0 && pr.Number == 0 {
+			pr, err = r.gitea.CreatePullRequest(ctx, mapping.Owner, mapping.RepoName, branch, base, patchTitle(ev), body)
+			if err != nil {
+				return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "gitea-api-fail", err)
+			}
+			createdPR = true
+		}
+		index := pr.Index
+		if index == 0 {
+			index = pr.Number
+		}
+		if index == 0 {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "gitea-api-fail", fmt.Errorf("pull request response has no index"))
+		}
+		current.GiteaPRID = pr.ID
+		current.GiteaPRNumber = index
+		current.HeadRefSHA = tip
+		current.LatestEventID = ev.ID.Hex()
+		current.LatestCreatedAt = int64(ev.CreatedAt)
+		current.UpdatedAt = time.Now().UTC()
+		advanced, err := r.proposalStore.UpsertProposal(ctx, current)
+		if err != nil {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "persistence-fail", err)
+		}
+		if !advanced {
+			persisted, readErr := r.proposalStore.GetProposal(ctx, addr, rootID)
+			if readErr != nil || persisted.LatestEventID != ev.ID.Hex() || persisted.HeadRefSHA != tip || persisted.GiteaPRNumber != index {
+				if createdPR {
+					_, _ = r.gitea.SetIssueState(ctx, mapping.Owner, mapping.RepoName, index, "closed")
+				}
+				if readErr == nil && persisted.HeadRefSHA != "" {
+					_ = updateBareRef(ctx, repoPath, "refs/heads/"+branch, persisted.HeadRefSHA)
+				} else {
+					_ = deleteBareRef(ctx, repoPath, "refs/heads/"+branch)
+				}
+				return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "materialization-conflict", fmt.Errorf("proposal state CAS lost after pull request creation"))
+			}
+			current = persisted
+		}
+		if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{NostrEventID: ev.ID.Hex(), GiteaRepoID: mapping.GiteaRepoID, GiteaIndex: index, HeadBranch: branch, Kind: relay.KindPROpen, EchoFingerprint: echofp.PROpen(patchTitle(ev), body)}); err != nil {
+			return false, err
+		}
+		if err := r.store.UpsertThreadRoot(ctx, store.ThreadRoot{ObjectType: "pr", GiteaRepoID: mapping.GiteaRepoID, GiteaIndex: index, NostrEventID: rootID, Pubkey: ev.PubKey.Hex(), Kind: relay.KindPROpen}); err != nil {
+			return false, err
+		}
+		r.logger.Info("reflector: materialized NIP-34 proposal as Gitea PR", "repo_addr", addr, "root_event_id", rootID, "latest_event_id", ev.ID.Hex(), "index", index, "head", branch)
+		return true, nil
+	}
+
+	commentBody := proposalUpdateBody(mapping, ev, tip)
+	current.HeadRefSHA = tip
+	current.ParentEventID = proposalReplyReference(ev)
+	current.LatestEventID = ev.ID.Hex()
+	current.LatestCreatedAt = int64(ev.CreatedAt)
+	current.UpdatedAt = time.Now().UTC()
+	advanced, err := r.proposalStore.UpsertProposal(ctx, current)
+	if err != nil {
+		return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "persistence-fail", err)
+	}
+	if !advanced {
+		persisted, readErr := r.proposalStore.GetProposal(ctx, addr, rootID)
+		if readErr != nil || persisted.LatestEventID != ev.ID.Hex() || persisted.HeadRefSHA != tip {
+			if readErr == nil && persisted.HeadRefSHA != "" {
+				_ = updateBareRef(ctx, repoPath, "refs/heads/"+branch, persisted.HeadRefSHA)
+			} else if previousTip != "" {
+				_ = updateBareRef(ctx, repoPath, "refs/heads/"+branch, previousTip)
+			}
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "materialization-conflict", fmt.Errorf("proposal state CAS lost after revision"))
+		}
+		current = persisted
+	}
+	commented := false
+	comments, lookupErr := r.gitea.ListIssueComments(ctx, mapping.Owner, mapping.RepoName, current.GiteaPRNumber)
+	if lookupErr != nil {
+		return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "gitea-api-fail", lookupErr)
+	}
+	marker := "grasp:nip34-proposal-event:" + ev.ID.Hex()
+	for _, comment := range comments {
+		if strings.Contains(comment.Body, marker) {
+			commented = true
+			break
+		}
+	}
+	if !commented {
+		if _, err := r.gitea.CreateIssueComment(ctx, mapping.Owner, mapping.RepoName, current.GiteaPRNumber, commentBody); err != nil {
+			return false, r.proposalFailure(ctx, mapping, addr, rootID, ev, "gitea-api-fail", err)
+		}
+	}
+	if _, err := r.store.RecordReflectedEvent(ctx, store.ReflectedEvent{NostrEventID: ev.ID.Hex(), GiteaRepoID: mapping.GiteaRepoID, GiteaIndex: current.GiteaPRNumber, HeadBranch: current.HeadBranch, Kind: relay.KindNIP22Comment, EchoFingerprint: echofp.Comment(commentBody)}); err != nil {
+		return false, err
+	}
+	r.logger.Info("reflector: updated Gitea PR from NIP-34 proposal revision", "repo_addr", addr, "root_event_id", rootID, "latest_event_id", ev.ID.Hex(), "index", current.GiteaPRNumber, "head", current.HeadBranch, "tip", tip)
+	return true, nil
+}
+
+func (r *Reflector) materializeProposalHead(ctx context.Context, mapping store.Mapping, ev *nostr.Event, repoPath, base, branch string) (string, error) {
+	stagingRef := refsnostr.RefPrefix + ev.ID.Hex()
+	declared := tagValue(ev.Tags, "commit")
+	legacy := tagValue(ev.Tags, "c")
+	if declared != "" && legacy != "" && declared != legacy {
+		return "", fmt.Errorf("conflicting commit and c tags")
+	}
+	if declared == "" {
+		declared = legacy
+	}
+	if staged, err := bareOutput(ctx, repoPath, "rev-parse", "--verify", stagingRef+"^{commit}"); err == nil {
+		if declared != "" && !strings.EqualFold(staged, declared) {
+			return "", fmt.Errorf("staged commit %s does not match declared commit %s", staged, declared)
+		}
+		if err := updateBareRef(ctx, repoPath, "refs/heads/"+branch, staged); err != nil {
+			return "", err
+		}
+		return staged, nil
+	}
+	baseRef := base
+	if !strings.HasPrefix(baseRef, "refs/") {
+		baseRef = "refs/heads/" + baseRef
+	}
+	if parent := tagValue(ev.Tags, "parent-commit"); parent != "" {
+		if hasTagValue(ev.Tags, "t", "root-revision") {
+			parentSHA, err := bareOutput(ctx, repoPath, "rev-parse", "--verify", parent+"^{commit}")
+			if err != nil {
+				return "", fmt.Errorf("parent-commit unavailable: %w", err)
+			}
+			baseRef = parentSHA
+		} else {
+			baseSHA, err := bareOutput(ctx, repoPath, "rev-parse", "--verify", baseRef+"^{commit}")
+			if err != nil {
+				return "", err
+			}
+			if !strings.EqualFold(baseSHA, parent) {
+				return "", fmt.Errorf("parent-commit %s does not match materialization base %s", parent, baseSHA)
+			}
+		}
+	}
+	if looksLikeFormatPatch(ev.Content) {
+		head, err := applyPatchContentRef(ctx, repoPath, baseRef, stagingRef, ev.Content)
+		if err != nil {
+			return "", err
+		}
+		if declared != "" && !strings.EqualFold(head, declared) {
+			return "", fmt.Errorf("applied commit %s does not match declared commit %s", head, declared)
+		}
+		if err := updateBareRef(ctx, repoPath, "refs/heads/"+branch, head); err != nil {
+			return "", err
+		}
+		return head, nil
+	}
+	if validSHA.MatchString(declared) && len(tagValues(ev.Tags, "clone")) > 0 {
+		if err := r.materializeTipBranch(ctx, mapping, ev, repoPath, declared, branch); err != nil {
+			return "", err
+		}
+		return declared, nil
+	}
+	return "", fmt.Errorf("patch content is not git format-patch and no fetchable commit was provided")
+}
+
 func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {
 	tip := tagValue(ev.Tags, "c")
 	if r.repositoriesDir == "" {
@@ -790,6 +1384,18 @@ func updateBareRef(ctx context.Context, repoPath string, ref string, value strin
 	return nil
 }
 
+func deleteBareRef(ctx context.Context, repoPath string, ref string) error {
+	out, err := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "update-ref", "-d", ref).CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("git update-ref -d %s: %w: %s", ref, err, msg)
+		}
+		return fmt.Errorf("git update-ref -d %s: %w", ref, err)
+	}
+	return nil
+}
+
 func resolveBaseBranch(ctx context.Context, repoPath string) (string, error) {
 	if out, err := exec.CommandContext(ctx, "git", "--git-dir", repoPath, "symbolic-ref", "--short", "HEAD").CombinedOutput(); err == nil {
 		base := strings.TrimSpace(string(out))
@@ -819,19 +1425,24 @@ func verifyBareCommit(ctx context.Context, repoPath string, rev string) error {
 }
 
 func applyPatchContentBranch(ctx context.Context, repoPath string, base string, branch string, content string) error {
-	baseCommit, err := bareOutput(ctx, repoPath, "rev-parse", "--verify", "refs/heads/"+base+"^{commit}")
+	_, err := applyPatchContentRef(ctx, repoPath, "refs/heads/"+base, "refs/heads/"+branch, content)
+	return err
+}
+
+func applyPatchContentRef(ctx context.Context, repoPath, baseRef, targetRef, content string) (string, error) {
+	baseCommit, err := bareOutput(ctx, repoPath, "rev-parse", "--verify", baseRef+"^{commit}")
 	if err != nil {
-		return err
+		return "", err
 	}
 	parent, err := os.MkdirTemp("", "grasp-nip34-patch-*")
 	if err != nil {
-		return fmt.Errorf("create patch temp dir: %w", err)
+		return "", fmt.Errorf("create patch temp dir: %w", err)
 	}
 	defer os.RemoveAll(parent)
 	worktree := filepath.Join(parent, "worktree")
 	patchPath := filepath.Join(parent, "patch.mbox")
 	if err := os.WriteFile(patchPath, []byte(content), 0o600); err != nil {
-		return fmt.Errorf("write patch content: %w", err)
+		return "", fmt.Errorf("write patch content: %w", err)
 	}
 
 	added := false
@@ -843,17 +1454,21 @@ func applyPatchContentBranch(ctx context.Context, repoPath string, base string, 
 	}()
 
 	if err := bareRun(ctx, repoPath, "worktree", "add", "--detach", worktree, strings.TrimSpace(baseCommit)); err != nil {
-		return err
+		return "", err
 	}
 	added = true
 	if err := worktreeRun(ctx, worktree, "-c", "user.name=GRASP Bridge", "-c", "user.email=grasp-bridge@example.invalid", "am", patchPath); err != nil {
-		return err
+		return "", err
 	}
 	head, err := worktreeOutput(ctx, worktree, "rev-parse", "HEAD")
 	if err != nil {
-		return err
+		return "", err
 	}
-	return updateBareRef(ctx, repoPath, "refs/heads/"+branch, strings.TrimSpace(head))
+	head = strings.TrimSpace(head)
+	if err := updateBareRef(ctx, repoPath, targetRef, head); err != nil {
+		return "", err
+	}
+	return head, nil
 }
 
 func bareRun(ctx context.Context, repoPath string, args ...string) error {
@@ -1072,6 +1687,15 @@ func fallbackTitle(ev *nostr.Event) string {
 		return "Nostr issue " + ev.ID.Hex()[:12]
 	}
 	return "Nostr issue"
+}
+
+func hasTagValue(tags nostr.Tags, key, value string) bool {
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == key && tag[1] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func tagValue(tags nostr.Tags, key string) string {

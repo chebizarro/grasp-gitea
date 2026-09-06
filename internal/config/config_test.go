@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,6 +56,36 @@ func TestTenantReconciliationEnabled(t *testing.T) {
 	}
 	if !cfg.TenantReconciliationEnabled {
 		t.Fatal("tenant reconciliation flag not loaded")
+	}
+}
+
+func TestLoadRejectsMultiReplicaSQLite(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN":    "tok123",
+		"CLONE_PREFIX":         "https://git.example.com",
+		"RELAY_URLS":           "wss://relay.example.com",
+		"BRIDGE_REPLICA_COUNT": "2",
+		"POSTGRES_DSN":         "",
+	})
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SQLite supports a single bridge process") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+func TestLoadProposalSecurityLimits(t *testing.T) {
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN":              "tok123",
+		"CLONE_PREFIX":                   "https://git.example.com",
+		"RELAY_URLS":                     "wss://relay.example.com",
+		"MAX_PROPOSAL_PATCH_BYTES":       "4096",
+		"PROPOSAL_SUBMITTER_CONCURRENCY": "3",
+	})
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxProposalPatchBytes != 4096 || cfg.ProposalSubmitterConcurrency != 3 {
+		t.Fatalf("proposal limits = %d, %d", cfg.MaxProposalPatchBytes, cfg.ProposalSubmitterConcurrency)
 	}
 }
 

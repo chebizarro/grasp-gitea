@@ -41,9 +41,27 @@ type reflectorFakeGitea struct {
 
 type reflectorPR struct {
 	gitea.PullRequest
-	Head string
-	Base string
-	Body string
+	Head    string
+	HeadSHA string
+	Base    string
+	Body    string
+	Creator string
+}
+
+type alwaysUnprocessedStore struct {
+	Store
+}
+
+func (s alwaysUnprocessedStore) EventProcessed(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+type losingProposalStore struct {
+	store.ProposalStore
+}
+
+func (s losingProposalStore) UpsertProposal(context.Context, store.ProposalState) (bool, error) {
+	return false, nil
 }
 
 type reflectorFakePublisher struct {
@@ -85,6 +103,15 @@ func (f *reflectorFakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if parts[2] == "pulls" && r.Method == http.MethodGet && len(parts) == 3 {
+		var rows []map[string]any
+		for _, pr := range f.pulls {
+			rows = append(rows, map[string]any{"id": pr.ID, "index": pr.Index, "number": pr.Number, "title": pr.Title, "body": pr.Body, "state": pr.State, "html_url": pr.HTMLURL, "user": map[string]any{"login": pr.Creator}, "head": map[string]any{"ref": pr.Head, "sha": pr.HeadSHA}, "base": map[string]any{"ref": pr.Base}})
+		}
+		_ = json.NewEncoder(w).Encode(rows)
+		return
+	}
+
 	if parts[2] == "pulls" && r.Method == http.MethodPost && len(parts) == 3 {
 		var body struct {
 			Head  string `json:"head"`
@@ -100,6 +127,7 @@ func (f *reflectorFakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Head:        body.Head,
 			Base:        body.Base,
 			Body:        body.Body,
+			Creator:     "admin",
 		}
 		f.pulls[idx] = pr
 		w.WriteHeader(http.StatusCreated)
@@ -135,6 +163,12 @@ func (f *reflectorFakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		issue, ok := f.issues[idx]
 		if !ok {
+			if pr, exists := f.pulls[idx]; exists {
+				issue = gitea.Issue{ID: pr.ID, Index: pr.Index, Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State}
+				ok = true
+			}
+		}
+		if !ok {
 			http.NotFound(w, r)
 			return
 		}
@@ -167,6 +201,14 @@ func (f *reflectorFakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		if r.Method == http.MethodGet && len(parts) == 5 && parts[4] == "comments" {
+			rows := make([]gitea.IssueComment, 0, len(f.comments[idx]))
+			for i, body := range f.comments[idx] {
+				rows = append(rows, gitea.IssueComment{ID: int64(i + 1), Body: body})
+			}
+			_ = json.NewEncoder(w).Encode(rows)
+			return
+		}
 		if r.Method == http.MethodPost && len(parts) == 5 && parts[4] == "comments" {
 			var body struct {
 				Body string `json:"body"`
@@ -183,7 +225,12 @@ func (f *reflectorFakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			issue.State = body.State
-			f.issues[idx] = issue
+			if pr, exists := f.pulls[idx]; exists {
+				pr.State = body.State
+				f.pulls[idx] = pr
+			} else {
+				f.issues[idx] = issue
+			}
 			_ = json.NewEncoder(w).Encode(issue)
 			return
 		}
@@ -448,14 +495,18 @@ func TestReflectorTipPatchCreatesPullRequest(t *testing.T) {
 			}
 			pr := fake.pulls[1]
 			fake.mu.Unlock()
-			if pr.Head != "feature/tip" || pr.Base != "main" || pr.Title != "Tip PR" {
+			wantHead := "feature/tip"
+			if kind == relay.KindPatch {
+				wantHead = "nostr-proposal-" + ev.ID.Hex()
+			}
+			if pr.Head != wantHead || pr.Base != "main" || pr.Title != "Tip PR" {
 				t.Fatalf("unexpected PR request: %+v", pr)
 			}
 			if !strings.Contains(pr.Body, ev.ID.Hex()) {
 				t.Fatalf("PR body missing source event id: %q", pr.Body)
 			}
 
-			gotTip := strings.TrimSpace(reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "rev-parse", "refs/heads/feature/tip"))
+			gotTip := strings.TrimSpace(reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "rev-parse", "refs/heads/"+wantHead))
 			if gotTip != repo.tip {
 				t.Fatalf("head branch tip = %s, want %s", gotTip, repo.tip)
 			}
@@ -463,11 +514,201 @@ func TestReflectorTipPatchCreatesPullRequest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("get reflected PR row: %v", err)
 			}
-			if ref.GiteaRepoID != mapping.GiteaRepoID || ref.GiteaIndex != 1 || ref.HeadBranch != "feature/tip" || ref.Kind != relay.KindPROpen {
+			if ref.GiteaRepoID != mapping.GiteaRepoID || ref.GiteaIndex != 1 || ref.HeadBranch != wantHead || ref.Kind != relay.KindPROpen {
 				t.Fatalf("unexpected reflected row: %+v", ref)
 			}
 		})
 	}
+}
+
+func TestReflectorKind1617ProposalIsIdempotentAndRevisionUpdatesPR(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
+	actorPriv := nostr.Generate().Hex()
+	root := signedEvent(t, actorPriv, relay.KindPatch, nostr.Tags{
+		{"a", coord}, {"t", "root"}, {"subject", "Astillero-style proposal"},
+		{"commit", repo.tip}, {"clone", repo.workDir}, {"branch-name", "proposal/fix"},
+	}, "proposal body")
+	if err := r.HandleEvent(ctx, root, "wss://relay.test"); err != nil {
+		t.Fatalf("root proposal: %v", err)
+	}
+	if err := r.HandleEvent(ctx, root, "wss://relay.test"); err != nil {
+		t.Fatalf("root replay: %v", err)
+	}
+	fake.mu.Lock()
+	if len(fake.pulls) != 1 {
+		t.Fatalf("root replay created %d PRs", len(fake.pulls))
+	}
+	body := fake.pulls[1].Body
+	fake.mu.Unlock()
+	for _, want := range []string{"nostr:nevent1", "nostr:naddr1", root.ID.Hex(), coord} {
+		if !strings.Contains(body, want) {
+			t.Errorf("PR body missing %q: %s", want, body)
+		}
+	}
+
+	_ = os.WriteFile(filepath.Join(repo.workDir, "revision.txt"), []byte("revision\n"), 0o644)
+	reflectorGitOutput(t, repo.workDir, "add", "revision.txt")
+	reflectorGitOutput(t, repo.workDir, "commit", "-m", "proposal revision")
+	tip2 := strings.TrimSpace(reflectorGitOutput(t, repo.workDir, "rev-parse", "HEAD"))
+	update := signedEvent(t, actorPriv, relay.KindPatch, nostr.Tags{
+		{"a", coord}, {"e", root.ID.Hex(), "", "reply"}, {"t", "root-revision"},
+		{"commit", tip2}, {"clone", repo.workDir},
+	}, "")
+	update.CreatedAt = root.CreatedAt + 1
+	if err := update.Sign(mustSK(actorPriv)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.HandleEvent(ctx, update, "wss://relay.test"); err != nil {
+		t.Fatalf("proposal revision: %v", err)
+	}
+	if err := r.HandleEvent(ctx, update, "wss://relay.test"); err != nil {
+		t.Fatalf("revision replay: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.pulls) != 1 {
+		t.Fatalf("revision created %d PRs", len(fake.pulls))
+	}
+	if got := fake.comments[1]; len(got) != 1 || !strings.Contains(got[0], update.ID.Hex()) {
+		t.Fatalf("revision comments = %#v", got)
+	}
+	if got := strings.TrimSpace(reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "rev-parse", "refs/heads/nostr-proposal-"+root.ID.Hex())); got != tip2 {
+		t.Fatalf("proposal head=%s want %s", got, tip2)
+	}
+	state, err := st.GetProposal(ctx, coord, root.ID.Hex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.LatestEventID != update.ID.Hex() || state.HeadRefSHA != tip2 || state.GiteaPRNumber != 1 {
+		t.Fatalf("proposal state = %+v", state)
+	}
+}
+
+func TestReflectorRejectsForeignSignerProposalRevisionWithoutMovingHead(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
+
+	submitter := nostr.Generate().Hex()
+	root := signedEvent(t, submitter, relay.KindPatch, nostr.Tags{{"a", coord}, {"commit", repo.tip}, {"clone", repo.workDir}}, "root")
+	if err := r.HandleEvent(ctx, root, "wss://relay.test"); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(repo.workDir, "attack.txt"), []byte("attack\n"), 0o644)
+	reflectorGitOutput(t, repo.workDir, "add", "attack.txt")
+	reflectorGitOutput(t, repo.workDir, "commit", "-m", "attacker revision")
+	attackTip := strings.TrimSpace(reflectorGitOutput(t, repo.workDir, "rev-parse", "HEAD"))
+	attacker := nostr.Generate().Hex()
+	revision := signedEvent(t, attacker, relay.KindPatch, nostr.Tags{{"a", coord}, {"e", root.ID.Hex(), "", "reply"}, {"t", "root"}, {"t", "root-revision"}, {"commit", attackTip}, {"clone", repo.workDir}}, "")
+	revision.CreatedAt = root.CreatedAt + 1
+	if err := revision.Sign(mustSK(attacker)); err != nil {
+		t.Fatal(err)
+	}
+	err := r.HandleEvent(ctx, revision, "wss://relay.test")
+	var materializationErr *MaterializationError
+	if !errors.As(err, &materializationErr) || materializationErr.FailureClass != "unauthorized-author" {
+		t.Fatalf("foreign revision error = %v", err)
+	}
+	got := strings.TrimSpace(reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "rev-parse", "refs/heads/nostr-proposal-"+root.ID.Hex()))
+	if got != repo.tip {
+		t.Fatalf("foreign revision moved head to %s, want %s", got, repo.tip)
+	}
+	state, err := st.GetProposal(ctx, coord, root.ID.Hex())
+	if err != nil || state.LatestEventID != root.ID.Hex() || state.RootSubmitterPubkey != root.PubKey.Hex() {
+		t.Fatalf("proposal state changed after attack: %+v err=%v", state, err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.comments[1]) != 0 {
+		t.Fatalf("foreign revision created comments: %#v", fake.comments[1])
+	}
+}
+
+func TestReflectorRefusesForgedProposalRecoveryMarkerWithoutNonce(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.SetGiteaCreator("admin")
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
+	priv := nostr.Generate().Hex()
+	root := signedEvent(t, priv, relay.KindPatch, nostr.Tags{{"a", coord}, {"commit", repo.tip}, {"clone", repo.workDir}}, "root")
+	branch := "nostr-proposal-" + root.ID.Hex()
+	fake.pulls[99] = reflectorPR{PullRequest: gitea.PullRequest{ID: 99, Index: 99, Number: 99, State: "open"}, Head: branch, HeadSHA: repo.tip, Base: "main", Body: "<!-- grasp:nip34-proposal-root:" + root.ID.Hex() + " -->", Creator: "admin"}
+
+	err := r.HandleEvent(ctx, root, "wss://relay.test")
+	var materializationErr *MaterializationError
+	if !errors.As(err, &materializationErr) || materializationErr.FailureClass != "materialization-conflict" {
+		t.Fatalf("forged recovery error = %v", err)
+	}
+	state, err := st.GetProposal(ctx, coord, root.ID.Hex())
+	if err != nil || state.GiteaPRNumber != 0 || state.RecoveryNonce == "" {
+		t.Fatalf("forged PR was adopted or nonce missing: %+v err=%v", state, err)
+	}
+}
+
+func TestReflectorAbortsWhenProposalCASLoses(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.SetProposalStore(losingProposalStore{ProposalStore: st})
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
+	ev := signedEvent(t, nostr.Generate().Hex(), relay.KindPatch, nostr.Tags{{"a", coord}, {"commit", repo.tip}, {"clone", repo.workDir}}, "root")
+	err := r.HandleEvent(ctx, ev, "wss://relay.test")
+	var materializationErr *MaterializationError
+	if !errors.As(err, &materializationErr) || materializationErr.FailureClass != "materialization-conflict" {
+		t.Fatalf("losing CAS error = %v", err)
+	}
+	if _, err := st.GetReflectedEvent(ctx, ev.ID.Hex()); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("losing CAS recorded completed reflection: %v", err)
+	}
+	state, err := st.GetProposal(ctx, coord, ev.ID.Hex())
+	if err != nil || state.GiteaPRNumber != 0 || state.LatestEventID != "" {
+		t.Fatalf("losing CAS advanced proposal: %+v err=%v", state, err)
+	}
+	if _, err := exec.Command("git", "--git-dir", repo.repoPath, "rev-parse", "--verify", "refs/heads/nostr-proposal-"+ev.ID.Hex()).CombinedOutput(); err == nil {
+		t.Fatal("losing CAS left proposal branch behind")
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.pulls[1].State != "closed" {
+		t.Fatalf("losing CAS left PR open: %+v", fake.pulls[1])
+	}
+}
+
+func TestProposalSubmitterConcurrencyLimit(t *testing.T) {
+	r := New(nil, nil, "", nil)
+	r.SetProposalSecurityLimits(1024, 1)
+	if !r.acquireProposalSubmitter("submitter") {
+		t.Fatal("first proposal slot rejected")
+	}
+	if r.acquireProposalSubmitter("submitter") {
+		t.Fatal("second concurrent proposal slot accepted")
+	}
+	r.releaseProposalSubmitter("submitter")
+	if !r.acquireProposalSubmitter("submitter") {
+		t.Fatal("proposal slot not released")
+	}
+	r.releaseProposalSubmitter("submitter")
 }
 
 func TestReflectorPRUpdateMovesExistingHeadBranchAndRecordsEchoGuard(t *testing.T) {
@@ -642,10 +883,11 @@ func TestReflectorContentPatchAppliesAndCreatesPullRequest(t *testing.T) {
 	}
 	pr := fake.pulls[1]
 	fake.mu.Unlock()
-	if pr.Head != "content-patch" || pr.Base != "main" || pr.Title != "Content patch" {
+	wantHead := "nostr-proposal-" + ev.ID.Hex()
+	if pr.Head != wantHead || pr.Base != "main" || pr.Title != "Content patch" {
 		t.Fatalf("unexpected PR request: %+v", pr)
 	}
-	readme := reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "show", "refs/heads/content-patch:README.md")
+	readme := reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "show", "refs/heads/"+wantHead+":README.md")
 	if !strings.Contains(readme, "feature") {
 		t.Fatalf("applied branch README = %q, want feature change", readme)
 	}
@@ -678,8 +920,10 @@ func TestReflectorGarbagePatchFallsBackAndCleansWorktree(t *testing.T) {
 		{"branch-name", "bad-patch"},
 	}, garbage)
 
-	if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err != nil {
-		t.Fatalf("garbage patch should fall back without crashing: %v", err)
+	err := r.HandleEvent(ctx, ev, "wss://relay.test")
+	var materializationErr *MaterializationError
+	if !errors.As(err, &materializationErr) || materializationErr.FailureClass != "patch-decode-fail" {
+		t.Fatalf("garbage patch error = %v", err)
 	}
 	fake.mu.Lock()
 	if len(fake.pulls) != 0 {
@@ -687,26 +931,72 @@ func TestReflectorGarbagePatchFallsBackAndCleansWorktree(t *testing.T) {
 		t.Fatalf("garbage patch created PRs: %#v", fake.pulls)
 	}
 	fake.mu.Unlock()
-	ref, err := st.GetReflectedEvent(ctx, ev.ID.Hex())
+	if _, err := st.GetReflectedEvent(ctx, ev.ID.Hex()); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("failed proposal reflected as complete: %v", err)
+	}
+	failure, err := st.GetProposalFailure(ctx, ev.ID.Hex())
 	if err != nil {
-		t.Fatalf("get reflected fallback row: %v", err)
+		t.Fatalf("get proposal failure: %v", err)
 	}
-	if ref.GiteaIndex != 0 || ref.Kind != relay.KindPatch {
-		t.Fatalf("unexpected fallback reflected row: %+v", ref)
+	if failure.FailureClass != "patch-decode-fail" || failure.RootEventID != ev.ID.Hex() {
+		t.Fatalf("unexpected proposal diagnostic: %+v", failure)
 	}
-	rejections := rejectionPub.published()
-	if len(rejections) != 1 {
-		t.Fatalf("expected 1 rejection event, got %d", len(rejections))
+	if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err != nil {
+		t.Fatalf("terminal failure replay was not deduplicated: %v", err)
 	}
-	if rejections[0].Kind != relay.KindStatusClosed || tagValue(rejections[0].Tags, "status") != "rejected" || tagValue(rejections[0].Tags, "e") != ev.ID.Hex() {
-		t.Fatalf("unexpected rejection event: %+v", rejections[0])
+	replayedFailure, err := st.GetProposalFailure(ctx, ev.ID.Hex())
+	if err != nil || !replayedFailure.UpdatedAt.Equal(failure.UpdatedAt) {
+		t.Fatalf("terminal replay repeated proposal work: before=%+v after=%+v err=%v", failure, replayedFailure, err)
 	}
-	if !strings.Contains(rejections[0].Content, "apply patch content failed") {
-		t.Fatalf("rejection content missing reason: %s", rejections[0].Content)
+	if rejections := rejectionPub.published(); len(rejections) != 0 {
+		t.Fatalf("kind 1617 failure published terminal rejection: %+v", rejections)
 	}
 	worktrees := reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "worktree", "list", "--porcelain")
 	if got := strings.Count(worktrees, "worktree "); got != 1 {
 		t.Fatalf("dangling worktrees after failed patch: count=%d output=%s", got, worktrees)
+	}
+}
+
+func TestReflectorSharedTerminalFailureDeduplicatesAcrossProcessedLedgers(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+	ev := signedEvent(t, nostr.Generate().Hex(), relay.KindPatch, nostr.Tags{{"a", coord}}, "invalid")
+	if err := st.RecordProposalFailure(ctx, store.ProposalFailure{RepositoryAddress: coord, RootEventID: ev.ID.Hex(), EventID: ev.ID.Hex(), FailureClass: "patch-decode-fail", FailureDetail: "terminal", UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	r := New(alwaysUnprocessedStore{Store: st}, gitea.NewClient(ts.URL, "tok"), t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.SetProposalStore(st)
+	if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err != nil {
+		t.Fatalf("shared terminal failure replay: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.pulls) != 0 {
+		t.Fatalf("shared terminal replay did work: %#v", fake.pulls)
+	}
+}
+
+func TestReflectorRejectsOversizedProposalBeforeMaterialization(t *testing.T) {
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+	r := New(st, gitea.NewClient(ts.URL, "tok"), t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.SetProposalSecurityLimits(16, 2)
+	ev := signedEvent(t, nostr.Generate().Hex(), relay.KindPatch, nostr.Tags{{"a", coord}}, strings.Repeat("x", 17))
+	err := r.HandleEvent(ctx, ev, "wss://relay.test")
+	var materializationErr *MaterializationError
+	if !errors.As(err, &materializationErr) || materializationErr.FailureClass != "patch-decode-fail" {
+		t.Fatalf("oversized proposal error = %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.pulls) != 0 {
+		t.Fatalf("oversized proposal created PRs: %#v", fake.pulls)
 	}
 }
 
