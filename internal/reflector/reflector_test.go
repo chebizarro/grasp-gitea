@@ -591,6 +591,67 @@ func TestReflectorKind1617ProposalIsIdempotentAndRevisionUpdatesPR(t *testing.T)
 	}
 }
 
+func TestReflectorProceedsWhenParentCommitDiffersFromCurrentBase(t *testing.T) {
+	// Track B regression 2026-09-06: Astillero proposal d2a8ef8b... carried
+	// parent-commit 7bb3076... but the current base was 230d36a...; the
+	// bridge REFUSED to materialize the PR, marking the event terminally
+	// failed. That is wrong. Author's parent-commit tag is a hint about the
+	// base tip they expected; the patch commits carry their own git parent
+	// SHAs. The bridge writes them at refs/nostr/<event-id> against the
+	// CURRENT base and Gitea's PR machinery renders the diff/conflict view
+	// like any stale GitHub PR whose base was force-pushed.
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+
+	var logs bytes.Buffer
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(&logs, nil)))
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
+
+	// A SHA that is NOT the current base tip.
+	staleParent := strings.Repeat("a", 40)
+	actorPriv := nostr.Generate().Hex()
+	ev := signedEvent(t, actorPriv, relay.KindPatch, nostr.Tags{
+		{"a", coord},
+		{"subject", "Stale-parent proposal"},
+		{"c", repo.tip},
+		{"clone", repo.workDir},
+		{"branch-name", "feature/stale"},
+		{"parent-commit", staleParent},
+	}, "stale-parent body")
+
+	if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err != nil {
+		t.Fatalf("HandleEvent must succeed against stale parent-commit; got: %v\nlogs:\n%s", err, logs.String())
+	}
+
+	fake.mu.Lock()
+	gotPulls := len(fake.pulls)
+	fake.mu.Unlock()
+	if gotPulls != 1 {
+		t.Fatalf("expected 1 PR created despite stale parent-commit; got %d", gotPulls)
+	}
+
+	// Structured drift diagnostic must have been logged.
+	if !strings.Contains(logs.String(), "parent-commit differs from current base") {
+		t.Errorf("drift diagnostic missing from logs:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "declared_parent="+staleParent) {
+		t.Errorf("drift log missing declared_parent:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "actual_base="+repo.base) {
+		t.Errorf("drift log missing actual_base=%s:\n%s", repo.base, logs.String())
+	}
+
+	// Terminal-failure store row must NOT be present (the event must remain
+	// eligible for replay/supersession).
+	if _, err := st.GetProposalFailure(ctx, ev.ID.Hex()); err == nil {
+		t.Errorf("stale-parent event was terminally failure-recorded but should not have been")
+	}
+}
+
 func TestReflectorRejectsForeignSignerProposalRevisionWithoutMovingHead(t *testing.T) {
 	ctx := context.Background()
 	st, _, coord := newReflectorTestStore(t)

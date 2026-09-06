@@ -1061,13 +1061,29 @@ func (r *Reflector) materializeProposalHead(ctx context.Context, mapping store.M
 			}
 			baseRef = parentSHA
 		} else {
+			// Non-revision proposal: the parent-commit tag is an author hint
+			// about the base tip the author expected. If the base has since
+			// moved, the patch is not the bridge's problem to rebase — write
+			// it at refs/nostr/<event-id> against the CURRENT base and let
+			// Gitea's PR machinery render the diff/conflict view like any
+			// stale GitHub PR whose base branch was force-pushed. Requiring
+			// the author to rebase before the bridge will materialize the PR
+			// was the Track B regression on 2026-09-06 (Astillero proposal
+			// d2a8ef8b… with declared parent 7bb3076… vs current base
+			// 230d36a…).
 			baseSHA, err := bareOutput(ctx, repoPath, "rev-parse", "--verify", baseRef+"^{commit}")
-			if err != nil {
-				return "", err
+			if err == nil && !strings.EqualFold(baseSHA, parent) {
+				r.logger.Info("reflector: NIP-34 proposal parent-commit differs from current base; proceeding against current base",
+					"event_id", ev.ID.Hex(),
+					"repo_addr", tagValue(ev.Tags, "a"),
+					"repo_path", repoPath,
+					"declared_parent", parent,
+					"actual_base", baseSHA,
+					"resolution", "proceed against current base; Gitea PR will show mergeable=false on conflict",
+				)
 			}
-			if !strings.EqualFold(baseSHA, parent) {
-				return "", fmt.Errorf("parent-commit %s does not match materialization base %s", parent, baseSHA)
-			}
+			// If rev-parse itself fails (e.g. base ref missing), fall through
+			// to the normal apply path which will surface a specific error.
 		}
 	}
 	if looksLikeFormatPatch(ev.Content) {
