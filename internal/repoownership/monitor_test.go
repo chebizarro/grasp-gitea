@@ -77,7 +77,7 @@ func TestFindMismatchesCoversBareRepositoryWritePathsAndModes(t *testing.T) {
 		{"refs", true}, {"refs/heads", true}, {"refs/heads/main", false},
 		{"objects", true}, {"objects/info", true}, {"objects/info/commit-graph", false},
 		{"worktrees", true}, {"worktrees/bridge", true}, {"worktrees/bridge/gitdir", false},
-		{"grasp-migration", false},
+		{"grasp-migrating", false},
 	}
 	for _, item := range paths {
 		path := filepath.Join(repoPath, item.name)
@@ -164,6 +164,89 @@ func TestFindMismatchesValidatesAlternatesWithoutScanningTarget(t *testing.T) {
 	}
 	if _, err := findMismatches(repoPath, uint32(os.Geteuid()), uint32(os.Getegid())); err == nil || !strings.Contains(err.Error(), "unavailable") {
 		t.Fatalf("missing alternate error = %v", err)
+	}
+}
+
+func TestFindMismatchesAllowsReadOnlyLooseObjectsAndPacks(t *testing.T) {
+	// Git creates loose objects (objects/<hex>/<hex>...) and packfiles
+	// (objects/pack/*.pack, .idx, .rev, .mtimes, .bitmap) with mode 0444 by
+	// design; they are content-addressed and intentionally immutable. The
+	// monitor must NOT report those files as writability drift or every
+	// normal Git repository would fail readiness — the Track B regression
+	// on 2026-09-06 that rolled back the deploy.
+	_, _, repoPath := initBareRepo(t)
+	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
+
+	looseDir := filepath.Join(repoPath, "objects", "ab")
+	if err := os.MkdirAll(looseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	loose := filepath.Join(looseDir, "cdef0123456789")
+	if err := os.WriteFile(loose, []byte("loose-content"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	packDir := filepath.Join(repoPath, "objects", "pack")
+	if err := os.MkdirAll(packDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"pack-deadbeef.pack", "pack-deadbeef.idx", "pack-deadbeef.rev",
+		"pack-deadbeef.mtimes", "pack-deadbeef.bitmap",
+	} {
+		if err := os.WriteFile(filepath.Join(packDir, name), []byte("pack"), 0o444); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mismatches, err := findMismatches(repoPath, uid, gid)
+	if err != nil {
+		t.Fatalf("findMismatches: %v", err)
+	}
+	for _, m := range mismatches {
+		t.Errorf("read-only content-addressed path unexpectedly flagged: %+v", m)
+	}
+
+	// Sanity: HEAD at 0400 must still be flagged (it needs owner write).
+	head := filepath.Join(repoPath, "HEAD")
+	if err := os.Chmod(head, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	mismatches, err = findMismatches(repoPath, uid, gid)
+	if err != nil {
+		t.Fatalf("findMismatches after chmod HEAD: %v", err)
+	}
+	var sawHEAD bool
+	for _, m := range mismatches {
+		if m.Path == head && strings.Contains(m.Reason, "read+write") {
+			sawHEAD = true
+		}
+	}
+	if !sawHEAD {
+		t.Fatalf("HEAD at 0400 must be flagged as needing read+write; got %+v", mismatches)
+	}
+}
+
+func TestRequiresOwnerWriteClassification(t *testing.T) {
+	cases := []struct {
+		rel  string
+		want bool
+	}{
+		{"HEAD", true}, {"packed-refs", true}, {"config", true}, {"description", true},
+		{"grasp-migrating", true},
+		{"refs/heads/main", true}, {"refs/nostr/abc", true},
+		{"hooks/pre-receive", true}, {"info/exclude", true}, {"logs/HEAD", true},
+		{"objects/info/packed-refs", true}, {"objects/info/commit-graph", true},
+		{"objects/info/alternates", true},
+		{"refs/heads/main.lock", true}, {"HEAD.lock", true},
+		{"objects/ab/cdef0123456789", false},
+		{"objects/pack/pack-deadbeef.pack", false},
+		{"objects/pack/pack-deadbeef.idx", false},
+		{"objects/pack/pack-deadbeef.bitmap", false},
+	}
+	for _, tc := range cases {
+		if got := requiresOwnerWrite(tc.rel); got != tc.want {
+			t.Errorf("requiresOwnerWrite(%q) = %v, want %v", tc.rel, got, tc.want)
+		}
 	}
 }
 

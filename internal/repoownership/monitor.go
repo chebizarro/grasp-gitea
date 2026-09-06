@@ -239,12 +239,25 @@ func findMismatches(repoPath string, uid, gid uint32) ([]Mismatch, error) {
 			reasons = append(reasons, "uid/gid mismatch")
 		}
 		if info.IsDir() {
-			if info.Mode().Perm()&0o300 != 0o300 {
-				reasons = append(reasons, "directory lacks owner write/execute permission")
+			if info.Mode().Perm()&0o700 != 0o700 {
+				reasons = append(reasons, "directory lacks owner read/write/execute permission")
 			}
 		} else if info.Mode().IsRegular() {
-			if info.Mode().Perm()&0o200 == 0 {
-				reasons = append(reasons, "file lacks owner write permission")
+			rel, relErr := filepath.Rel(repoPath, path)
+			if relErr != nil {
+				return relErr
+			}
+			perm := info.Mode().Perm()
+			if requiresOwnerWrite(rel) {
+				if perm&0o600 != 0o600 {
+					reasons = append(reasons, "mutable file lacks owner read+write permission")
+				}
+			} else {
+				// Git creates loose objects and packfiles read-only (0444)
+				// by design; require only owner read.
+				if perm&0o400 == 0 {
+					reasons = append(reasons, "file lacks owner read permission")
+				}
 			}
 		} else {
 			reasons = append(reasons, "unsupported filesystem node")
@@ -260,6 +273,40 @@ func findMismatches(repoPath string, uid, gid uint32) ([]Mismatch, error) {
 		return nil
 	})
 	return mismatches, err
+}
+
+// requiresOwnerWrite reports whether a regular file at the given repo-relative
+// path must be owner-writable for Git and Gitea to operate. Git creates loose
+// objects under objects/<hex>/... and packfiles under objects/pack/... with
+// mode 0444 (read-only) by design — the content is content-addressed and the
+// files are immutable. Requiring owner-write on those paths is a bug that
+// false-positives every normal Git repository. Only paths Git actually
+// rewrites in place need write permission.
+func requiresOwnerWrite(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	switch rel {
+	case "HEAD", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG",
+		"packed-refs", "config", "description", "index", "COMMIT_EDITMSG", "MERGE_MSG", "SQUASH_MSG",
+		"gc.pid", "shallow", "grasp-migrating":
+		return true
+	}
+	if strings.HasSuffix(rel, ".lock") {
+		return true
+	}
+	// Anything under refs/, hooks/, info/, logs/, worktrees/ Git rewrites in
+	// place. objects/info/ (packed-refs, commit-graph, alternates) is likewise
+	// mutable; only the content-addressed objects/<hex>/ and objects/pack/
+	// trees are intentionally read-only.
+	switch {
+	case strings.HasPrefix(rel, "refs/"),
+		strings.HasPrefix(rel, "hooks/"),
+		strings.HasPrefix(rel, "info/"),
+		strings.HasPrefix(rel, "logs/"),
+		strings.HasPrefix(rel, "worktrees/"),
+		strings.HasPrefix(rel, "objects/info/"):
+		return true
+	}
+	return false
 }
 
 func validateAlternates(repoPath, alternatesPath string) error {

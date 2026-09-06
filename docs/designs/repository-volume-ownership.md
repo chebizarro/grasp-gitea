@@ -33,7 +33,11 @@ The hardening and full-proxy command wrappers read bridge credentials exclusivel
 
 ## Managed write boundary and symlinks
 
-The complete managed bare-repository tree is the write boundary, including `HEAD`, `config`, `packed-refs`, `refs/`, `objects/`, `hooks/`, `info/`, linked-worktree metadata, and migration markers. The preflight requires the configured uid/gid and owner write permission on files plus owner write/execute permission on directories.
+The complete managed bare-repository tree is the write boundary. The preflight requires the configured uid/gid on every entry, plus:
+
+- **Directories**: owner read+write+execute (`0o700` on the owner bits).
+- **Mutable regular files**: owner read+write (`0o600`). This covers exactly the files Git rewrites in place — `HEAD`, `ORIG_HEAD`, `FETCH_HEAD`, `MERGE_HEAD`, `packed-refs`, `config`, `description`, `index`, `COMMIT_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG`, `gc.pid`, `shallow`, the `grasp-migrating` marker, everything under `refs/`, `hooks/`, `info/`, `logs/`, `worktrees/`, and `objects/info/` (including `packed-refs`, `commit-graph`, `alternates`), plus any `*.lock` files.
+- **All other regular files**: owner read only (`0o400`). This covers Git's content-addressed store — loose objects at `objects/<hex>/<hex>...` and packfiles at `objects/pack/*` — which Git creates with mode `0444` **by design** because the content is immutable. Requiring owner-write on those paths would false-positive every normal Git repository (the Track B regression on 2026-09-06 that rolled back an otherwise-healthy deployment).
 
 Symlinks anywhere in this boundary are rejected without being followed. This prevents a symlinked `refs`, `objects`, or hook path from hiding drift or redirecting repair outside the repository. `objects/info/alternates` is the exception only as a reference mechanism: the alternates file remains part of the checked repository, while each referenced object directory must exist and be readable/searchable by the configured identity. Alternate directories are never traversed, chowned, or chmodded.
 
