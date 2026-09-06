@@ -17,6 +17,7 @@ services:
       CLONE_PREFIX: https://grasp.test
       BRIDGE_PUBLIC_URL: https://grasp.test
       GRASP_PUBLIC_URL: https://grasp.test
+      GRASP_RELAY_URL: wss://grasp.test
       RELAY_URLS: ""
       EMBEDDED_RELAY: "true"
       EMBEDDED_RELAY_PORT: "3334"

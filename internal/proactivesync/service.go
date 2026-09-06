@@ -3,6 +3,7 @@ package proactivesync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -70,13 +71,20 @@ type realTicker struct {
 func (t realTicker) C() <-chan time.Time { return t.Ticker.C }
 
 type Service struct {
-	repositoriesDir string
-	orgResolver     OrgResolver
-	mappingLister   MappingLister
-	logger          *slog.Logger
-	git             gitRunner
-	queryRelay      relayQueryFunc
-	newTicker       func(time.Duration) syncTicker
+	repositoriesDir    string
+	orgResolver        OrgResolver
+	mappingLister      MappingLister
+	logger             *slog.Logger
+	git                gitRunner
+	queryRelay         relayQueryFunc
+	newTicker          func(time.Duration) syncTicker
+	ownershipDiagnoser func(repoPath string) string
+}
+
+// SetOwnershipDiagnoser attaches refs/objects ownership details to Git
+// permission failures without coupling synchronization to a repair policy.
+func (s *Service) SetOwnershipDiagnoser(diagnose func(repoPath string) string) {
+	s.ownershipDiagnoser = diagnose
 }
 
 func New(repositoriesDir string, orgResolver OrgResolver, logger *slog.Logger) *Service {
@@ -126,9 +134,12 @@ func (s *Service) HandleStateEvent(ctx context.Context, ev *nostr.Event) error {
 		return nil
 	}
 	if err := s.requireStateObjects(ctx, repoPath, ev); err != nil {
-		return err
+		return s.repositoryError(mapping, repoPath, err)
 	}
-	return s.applyStateEvent(ctx, repoPath, ev)
+	if err := s.applyStateEvent(ctx, repoPath, ev); err != nil {
+		return s.repositoryError(mapping, repoPath, err)
+	}
+	return nil
 }
 
 // AuthorizeStateEvent validates a live kind:30618 signer without mutating
@@ -443,22 +454,51 @@ func (s *Service) syncMapping(ctx context.Context, mapping store.Mapping) error 
 		if latestState != nil {
 			state := nip34.ParseRepositoryState(*latestState)
 			if err := s.fetchMissingStateObjects(ctx, repoPath, cloneURLs, state); err != nil {
-				s.logger.Warn("proactive sync state object fetch failed", "repo", repoPath, "error", err)
+				s.logRepositoryFailure("proactive sync state object fetch failed", mapping, repoPath, latestState.ID.Hex(), err)
 			} else if err := s.requireStateObjects(ctx, repoPath, latestState); err != nil {
-				s.logger.Warn("proactive sync state objects incomplete; refs left unchanged", "repo", repoPath, "event", latestState.ID, "error", err)
+				s.logRepositoryFailure("proactive sync state objects incomplete; refs left unchanged", mapping, repoPath, latestState.ID.Hex(), err)
 			} else if err := s.applyStateEvent(ctx, repoPath, latestState); err != nil {
-				s.logger.Warn("proactive sync state ref reconciliation failed", "repo", repoPath, "event", latestState.ID, "error", err)
+				s.logRepositoryFailure("proactive sync state ref reconciliation failed", mapping, repoPath, latestState.ID.Hex(), err)
 			}
 		}
 
 		prEvents := s.fetchPREvents(ctx, mapping, relayURLs)
 		for _, ev := range prEvents {
 			if err := s.fetchPRTip(ctx, repoPath, ev); err != nil {
-				s.logger.Warn("proactive sync PR tip fetch failed", "repo", repoPath, "event", ev.ID.Hex(), "error", err)
+				s.logRepositoryFailure("proactive sync PR tip fetch failed", mapping, repoPath, ev.ID.Hex(), err)
 			}
 		}
 	}
 	return nil
+}
+
+func (s *Service) repositoryError(mapping store.Mapping, repoPath string, err error) error {
+	diagnosis := ""
+	if isPermissionError(err) && s.ownershipDiagnoser != nil {
+		diagnosis = s.ownershipDiagnoser(repoPath)
+	}
+	if diagnosis != "" {
+		return fmt.Errorf("repo_address=%s repo_path=%s ownership_mismatch=%s: %w", repoCoordinate(mapping), repoPath, diagnosis, err)
+	}
+	return fmt.Errorf("repo_address=%s repo_path=%s: %w", repoCoordinate(mapping), repoPath, err)
+}
+
+func (s *Service) logRepositoryFailure(message string, mapping store.Mapping, repoPath, eventID string, err error) {
+	args := []any{"repo_address", repoCoordinate(mapping), "repo_path", repoPath, "event", eventID, "error", err}
+	if isPermissionError(err) && s.ownershipDiagnoser != nil {
+		if diagnosis := s.ownershipDiagnoser(repoPath); diagnosis != "" {
+			args = append(args, "ownership_mismatch", diagnosis)
+		}
+	}
+	s.logger.Warn(message, args...)
+}
+
+func isPermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "permission denied") || strings.Contains(message, "insufficient permission") || strings.Contains(message, "cannot lock ref")
 }
 
 func (s *Service) fetchLatestStateEvent(ctx context.Context, mapping store.Mapping, relayURLs []string) *nostr.Event {
@@ -635,6 +675,7 @@ func (s *Service) fetchPRTip(ctx context.Context, repoPath string, ev *nostr.Eve
 
 func (s *Service) applyStateEvent(ctx context.Context, repoPath string, ev *nostr.Event) error {
 	state := nip34.ParseRepositoryState(*ev)
+	var applyErrors []error
 	for branch, sha := range state.Branches {
 		ref := "refs/heads/" + branch
 		if !validRef.MatchString(ref) || !validHex.MatchString(sha) {
@@ -642,7 +683,10 @@ func (s *Service) applyStateEvent(ctx context.Context, repoPath string, ev *nost
 			continue
 		}
 		if err := s.updateRefIfObjectExists(ctx, repoPath, ref, sha); err != nil {
-			s.logger.Warn("proactive sync branch update failed", "repo", repoPath, "ref", branch, "error", err)
+			s.logger.Warn("proactive sync branch update failed", "repo_path", repoPath, "ref", branch, "error", err)
+			if isPermissionError(err) {
+				applyErrors = append(applyErrors, fmt.Errorf("update branch %s: %w", branch, err))
+			}
 		}
 	}
 	for tag, sha := range state.Tags {
@@ -655,13 +699,23 @@ func (s *Service) applyStateEvent(ctx context.Context, repoPath string, ev *nost
 			continue
 		}
 		if err := s.updateRefIfObjectExists(ctx, repoPath, ref, sha); err != nil {
-			s.logger.Warn("proactive sync tag update failed", "repo", repoPath, "ref", tag, "error", err)
+			s.logger.Warn("proactive sync tag update failed", "repo_path", repoPath, "ref", tag, "error", err)
+			if isPermissionError(err) {
+				applyErrors = append(applyErrors, fmt.Errorf("update tag %s: %w", tag, err))
+			}
 		}
 	}
 
-	s.reconcileHEAD(ctx, repoPath, state)
-	s.reconcileDeletedRefs(ctx, repoPath, state)
+	if err := s.reconcileHEAD(ctx, repoPath, state); err != nil {
+		applyErrors = append(applyErrors, fmt.Errorf("reconcile HEAD: %w", err))
+	}
+	if err := s.reconcileDeletedRefs(ctx, repoPath, state); err != nil {
+		applyErrors = append(applyErrors, fmt.Errorf("reconcile deleted refs: %w", err))
+	}
 
+	if err := errors.Join(applyErrors...); err != nil {
+		return err
+	}
 	s.logger.Info("proactive sync applied state event", "repo", repoPath, "event", ev.ID.Hex())
 	return nil
 }
@@ -671,11 +725,13 @@ func (s *Service) applyStateEvent(ctx context.Context, repoPath string, ev *nost
 // deletion by omission, so a ref present locally but absent from the latest
 // state has been deleted upstream. Other namespaces (refs/nostr, refs/pull,
 // internal refs) are never touched.
-func (s *Service) reconcileDeletedRefs(ctx context.Context, repoPath string, state nip34.RepositoryState) {
+func (s *Service) reconcileDeletedRefs(ctx context.Context, repoPath string, state nip34.RepositoryState) error {
+	var reconcileErrors []error
 	prune := func(prefix string, declared func(name string) bool) {
 		refs, err := s.git.ListRefs(ctx, repoPath, prefix)
 		if err != nil {
 			s.logger.Warn("proactive sync ref listing failed", "repo", repoPath, "prefix", prefix, "error", err)
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("list %s: %w", prefix, err))
 			return
 		}
 		for _, ref := range refs {
@@ -685,6 +741,7 @@ func (s *Service) reconcileDeletedRefs(ctx context.Context, repoPath string, sta
 			}
 			if err := s.git.DeleteRef(ctx, repoPath, ref); err != nil {
 				s.logger.Warn("proactive sync ref deletion failed", "repo", repoPath, "ref", ref, "error", err)
+				reconcileErrors = append(reconcileErrors, fmt.Errorf("delete %s: %w", ref, err))
 				continue
 			}
 			s.logger.Info("proactive sync deleted ref omitted from state", "repo", repoPath, "ref", ref)
@@ -701,39 +758,46 @@ func (s *Service) reconcileDeletedRefs(ctx context.Context, repoPath string, sta
 		_, ok := state.Tags[name+"^{}"]
 		return ok
 	})
+	return errors.Join(reconcileErrors...)
 }
 
 // reconcileHEAD updates the bare repository's symbolic HEAD to match the
 // state event's HEAD tag. The target must name a branch the state declares
 // (refs/heads/*), pass ref validation, and point at an object that exists
 // locally — otherwise HEAD is left untouched.
-func (s *Service) reconcileHEAD(ctx context.Context, repoPath string, state nip34.RepositoryState) {
+func (s *Service) reconcileHEAD(ctx context.Context, repoPath string, state nip34.RepositoryState) error {
 	branch := strings.TrimSpace(state.HEAD)
 	if branch == "" {
-		return
+		return nil
 	}
 	ref := "refs/heads/" + branch
 	if !validRef.MatchString(ref) {
 		s.logger.Warn("proactive sync skipped invalid HEAD target", "repo", repoPath, "head", branch)
-		return
+		return nil
 	}
 	sha, declared := state.Branches[branch]
 	if !declared {
 		s.logger.Warn("proactive sync HEAD names undeclared branch", "repo", repoPath, "head", branch)
-		return
+		return nil
 	}
 	if !validHex.MatchString(sha) {
 		s.logger.Warn("proactive sync HEAD branch has invalid sha", "repo", repoPath, "head", branch, "sha", sha)
-		return
+		return nil
 	}
 	exists, err := s.git.ObjectExists(ctx, repoPath, sha)
-	if err != nil || !exists {
-		s.logger.Warn("proactive sync HEAD target object missing", "repo", repoPath, "head", branch, "sha", sha, "error", err)
-		return
+	if err != nil {
+		s.logger.Warn("proactive sync HEAD target object check failed", "repo", repoPath, "head", branch, "sha", sha, "error", err)
+		return err
+	}
+	if !exists {
+		s.logger.Warn("proactive sync HEAD target object missing", "repo", repoPath, "head", branch, "sha", sha)
+		return nil
 	}
 	if err := s.git.SetSymbolicHEAD(ctx, repoPath, ref); err != nil {
 		s.logger.Warn("proactive sync HEAD update failed", "repo", repoPath, "head", branch, "error", err)
+		return err
 	}
+	return nil
 }
 
 func (s *Service) updateRefIfObjectExists(ctx context.Context, repoPath string, ref string, sha string) error {

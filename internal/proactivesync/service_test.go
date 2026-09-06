@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -70,6 +71,23 @@ func TestHandleStateEventMissingDTag(t *testing.T) {
 	err := svc.HandleStateEvent(context.Background(), ev)
 	if err == nil {
 		t.Fatal("expected error for event without valid signature")
+	}
+}
+
+func TestRepositoryPermissionErrorIncludesIdentityPathAndOwnershipMismatch(t *testing.T) {
+	svc := New("/repos", nil, testLogger())
+	svc.SetOwnershipDiagnoser(func(repoPath string) string {
+		if repoPath != "/repos/org/project.git" {
+			t.Fatalf("diagnosed repo path = %q", repoPath)
+		}
+		return "1 mismatched refs/objects paths; first=/repos/org/project.git/objects/aa/bb uid=0 gid=0 expected_uid=1000 expected_gid=1000"
+	})
+	mapping := store.Mapping{Pubkey: strings.Repeat("a", 64), RepoID: "project", Owner: "org", RepoName: "project"}
+	err := svc.repositoryError(mapping, "/repos/org/project.git", errors.New("update-ref failed: Permission denied"))
+	for _, want := range []string{"repo_address=30617:" + mapping.Pubkey + ":project", "repo_path=/repos/org/project.git", "ownership_mismatch=1 mismatched", "Permission denied"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("permission error missing %q: %v", want, err)
+		}
 	}
 }
 
@@ -196,11 +214,13 @@ type fetchCall struct {
 }
 
 type fakeGitRunner struct {
-	mu      sync.Mutex
-	objects map[string]bool
-	fetches []fetchCall
-	updates map[string]string
-	heads   map[string]string
+	mu             sync.Mutex
+	objects        map[string]bool
+	fetches        []fetchCall
+	updates        map[string]string
+	heads          map[string]string
+	deleteRefErr   error
+	setSymbolicErr error
 }
 
 func newFakeGitRunner() *fakeGitRunner {
@@ -223,6 +243,9 @@ func (g *fakeGitRunner) ListRefs(_ context.Context, repoPath string, prefix stri
 func (g *fakeGitRunner) DeleteRef(_ context.Context, repoPath string, ref string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.deleteRefErr != nil {
+		return g.deleteRefErr
+	}
 	delete(g.updates, repoPath+"|"+ref)
 	return nil
 }
@@ -230,6 +253,9 @@ func (g *fakeGitRunner) DeleteRef(_ context.Context, repoPath string, ref string
 func (g *fakeGitRunner) SetSymbolicHEAD(_ context.Context, repoPath string, ref string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.setSymbolicErr != nil {
+		return g.setSymbolicErr
+	}
 	g.heads[repoPath] = ref
 	return nil
 }
@@ -671,6 +697,34 @@ func TestApplyStateEventDeletesRefsOmittedFromState(t *testing.T) {
 	}
 	if _, ok := git.updates[repoPath+"|refs/nostr/"+strings.Repeat("ab", 32)]; !ok {
 		t.Fatalf("expected refs/nostr namespace to be untouched")
+	}
+}
+
+func TestApplyStateEventReturnsJoinedHEADAndDeletionFailures(t *testing.T) {
+	ctx := context.Background()
+	priv := nostr.Generate().Hex()
+	git := newFakeGitRunner()
+	sha := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	oldSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	git.objects[sha] = true
+	repoPath := "/repos/alice/project.git"
+	git.updates[repoPath+"|refs/heads/stale"] = oldSHA
+	git.setSymbolicErr = errors.New("HEAD permission denied")
+	git.deleteRefErr = errors.New("delete permission denied")
+
+	svc := New(t.TempDir(), &stubStore{}, testLogger())
+	svc.git = git
+	state := signedTestEvent(t, priv, relay.KindRepositoryState, nostr.Tags{
+		{"d", "project"},
+		{"HEAD", "ref: refs/heads/main"},
+		{"refs/heads/main", sha},
+	})
+	err := svc.applyStateEvent(ctx, repoPath, state)
+	if err == nil || !strings.Contains(err.Error(), "HEAD permission denied") || !strings.Contains(err.Error(), "delete permission denied") {
+		t.Fatalf("applyStateEvent error = %v, want joined HEAD and deletion failures", err)
+	}
+	if got := git.updates[repoPath+"|refs/heads/main"]; got != sha {
+		t.Fatalf("branch update did not occur before reconciliation failures: %q", got)
 	}
 }
 

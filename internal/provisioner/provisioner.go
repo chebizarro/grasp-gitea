@@ -37,17 +37,18 @@ type tenantPlacementCoordinator interface {
 var errTenantPlacementDeclined = errors.New("tenant placement declined")
 
 type Service struct {
-	cfg               config.Config
-	store             *store.SQLiteStore
-	authStore         store.AuthStore
-	tenantPlacement   tenantPlacementCoordinator
-	gitea             *gitea.Client
-	logger            *slog.Logger
-	installer         *hooks.Installer
-	resolver          *nip05resolve.Resolver
-	policy            *policy.Store
-	verifyAffiliation func(context.Context, string, []string) nip05resolve.AffiliationVerification
-	migrationStepHook func(string) error // test-only crash boundary injection
+	cfg                config.Config
+	store              *store.SQLiteStore
+	authStore          store.AuthStore
+	tenantPlacement    tenantPlacementCoordinator
+	gitea              *gitea.Client
+	logger             *slog.Logger
+	installer          *hooks.Installer
+	resolver           *nip05resolve.Resolver
+	policy             *policy.Store
+	verifyAffiliation  func(context.Context, string, []string) nip05resolve.AffiliationVerification
+	ownershipPreflight func(context.Context) error
+	migrationStepHook  func(string) error // test-only crash boundary injection
 
 	// repoMu serializes provisioning per (npub, repoID) to prevent concurrent
 	// races when multiple events for the same repo arrive simultaneously.
@@ -58,6 +59,12 @@ type Service struct {
 // SetPolicyStore makes repository admission consult live policy snapshots.
 func (s *Service) SetPolicyStore(store *policy.Store) {
 	s.policy = store
+}
+
+// SetOwnershipPreflight installs the fail-closed repository safety scan run
+// after provisioning has created and installed every bridge-written path.
+func (s *Service) SetOwnershipPreflight(preflight func(context.Context) error) {
+	s.ownershipPreflight = preflight
 }
 
 type Result struct {
@@ -402,6 +409,11 @@ func (s *Service) provisionFromAnnouncement(ctx context.Context, npub string, pu
 
 	if err := s.store.SetHookInstalled(ctx, npub, repoID, true); err != nil {
 		return fmt.Errorf("mark hook installed: %w", err)
+	}
+	if s.ownershipPreflight != nil {
+		if err := s.ownershipPreflight(ctx); err != nil {
+			return fmt.Errorf("post-provision repository ownership preflight: %w", err)
+		}
 	}
 
 	s.logger.Info("provisioned repository", "npub", npub, "org_name", orgName, "repo_id", repoID, "relay", sourceRelay, "event", sourceEvent)

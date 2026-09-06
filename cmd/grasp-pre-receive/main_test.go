@@ -103,6 +103,13 @@ func TestEvaluatePushRefNostrAndPRPolicy(t *testing.T) {
 	if ok, _ := evaluatePushRef("refs/heads/pr/feature", "abc123", state, nil); ok {
 		t.Fatalf("expected refs/heads/pr/* to fail")
 	}
+
+	if ok, reason := evaluatePushRef("refs/pull/1/head", "abc123", nil, nil); !ok {
+		t.Fatalf("expected Gitea-managed refs/pull/* to pass without repository state: %s", reason)
+	}
+	if requiresStateCheck([]pushUpdate{{refName: "refs/pull/1/head", newSHA: "abc123"}}) {
+		t.Fatal("Gitea-managed refs/pull/* should not require repository state")
+	}
 }
 
 func TestRefDeletionSemantics(t *testing.T) {

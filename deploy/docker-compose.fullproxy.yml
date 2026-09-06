@@ -33,8 +33,10 @@
 
 services:
   grasp-bridge:
-    entrypoint: ["/bin/sh", "-ec"]
+    entrypoint: ["/usr/local/bin/grasp-bridge-entrypoint"]
     command:
+      - /bin/sh
+      - -ec
       - |
         export ADMIN_API_TOKEN="$$(cat /run/secrets/grasp-admin-api-token)"
         export GRASP_CREDENTIAL_KEYS="$$(cat /run/secrets/grasp-credential-keys)"

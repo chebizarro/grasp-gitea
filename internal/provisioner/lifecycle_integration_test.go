@@ -359,6 +359,23 @@ func TestAnnouncementProvisionsNewRepo(t *testing.T) {
 	}
 }
 
+func TestProvisioningRunsOwnershipPreflightAndFailsClosed(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	called := 0
+	svc.SetOwnershipPreflight(func(context.Context) error {
+		called++
+		return fmt.Errorf("unsafe repository fixture")
+	})
+	ev := makeSignedAnnouncementEvent(t, "ownership-preflight", "https://git.example.com/whatever/ownership-preflight.git")
+	err := svc.HandleAnnouncementEvent(context.Background(), ev, "ws://relay")
+	if err == nil || !strings.Contains(err.Error(), "post-provision repository ownership preflight") {
+		t.Fatalf("HandleAnnouncementEvent error = %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("ownership preflight calls = %d, want 1", called)
+	}
+}
+
 func TestAnnouncementRejectsMissingServiceRelay(t *testing.T) {
 	svc, st, state, _ := newTestService(t)
 	ctx := context.Background()

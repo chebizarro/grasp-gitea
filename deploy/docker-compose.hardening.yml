@@ -18,10 +18,12 @@ services:
     depends_on:
       grasp-hook-install:
         condition: service_completed_successfully
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - export ADMIN_API_TOKEN="$$(cat /run/secrets/grasp-admin-api-token)"; exec grasp-bridge
+    entrypoint: ["/usr/local/bin/grasp-bridge-entrypoint"]
+    command: ["/bin/sh", "-ec", "export ADMIN_API_TOKEN=\"$$(cat /run/secrets/grasp-admin-api-token)\"; exec grasp-bridge"]
     environment:
+      USER_UID: ${USER_UID:?USER_UID must match the Gitea git uid}
+      USER_GID: ${USER_GID:?USER_GID must match the Gitea git gid}
+      GITEA_REPO_OWNERSHIP_AUTO_REPAIR: ${GITEA_REPO_OWNERSHIP_AUTO_REPAIR:-false}
       GRASP_ENV: production
       EMBEDDED_RELAY: "true"
       EMBEDDED_RELAY_PORT: "3334"
@@ -47,6 +49,8 @@ services:
         condition: service_completed_successfully
     # Do not publish port 3000. Only canonical nginx may reach this service.
     environment:
+      USER_UID: ${USER_UID:?USER_UID must match the Gitea git uid}
+      USER_GID: ${USER_GID:?USER_GID must match the Gitea git gid}
       GITEA__SERVICE__ENABLE_REVERSE_PROXY_AUTHENTICATION: "true"
       GITEA__SERVICE__ENABLE_REVERSE_PROXY_AUTHENTICATION_API: "false"
       GITEA__SERVICE__ENABLE_REVERSE_PROXY_AUTO_REGISTRATION: "false"

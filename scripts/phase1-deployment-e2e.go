@@ -25,6 +25,8 @@ import (
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip19"
+
+	"github.com/sharegap/grasp-gitea/internal/relay"
 )
 
 const (
@@ -63,8 +65,15 @@ func main() {
 func run() error {
 	key := nostr.Generate()
 	client := browserClient()
+	if os.Getenv("E2E_OWNERSHIP_ONLY") == "true" {
+		if err := runRepositoryOwnershipE2E(client, key); err != nil {
+			return err
+		}
+		fmt.Println("phase1 repository ownership E2E PASSED")
+		return nil
+	}
 
-	fmt.Println("[1/10] signed NIP-07 verification through canonical TLS/nginx")
+	fmt.Println("[1/11] signed NIP-07 verification through canonical TLS/nginx")
 	var ch challenge
 	if err := jsonRequest(client, http.MethodPost, publicURL+"/auth/nip07/challenge", map[string]string{"redirect_uri": "/"}, &ch, http.StatusOK); err != nil {
 		return err
@@ -81,7 +90,7 @@ func run() error {
 		return fmt.Errorf("incomplete verify response: %+v", verified)
 	}
 
-	fmt.Println("[2/10] cross-browser handoff and internal-header spoofing fail")
+	fmt.Println("[2/11] cross-browser handoff and internal-header spoofing fail")
 	if status, _, err := get(browserClient(), verified.HandoffURL, nil); err != nil || status != http.StatusUnauthorized {
 		return fmt.Errorf("cross-browser handoff = %d, %v; want 401", status, err)
 	}
@@ -94,7 +103,7 @@ func run() error {
 		return fmt.Errorf("spoofed request = %d, %v; want 401/403", status, err)
 	}
 
-	fmt.Println("[3/10] handoff emits durable Gitea cookie and header-free session")
+	fmt.Println("[3/11] handoff emits durable Gitea cookie and header-free session")
 	status, body, err := get(client, verified.HandoffURL, nil)
 	if err != nil || status != http.StatusOK {
 		return fmt.Errorf("handoff = %d, %v: %s", status, err, body)
@@ -114,12 +123,12 @@ func run() error {
 		return fmt.Errorf("header-free session not durable: status=%d err=%v user=%q", status, err, verified.Identity.GiteaUser)
 	}
 
-	fmt.Println("[4/10] one-time handoff replay fails")
+	fmt.Println("[4/11] one-time handoff replay fails")
 	if status, _, err := get(client, verified.HandoffURL, nil); err != nil || status != http.StatusUnauthorized {
 		return fmt.Errorf("handoff replay = %d, %v; want 401", status, err)
 	}
 
-	fmt.Println("[5/10] NIP-55 endpoint emits launchable Android deep link")
+	fmt.Println("[5/11] NIP-55 endpoint emits launchable Android deep link")
 	var nip55 struct {
 		URI      string `json:"nostrsigner_uri"`
 		Callback string `json:"callback_url"`
@@ -135,7 +144,7 @@ func run() error {
 		return fmt.Errorf("deployed login asset does not launch NIP-55 URI: status=%d err=%v", status, err)
 	}
 
-	fmt.Println("[6/10] REST bridge-token scopes and bounded direct NIP-98 work through Gitea")
+	fmt.Println("[6/11] REST bridge-token scopes and bounded direct NIP-98 work through Gitea")
 	apiClient := browserClient()
 	apiClient.Jar = nil // API authentication must not be shadowed by the browser-session cookie.
 	readToken, err := mintBridgeToken(apiClient, key, "phase4-read", []string{"api:read"})
@@ -185,12 +194,17 @@ func run() error {
 		return fmt.Errorf("payload-mismatched direct NIP-98 POST = %d, %v; want 401", status, err)
 	}
 
-	fmt.Println("[7/10] LFS batch scopes, streamed object round-trip, URL rewrite, NIP-98 denial, and locks")
+	fmt.Println("[7/11] LFS batch scopes, streamed object round-trip, URL rewrite, NIP-98 denial, and locks")
 	if err := runLFSE2E(apiClient, key, verified.Identity.GiteaUser); err != nil {
 		return err
 	}
 
-	fmt.Println("[8/10] mounted hook reads admin-token secret and accepts proposed state")
+	fmt.Println("[8/11] NIP-34 proposal remains writable by Gitea and leaves no ownership drift")
+	if err := runRepositoryOwnershipE2E(apiClient, key); err != nil {
+		return err
+	}
+
+	fmt.Println("[9/11] mounted hook reads admin-token secret and accepts proposed state")
 	fixture := &hookFixture{token: os.Getenv("E2E_ADMIN_TOKEN"), key: key}
 	listener, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
@@ -230,14 +244,14 @@ printf '%s %s refs/heads/main\n' | env GRASP_REPO_NPUB='%s' GRASP_REPO_ID=demo G
 		return fmt.Errorf("hook never requested proposed state with mounted credential")
 	}
 
-	fmt.Println("[9/10] in-container hook rejects new-object quota overflow")
+	fmt.Println("[10/11] in-container hook rejects new-object quota overflow")
 	quota := fmt.Sprintf(`cd /tmp/grasp-phase1-e2e.git
 printf '%s %s refs/nostr/%s\n' | env GRASP_REPO_NPUB='%s' GRASP_REPO_ID=demo GRASP_HOOK_RELAY_URL=ws://127.0.0.1:1 GRASP_HOOK_MAX_OBJECTS=1 hooks/pre-receive`, zeroSHA, commit, strings.Repeat("a", 64), npub)
 	if out, err := composeExec(quota); err == nil || !strings.Contains(out, "new object quota exceeded") {
 		return fmt.Errorf("object quota was not enforced: err=%v output=%s", err, out)
 	}
 
-	fmt.Println("[10/10] in-container hook obeys configured timeout")
+	fmt.Println("[11/11] in-container hook obeys configured timeout")
 	fixture.delay.Store(true)
 	started := time.Now()
 	timed := fmt.Sprintf(`cd /tmp/grasp-phase1-e2e.git
@@ -249,6 +263,269 @@ printf '%s %s refs/heads/main\n' | env GRASP_REPO_NPUB='%s' GRASP_REPO_ID=slow G
 
 	fmt.Println("phase1 deployment E2E PASSED")
 	return nil
+}
+
+func runRepositoryOwnershipE2E(_ *http.Client, ownerKey nostr.SecretKey) error {
+	bridgeID, err := composeExecService("grasp-bridge", "", `awk '/^Uid:/{u=$2} /^Gid:/{g=$2} END{printf "%s:%s",u,g}' /proc/1/status`)
+	if err != nil {
+		return fmt.Errorf("read bridge uid/gid: %w: %s", err, bridgeID)
+	}
+	giteaID, err := composeExecService("gitea", "git", "printf '%s:%s' \"$(id -u)\" \"$(id -g)\"")
+	if err != nil {
+		return fmt.Errorf("read Gitea git uid/gid: %w: %s", err, giteaID)
+	}
+	bridgeID, giteaID = strings.TrimSpace(bridgeID), strings.TrimSpace(giteaID)
+	if bridgeID != giteaID {
+		return fmt.Errorf("bridge uid/gid %s does not match Gitea git uid/gid %s", bridgeID, giteaID)
+	}
+
+	repoID := "ownership-e2e"
+	ownerPubkey := ownerKey.Public().Hex()
+	ownerOrg := ownerPubkey[:39]
+	npub := nip19.EncodeNpub(ownerKey.Public())
+	announcement := nostr.Event{
+		Kind:      relay.KindRepositoryAnnouncement,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"d", repoID},
+			{"clone", publicURL + "/" + npub + "/" + repoID + ".git"},
+			{"relays", "wss://grasp.test"},
+		},
+	}
+	if err := announcement.Sign(ownerKey); err != nil {
+		return fmt.Errorf("sign ownership announcement: %w", err)
+	}
+	if err := publishE2EEvent(&announcement); err != nil {
+		return fmt.Errorf("publish ownership announcement: %w", err)
+	}
+
+	repoPath := "/data/git/repositories/" + ownerOrg + "/" + repoID + ".git"
+	if err := waitForComposeTest("gitea", "git", "test -d "+shellQuoteE2E(repoPath), 30*time.Second); err != nil {
+		return fmt.Errorf("wait for provisioned repository: %w", err)
+	}
+
+	seed := fmt.Sprintf(`set -eu
+work=/tmp/grasp-ownership-source
+rm -rf "$work"
+git init -q "$work"
+cd "$work"
+git config user.name e2e
+git config user.email e2e@example.invalid
+printf 'base\n' > README.md
+git add README.md
+git commit -qm base
+base=$(git rev-parse HEAD)
+printf 'base\nproposal\n' > README.md
+git commit -qam proposal
+printf 'BASE=%%s\n' "$base"
+git format-patch --stdout -1 HEAD`)
+	seeded, err := composeExec(seed)
+	if err != nil {
+		return fmt.Errorf("seed hosted base and proposal patch: %w: %s", err, seeded)
+	}
+	parts := strings.SplitN(seeded, "\n", 2)
+	if len(parts) != 2 || !strings.HasPrefix(parts[0], "BASE=") || !strings.HasPrefix(parts[1], "From ") {
+		return fmt.Errorf("unexpected proposal fixture output: %s", seeded)
+	}
+	baseSHA := strings.TrimPrefix(parts[0], "BASE=")
+	state := nostr.Event{
+		Kind:      relay.KindRepositoryState,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"d", repoID},
+			{"HEAD", "ref: refs/heads/main"},
+			{"refs/heads/main", baseSHA},
+		},
+	}
+	if err := state.Sign(ownerKey); err != nil {
+		return fmt.Errorf("sign base repository state: %w", err)
+	}
+	if err := publishE2EEvent(&state); err != nil {
+		return fmt.Errorf("publish base repository state: %w", err)
+	}
+	pushURL := fmt.Sprintf("http://e2e-admin:%s@127.0.0.1:3000/%s/%s.git", url.PathEscape(os.Getenv("E2E_GITEA_ADMIN_TOKEN")), ownerOrg, repoID)
+	push := fmt.Sprintf(`git -C /tmp/grasp-ownership-source push -q %s HEAD~1:refs/heads/main`, shellQuoteE2E(pushURL))
+	pushDeadline := time.Now().Add(10 * time.Second)
+	var pushOutput string
+	for {
+		pushOutput, err = composeExec(push)
+		if err == nil {
+			break
+		}
+		if time.Now().After(pushDeadline) {
+			return fmt.Errorf("push base through Gitea after state publication: %w: %s", err, pushOutput)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	// The push updates Gitea's repository metadata asynchronously. Do not race
+	// proposal reflection against the base branch becoming API-visible.
+	baseAPI := fmt.Sprintf("http://127.0.0.1:3000/api/v1/repos/%s/%s/branches/main", ownerOrg, repoID)
+	baseAuth := shellQuoteE2E("Authorization: token " + os.Getenv("E2E_GITEA_ADMIN_TOKEN"))
+	if err := waitForComposeTest("gitea", "git", fmt.Sprintf("curl -fsS -H %s %s >/dev/null", baseAuth, shellQuoteE2E(baseAPI)), 10*time.Second); err != nil {
+		return fmt.Errorf("wait for pushed base branch in Gitea API: %w", err)
+	}
+	time.Sleep(time.Second)
+
+	proposal := nostr.Event{
+		Kind:      relay.KindPROpen,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"a", fmt.Sprintf("30617:%s:%s", ownerPubkey, repoID)},
+			{"subject", "Ownership-safe proposal"},
+			{"branch-name", "ownership-proposal"},
+		},
+		Content: parts[1],
+	}
+	if err := proposal.Sign(nostr.Generate()); err != nil {
+		return fmt.Errorf("sign ownership proposal: %w", err)
+	}
+	if err := publishE2EEvent(&proposal); err != nil {
+		return fmt.Errorf("publish ownership proposal: %w", err)
+	}
+
+	apiBase := fmt.Sprintf("http://127.0.0.1:3000/api/v1/repos/%s/%s", ownerOrg, repoID)
+	authHeader := shellQuoteE2E("Authorization: token " + os.Getenv("E2E_GITEA_ADMIN_TOKEN"))
+	var pullNumber int64
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		body, reqErr := composeExec(fmt.Sprintf(`curl -fsS -H %s %s/pulls?state=all`, authHeader, shellQuoteE2E(apiBase)))
+		if reqErr == nil {
+			var pulls []struct {
+				Number int64  `json:"number"`
+				Title  string `json:"title"`
+			}
+			if json.Unmarshal([]byte(body), &pulls) == nil && len(pulls) > 0 {
+				pullNumber = pulls[0].Number
+				break
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if pullNumber == 0 {
+		return fmt.Errorf("Gitea did not create PR after NIP-34 proposal")
+	}
+	update, err := composeExec(fmt.Sprintf(`curl -fsS -X PATCH -H %s -H 'Content-Type: application/json' --data '{"title":"Ownership-safe proposal updated"}' %s/pulls/%d`, authHeader, shellQuoteE2E(apiBase), pullNumber))
+	if err != nil || !strings.Contains(update, "Ownership-safe proposal updated") {
+		return fmt.Errorf("Gitea PR update after proposal failed: %v: %s", err, update)
+	}
+
+	// Reproduce the legacy root-writer damage across non-loose-ref paths while
+	// the bridge is stopped, then exercise the explicit entrypoint repair.
+	if out, err := composeControl("stop", "grasp-bridge"); err != nil {
+		return fmt.Errorf("stop bridge before legacy ownership fixture: %w: %s", err, out)
+	}
+	seedDrift := fmt.Sprintf(`set -eu
+repo=%s
+git --git-dir "$repo" pack-refs --all
+printf 'migration in progress
+' > "$repo/grasp-migrating"
+printf 'legacy root hook
+' > "$repo/hooks/legacy-root"
+chown 0:0 "$repo/HEAD" "$repo/config" "$repo/packed-refs" "$repo/grasp-migrating"
+chown -R 0:0 "$repo/hooks"
+chmod 0400 "$repo/HEAD" "$repo/config" "$repo/packed-refs" "$repo/grasp-migrating"
+chmod 0500 "$repo/hooks"`, shellQuoteE2E(repoPath))
+	if out, err := composeExecService("gitea", "root", seedDrift); err != nil {
+		return fmt.Errorf("seed legacy root-owned repository paths: %w: %s", err, out)
+	}
+	if out, err := composeControl("start", "grasp-bridge"); err != nil {
+		return fmt.Errorf("restart bridge for explicit ownership repair: %w: %s", err, out)
+	}
+	if err := waitForComposeTest("grasp-bridge", "", `test "$(awk '/^Uid:/{print $2}' /proc/1/status)" = 1000`, 20*time.Second); err != nil {
+		return fmt.Errorf("wait for repaired non-root bridge restart: %w", err)
+	}
+
+	postRepairRepoID := "ownership-post-repair"
+	postRepairAnnouncement := nostr.Event{
+		Kind:      relay.KindRepositoryAnnouncement,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"d", postRepairRepoID},
+			{"clone", publicURL + "/" + npub + "/" + postRepairRepoID + ".git"},
+			{"relays", "wss://grasp.test"},
+		},
+	}
+	if err := postRepairAnnouncement.Sign(ownerKey); err != nil {
+		return fmt.Errorf("sign post-repair repository announcement: %w", err)
+	}
+	publishDeadline := time.Now().Add(20 * time.Second)
+	for {
+		err = publishE2EEvent(&postRepairAnnouncement)
+		if err == nil {
+			break
+		}
+		if time.Now().After(publishDeadline) {
+			return fmt.Errorf("publish post-repair repository announcement: %w", err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	postRepairRepoPath := "/data/git/repositories/" + ownerOrg + "/" + postRepairRepoID + ".git"
+	if err := waitForComposeTest("gitea", "git", "test -x "+shellQuoteE2E(postRepairRepoPath+"/hooks/pre-receive"), 30*time.Second); err != nil {
+		return fmt.Errorf("post-repair repository hook installation: %w", err)
+	}
+
+	postRepairWrites := fmt.Sprintf(`set -eu
+repo=%s
+cp "$repo/hooks/pre-receive" "$repo/hooks/.pre-receive-ownership-test"
+chmod 0755 "$repo/hooks/.pre-receive-ownership-test"
+mv "$repo/hooks/.pre-receive-ownership-test" "$repo/hooks/pre-receive"
+git --git-dir "$repo" symbolic-ref HEAD refs/heads/main
+git --git-dir "$repo" pack-refs --all
+git --git-dir "$repo" config uploadpack.allowFilter true
+printf 'migration in progress
+' > "$repo/grasp-migrating"
+rm "$repo/grasp-migrating"`, shellQuoteE2E(repoPath))
+	if out, err := composeExec(postRepairWrites); err != nil {
+		return fmt.Errorf("non-root hook/HEAD/packed-ref/config/migration writes after repair: %w: %s", err, out)
+	}
+
+	expectedOwner := bridgeID
+	ownershipCheck := fmt.Sprintf(`find %s %s -exec sh -ec '
+expected=$1; shift
+for path do
+	if [ -L "$path" ]; then echo "symlink: $path"; exit 1; fi
+	actual=$(stat -c "%%u:%%g" "$path")
+	if [ "$actual" != "$expected" ]; then echo "$actual $path"; exit 1; fi
+	if [ -d "$path" ]; then
+	[ -w "$path" ] && [ -x "$path" ] || { echo "directory not writable/searchable: $path"; exit 1; }
+	elif [ -f "$path" ]; then
+	[ -w "$path" ] || { echo "file not writable: $path"; exit 1; }
+	fi
+done
+' sh %s {} +`, shellQuoteE2E(repoPath), shellQuoteE2E(postRepairRepoPath), shellQuoteE2E(expectedOwner))
+	if out, err := composeExec(ownershipCheck); err != nil {
+		return fmt.Errorf("unsafe ownership, mode, or symlink remains in managed bare repository: %w: %s", err, out)
+	}
+	return nil
+}
+
+func publishE2EEvent(ev *nostr.Event) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	r := nostr.NewRelay(context.Background(), "wss://grasp.test", nostr.RelayOptions{})
+	if err := r.ConnectWithClient(ctx, browserClient()); err != nil {
+		return err
+	}
+	defer r.Close()
+	return r.Publish(ctx, *ev)
+}
+
+func waitForComposeTest(service, user, script string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var last string
+	for time.Now().Before(deadline) {
+		out, err := composeExecService(service, user, script)
+		last = out
+		if err == nil {
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out: %s", last)
+}
+
+func shellQuoteE2E(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 type lfsAction struct {
@@ -607,7 +884,23 @@ func get(client *http.Client, target string, headers http.Header) (int, string, 
 }
 
 func composeExec(script string) (string, error) {
-	cmd := exec.Command("docker", "compose", "exec", "-T", "gitea", "sh", "-ec", script)
+	return composeExecService("gitea", "git", script)
+}
+
+func composeControl(args ...string) (string, error) {
+	cmd := exec.Command("docker", append([]string{"compose"}, args...)...)
+	cmd.Env = os.Environ()
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+func composeExecService(service, user, script string) (string, error) {
+	args := []string{"compose", "exec", "-T"}
+	if user != "" {
+		args = append(args, "--user", user)
+	}
+	args = append(args, service, "sh", "-ec", script)
+	cmd := exec.Command("docker", args...)
 	cmd.Env = os.Environ()
 	output, err := cmd.CombinedOutput()
 	return string(output), err

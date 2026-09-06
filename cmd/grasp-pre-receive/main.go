@@ -490,7 +490,7 @@ func envDuration(key string, fallback time.Duration) (time.Duration, error) {
 
 func requiresStateCheck(updates []pushUpdate) bool {
 	for _, update := range updates {
-		if !strings.HasPrefix(update.refName, "refs/nostr/") {
+		if !strings.HasPrefix(update.refName, "refs/nostr/") && !strings.HasPrefix(update.refName, "refs/pull/") {
 			return true
 		}
 	}
@@ -522,6 +522,13 @@ func evaluatePushRef(refName string, newSHA string, state *nip34.RepositoryState
 				return false, err.Error()
 			}
 		}
+		return true, ""
+	}
+
+	// Gitea maintains refs/pull/* itself while creating and updating pull
+	// requests. External receive-pack authorization remains Gitea's concern;
+	// this hook must not reject Gitea's internal ref transaction.
+	if strings.HasPrefix(refName, "refs/pull/") {
 		return true, ""
 	}
 

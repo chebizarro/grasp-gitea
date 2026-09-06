@@ -72,6 +72,7 @@ type Reflector struct {
 	statusSyncEnabled       bool
 	patchRejectionPublisher PatchRejectionPublisher
 	validateGitCloneURL     func(context.Context, string) error
+	ownershipDiagnoser      func(repoPath string) string
 }
 
 func New(st Store, g GiteaClient, repositoriesDir string, logger *slog.Logger) *Reflector {
@@ -84,6 +85,14 @@ func New(st Store, g GiteaClient, repositoriesDir string, logger *slog.Logger) *
 		repositoriesDir:     repositoriesDir,
 		logger:              logger,
 		validateGitCloneURL: safefetch.ValidateGitCloneURL,
+	}
+}
+
+// SetOwnershipDiagnoser attaches current refs/objects ownership details to
+// proposal materialization permission failures.
+func (r *Reflector) SetOwnershipDiagnoser(diagnose func(repoPath string) string) {
+	if r != nil {
+		r.ownershipDiagnoser = diagnose
 	}
 }
 
@@ -510,7 +519,7 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 
 	if validSHA.MatchString(tip) {
 		if err := r.materializeTipBranch(ctx, mapping, ev, repoPath, tip, branch); err != nil {
-			r.logger.Warn("reflector: failed to materialize patch tip; rejecting patch", "event", ev.ID.Hex(), "tip", tip, "error", err)
+			r.logRepositoryFailure("reflector: failed to materialize patch tip; rejecting patch", mapping, repoPath, ev.ID.Hex(), err, "tip", tip)
 			return r.recordPatchRejection(ctx, mapping, ev, tip, "materialize patch tip failed: "+err.Error())
 		}
 	} else {
@@ -519,7 +528,7 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 			return r.recordPatchRejection(ctx, mapping, ev, "", "patch content is not a git format-patch and no usable c tip was provided")
 		}
 		if err := applyPatchContentBranch(ctx, repoPath, base, branch, ev.Content); err != nil {
-			r.logger.Warn("reflector: failed to apply patch content; rejecting patch", "event", ev.ID.Hex(), "error", err)
+			r.logRepositoryFailure("reflector: failed to apply patch content; rejecting patch", mapping, repoPath, ev.ID.Hex(), err)
 			return r.recordPatchRejection(ctx, mapping, ev, "", "apply patch content failed: "+err.Error())
 		}
 	}
@@ -528,7 +537,7 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 	body := patchBody(ev)
 	pr, err := r.gitea.CreatePullRequest(ctx, mapping.Owner, mapping.RepoName, branch, base, title, body)
 	if err != nil {
-		r.logger.Warn("reflector: failed to create Gitea PR for patch; rejecting patch", "event", ev.ID.Hex(), "branch", branch, "base", base, "error", err)
+		r.logRepositoryFailure("reflector: failed to create Gitea PR for patch; rejecting patch", mapping, repoPath, ev.ID.Hex(), err, "branch", branch, "base", base)
 		return r.recordPatchRejection(ctx, mapping, ev, tip, "create pull request failed: "+err.Error())
 	}
 	index := pr.Index
@@ -561,6 +570,25 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 	}
 	r.logger.Info("reflector: created Gitea PR from Nostr patch", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "index", index, "head", branch, "base", base)
 	return true, nil
+}
+
+func (r *Reflector) logRepositoryFailure(message string, mapping store.Mapping, repoPath, eventID string, err error, extra ...any) {
+	args := []any{"repo_address", fmt.Sprintf("30617:%s:%s", mapping.Pubkey, mapping.RepoID), "repo_path", repoPath, "event", eventID, "error", err}
+	args = append(args, extra...)
+	if isPermissionError(err) && r.ownershipDiagnoser != nil {
+		if diagnosis := r.ownershipDiagnoser(repoPath); diagnosis != "" {
+			args = append(args, "ownership_mismatch", diagnosis)
+		}
+	}
+	r.logger.Warn(message, args...)
+}
+
+func isPermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "permission denied") || strings.Contains(message, "insufficient permission") || strings.Contains(message, "cannot lock ref")
 }
 
 func (r *Reflector) reflectPRUpdate(ctx context.Context, mapping store.Mapping, ev *nostr.Event) (bool, error) {

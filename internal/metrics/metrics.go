@@ -46,6 +46,7 @@ var profileSyncPATCleanupFailures atomic.Int64
 var profileSyncRelayFailures atomic.Int64
 var registryTokenLifetimeSeconds atomic.Int64
 var registryTokenRevocationBoundExceeded atomic.Int64
+var repositoryOwnershipDrift atomic.Int64
 
 func IncAnnouncementReceived() {
 	announcementEventsReceived.Add(1)
@@ -236,6 +237,15 @@ func SetRegistryTokenRevocationBoundExceeded(exceeded bool) {
 	registryTokenRevocationBoundExceeded.Store(0)
 }
 
+// SetRepositoryOwnershipDrift records the number of refs/objects paths in
+// managed repositories that are not owned by the Gitea git uid/gid.
+func SetRepositoryOwnershipDrift(count int64) {
+	if count < 0 {
+		count = 0
+	}
+	repositoryOwnershipDrift.Store(count)
+}
+
 func Snapshot() map[string]int64 {
 	return map[string]int64{
 		"announcement_events_received":      announcementEventsReceived.Load(),
@@ -282,5 +292,6 @@ func Snapshot() map[string]int64 {
 		"profile_sync_relay_failures":       profileSyncRelayFailures.Load(),
 		"registry_token_lifetime_seconds":   registryTokenLifetimeSeconds.Load(),
 		"registry_token_bound_exceeded":     registryTokenRevocationBoundExceeded.Load(),
+		"repository_ownership_drift":        repositoryOwnershipDrift.Load(),
 	}
 }

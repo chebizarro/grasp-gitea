@@ -4,9 +4,11 @@
 package reflector
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -399,6 +401,19 @@ func TestReflectorAppliesAndRemovesInboundNIP32Label(t *testing.T) {
 	defer fake.mu.Unlock()
 	if got := fake.labels[1]; len(got) != 0 {
 		t.Fatalf("labels after removal = %#v", got)
+	}
+}
+
+func TestProposalPermissionLogIncludesRepositoryOwnershipDiagnosis(t *testing.T) {
+	var logs bytes.Buffer
+	r := &Reflector{logger: slog.New(slog.NewTextHandler(&logs, nil))}
+	r.SetOwnershipDiagnoser(func(string) string { return "root-owned objects path uid=0 gid=0 expected_uid=1000 expected_gid=1000" })
+	mapping := store.Mapping{Pubkey: strings.Repeat("a", 64), RepoID: "project", Owner: "org", RepoName: "hosted"}
+	r.logRepositoryFailure("proposal failed", mapping, "/repos/org/hosted.git", strings.Repeat("b", 64), errors.New("insufficient permission for adding an object"))
+	for _, want := range []string{"repo_address=30617:" + mapping.Pubkey + ":project", "repo_path=/repos/org/hosted.git", "ownership_mismatch=\"root-owned objects", "insufficient permission"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("permission log missing %q:\n%s", want, logs.String())
+		}
 	}
 }
 

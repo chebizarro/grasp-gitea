@@ -39,6 +39,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/registrytoken"
 	"github.com/sharegap/grasp-gitea/internal/relay"
+	"github.com/sharegap/grasp-gitea/internal/repoownership"
 	"github.com/sharegap/grasp-gitea/internal/safefetch"
 	"github.com/sharegap/grasp-gitea/internal/scim"
 	"github.com/sharegap/grasp-gitea/internal/signer"
@@ -270,6 +271,12 @@ func main() {
 	}
 	defer st.Close()
 
+	ownershipMonitor := repoownership.New(cfg.GiteaRepositoriesDir, st, logger)
+	if err := ownershipMonitor.Scan(context.Background()); err != nil {
+		logger.Error("repository ownership startup preflight failed; refusing to enable writers", "error", err)
+		os.Exit(1)
+	}
+
 	// SQLite remains the store for repository/CI state. Auth, signer sessions,
 	// identity links, profile-sync identity reads, webhook actor lookup, and
 	// proxy audit/token state converge on Postgres when configured.
@@ -300,6 +307,7 @@ func main() {
 	tenantSvc := tenant.New(sharedStore, giteaClient, cfg.TenantReconciliationEnabled, logger).WithDomainAffiliationMaxAge(cfg.DomainAffiliationMaxAge)
 	provisionerSvc := provisioner.New(cfg, st, sharedStore, tenantSvc, giteaClient, hookInstaller, nip05Resolver, logger)
 	provisionerSvc.SetPolicyStore(policies)
+	provisionerSvc.SetOwnershipPreflight(ownershipMonitor.Scan)
 
 	// Roll back any repository transfer interrupted by a previous crash before
 	// ordinary hook reconciliation observes its transient physical path.
@@ -319,11 +327,17 @@ func main() {
 	if err := provisionerSvc.EnsureUploadPackCapabilities(context.Background()); err != nil {
 		logger.Warn("upload-pack capability migration had errors", "error", err)
 	}
+	if err := ownershipMonitor.Scan(context.Background()); err != nil {
+		logger.Error("repository ownership preflight failed after startup recovery; refusing to enable writers", "error", err)
+		os.Exit(1)
+	}
 
 	proactiveSyncSvc := proactivesync.New(cfg.GiteaRepositoriesDir, st, logger)
+	proactiveSyncSvc.SetOwnershipDiagnoser(ownershipMonitor.Diagnose)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	go ownershipMonitor.Run(ctx, 5*time.Minute)
 	go reconcileHooksOnPolicyChange(ctx, policies, provisionerSvc, logger)
 	reloadSignals := make(chan os.Signal, 1)
 	signal.Notify(reloadSignals, syscall.SIGHUP)
@@ -523,6 +537,7 @@ func main() {
 
 	apiServer := api.New(cfg, provisionerSvc, publisherSvc, st, logger)
 	apiServer.SetPolicyStore(policies)
+	apiServer.AddReadinessProbe(ownershipMonitor)
 	apiServer.SetAffiliationStore(sharedStore)
 	apiServer.SetTenantOperator(tenantSvc)
 	installSCIMProvider(apiServer, sharedStore, tenantSvc)
@@ -659,6 +674,7 @@ func main() {
 	}
 
 	reflectorSvc := reflector.New(st, giteaClient, cfg.GiteaRepositoriesDir, logger)
+	reflectorSvc.SetOwnershipDiagnoser(ownershipMonitor.Diagnose)
 	reflectorSvc.SetStatusSyncEnabled(cfg.NIP34StatusSyncEnabled)
 	if publisherSvc != nil && publisherSvc.Enabled() {
 		reflectorSvc.SetPatchRejectionPublisher(publisherSvc)

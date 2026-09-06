@@ -19,6 +19,13 @@ export GRASP_EDGE_SECRET_FILE="$tmp/grasp-edge-shared-secret"
 export E2E_ADMIN_TOKEN="$admin_token"
 export E2E_EDGE_SECRET="$edge_secret"
 export GITEA_ADMIN_USER=e2e-admin
+export USER_UID=1000
+export USER_GID=1000
+if [[ "${E2E_OWNERSHIP_ONLY:-false}" == "true" ]]; then
+  export GITEA_REPO_OWNERSHIP_AUTO_REPAIR=true
+else
+  export GITEA_REPO_OWNERSHIP_AUTO_REPAIR="${GITEA_REPO_OWNERSHIP_AUTO_REPAIR:-false}"
+fi
 export BRIDGE_TOKENS_ENABLED=true
 export GITEA_IMAGE="${GITEA_IMAGE:-gitea/gitea:1.24.6}"
 export GRASP_BRIDGE_IMAGE="${GRASP_BRIDGE_IMAGE:-grasp-bridge:phase1-e2e}"
@@ -58,6 +65,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout "$E2E_TLS_KEY" -out "$E2E_TLS_CERT" >/dev/null 2>&1
 sed \
   -e 's/YOUR_DOMAIN/grasp.test/g' \
+  -e 's/grasp-bridge-a/grasp-bridge/g' \
+  -e '/grasp-bridge-b:/d' \
   -e "s/REPLACE_WITH_GRASP_EDGE_SHARED_SECRET/${edge_secret}/g" \
   -e 's#/etc/letsencrypt/live/grasp.test/fullchain.pem#/etc/nginx/tls/tls.crt#g' \
   -e 's#/etc/letsencrypt/live/grasp.test/privkey.pem#/etc/nginx/tls/tls.key#g' \
@@ -92,7 +101,16 @@ E2E_GITEA_ADMIN_TOKEN="$e2e_token"
 export E2E_GITEA_ADMIN_TOKEN
 
 echo "[setup] building bridge/hook and starting hardened full-proxy stack"
-if [[ "${E2E_USE_EXISTING_BRIDGE_IMAGE:-false}" == "true" ]]; then
+if [[ "${E2E_OWNERSHIP_ONLY:-false}" == "true" ]]; then
+  if [[ "${E2E_USE_EXISTING_BRIDGE_IMAGE:-false}" == "true" ]]; then
+    docker compose up -d grasp-bridge
+  else
+    docker compose up -d --build grasp-bridge
+  fi
+  # The focused ownership scenario is independent of unrelated readiness
+  # probes, so start nginx without waiting for their health state.
+  docker compose up -d --no-deps nginx
+elif [[ "${E2E_USE_EXISTING_BRIDGE_IMAGE:-false}" == "true" ]]; then
   docker compose up -d
 else
   docker compose up -d --build
