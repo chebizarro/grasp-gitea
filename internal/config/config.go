@@ -133,13 +133,18 @@ type Config struct {
 	EdgeSharedSecret string
 	// FullProxyEnabled routes ALL unmatched HTTP traffic through the bridge to
 	// Gitea (full reverse proxy mode) instead of only canonical npub paths.
-	FullProxyEnabled        bool
-	TokenTTLDefault         time.Duration
-	TokenTTLMin             time.Duration
-	TokenTTLMax             time.Duration
-	AuthAuditRetention      time.Duration
-	RegistryTokenMaxTTL     time.Duration
-	RegistryTokenProbeEvery time.Duration
+	FullProxyEnabled            bool
+	TokenTTLDefault             time.Duration
+	TokenTTLMin                 time.Duration
+	TokenTTLMax                 time.Duration
+	AuthAuditRetention          time.Duration
+	RegistryTokenMaxTTL         time.Duration
+	RegistryTokenProbeEvery     time.Duration
+	RegistryTokenMonitorMode    string
+	RegistryTokenProbeURL       string
+	RegistryTokenProbeUser      string
+	RegistryTokenProbeToken     string
+	RegistryTokenProbeTokenFile string
 	// ShutdownGrace bounds graceful HTTP shutdown; long enough for active
 	// streaming git/package uploads to complete.
 	ShutdownGrace time.Duration
@@ -248,8 +253,33 @@ func Load() (Config, error) {
 		AuthAuditRetention:          boundedDurationEnv("AUTH_AUDIT_RETENTION", 90*24*time.Hour, 24*time.Hour, 365*24*time.Hour),
 		RegistryTokenMaxTTL:         durationEnv("REGISTRY_TOKEN_MAX_LIFETIME", 24*time.Hour),
 		RegistryTokenProbeEvery:     durationEnv("REGISTRY_TOKEN_PROBE_INTERVAL", 5*time.Minute),
+		RegistryTokenMonitorMode:    envOrDefault("REGISTRY_TOKEN_MONITOR_MODE", "warn"),
+		RegistryTokenProbeURL:       strings.TrimSpace(os.Getenv("REGISTRY_TOKEN_PROBE_URL")),
+		RegistryTokenProbeUser:      strings.TrimSpace(os.Getenv("REGISTRY_TOKEN_PROBE_USER")),
+		RegistryTokenProbeTokenFile: strings.TrimSpace(os.Getenv("REGISTRY_TOKEN_PROBE_TOKEN_FILE")),
 		ShutdownGrace:               boundedDurationEnv("SHUTDOWN_GRACE", 5*time.Minute, time.Second, 30*time.Minute),
 	}
+	if cfg.RegistryTokenMonitorMode != "require" && cfg.RegistryTokenMonitorMode != "warn" && cfg.RegistryTokenMonitorMode != "disabled" {
+		return Config{}, fmt.Errorf("REGISTRY_TOKEN_MONITOR_MODE must be require, warn, or disabled")
+	}
+	probeURL, err := resolveRegistryTokenProbeURL(cfg.GiteaURL, cfg.RegistryTokenProbeURL)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.RegistryTokenProbeURL = probeURL
+	if cfg.RegistryTokenProbeUser == "" {
+		cfg.RegistryTokenProbeUser = cfg.GiteaAdminUser
+	}
+	cfg.RegistryTokenProbeToken = cfg.GiteaAdminToken
+	if cfg.RegistryTokenProbeTokenFile != "" {
+		token, resolvedPath, err := readRegistryTokenProbeToken(cfg.RegistryTokenProbeTokenFile)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.RegistryTokenProbeToken = token
+		cfg.RegistryTokenProbeTokenFile = resolvedPath
+	}
+
 	_, policyStatErr := os.Stat(cfg.PolicyPath)
 	hasPersistedPolicy := policyStatErr == nil
 	if policyStatErr != nil && !errors.Is(policyStatErr, os.ErrNotExist) {
@@ -416,6 +446,45 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func resolveRegistryTokenProbeURL(giteaURL, override string) (string, error) {
+	raw := override
+	if raw == "" {
+		base, err := url.Parse(giteaURL)
+		if err != nil || !base.IsAbs() || base.Host == "" {
+			return "", fmt.Errorf("GITEA_URL must be an absolute URL")
+		}
+		endpoint := base.JoinPath("/v2/token")
+		query := endpoint.Query()
+		query.Set("service", "container_registry")
+		endpoint.RawQuery = query.Encode()
+		return endpoint.String(), nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() || u.Host == "" {
+		return "", fmt.Errorf("REGISTRY_TOKEN_PROBE_URL must be an absolute URL")
+	}
+	return u.String(), nil
+}
+
+func readRegistryTokenProbeToken(configuredPath string) (string, string, error) {
+	resolvedPath := configuredPath
+	privateCopy := filepath.Join("/run/grasp-secrets", filepath.Base(configuredPath))
+	if filepath.Clean(privateCopy) != filepath.Clean(configuredPath) {
+		if _, err := os.Stat(privateCopy); err == nil {
+			resolvedPath = privateCopy
+		}
+	}
+	contents, err := os.ReadFile(resolvedPath)
+	if err != nil {
+		return "", "", fmt.Errorf("read REGISTRY_TOKEN_PROBE_TOKEN_FILE %q: %w", resolvedPath, err)
+	}
+	token := strings.TrimSpace(string(contents))
+	if token == "" {
+		return "", "", fmt.Errorf("REGISTRY_TOKEN_PROBE_TOKEN_FILE %q is empty", resolvedPath)
+	}
+	return token, resolvedPath, nil
 }
 
 func (c Config) AllowlistEnabled() bool {

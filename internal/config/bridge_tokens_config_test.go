@@ -5,6 +5,8 @@ package config
 
 import (
 	"encoding/base64"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +29,10 @@ func setBridgeBaseEnv(t *testing.T) {
 	t.Setenv("BRIDGE_TOKEN_TTL_MAX", "")
 	t.Setenv("REGISTRY_TOKEN_MAX_LIFETIME", "")
 	t.Setenv("REGISTRY_TOKEN_PROBE_INTERVAL", "")
+	t.Setenv("REGISTRY_TOKEN_MONITOR_MODE", "")
+	t.Setenv("REGISTRY_TOKEN_PROBE_URL", "")
+	t.Setenv("REGISTRY_TOKEN_PROBE_USER", "")
+	t.Setenv("REGISTRY_TOKEN_PROBE_TOKEN_FILE", "")
 	t.Setenv("GRASP_ENV", "")
 	t.Setenv("AUTH_ENABLED", "")
 	t.Setenv("ADMIN_API_TOKEN", "")
@@ -118,6 +124,12 @@ func TestBridgeTokensConfigValidation(t *testing.T) {
 	if cfg.RegistryTokenMaxTTL != 24*time.Hour || cfg.RegistryTokenProbeEvery != 5*time.Minute {
 		t.Fatalf("registry monitor defaults = (%s, %s)", cfg.RegistryTokenMaxTTL, cfg.RegistryTokenProbeEvery)
 	}
+	if cfg.RegistryTokenMonitorMode != "warn" || cfg.RegistryTokenProbeURL != "http://gitea:3000/v2/token?service=container_registry" {
+		t.Fatalf("registry probe defaults = (%q, %q)", cfg.RegistryTokenMonitorMode, cfg.RegistryTokenProbeURL)
+	}
+	if cfg.RegistryTokenProbeUser != "grasp-admin" || cfg.RegistryTokenProbeToken != "admin-token" {
+		t.Fatalf("registry probe default credentials = (%q, %q)", cfg.RegistryTokenProbeUser, cfg.RegistryTokenProbeToken)
+	}
 }
 
 func TestRegistryTokenMonitorConfigValidation(t *testing.T) {
@@ -132,6 +144,45 @@ func TestRegistryTokenMonitorConfigValidation(t *testing.T) {
 	t.Setenv("REGISTRY_TOKEN_PROBE_INTERVAL", "-1s")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REGISTRY_TOKEN_PROBE_INTERVAL") {
 		t.Fatalf("non-positive probe interval accepted: %v", err)
+	}
+}
+
+func TestRegistryTokenProbeOverridesAndValidation(t *testing.T) {
+	setBridgeBaseEnv(t)
+
+	t.Setenv("REGISTRY_TOKEN_MONITOR_MODE", "optional")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REGISTRY_TOKEN_MONITOR_MODE") {
+		t.Fatalf("invalid monitor mode accepted: %v", err)
+	}
+
+	t.Setenv("REGISTRY_TOKEN_MONITOR_MODE", "disabled")
+	t.Setenv("REGISTRY_TOKEN_PROBE_URL", "/v2/token")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REGISTRY_TOKEN_PROBE_URL") {
+		t.Fatalf("relative probe URL accepted: %v", err)
+	}
+
+	t.Setenv("REGISTRY_TOKEN_PROBE_URL", "http://registry.internal:3000/custom/token?service=container_registry")
+	missing := filepath.Join(t.TempDir(), "missing-token")
+	t.Setenv("REGISTRY_TOKEN_PROBE_TOKEN_FILE", missing)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REGISTRY_TOKEN_PROBE_TOKEN_FILE") {
+		t.Fatalf("missing probe token file accepted: %v", err)
+	}
+
+	tokenFile := filepath.Join(t.TempDir(), "registry-token")
+	if err := os.WriteFile(tokenFile, []byte("probe-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REGISTRY_TOKEN_PROBE_TOKEN_FILE", tokenFile)
+	t.Setenv("REGISTRY_TOKEN_PROBE_USER", "probe-user")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("valid registry probe overrides rejected: %v", err)
+	}
+	if cfg.RegistryTokenMonitorMode != "disabled" || cfg.RegistryTokenProbeURL != "http://registry.internal:3000/custom/token?service=container_registry" {
+		t.Fatalf("registry probe override = (%q, %q)", cfg.RegistryTokenMonitorMode, cfg.RegistryTokenProbeURL)
+	}
+	if cfg.RegistryTokenProbeUser != "probe-user" || cfg.RegistryTokenProbeToken != "probe-secret" || cfg.RegistryTokenProbeTokenFile != tokenFile {
+		t.Fatalf("registry probe override credentials = (%q, %q, %q)", cfg.RegistryTokenProbeUser, cfg.RegistryTokenProbeToken, cfg.RegistryTokenProbeTokenFile)
 	}
 }
 

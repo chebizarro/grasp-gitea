@@ -24,12 +24,25 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 )
 
-const maxResponseBytes = 1 << 20
+const (
+	maxResponseBytes     = 1 << 20
+	maxErrorResponseBody = 512
+)
+
+// Mode controls whether probe failures gate readiness.
+type Mode string
+
+const (
+	ModeRequire  Mode = "require"
+	ModeWarn     Mode = "warn"
+	ModeDisabled Mode = "disabled"
+)
 
 // Monitor periodically measures exp-iat on JWTs issued by Gitea's /v2/token
 // endpoint and exposes the last result as a readiness probe.
 type Monitor struct {
 	endpoint    string
+	mode        Mode
 	username    string
 	token       string
 	maxLifetime time.Duration
@@ -42,10 +55,13 @@ type Monitor struct {
 }
 
 // New constructs a registry-token lifetime monitor.
-func New(baseURL, username, token string, maxLifetime, interval time.Duration, client *http.Client, logger *slog.Logger) (*Monitor, error) {
-	base, err := url.Parse(baseURL)
-	if err != nil || !base.IsAbs() || base.Host == "" {
-		return nil, fmt.Errorf("invalid Gitea URL %q", baseURL)
+func New(endpointURL, username, token string, mode Mode, maxLifetime, interval time.Duration, client *http.Client, logger *slog.Logger) (*Monitor, error) {
+	endpoint, err := url.Parse(endpointURL)
+	if err != nil || !endpoint.IsAbs() || endpoint.Host == "" {
+		return nil, fmt.Errorf("invalid registry token probe URL %q", endpointURL)
+	}
+	if mode != ModeRequire && mode != ModeWarn && mode != ModeDisabled {
+		return nil, fmt.Errorf("invalid registry token monitor mode %q", mode)
 	}
 	if username == "" || token == "" {
 		return nil, errors.New("Gitea admin Basic credentials are required")
@@ -63,12 +79,8 @@ func New(baseURL, username, token string, maxLifetime, interval time.Duration, c
 		logger = slog.Default()
 	}
 
-	endpoint := base.JoinPath("/v2/token")
-	query := endpoint.Query()
-	query.Set("service", "container_registry")
-	endpoint.RawQuery = query.Encode()
 	return &Monitor{
-		endpoint: endpoint.String(), username: username, token: token,
+		endpoint: endpoint.String(), mode: mode, username: username, token: token,
 		maxLifetime: maxLifetime, interval: interval, client: client, logger: logger,
 		lastErr: errors.New("registry token lifetime has not been measured"),
 	}, nil
@@ -79,9 +91,24 @@ func (m *Monitor) Name() string { return "registry_token_lifetime" }
 
 // Check returns the result of the most recent periodic probe.
 func (m *Monitor) Check(context.Context) error {
+	if m.mode != ModeRequire {
+		return nil
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.lastErr
+}
+
+// RedactedURL returns a probe URL safe for logs and readiness errors.
+func RedactedURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.User != nil {
+		u.User = url.User("REDACTED")
+	}
+	return u.String()
 }
 
 // Run probes immediately, then repeats until ctx is canceled.
@@ -106,15 +133,28 @@ func (m *Monitor) probeAndRecord(ctx context.Context) {
 	}
 	if lifetime > 0 {
 		metrics.SetRegistryTokenLifetimeSeconds(int64(lifetime / time.Second))
-		metrics.SetRegistryTokenRevocationBoundExceeded(lifetime > m.maxLifetime)
 	}
+	metrics.SetRegistryTokenRevocationBoundExceeded(err != nil)
 
 	m.mu.Lock()
 	m.lastErr = err
 	m.mu.Unlock()
 
 	if err != nil {
-		m.logger.Warn("registry token revocation-bound probe failed", "error", err)
+		fields := []any{"error", err}
+		var responseErr *endpointResponseError
+		if errors.As(err, &responseErr) {
+			fields = append(fields,
+				"request_url", responseErr.requestURL,
+				"http_status", responseErr.status,
+				"www_authenticate", responseErr.wwwAuthenticate,
+			)
+			if responseErr.dockerDistributionAPIVersion != "" {
+				fields = append(fields, "docker_distribution_api_version", responseErr.dockerDistributionAPIVersion)
+			}
+			fields = append(fields, "response_body", responseErr.body)
+		}
+		m.logger.Warn("registry token revocation-bound probe failed", fields...)
 		return
 	}
 	m.logger.Info("registry token revocation bound measured", "lifetime", lifetime.String(), "accepted_bound", m.maxLifetime.String())
@@ -132,8 +172,17 @@ func (m *Monitor) probe(ctx context.Context) (time.Duration, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
-		return 0, fmt.Errorf("registry token endpoint returned %s", resp.Status)
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorResponseBody))
+		if readErr != nil {
+			return 0, fmt.Errorf("read registry token error response from %s: %w", RedactedURL(m.endpoint), readErr)
+		}
+		return 0, &endpointResponseError{
+			requestURL:                   RedactedURL(m.endpoint),
+			status:                       resp.Status,
+			wwwAuthenticate:              resp.Header.Get("WWW-Authenticate"),
+			dockerDistributionAPIVersion: resp.Header.Get("Docker-Distribution-Api-Version"),
+			body:                         string(body),
+		}
 	}
 
 	var payload struct {
@@ -149,6 +198,18 @@ func (m *Monitor) probe(ctx context.Context) (time.Duration, error) {
 		jwt = payload.AccessToken
 	}
 	return jwtLifetime(jwt)
+}
+
+type endpointResponseError struct {
+	requestURL                   string
+	status                       string
+	wwwAuthenticate              string
+	dockerDistributionAPIVersion string
+	body                         string
+}
+
+func (e *endpointResponseError) Error() string {
+	return fmt.Sprintf("registry token endpoint %s returned %s (WWW-Authenticate: %s)", e.requestURL, e.status, e.wwwAuthenticate)
 }
 
 func jwtLifetime(token string) (time.Duration, error) {

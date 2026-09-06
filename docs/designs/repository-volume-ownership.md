@@ -27,6 +27,10 @@ The portable repair happens during root initialization and never mutates the mou
 
 The hardening and full-proxy command wrappers read bridge credentials exclusively from `/run/grasp-secrets`. This guarantees that the shell executed after `su-exec` sees target-owned `0400` files across file-backed Compose secrets, Swarm secrets, Kubernetes mounts, and alternative secret mounts. The Gitea hook remains a separate container and continues to use its own `/run/secrets/grasp-admin-api-token` mount.
 
+## Registry-token probe
+
+`REGISTRY_TOKEN_MONITOR_MODE` selects `require`, `warn` (the default), or `disabled`. Require mode gates `/ready`; warn mode retains metrics and structured failure diagnostics without failing readiness; disabled mode does not start the monitor. `REGISTRY_TOKEN_PROBE_URL` may override the full token endpoint, while `REGISTRY_TOKEN_PROBE_USER` and `REGISTRY_TOKEN_PROBE_TOKEN_FILE` may override its Basic credentials. The URL must be absolute, and a configured token file must be readable at startup. If the root entrypoint staged a matching basename under `/run/grasp-secrets`, the bridge reads that target-owned copy.
+
 ## Managed write boundary and symlinks
 
 The complete managed bare-repository tree is the write boundary, including `HEAD`, `config`, `packed-refs`, `refs/`, `objects/`, `hooks/`, `info/`, linked-worktree metadata, and migration markers. The preflight requires the configured uid/gid and owner write permission on files plus owner write/execute permission on directories.

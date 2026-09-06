@@ -548,18 +548,25 @@ func main() {
 		apiServer.AddReadinessProbe(postgresStore)
 	}
 	if cfg.BridgeTokensEnabled {
-		registryTokenMonitor, monitorErr := registrytoken.New(
-			cfg.GiteaURL, cfg.GiteaAdminUser, cfg.GiteaAdminToken,
-			cfg.RegistryTokenMaxTTL, cfg.RegistryTokenProbeEvery,
-			nil, logger,
+		logger.Info("registry token revocation-bound monitor configured",
+			"mode", cfg.RegistryTokenMonitorMode,
+			"probe_url", registrytoken.RedactedURL(cfg.RegistryTokenProbeURL),
 		)
-		if monitorErr != nil {
-			logger.Error("failed to initialize registry token revocation-bound monitor", "error", monitorErr)
-			os.Exit(1)
+		if cfg.RegistryTokenMonitorMode != string(registrytoken.ModeDisabled) {
+			registryTokenMonitor, monitorErr := registrytoken.New(
+				cfg.RegistryTokenProbeURL, cfg.RegistryTokenProbeUser, cfg.RegistryTokenProbeToken,
+				registrytoken.Mode(cfg.RegistryTokenMonitorMode),
+				cfg.RegistryTokenMaxTTL, cfg.RegistryTokenProbeEvery,
+				nil, logger,
+			)
+			if monitorErr != nil {
+				logger.Error("failed to initialize registry token revocation-bound monitor", "error", monitorErr)
+				os.Exit(1)
+			}
+			apiServer.AddReadinessProbe(registryTokenMonitor)
+			go registryTokenMonitor.Run(ctx)
+			logger.Info("registry token revocation-bound monitor enabled", "accepted_bound", cfg.RegistryTokenMaxTTL.String(), "interval", cfg.RegistryTokenProbeEvery.String())
 		}
-		apiServer.AddReadinessProbe(registryTokenMonitor)
-		go registryTokenMonitor.Run(ctx)
-		logger.Info("registry token revocation-bound monitor enabled", "accepted_bound", cfg.RegistryTokenMaxTTL.String(), "interval", cfg.RegistryTokenProbeEvery.String())
 	}
 	var bridgeTokenSvc *auth.TokenService
 	var proxyNostrVerifier *auth.ProxyNIP98Verifier
