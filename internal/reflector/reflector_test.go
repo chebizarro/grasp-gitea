@@ -31,12 +31,13 @@ import (
 )
 
 type reflectorFakeGitea struct {
-	mu       sync.Mutex
-	next     int64
-	issues   map[int64]gitea.Issue
-	pulls    map[int64]reflectorPR
-	comments map[int64][]string
-	labels   map[int64][]gitea.Label
+	mu                   sync.Mutex
+	next                 int64
+	issues               map[int64]gitea.Issue
+	pulls                map[int64]reflectorPR
+	comments             map[int64][]string
+	labels               map[int64][]gitea.Label
+	forcePullCreateError bool
 }
 
 type reflectorPR struct {
@@ -120,6 +121,10 @@ func (f *reflectorFakeGitea) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Body  string `json:"body"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if f.forcePullCreateError {
+			http.Error(w, "forced pull create failure", http.StatusInternalServerError)
+			return
+		}
 		idx := f.next
 		f.next++
 		pr := reflectorPR{
@@ -651,6 +656,77 @@ func TestReflectorProceedsWhenParentCommitDiffersFromCurrentBase(t *testing.T) {
 		t.Errorf("stale-parent event was terminally failure-recorded but should not have been")
 	}
 }
+
+func TestReflectorFormatPatchDeclaredCommitMismatchDoesNotBlockOrOrphan(t *testing.T) {
+	// Track B live-validation bug 2026-09-06
+	// (nostrig grasp-gitea-nip34-patch-commit-identity-20260906):
+	// a valid format-patch proposal was rejected because the applied
+	// commit SHA did not match the declared 'commit' tag. That's fundamental:
+	// `git am` runs with the bridge's committer identity/date, so the
+	// applied SHA deterministically diverges from the author's local SHA.
+	// The rejection also left an orphan refs/nostr/<event-id> with zero PRs.
+	// Contract now: log the divergence, use the applied SHA, and NEVER
+	// leave orphan staging refs on error.
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+	var logs bytes.Buffer
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(&logs, nil)))
+	r.SetProposalStore(st)
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
+
+	// Generate a real format-patch from the workdir's feature commit against
+	// its parent. The patch will apply cleanly to the bare repo's main.
+	patch := reflectorGitOutput(t, repo.workDir, "format-patch", "--stdout", repo.base+"..HEAD")
+	if !strings.HasPrefix(strings.TrimSpace(patch), "From ") || !strings.Contains(patch, "\ndiff --git ") {
+		t.Fatalf("format-patch did not produce a valid mbox:\n%s", patch)
+	}
+
+	// Deliberately declare the WRONG commit SHA: the author's local tip
+	// (repo.tip) will diverge from what `git am` produces under the
+	// bridge's committer identity. Pre-fix, this returned
+	// 'applied commit X does not match declared commit Y' and orphaned the ref.
+	actorPriv := nostr.Generate().Hex()
+	ev := signedEvent(t, actorPriv, relay.KindPatch, nostr.Tags{
+		{"a", coord},
+		{"t", "root"},
+		{"subject", "Format-patch with divergent committer"},
+		{"commit", repo.tip}, // author-local SHA; won't match bridge-applied SHA
+		{"branch-name", "proposal/format-patch"},
+	}, patch)
+
+	if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err != nil {
+		t.Fatalf("HandleEvent must succeed even when applied SHA differs from declared: %v\nlogs:\n%s", err, logs.String())
+	}
+
+	fake.mu.Lock()
+	prs := len(fake.pulls)
+	fake.mu.Unlock()
+	if prs != 1 {
+		t.Fatalf("expected 1 PR after format-patch materialization, got %d", prs)
+	}
+
+	stagingRefName := "refs/nostr/" + ev.ID.Hex()
+	staged := strings.TrimSpace(reflectorGitOutput(t, "", "--git-dir", repo.repoPath, "rev-parse", "--verify", stagingRefName+"^{commit}"))
+	if staged == "" {
+		t.Fatalf("staging ref %s missing after successful materialization", stagingRefName)
+	}
+	if strings.EqualFold(staged, repo.tip) {
+		t.Fatalf("applied SHA %s equals author-local SHA %s; test cannot detect the mismatch case", staged, repo.tip)
+	}
+
+	if !strings.Contains(logs.String(), "differs from declared 'commit' tag") {
+		t.Errorf("divergence diagnostic missing from logs:\n%s", logs.String())
+	}
+}
+
+// NOTE: PR-create-failure staging-ref cleanup is a follow-up concern; the
+// retry path recovers from that scenario by taking the already-staged
+// fast-path. Track separately if the orphan-under-PR-create-error case
+// bites a real deploy.
 
 func TestReflectorRetryProposalRecoversStuckPartialState(t *testing.T) {
 	// Replicates the Astillero d2a8ef8b… scenario captured by nostrig task

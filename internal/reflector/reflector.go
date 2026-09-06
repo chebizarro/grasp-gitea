@@ -1031,7 +1031,7 @@ func (r *Reflector) reflectProposalLocked(ctx context.Context, mapping store.Map
 	return true, nil
 }
 
-func (r *Reflector) materializeProposalHead(ctx context.Context, mapping store.Mapping, ev *nostr.Event, repoPath, base, branch string) (string, error) {
+func (r *Reflector) materializeProposalHead(ctx context.Context, mapping store.Mapping, ev *nostr.Event, repoPath, base, branch string) (sha string, retErr error) {
 	stagingRef := refsnostr.RefPrefix + ev.ID.Hex()
 	declared := tagValue(ev.Tags, "commit")
 	legacy := tagValue(ev.Tags, "c")
@@ -1041,9 +1041,30 @@ func (r *Reflector) materializeProposalHead(ctx context.Context, mapping store.M
 	if declared == "" {
 		declared = legacy
 	}
+	// Track whether we've written stagingRef so any error return after that
+	// point cleans it up. An orphaned refs/nostr/<event-id> with no PR is
+	// what wedged Track B's live validation on 2026-09-06 and is captured
+	// by nostrig task grasp-gitea-nip34-patch-commit-identity-20260906.
+	stagingWritten := false
+	defer func() {
+		if retErr != nil && stagingWritten {
+			_ = deleteBareRef(context.Background(), repoPath, stagingRef)
+		}
+	}()
 	if staged, err := bareOutput(ctx, repoPath, "rev-parse", "--verify", stagingRef+"^{commit}"); err == nil {
 		if declared != "" && !strings.EqualFold(staged, declared) {
-			return "", fmt.Errorf("staged commit %s does not match declared commit %s", staged, declared)
+			// Third-party reapply of a format-patch necessarily produces a
+			// different commit SHA because the committer identity + date
+			// differ from the author's local commit. This is not a defect;
+			// the tree hash carries the semantic content. Log the divergence
+			// and proceed with the staged SHA (used to be a hard-fail that
+			// wedged the Astillero d2a8ef8b… re-fixture on 2026-09-06).
+			r.logger.Info("reflector: staged proposal SHA differs from declared 'commit' tag; using staged SHA (git am reapply diverges deterministically from author-local SHA)",
+				"event_id", ev.ID.Hex(),
+				"repo_path", repoPath,
+				"declared_commit", declared,
+				"staged_commit", staged,
+			)
 		}
 		if err := updateBareRef(ctx, repoPath, "refs/heads/"+branch, staged); err != nil {
 			return "", err
@@ -1092,8 +1113,20 @@ func (r *Reflector) materializeProposalHead(ctx context.Context, mapping store.M
 		if err != nil {
 			return "", err
 		}
+		stagingWritten = true
 		if declared != "" && !strings.EqualFold(head, declared) {
-			return "", fmt.Errorf("applied commit %s does not match declared commit %s", head, declared)
+			// See the earlier `staged commit differs from declared` comment:
+			// git am necessarily reproduces a different commit SHA because
+			// the bridge's committer identity + date differ from the
+			// author's. Log the divergence and use the applied SHA. Compare
+			// tree hashes if we later add a `tree` NIP-34 tag; the commit
+			// SHA is not a semantic invariant across third-party reapply.
+			r.logger.Info("reflector: applied proposal SHA differs from declared 'commit' tag; using applied SHA (git am reapply diverges deterministically from author-local SHA)",
+				"event_id", ev.ID.Hex(),
+				"repo_path", repoPath,
+				"declared_commit", declared,
+				"applied_commit", head,
+			)
 		}
 		if err := updateBareRef(ctx, repoPath, "refs/heads/"+branch, head); err != nil {
 			return "", err
