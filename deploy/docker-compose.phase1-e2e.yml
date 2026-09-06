@@ -34,6 +34,8 @@ services:
     volumes:
       - grasp-bridge-data:/data
       - gitea-data:/gitea-data
+    secrets:
+      - grasp-test-secret
 
   gitea:
     image: ${GITEA_IMAGE:-gitea/gitea:1.24.6}
@@ -68,6 +70,8 @@ services:
       - ${E2E_TLS_KEY:?set E2E_TLS_KEY}:/etc/nginx/tls/tls.key:ro
 
 secrets:
+  grasp-test-secret:
+    file: ${E2E_GRASP_TEST_SECRET_FILE:?set E2E_GRASP_TEST_SECRET_FILE}
   grasp-admin-api-token:
     file: ${GRASP_ADMIN_TOKEN_FILE:?set GRASP_ADMIN_TOKEN_FILE}
   grasp-credential-keys:

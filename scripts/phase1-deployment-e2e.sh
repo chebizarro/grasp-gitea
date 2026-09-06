@@ -7,6 +7,7 @@ project="grasp-phase1-e2e-${$}"
 volume="${project}-gitea-data"
 admin_token="phase1-e2e-admin-token-0123456789abcdef"
 edge_secret="phase1-e2e-edge-secret-0123456789abcdef0123456789abcdef"
+test_secret="phase1-e2e-mounted-secret"
 
 export COMPOSE_PROJECT_NAME="$project"
 export E2E_GITEA_DATA_VOLUME="$volume"
@@ -16,6 +17,7 @@ export E2E_TLS_KEY="$tmp/tls.key"
 export GRASP_ADMIN_TOKEN_FILE="$tmp/grasp-admin-api-token"
 export GRASP_CREDENTIAL_KEYS_FILE="$tmp/grasp-credential-keys"
 export GRASP_EDGE_SECRET_FILE="$tmp/grasp-edge-shared-secret"
+export E2E_GRASP_TEST_SECRET_FILE="$tmp/grasp-test-secret"
 export E2E_ADMIN_TOKEN="$admin_token"
 export E2E_EDGE_SECRET="$edge_secret"
 export GITEA_ADMIN_USER=e2e-admin
@@ -57,7 +59,9 @@ docker info >/dev/null
 echo -n "$admin_token" > "$GRASP_ADMIN_TOKEN_FILE"
 echo -n 'current:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=' > "$GRASP_CREDENTIAL_KEYS_FILE"
 echo -n "$edge_secret" > "$GRASP_EDGE_SECRET_FILE"
+echo -n "$test_secret" > "$E2E_GRASP_TEST_SECRET_FILE"
 chmod 600 "$GRASP_ADMIN_TOKEN_FILE" "$GRASP_CREDENTIAL_KEYS_FILE" "$GRASP_EDGE_SECRET_FILE"
+chmod 0400 "$E2E_GRASP_TEST_SECRET_FILE"
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj '/CN=grasp.test' \
@@ -123,9 +127,12 @@ for _ in $(seq 1 120); do
 done
 curl -kfsS --resolve grasp.test:443:127.0.0.1 https://grasp.test/ >/dev/null
 
-echo "[setup] verifying deployed images and mounted hook"
+echo "[setup] verifying deployed images, mounted hook, and private secret copy"
 test "sha256:$(docker compose images -q gitea)" = "$(docker image inspect "$GITEA_IMAGE" --format '{{.Id}}')"
 docker compose exec -T gitea test -x /opt/grasp/grasp-pre-receive
+docker compose exec -T grasp-bridge sh -ec 'test "$(stat -c "%u:%g:%a" /run/secrets/grasp-test-secret)" = "0:0:400"'
+docker compose exec -T --user "$USER_UID:$USER_GID" grasp-bridge sh -ec \
+  'test "$(stat -c "%u:%g:%a" /run/grasp-secrets/grasp-test-secret)" = "1000:1000:400"; test "$(cat /run/grasp-secrets/grasp-test-secret)" = "phase1-e2e-mounted-secret"'
 
 cd "$repo_root"
 go run ./scripts/phase1-deployment-e2e.go

@@ -11,10 +11,21 @@ This is preferred over post-write `chown`: Git object and ref transactions remai
 The image entrypoint starts as root only to:
 
 1. make the bridge-private `/data` directory writable by the configured uid/gid;
-2. optionally run the explicitly enabled ownership and mode repair described below; and
-3. drop to `USER_UID:USER_GID` with `su-exec` before starting the bridge or any Git operation.
+2. optionally run the explicitly enabled repository ownership and mode repair described below;
+3. stage private mounted-secret copies as described below; and
+4. drop to `USER_UID:USER_GID` with `su-exec` before starting the bridge or any Git operation.
 
 UID or GID zero, oversized values, missing variables, and nonnumeric values fail before filesystem mutation. If Compose starts the image as a non-root user whose numeric identity differs from the configured Gitea identity, startup also fails closed. Production Compose overlays invoke the image entrypoint rather than bypassing it.
+
+## Mounted secrets and privilege drop
+
+A Track B live deployment exposed a privilege-ordering failure: Docker mounted the bridge secrets as `0600 root:root`, then the entrypoint invoked `su-exec "$uid:$gid"`. The full-proxy Compose `command` shell therefore ran after the privilege drop and could not read `grasp-admin-api-token`, `grasp-credential-keys`, or `grasp-edge-shared-secret`. The bridge restart-looped and Track B was rolled back to the previous healthy deployment.
+
+Long-form Compose secret declarations initially appeared to offer a mount-time repair through `uid`, `gid`, and `mode`. Live E2E showed that Docker Compose ignores those fields for file-backed secrets, warns that they are unsupported, and exposes the source as a read-only bind mount. An in-place `chown` therefore fails with `Read-only file system`. Those declarations were removed rather than retaining misleading configuration; bridge secret mounts remain in stable short-form order.
+
+The portable repair happens during root initialization and never mutates the mounted source. The entrypoint recreates `/run/grasp-secrets` as `0750 root:USER_GID`. By default it considers only direct `/run/secrets/grasp-*` entries and never traverses subdirectories. `GRASP_SECRET_FILES` may instead provide a newline- or colon-separated whitelist of absolute paths for deployments using another secret root. Every source must be a regular file and not a symlink. Each source is copied to `/run/grasp-secrets/<basename>`, then the private copy is owned by `USER_UID:USER_GID` and set to `0400`. Explicitly listed missing sources, validation failures, and copy, ownership, or mode failures abort startup with the offending path; a missing default glob is a no-op. Logs contain paths only, never secret contents.
+
+The hardening and full-proxy command wrappers read bridge credentials exclusively from `/run/grasp-secrets`. This guarantees that the shell executed after `su-exec` sees target-owned `0400` files across file-backed Compose secrets, Swarm secrets, Kubernetes mounts, and alternative secret mounts. The Gitea hook remains a separate container and continues to use its own `/run/secrets/grasp-admin-api-token` mount.
 
 ## Managed write boundary and symlinks
 

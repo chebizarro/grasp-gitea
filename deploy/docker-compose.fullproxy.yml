@@ -38,9 +38,9 @@ services:
       - /bin/sh
       - -ec
       - |
-        export ADMIN_API_TOKEN="$$(cat /run/secrets/grasp-admin-api-token)"
-        export GRASP_CREDENTIAL_KEYS="$$(cat /run/secrets/grasp-credential-keys)"
-        export GRASP_EDGE_SHARED_SECRET="$$(cat /run/secrets/grasp-edge-shared-secret)"
+        export ADMIN_API_TOKEN="$$(cat /run/grasp-secrets/grasp-admin-api-token)"
+        export GRASP_CREDENTIAL_KEYS="$$(cat /run/grasp-secrets/grasp-credential-keys)"
+        export GRASP_EDGE_SHARED_SECRET="$$(cat /run/grasp-secrets/grasp-edge-shared-secret)"
         exec grasp-bridge
     environment:
       # Step 1 of the cutover: proxy on, tokens off. Flip BRIDGE_TOKENS_ENABLED

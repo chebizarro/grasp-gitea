@@ -15,11 +15,12 @@ services:
       - grasp-hook-bin:/hook-bin
 
   grasp-bridge:
+    image: ${GRASP_BRIDGE_IMAGE:-grasp-bridge:local-full}
     depends_on:
       grasp-hook-install:
         condition: service_completed_successfully
     entrypoint: ["/usr/local/bin/grasp-bridge-entrypoint"]
-    command: ["/bin/sh", "-ec", "export ADMIN_API_TOKEN=\"$$(cat /run/secrets/grasp-admin-api-token)\"; exec grasp-bridge"]
+    command: ["/bin/sh", "-ec", "export ADMIN_API_TOKEN=\"$$(cat /run/grasp-secrets/grasp-admin-api-token)\"; exec grasp-bridge"]
     environment:
       USER_UID: ${USER_UID:?USER_UID must match the Gitea git uid}
       USER_GID: ${USER_GID:?USER_GID must match the Gitea git gid}

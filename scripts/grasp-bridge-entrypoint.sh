@@ -75,5 +75,88 @@ if [ "${GITEA_REPO_OWNERSHIP_AUTO_REPAIR:-false}" = "true" ] && [ -d "$repositor
   ' sh "$uid" "$gid" {} +
 fi
 
+secret_dir=/run/grasp-secrets
+if [ -L "$secret_dir" ]; then
+  echo "refusing mounted secret copy: destination is a symlink: $secret_dir" >&2
+  exit 1
+fi
+if ! rm -rf "$secret_dir"; then
+  echo "refusing mounted secret copy: cannot clear destination: $secret_dir" >&2
+  exit 1
+fi
+if ! mkdir -p "$secret_dir"; then
+  echo "refusing mounted secret copy: cannot create destination: $secret_dir" >&2
+  exit 1
+fi
+if ! chown "0:$gid" "$secret_dir"; then
+  echo "refusing mounted secret copy: destination chown failed: $secret_dir" >&2
+  exit 1
+fi
+if ! chmod 0750 "$secret_dir"; then
+  echo "refusing mounted secret copy: destination chmod failed: $secret_dir" >&2
+  exit 1
+fi
+
+copy_secret() {
+  path=$1
+  allow_alternative_root=$2
+
+  case "$path" in
+    /*) ;;
+    *)
+      echo "refusing mounted secret copy: path is not absolute: $path" >&2
+      return 1
+      ;;
+  esac
+  if [ "$allow_alternative_root" != "true" ]; then
+    case "$path" in
+      /run/secrets/*) ;;
+      *)
+        echo "refusing mounted secret copy: path escapes /run/secrets: $path" >&2
+        return 1
+        ;;
+    esac
+  fi
+  if [ -L "$path" ]; then
+    echo "refusing mounted secret copy: secret is a symlink: $path" >&2
+    return 1
+  fi
+  if [ ! -f "$path" ]; then
+    echo "refusing mounted secret copy: secret is not a regular file: $path" >&2
+    return 1
+  fi
+
+  target="$secret_dir/${path##*/}"
+  if ! cp "$path" "$target"; then
+    echo "refusing mounted secret copy: copy failed: $path" >&2
+    return 1
+  fi
+  if ! chown "$uid:$gid" "$target"; then
+    echo "refusing mounted secret copy: chown failed: $target" >&2
+    return 1
+  fi
+  if ! chmod 0400 "$target"; then
+    echo "refusing mounted secret copy: chmod failed: $target" >&2
+    return 1
+  fi
+  echo "mounted secret copy: $path -> $target" >&2
+}
+
+if [ -n "${GRASP_SECRET_FILES+x}" ]; then
+  printf '%s' "$GRASP_SECRET_FILES" | tr ':' '\n' | while IFS= read -r path || [ -n "$path" ]; do
+    [ -n "$path" ] || continue
+    copy_secret "$path" true
+  done
+else
+  for path in /run/secrets/grasp-*; do
+    # An unmatched shell glob is left literal. Missing secrets are expected in
+    # deployments that do not use Docker secrets.
+    if [ "$path" = '/run/secrets/grasp-*' ] && [ ! -e "$path" ] && [ ! -L "$path" ]; then
+      continue
+    fi
+    copy_secret "$path" false
+  done
+fi
+
 export HOME=/tmp
 exec su-exec "$uid:$gid" "$@"
