@@ -119,3 +119,19 @@ func (s *SQLiteStore) GetProposalFailure(ctx context.Context, eventID string) (P
 	}
 	return f, nil
 }
+
+// DeleteProposalFailure removes a terminal-failure row for one proposal event
+// so a supported operator retry can re-run materialization. It is a no-op
+// (deleted=false, nil) if no failure row exists. It does not touch the
+// proposal state row itself.
+func (s *SQLiteStore) DeleteProposalFailure(ctx context.Context, eventID string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM nip34_proposal_events WHERE event_id=? AND state='failed'`, eventID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}

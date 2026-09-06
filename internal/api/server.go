@@ -50,6 +50,28 @@ type Server struct {
 	policyStore             *policy.Store
 	tenantOperator          TenantOperator
 	scimHandler             http.Handler
+	proposalRetrier         ProposalRetrier
+}
+
+// ProposalRetrier is the supported recovery path for stuck NIP-34 proposals.
+// Implemented via a small adapter around *reflector.Reflector in main.go so
+// this package does not need to import nostr.
+type ProposalRetrier interface {
+	RetryProposalFromJSON(ctx context.Context, rawEventJSON []byte, actor string) (ProposalRetryResult, error)
+}
+
+// ProposalRetryResult mirrors reflector.RetryProposalResult for the API JSON
+// surface. The concrete reflector type must be adaptable to this via a small
+// wiring shim in main.go.
+type ProposalRetryResult struct {
+	RepositoryAddress   string `json:"repository_address"`
+	RootEventID         string `json:"root_event_id"`
+	RetriedEventID      string `json:"retried_event_id"`
+	FailureRowCleared   bool   `json:"failure_row_cleared"`
+	ProcessedRowCleared bool   `json:"processed_row_cleared"`
+	Materialized        bool   `json:"materialized"`
+	GiteaPRNumber       int64  `json:"gitea_pr_number"`
+	HeadRefSHA          string `json:"head_ref_sha"`
 }
 
 type SignerAuthorizer interface {
@@ -135,6 +157,7 @@ func (s *Server) SetPolicyStore(store *policy.Store) { s.policyStore = store }
 func (s *Server) SetAffiliationStore(st store.AuthStore) { s.affiliationStore = st }
 func (s *Server) SetTenantOperator(op TenantOperator)    { s.tenantOperator = op }
 func (s *Server) SetSCIMHandler(h http.Handler)          { s.scimHandler = h }
+func (s *Server) SetProposalRetrier(retrier ProposalRetrier) { s.proposalRetrier = retrier }
 
 // AddRouteRegistrar lets optional subsystems register extra routes on the main mux.
 func (s *Server) AddRouteRegistrar(register func(*http.ServeMux)) {
@@ -157,6 +180,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/policy", s.requireAuth(s.policyDocument))
 	mux.HandleFunc("/admin/policy/", s.requireAuth(s.policyGroup))
 	mux.HandleFunc("/admin/tenants/", s.requireAuth(s.tenantAction))
+	mux.HandleFunc("/admin/proposals/retry", method(http.MethodPost, s.requireAuth(s.proposalRetry)))
 	if s.scimHandler != nil {
 		mux.Handle("/scim/v2/", s.scimHandler)
 	}
@@ -176,6 +200,41 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.rootHandler)
 
 	return mux
+}
+
+// proposalRetry is the supported recovery path for a NIP-34 proposal event
+// that ended up marked "processed" without a materialized PR/ref. Callers
+// POST the full signed event JSON as the request body. See nostrig task
+// grasp-gitea-nip34-proposal-partial-state-recovery-20260906.
+func (s *Server) proposalRetry(w http.ResponseWriter, r *http.Request) {
+	if s.proposalRetrier == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "proposal retry is not configured"})
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodySize))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "read request body: " + err.Error()})
+		return
+	}
+	if len(body) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must contain the raw signed proposal event JSON"})
+		return
+	}
+	actor := r.Header.Get("X-Grasp-Operator")
+	if actor == "" {
+		actor = "admin-api"
+	}
+	result, err := s.proposalRetrier.RetryProposalFromJSON(r.Context(), body, actor)
+	if err != nil {
+		s.logger.Warn("admin proposal retry failed", "actor", actor, "error", err)
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error":  err.Error(),
+			"result": result,
+		})
+		return
+	}
+	s.logger.Info("admin proposal retry completed", "actor", actor, "repo_addr", result.RepositoryAddress, "root_event_id", result.RootEventID, "retried_event_id", result.RetriedEventID, "materialized", result.Materialized, "pr_number", result.GiteaPRNumber)
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) policyDocument(w http.ResponseWriter, r *http.Request) {

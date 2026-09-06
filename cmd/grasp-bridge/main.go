@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -50,6 +51,38 @@ import (
 
 // mergeRelayURLs combines configured relay URLs with the embedded relay URL,
 // deduplicating if the embedded URL is already in the list.
+// reflectorProposalRetrier adapts *reflector.Reflector to the api.ProposalRetrier
+// interface, which accepts raw JSON so api/ does not depend on the nostr package.
+type reflectorProposalRetrier struct {
+	svc    *reflector.Reflector
+	logger *slog.Logger
+}
+
+func newReflectorProposalRetrier(svc *reflector.Reflector, logger *slog.Logger) api.ProposalRetrier {
+	return &reflectorProposalRetrier{svc: svc, logger: logger}
+}
+
+func (r *reflectorProposalRetrier) RetryProposalFromJSON(ctx context.Context, raw []byte, actor string) (api.ProposalRetryResult, error) {
+	if r == nil || r.svc == nil {
+		return api.ProposalRetryResult{}, fmt.Errorf("proposal retrier not configured")
+	}
+	var ev nostr.Event
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return api.ProposalRetryResult{}, fmt.Errorf("decode proposal event JSON: %w", err)
+	}
+	res, err := r.svc.RetryProposal(ctx, &ev, actor)
+	return api.ProposalRetryResult{
+		RepositoryAddress:   res.RepositoryAddress,
+		RootEventID:         res.RootEventID,
+		RetriedEventID:      res.RetriedEventID,
+		FailureRowCleared:   res.FailureRowCleared,
+		ProcessedRowCleared: res.ProcessedRowCleared,
+		Materialized:        res.Materialized,
+		GiteaPRNumber:       res.GiteaPRNumber,
+		HeadRefSHA:          res.HeadRefSHA,
+	}, err
+}
+
 func installSCIMProvider(server *api.Server, st store.AuthStore, reconciler scim.Reconciler) {
 	server.SetSCIMHandler(scim.New(st, reconciler).Handler())
 }
@@ -687,6 +720,7 @@ func main() {
 		reflectorSvc.SetPatchRejectionPublisher(publisherSvc)
 	}
 	proactiveSyncSvc.SetCollaborationHandler(reflectorSvc.HandleEvent)
+	apiServer.SetProposalRetrier(newReflectorProposalRetrier(reflectorSvc, logger))
 	go func() {
 		defer close(proactiveSyncDone)
 		proactiveSyncSvc.Run(ctx, cfg.ProactiveSyncInterval)

@@ -89,3 +89,51 @@ Both should be empty.
 | `go: 403 Forbidden` from `git.sharegap.net/...` | Bot user lacks read access | Grant the bot user repo access on both cascadia-go and cascadia-nips |
 | `fatal: could not read Username` mid-build | `credential.helper` not set for the RUN | Confirm the Dockerfile line `git config --global credential.helper store` ran (only fires when the secret is non-empty) |
 | Track B rollback with `grasp-gitea-clean-edge-build-private-module-auth-20260906` | Old build path assumed a host-level `.netrc` copied from a rollout folder | Use `make docker-build-full` from a clean checkout |
+
+## Recovering a stuck NIP-34 proposal (`POST /admin/proposals/retry`)
+
+A proposal that ended up marked "processed" without a materialized PR/ref —
+the Astillero `d2a8ef8b…` scenario captured by nostrig task
+`grasp-gitea-nip34-proposal-partial-state-recovery-20260906` — can be retried
+through the supported operator recovery path. The bridge exposes
+`POST /admin/proposals/retry` (admin-token authenticated) that accepts the
+full signed proposal event JSON:
+
+```sh
+curl -sSf -X POST \
+  -H "Authorization: Bearer $ADMIN_API_TOKEN" \
+  -H "X-Grasp-Operator: alice@example.com" \
+  -H "Content-Type: application/json" \
+  --data @stuck-proposal-event.json \
+  https://bridge.example/admin/proposals/retry
+```
+
+Behavior:
+
+- Signature is re-validated. The event must be a `KindPatch` (kind 1617).
+- Under the proposal lock: the terminal-failure row for that specific event
+  is cleared, the processed-events dedup marker is cleared, and
+  `HandleEvent` is re-run so materialization runs against the corrected
+  code path.
+- **Refuses** if the proposal already has a PR (`gitea_pr_number != 0`) or
+  a materialized head SHA. Operators must not use this path to overwrite a
+  successful proposal.
+- Every retry is audit-logged with the actor from the optional
+  `X-Grasp-Operator` header (defaulting to `admin-api`), the repository
+  address, root event ID, the two dedup-cleared flags, and the materialization
+  outcome.
+
+Response (JSON):
+
+```json
+{
+  "repository_address": "30617:<pubkey>:<repo-id>",
+  "root_event_id": "...",
+  "retried_event_id": "...",
+  "failure_row_cleared": true,
+  "processed_row_cleared": true,
+  "materialized": true,
+  "gitea_pr_number": 42,
+  "head_ref_sha": "..."
+}
+```

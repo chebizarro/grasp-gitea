@@ -44,6 +44,7 @@ var (
 type Store interface {
 	EventProcessed(ctx context.Context, eventID string) (bool, error)
 	MarkEventProcessed(ctx context.Context, eventID string, pubkey string, kind int) error
+	DeleteEventProcessed(ctx context.Context, eventID string) (bool, error)
 	GetProvisionedMappingByRepoAddr(ctx context.Context, pubkey string, repoID string) (store.Mapping, error)
 	GetMappingByGiteaRepoID(ctx context.Context, giteaRepoID int64) (store.Mapping, error)
 	RecordReflectedEvent(ctx context.Context, ref store.ReflectedEvent) (bool, error)
@@ -1180,6 +1181,97 @@ func (r *Reflector) reflectPatch(ctx context.Context, mapping store.Mapping, ev 
 	}
 	r.logger.Info("reflector: created Gitea PR from Nostr patch", "event", ev.ID.Hex(), "repo", mapping.Owner+"/"+mapping.RepoName, "index", index, "head", branch, "base", base)
 	return true, nil
+}
+
+// RetryProposalResult reports the outcome of a supported operator retry.
+type RetryProposalResult struct {
+	RepositoryAddress   string
+	RootEventID         string
+	RetriedEventID      string
+	FailureRowCleared   bool
+	ProcessedRowCleared bool
+	Materialized        bool
+	GiteaPRNumber       int64
+	HeadRefSHA          string
+}
+
+// RetryProposal is the supported recovery path for a proposal that ended up
+// in the "processed but not materialized" state — the Astillero d2a8ef8b
+// scenario captured by nostrig task grasp-gitea-nip34-proposal-partial-state-recovery-20260906.
+// It clears the terminal-failure row and the processed-event dedup marker
+// for the caller-supplied event, then re-runs HandleEvent inside the
+// existing proposal lock so materialization runs against the corrected code
+// path. Refuses if the proposal already has a PR or a materialized head SHA:
+// operators must NOT use this path to overwrite a successful proposal.
+func (r *Reflector) RetryProposal(ctx context.Context, ev *nostr.Event, actor string) (RetryProposalResult, error) {
+	if ev == nil {
+		return RetryProposalResult{}, fmt.Errorf("retry: nil event")
+	}
+	if ev.Kind != relay.KindPatch {
+		return RetryProposalResult{}, fmt.Errorf("retry: unsupported event kind %d; only kind %d proposals are retryable via this path", ev.Kind, relay.KindPatch)
+	}
+	if err := nostrverify.ValidateEventIDAndSignature(ev); err != nil {
+		return RetryProposalResult{}, fmt.Errorf("retry: signature validation failed: %w", err)
+	}
+	if r.proposalStore == nil {
+		return RetryProposalResult{}, fmt.Errorf("retry: proposal store is not configured")
+	}
+	mapping, ok, err := r.mappingForEvent(ctx, ev)
+	if err != nil {
+		return RetryProposalResult{}, fmt.Errorf("retry: mapping lookup: %w", err)
+	}
+	if !ok {
+		return RetryProposalResult{}, fmt.Errorf("retry: no managed repository mapping for event %s", ev.ID.Hex())
+	}
+	addr := proposalRepositoryAddress(mapping)
+	rootID := proposalRootReference(ev)
+	if rootID == "" {
+		return RetryProposalResult{}, fmt.Errorf("retry: event %s has no proposal root reference", ev.ID.Hex())
+	}
+
+	result := RetryProposalResult{
+		RepositoryAddress: addr,
+		RootEventID:       rootID,
+		RetriedEventID:    ev.ID.Hex(),
+	}
+	if err := r.proposalStore.WithProposalLock(ctx, addr, rootID, func(ctx context.Context) error {
+		existing, err := r.proposalStore.GetProposal(ctx, addr, rootID)
+		if err == nil {
+			if existing.GiteaPRNumber != 0 || existing.HeadRefSHA != "" {
+				return fmt.Errorf("retry: proposal %s already materialized (pr_number=%d head_sha=%q); refusing to overwrite via retry", rootID, existing.GiteaPRNumber, existing.HeadRefSHA)
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("retry: load proposal state: %w", err)
+		}
+		failureCleared, err := r.proposalStore.DeleteProposalFailure(ctx, ev.ID.Hex())
+		if err != nil {
+			return fmt.Errorf("retry: clear terminal failure: %w", err)
+		}
+		result.FailureRowCleared = failureCleared
+		processedCleared, err := r.store.DeleteEventProcessed(ctx, ev.ID.Hex())
+		if err != nil {
+			return fmt.Errorf("retry: clear processed marker: %w", err)
+		}
+		result.ProcessedRowCleared = processedCleared
+		return nil
+	}); err != nil {
+		r.logger.Warn("reflector: proposal retry preflight failed", "repo_addr", addr, "root_event_id", rootID, "retried_event", ev.ID.Hex(), "actor", actor, "error", err)
+		return result, err
+	}
+
+	r.logger.Info("reflector: cleared dedup markers for supported proposal retry", "repo_addr", addr, "root_event_id", rootID, "retried_event", ev.ID.Hex(), "actor", actor, "failure_row_cleared", result.FailureRowCleared, "processed_row_cleared", result.ProcessedRowCleared)
+
+	if err := r.HandleEvent(ctx, ev, "operator-retry"); err != nil {
+		r.logger.Warn("reflector: proposal retry materialization failed", "repo_addr", addr, "root_event_id", rootID, "retried_event", ev.ID.Hex(), "actor", actor, "error", err)
+		return result, err
+	}
+	if final, err := r.proposalStore.GetProposal(ctx, addr, rootID); err == nil {
+		result.Materialized = final.GiteaPRNumber != 0 || final.HeadRefSHA != ""
+		result.GiteaPRNumber = final.GiteaPRNumber
+		result.HeadRefSHA = final.HeadRefSHA
+	}
+	r.logger.Info("reflector: proposal retry completed", "repo_addr", addr, "root_event_id", rootID, "retried_event", ev.ID.Hex(), "actor", actor, "materialized", result.Materialized, "pr_number", result.GiteaPRNumber, "head_sha", result.HeadRefSHA)
+	return result, nil
 }
 
 func (r *Reflector) logRepositoryFailure(message string, mapping store.Mapping, repoPath, eventID string, err error, extra ...any) {

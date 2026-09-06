@@ -652,6 +652,98 @@ func TestReflectorProceedsWhenParentCommitDiffersFromCurrentBase(t *testing.T) {
 	}
 }
 
+func TestReflectorRetryProposalRecoversStuckPartialState(t *testing.T) {
+	// Replicates the Astillero d2a8ef8b… scenario captured by nostrig task
+	// grasp-gitea-nip34-proposal-partial-state-recovery-20260906: the old
+	// code hard-failed parent-commit drift as 'patch-decode-fail' (terminal),
+	// which recorded a ProposalFailure row and marked the event processed —
+	// so subsequent replays were dedup-refused and no PR was ever created.
+	// The RetryProposal admin path must clear both dedup markers and re-run
+	// materialization under the corrected code path.
+	ctx := context.Background()
+	st, _, coord := newReflectorTestStore(t)
+	repo := setupReflectorGitRepo(t)
+	fake := newReflectorFakeGitea()
+	ts := httptest.NewServer(fake)
+	defer ts.Close()
+	var logs bytes.Buffer
+	r := New(st, gitea.NewClient(ts.URL, "tok"), repo.repositoriesDir, slog.New(slog.NewTextHandler(&logs, nil)))
+	r.SetProposalStore(st)
+	r.validateGitCloneURL = func(context.Context, string) error { return nil }
+
+	actorPriv := nostr.Generate().Hex()
+	ev := signedEvent(t, actorPriv, relay.KindPatch, nostr.Tags{
+		{"a", coord},
+		{"t", "root"},
+		{"subject", "Stuck proposal"},
+		{"commit", repo.tip},
+		{"clone", repo.workDir},
+		{"branch-name", "feature/stuck"},
+	}, "stuck body")
+
+	// Manually install the exact stuck fingerprint: the event is marked
+	// processed AND has a terminal (non-retryable) failure row. No PR
+	// exists in Gitea. This matches the durable production state Track B
+	// observed.
+	if err := st.MarkEventProcessed(ctx, ev.ID.Hex(), ev.PubKey.Hex(), int(ev.Kind)); err != nil {
+		t.Fatalf("seed processed marker: %v", err)
+	}
+	if err := st.RecordProposalFailure(ctx, store.ProposalFailure{
+		RepositoryAddress: coord,
+		RootEventID:       ev.ID.Hex(),
+		EventID:           ev.ID.Hex(),
+		FailureClass:      "patch-decode-fail",
+		FailureDetail:     "parent-commit does not match materialization base (old hard-failure code path)",
+		UpdatedAt:         time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed failure row: %v", err)
+	}
+
+	// Preflight: a normal HandleEvent replay must be dedup-refused (no PR).
+	if err := r.HandleEvent(ctx, ev, "wss://relay.test"); err != nil {
+		t.Fatalf("replay before retry: %v", err)
+	}
+	fake.mu.Lock()
+	if len(fake.pulls) != 0 {
+		fake.mu.Unlock()
+		t.Fatalf("stuck event was not dedup-refused; created %d PRs", len(fake.pulls))
+	}
+	fake.mu.Unlock()
+
+	// Supported retry: clears both markers and re-runs materialization.
+	result, err := r.RetryProposal(ctx, ev, "test-operator")
+	if err != nil {
+		t.Fatalf("RetryProposal: %v\nlogs:\n%s", err, logs.String())
+	}
+	if !result.FailureRowCleared {
+		t.Errorf("failure row was not cleared: %+v", result)
+	}
+	if !result.ProcessedRowCleared {
+		t.Errorf("processed row was not cleared: %+v", result)
+	}
+	if !result.Materialized || result.GiteaPRNumber == 0 || result.HeadRefSHA == "" {
+		t.Fatalf("retry did not materialize the PR: %+v", result)
+	}
+
+	fake.mu.Lock()
+	got := len(fake.pulls)
+	fake.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("expected 1 PR after retry, got %d", got)
+	}
+
+	// Idempotency: retrying a NOW-materialized proposal must refuse rather
+	// than overwrite — operators must not use this path to stomp on a
+	// successful PR.
+	if _, err := r.RetryProposal(ctx, ev, "test-operator"); err == nil || !strings.Contains(err.Error(), "already materialized") {
+		t.Fatalf("second retry against materialized proposal must refuse; got err=%v", err)
+	}
+
+	if !strings.Contains(logs.String(), "cleared dedup markers for supported proposal retry") {
+		t.Errorf("audit log missing dedup-clear diagnostic:\n%s", logs.String())
+	}
+}
+
 func TestReflectorRejectsForeignSignerProposalRevisionWithoutMovingHead(t *testing.T) {
 	ctx := context.Background()
 	st, _, coord := newReflectorTestStore(t)

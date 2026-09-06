@@ -94,3 +94,18 @@ func (s *PostgresStore) GetProposalFailure(ctx context.Context, eventID string) 
 	}
 	return f, nil
 }
+
+// DeleteProposalFailure removes a terminal-failure row for one proposal event
+// so a supported operator retry can re-run materialization. See the SQLite
+// implementation for the full contract. Idempotent.
+func (s *PostgresStore) DeleteProposalFailure(ctx context.Context, eventID string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM nip34_proposal_events WHERE event_id=$1 AND state='failed'`, eventID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}

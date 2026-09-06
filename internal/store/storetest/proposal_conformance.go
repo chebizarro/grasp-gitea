@@ -137,4 +137,28 @@ func RunProposal(t *testing.T, factory ProposalFactory) {
 			t.Fatalf("failure=%+v detail_len=%d", got, len(got.FailureDetail))
 		}
 	})
+
+	t.Run("DeleteProposalFailureIsIdempotent", func(t *testing.T) {
+		ctx := context.Background()
+		st := factory(t)
+		// No row — delete is a no-op returning deleted=false.
+		if deleted, err := st.DeleteProposalFailure(ctx, "missing"); err != nil || deleted {
+			t.Fatalf("missing delete: deleted=%v err=%v", deleted, err)
+		}
+		// Record then delete: deleted=true, subsequent Get returns ErrNoRows,
+		// second delete is a no-op.
+		f := store.ProposalFailure{RepositoryAddress: "30617:owner:repo", RootEventID: "root", EventID: "retry-event", FailureClass: "patch-decode-fail", FailureDetail: "boom", UpdatedAt: time.Now().UTC()}
+		if err := st.RecordProposalFailure(ctx, f); err != nil {
+			t.Fatal(err)
+		}
+		if deleted, err := st.DeleteProposalFailure(ctx, "retry-event"); err != nil || !deleted {
+			t.Fatalf("first delete: deleted=%v err=%v", deleted, err)
+		}
+		if _, err := st.GetProposalFailure(ctx, "retry-event"); err == nil {
+			t.Fatalf("failure row was not removed")
+		}
+		if deleted, err := st.DeleteProposalFailure(ctx, "retry-event"); err != nil || deleted {
+			t.Fatalf("second delete: deleted=%v err=%v", deleted, err)
+		}
+	})
 }

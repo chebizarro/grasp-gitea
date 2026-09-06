@@ -1273,6 +1273,22 @@ func (s *SQLiteStore) MarkEventProcessed(ctx context.Context, eventID string, pu
 	return err
 }
 
+// DeleteEventProcessed clears the processed-events dedup marker for one event.
+// It is intended for the supported operator retry path only — clearing this
+// marker allows a stuck event to be re-materialized. Returns true when a row
+// was actually removed; false is not an error.
+func (s *SQLiteStore) DeleteEventProcessed(ctx context.Context, eventID string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM processed_events WHERE event_id = ?`, eventID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // RecordReflectedEvent records a Nostr event that was reflected into Gitea.
 // It returns true when a new row was inserted; duplicate Nostr event IDs are a no-op.
 func (s *SQLiteStore) RecordReflectedEvent(ctx context.Context, ref ReflectedEvent) (bool, error) {

@@ -54,6 +54,11 @@ type ProposalStore interface {
 	UpsertProposal(ctx context.Context, proposal ProposalState) (advanced bool, err error)
 	RecordProposalFailure(ctx context.Context, failure ProposalFailure) error
 	GetProposalFailure(ctx context.Context, eventID string) (ProposalFailure, error)
+	// DeleteProposalFailure clears one terminal-failure row so a supported
+	// operator retry can re-run materialization for a stuck proposal. It
+	// does not touch the proposal state row. Idempotent: returns false, nil
+	// when no failure row exists.
+	DeleteProposalFailure(ctx context.Context, eventID string) (bool, error)
 }
 
 var _ ProposalStore = (*SQLiteStore)(nil)
