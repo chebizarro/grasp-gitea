@@ -23,8 +23,6 @@ func TestSnapshotInitiallyZero(t *testing.T) {
 	nip55ChallengesIssued.Store(0)
 	nip55VerifySuccess.Store(0)
 	nip55VerifyFailure.Store(0)
-	ciWorkflowRunsPublished.Store(0)
-	ciWorkflowRunsFailed.Store(0)
 	webhookEventsReceived.Store(0)
 	webhookEventsPublished.Store(0)
 	webhookEventsFailed.Store(0)
@@ -64,8 +62,6 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 	nip55ChallengesIssued.Store(0)
 	nip55VerifySuccess.Store(0)
 	nip55VerifyFailure.Store(0)
-	ciWorkflowRunsPublished.Store(0)
-	ciWorkflowRunsFailed.Store(0)
 	webhookEventsReceived.Store(0)
 	webhookEventsPublished.Store(0)
 	webhookEventsFailed.Store(0)
@@ -102,8 +98,6 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 	IncNIP55VerifySuccess()
 	IncNIP55VerifyFailure()
 	IncNIP55VerifyFailure()
-	IncCIWorkflowRunsPublished()
-	IncCIWorkflowRunsFailed()
 	IncWebhookEventsReceived()
 	IncWebhookEventsPublished()
 	IncWebhookEventsFailed()
@@ -138,8 +132,6 @@ func TestIncFunctionsAndSnapshot(t *testing.T) {
 		"nip55_challenges_issued":         1,
 		"nip55_verify_success":            1,
 		"nip55_verify_failure":            2,
-		"ci_workflow_runs_published":      1,
-		"ci_workflow_runs_failed":         1,
 		"webhook_events_received":         1,
 		"webhook_events_published":        1,
 		"webhook_events_failed":           1,
@@ -179,8 +171,6 @@ func TestSnapshotReturnsAllKeys(t *testing.T) {
 		"nip55_challenges_issued",
 		"nip55_verify_success",
 		"nip55_verify_failure",
-		"ci_workflow_runs_published",
-		"ci_workflow_runs_failed",
 		"webhook_events_received",
 		"webhook_events_published",
 		"webhook_events_failed",

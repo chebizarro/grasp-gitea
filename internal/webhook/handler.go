@@ -54,7 +54,6 @@ const (
 type Publisher interface {
 	PublishEvent(ctx context.Context, ev *nostr.Event) error
 	RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) error
-	HandleWebhookPushCI(ctx context.Context, giteaRepoID int64, ref, before, after, sourceRelay string) error
 	FetchEvent(ctx context.Context, id string) (*nostr.Event, error)
 }
 
@@ -333,12 +332,6 @@ func (h *Handler) handlePush(ctx context.Context, body []byte) error {
 
 	if err := h.publishRepoState(ctx, mapping, p.Repository); err != nil {
 		return err
-	}
-
-	if h.pub != nil {
-		if err := h.pub.HandleWebhookPushCI(ctx, p.Repository.ID, p.Ref, p.Before, p.After, "webhook:gitea"); err != nil {
-			return err
-		}
 	}
 
 	return nil

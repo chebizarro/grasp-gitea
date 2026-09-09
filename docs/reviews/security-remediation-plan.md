@@ -123,9 +123,8 @@ before code.
 Done when:
 - [x] Design doc written + Oracle-reviewed: `docs/designs/loom-integration.md`.
       grasp-gitea = Hive-CI orchestrator / Loom **client** targeting the
-      **canonical** Loom+Hive kinds (5100/5101/30100/5102/5401/5402), not the
-      cascadia 25910 `ci/workflow-run` dialect `internal/publisher/ci.go` emits
-      today (the two do NOT interoperate on the core job request/result).
+      **canonical** Loom+Hive kinds (5100/5101/30100/5102/5401/5402); the
+      dead-end cascadia kind-25910 publisher has since been retired.
 - [x] Mapping defined: inbound 30100/5101/5402 → **new** Gitea commit-status
       writer (`internal/gitea/status.go`, POST /statuses/{sha}); correlation via a
       new bounded `loom_jobs` store; inbound authority anchored in our own
@@ -134,8 +133,8 @@ Done when:
       reuses `internal/nostrauthz`.
 - [x] Config surface (minimal, default-off): `LOOM_ENABLED`,
       `LOOM_DISPATCH_MODE`, `LOOM_WORKER_PUBKEYS`, `LOOM_RELAY_URLS`,
-      `LOOM_JOB_MAX_DURATION`, `CI_PROTOCOL=canonical|cascadia`, Cashu keys
-      reserved for Phase 3. Reuses existing `CI_TRIGGER_REPOS`.
+      `LOOM_JOB_MAX_DURATION`, with Cashu keys reserved for Phase 3. Reuses
+      existing `CI_TRIGGER_REPOS`; retired selectors fail startup.
 - [x] Follow-up implementation beads filed: phase1-asj (P1 status writer +
       reflect Tier-A local runs), phase1-5de (P2 outbound dispatch), phase1-zrk
       (P3 Cashu + Blossom + cancel), phase1-pwy (P4 dialect reconcile, gated on
@@ -157,9 +156,8 @@ hooks / owner sign-off when those phases execute.
   valid signed kind:30617 announcement pool, then call
   `resolver.IsAuthorized(pubkey, repoCoord)`; event `p`/`a` values are hints,
   never authority.
-- 2026-07-25 Item A → Item D: `proactivesync.Service.AuthorizeStateEvent` is
-  available as a mutation-free gate. Wire it in `cmd/grasp-bridge/main.go`
-  before `HandleStateEventCI`; Item A could not edit Item D's owned file.
+- 2026-07-25 Item A → Item D: `proactivesync.Service.AuthorizeStateEvent` was
+  made available as a mutation-free gate for accepted repository state.
 - 2026-07-25 Item C: `internal/safefetch` now compiles. Items A/B can use `safefetch.ValidateGitCloneURL(ctx, rawURL)` immediately before Git clone/fetch; guarded HTTP callers should use `safefetch.NewClient()`.
 - 2026-07-25 Item B: added isolated `internal/store/threads.go` for lazy
   thread-root and webhook-delivery tables, avoiding concurrent `sqlite.go`

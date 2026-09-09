@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,11 @@ func setEnvs(t *testing.T, vars map[string]string) {
 	t.Helper()
 	if _, ok := vars["SIGNER_MASTER_KEY"]; !ok {
 		t.Setenv("SIGNER_MASTER_KEY", "")
+	}
+	for _, retired := range []string{"CI_PROTOCOL", "CI_ENABLED"} {
+		if _, ok := vars[retired]; !ok {
+			t.Setenv(retired, "")
+		}
 	}
 	for k, v := range vars {
 		t.Setenv(k, v)
@@ -307,7 +313,7 @@ func TestLoadLoomPhaseOneConfig(t *testing.T) {
 		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",
 		"RELAY_URLS": "wss://repo-relay", "LOOM_ENABLED": "true",
 		"LOOM_RELAY_URLS":            "wss://loom-one,wss://loom-two",
-		"LOOM_STATUS_CONTEXT_PREFIX": "checks", "CI_PROTOCOL": "canonical",
+		"LOOM_STATUS_CONTEXT_PREFIX": "checks",
 	})
 	cfg, err := Load()
 	if err != nil {
@@ -322,7 +328,7 @@ func TestLoadLoomRemoteRequiresTrustedFleetGuards(t *testing.T) {
 	base := map[string]string{
 		"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",
 		"RELAY_URLS": "wss://repo-relay", "LOOM_ENABLED": "true",
-		"LOOM_DISPATCH_MODE": "remote", "CI_PROTOCOL": "canonical",
+		"LOOM_DISPATCH_MODE": "remote",
 	}
 	setEnvs(t, base)
 	if _, err := Load(); err == nil {
@@ -337,6 +343,28 @@ func TestLoadLoomRemoteRequiresTrustedFleetGuards(t *testing.T) {
 	}
 	if cfg.LoomDispatchMode != "remote" || len(cfg.LoomWorkerPubkeys) != 1 {
 		t.Fatalf("unexpected remote Loom config: %#v", cfg)
+	}
+}
+
+func TestLoadRejectsRetiredCISelection(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+	}{
+		{name: "CI_PROTOCOL", value: "cascadia"},
+		{name: "CI_PROTOCOL", value: "canonical"},
+		{name: "CI_ENABLED", value: "true"},
+	} {
+		t.Run(tc.name+"="+tc.value, func(t *testing.T) {
+			setEnvs(t, map[string]string{
+				"GITEA_ADMIN_TOKEN": "tok", "CLONE_PREFIX": "https://git.example.com",
+				"RELAY_URLS": "wss://repo-relay", tc.name: tc.value,
+			})
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), tc.name+" is retired") ||
+				!strings.Contains(err.Error(), "HIVE_CI_ENABLED") || !strings.Contains(err.Error(), "LOOM_DISPATCH_MODE") {
+				t.Fatalf("retired selection error = %v", err)
+			}
+		})
 	}
 }
 

@@ -4,6 +4,24 @@ Breaking and behaviour-changing updates, newest first.
 
 ---
 
+## Legacy ContextVM CI publisher removed
+
+The bridge no longer publishes `ci/workflow-run` as a ContextVM intent. Those
+events were emitted as kind `25910`, but neither Bahia HiveCI (kind `5401`) nor
+loom-worker (kind `5100`) consumed them. Remote CI is now produced only by the
+Loom dispatcher, which emits exactly one fleet-local kind `5401` workflow run
+and one p-tag-targeted kind `5100` worker job for an accepted trigger.
+
+**Action required:** remove `CI_PROTOCOL` and `CI_ENABLED` from deployment
+configuration. A non-empty value for either variable now prevents startup and
+names the replacement controls. Select execution using `HIVE_CI_ENABLED` and/or
+`LOOM_ENABLED` with `LOOM_DISPATCH_MODE`; `CI_TRIGGER_REPOS` remains the shared
+repository allowlist. Also remove the retired `enabled` member from the persisted
+`ci` policy group; its presence (even when false) prevents startup rather than
+silently changing CI behavior.
+
+---
+
 ## Nostr authentication for all Gitea surfaces (full-proxy bridge)
 
 This release adds NIP-98-authenticated bridge tokens and makes the bridge

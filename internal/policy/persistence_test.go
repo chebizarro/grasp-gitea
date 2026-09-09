@@ -14,7 +14,7 @@ import (
 func validSeed() config.Config {
 	return config.Config{
 		RelayURLs: []string{"wss://seed-relay.example"}, HookRelayURL: "wss://seed-hook.example",
-		CIEnabled: true, CITriggerRepos: []string{"owner/seed"}, ProvisionRateLimit: 3,
+		CITriggerRepos: []string{"owner/seed"}, ProvisionRateLimit: 3,
 		ProfileSyncInterval: 10 * time.Minute, ProfileSyncWorkers: 4,
 		HiveCIJobTimeoutMinutes: 15, HiveCINostrRelays: []string{"wss://hive-seed.example"},
 	}
@@ -29,19 +29,18 @@ func TestOpenSeedsOnceAndExistingProjectionWins(t *testing.T) {
 	if got := store.Current().CITriggerRepos; len(got) != 1 || got[0] != "owner/seed" {
 		t.Fatalf("seed trigger repos = %v", got)
 	}
-	if err := store.UpdateGroup("ci", []byte(`{"enabled":false,"trigger_repos":["owner/persisted"]}`)); err != nil {
+	if err := store.UpdateGroup("ci", []byte(`{"trigger_repos":["owner/persisted"]}`)); err != nil {
 		t.Fatal(err)
 	}
 
 	replacementEnv := validSeed()
-	replacementEnv.CIEnabled = true
 	replacementEnv.CITriggerRepos = []string{"owner/env-override"}
 	reopened, err := Open(path, replacementEnv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := reopened.Current()
-	if got.CIEnabled || len(got.CITriggerRepos) != 1 || got.CITriggerRepos[0] != "owner/persisted" {
+	if len(got.CITriggerRepos) != 1 || got.CITriggerRepos[0] != "owner/persisted" {
 		t.Fatalf("existing projection was overridden by seed: %#v", got)
 	}
 	info, err := os.Stat(path)
@@ -50,6 +49,51 @@ func TestOpenSeedsOnceAndExistingProjectionWins(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("config mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestOpenAndUpdatesRejectRetiredCIEnabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if _, err := Open(path, validSeed()); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, enabled := range []bool{false, true} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatal(err)
+		}
+		raw["ci"].(map[string]any)["enabled"] = enabled
+		legacy, err := json.MarshalIndent(raw, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, legacy, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(path, validSeed()); err == nil || !strings.Contains(err.Error(), "ci.enabled is retired") {
+			t.Fatalf("Open(ci.enabled=%t) error = %v", enabled, err)
+		}
+		delete(raw["ci"].(map[string]any), "enabled")
+		clean, err := json.MarshalIndent(raw, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, clean, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store, err := Open(path, validSeed())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateGroup("ci", []byte(`{"enabled":true,"trigger_repos":["owner/new"]}`)); err == nil || !strings.Contains(err.Error(), "ci.enabled is retired") {
+		t.Fatalf("retired ci.enabled update error = %v", err)
 	}
 }
 

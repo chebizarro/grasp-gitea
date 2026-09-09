@@ -51,17 +51,11 @@ type fakePublisher struct {
 	mu          sync.Mutex
 	events      []*nostr.Event
 	republished []int64
-	ciPushes    []ciPush
 	failPublish bool
 
 	fetched     []string
 	fetchResult *nostr.Event
 	fetchErr    error
-}
-
-type ciPush struct {
-	repoID             int64
-	ref, before, after string
 }
 
 type fakeActorSigner struct {
@@ -119,13 +113,6 @@ func (f *fakePublisher) RepublishForGiteaRepo(_ context.Context, giteaRepoID int
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.republished = append(f.republished, giteaRepoID)
-	return nil
-}
-
-func (f *fakePublisher) HandleWebhookPushCI(_ context.Context, giteaRepoID int64, ref, before, after, _ string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.ciPushes = append(f.ciPushes, ciPush{giteaRepoID, ref, before, after})
 	return nil
 }
 
@@ -342,7 +329,9 @@ func TestServeHTTP_HMACRejectAndAccept(t *testing.T) {
 		t.Fatalf("bad-HMAC should not have republished, got %v", fake.republished)
 	}
 
-	// Correct signature -> 200, republish + CI push invoked.
+	// Correct signature -> 200 and only repository state is republished. The
+	// relay subscriber feeds that state to the canonical HiveCI/Loom path; the
+	// retired direct CI publisher must not receive a second push callback.
 	rr = post(t, h, "push", payload, secret)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("good-HMAC status = %d, want 200", rr.Code)
@@ -350,8 +339,8 @@ func TestServeHTTP_HMACRejectAndAccept(t *testing.T) {
 	if len(fake.republished) != 1 || fake.republished[0] != testGiteaID {
 		t.Fatalf("expected republish for repo %d, got %v", testGiteaID, fake.republished)
 	}
-	if len(fake.ciPushes) != 1 || fake.ciPushes[0].ref != "refs/heads/main" {
-		t.Fatalf("expected one CI push for refs/heads/main, got %v", fake.ciPushes)
+	if len(fake.events) != 0 {
+		t.Fatalf("push emitted direct events in addition to repository state: kinds=%v", fake.kinds())
 	}
 }
 
@@ -408,9 +397,9 @@ func TestPush_UnknownRepoIsNoOp(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
 	}
-	if len(fake.republished) != 0 || len(fake.events) != 0 || len(fake.ciPushes) != 0 {
-		t.Fatalf("unknown repo must be a no-op; got republished=%v events=%d ci=%v",
-			fake.republished, len(fake.events), fake.ciPushes)
+	if len(fake.republished) != 0 || len(fake.events) != 0 {
+		t.Fatalf("unknown repo must be a no-op; got republished=%v events=%d",
+			fake.republished, len(fake.events))
 	}
 }
 

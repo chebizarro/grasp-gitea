@@ -30,7 +30,7 @@ func TestPolicyAdminGetPutRequiresAuthAndHotApplies(t *testing.T) {
 		t.Fatalf("unauthorized status = %d", unauthorized.Code)
 	}
 
-	req := httptest.NewRequest(http.MethodPut, "/admin/policy/ci", strings.NewReader(`{"enabled":true,"trigger_repos":["owner/repo"]}`))
+	req := httptest.NewRequest(http.MethodPut, "/admin/policy/ci", strings.NewReader(`{"trigger_repos":["owner/repo"]}`))
 	req.Header.Set("Authorization", "Bearer admin-token")
 	resp := httptest.NewRecorder()
 	h.ServeHTTP(resp, req)
@@ -38,7 +38,7 @@ func TestPolicyAdminGetPutRequiresAuthAndHotApplies(t *testing.T) {
 		t.Fatalf("PUT status = %d body=%s", resp.Code, resp.Body.String())
 	}
 	got := policies.Current()
-	if !got.CIEnabled || len(got.CITriggerRepos) != 1 || got.CITriggerRepos[0] != "owner/repo" {
+	if len(got.CITriggerRepos) != 1 || got.CITriggerRepos[0] != "owner/repo" {
 		t.Fatalf("policy not hot-applied: %#v", got)
 	}
 
@@ -46,7 +46,7 @@ func TestPolicyAdminGetPutRequiresAuthAndHotApplies(t *testing.T) {
 	get.Header.Set("Authorization", "Bearer admin-token")
 	getResp := httptest.NewRecorder()
 	h.ServeHTTP(getResp, get)
-	if getResp.Code != http.StatusOK || !strings.Contains(getResp.Body.String(), "owner/repo") {
+	if getResp.Code != http.StatusOK || !strings.Contains(getResp.Body.String(), "owner/repo") || strings.Contains(getResp.Body.String(), `"enabled"`) {
 		t.Fatalf("GET response = %d %s", getResp.Code, getResp.Body.String())
 	}
 }

@@ -41,7 +41,9 @@ Live relay exercise is operator-gated because it publishes real events to `relay
    - `HOOK_RELAY_URL=wss://relay.sharegap.net`
    - `SIGNET_BUNKER_URL` for server/operator signing (production); `BRIDGE_NSEC` only for development fallback
    - `GITEA_WEBHOOK_SECRET`
-   - `CI_ENABLED=true`
+   - `HIVE_CI_ENABLED=true` for local execution, or `LOOM_ENABLED=true` with
+     `LOOM_DISPATCH_MODE=remote` (or `both`) and `LOOM_WORKER_PUBKEYS` for
+     remote execution
    - `CI_TRIGGER_REPOS=*` or the target `owner/repo`
 2. Pick a provisioned test repository with a workflow file in `.github/workflows/*.yml` or `.hive/workflows/*.yaml`.
 3. Start a relay subscription filtered to the repo coordinate and CI kind:

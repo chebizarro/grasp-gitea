@@ -18,8 +18,6 @@ var nip46SessionsFailed atomic.Int64
 var nip55ChallengesIssued atomic.Int64
 var nip55VerifySuccess atomic.Int64
 var nip55VerifyFailure atomic.Int64
-var ciWorkflowRunsPublished atomic.Int64
-var ciWorkflowRunsFailed atomic.Int64
 var webhookEventsReceived atomic.Int64
 var webhookEventsPublished atomic.Int64
 var webhookEventsFailed atomic.Int64
@@ -109,14 +107,6 @@ func IncNIP55VerifySuccess() {
 
 func IncNIP55VerifyFailure() {
 	nip55VerifyFailure.Add(1)
-}
-
-func IncCIWorkflowRunsPublished() {
-	ciWorkflowRunsPublished.Add(1)
-}
-
-func IncCIWorkflowRunsFailed() {
-	ciWorkflowRunsFailed.Add(1)
 }
 
 func IncWebhookEventsReceived() {
@@ -254,8 +244,6 @@ func Snapshot() map[string]int64 {
 		"nip55_challenges_issued":           nip55ChallengesIssued.Load(),
 		"nip55_verify_success":              nip55VerifySuccess.Load(),
 		"nip55_verify_failure":              nip55VerifyFailure.Load(),
-		"ci_workflow_runs_published":        ciWorkflowRunsPublished.Load(),
-		"ci_workflow_runs_failed":           ciWorkflowRunsFailed.Load(),
 		"webhook_events_received":           webhookEventsReceived.Load(),
 		"webhook_events_published":          webhookEventsPublished.Load(),
 		"webhook_events_failed":             webhookEventsFailed.Load(),

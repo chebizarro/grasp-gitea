@@ -10,7 +10,6 @@ func TestStoreReplacesCopiedSnapshot(t *testing.T) {
 	cfg := config.Config{
 		PubkeyAllowlist: map[string]struct{}{"old": {}},
 		CITriggerRepos:  []string{"owner/old"},
-		CIEnabled:       true,
 	}
 	store := New(cfg)
 
@@ -29,7 +28,7 @@ func TestStoreReplacesCopiedSnapshot(t *testing.T) {
 	if _, ok := current.PubkeyAllowlist["new"]; !ok {
 		t.Fatal("replacement allowlist was not published")
 	}
-	if current.CIEnabled || len(current.CITriggerRepos) != 1 || current.CITriggerRepos[0] != "*" {
+	if len(current.CITriggerRepos) != 1 || current.CITriggerRepos[0] != "*" {
 		t.Fatalf("unexpected replacement snapshot: %#v", current)
 	}
 }

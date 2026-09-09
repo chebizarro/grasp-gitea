@@ -174,7 +174,7 @@ func (d *recordingRemoteDispatcher) Dispatch(_ context.Context, req loom.Dispatc
 	return true, nil
 }
 
-func TestRunnerRemoteDispatchRequiresResolverAuthorization(t *testing.T) {
+func TestSinglePushProducesExactlyOneRemoteWorkflowDispatch(t *testing.T) {
 	ctx := context.Background()
 	st, mapping, ownerPriv := newHiveTestStore(t)
 	repo := setupHiveRepo(t, mapping, ".github/workflows/ci.yml")
@@ -195,6 +195,10 @@ func TestRunnerRemoteDispatchRequiresResolverAuthorization(t *testing.T) {
 	}
 	if len(remote.requests) != 1 {
 		t.Fatalf("authorized dispatches = %d, want 1", len(remote.requests))
+	}
+	if got := remote.requests[0]; got.Trigger != "push" || got.Branch != "main" ||
+		got.WorkflowPath != ".github/workflows/ci.yml" || got.CommitSHA != repo.commit {
+		t.Fatalf("canonical push dispatch = %#v", got)
 	}
 	if remote.requests[0].CloneURL != mapping.AnnouncedCloneURL {
 		t.Fatalf("remote clone URL = %q, want public %q", remote.requests[0].CloneURL, mapping.AnnouncedCloneURL)

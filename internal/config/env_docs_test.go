@@ -23,6 +23,12 @@ var undocumentedLegacyVars = map[string]bool{
 	"APP_ENV": true, "GRASP_ENV": true,
 }
 
+// retiredEnvVars are inspected only to reject stale deployment configuration.
+// They must not be advertised as supported knobs in .env.example.
+var retiredEnvVars = map[string]bool{
+	"CI_ENABLED": true, "CI_PROTOCOL": true,
+}
+
 func TestEveryConfigEnvVarIsDocumented(t *testing.T) {
 	source, err := os.ReadFile("config.go")
 	if err != nil {
@@ -61,6 +67,10 @@ func TestEveryConfigEnvVarIsDocumented(t *testing.T) {
 
 	for _, name := range names {
 		switch {
+		case retiredEnvVars[name]:
+			if documented(name) {
+				t.Errorf("%s is retired; remove it from .env.example", name)
+			}
 		case documented(name):
 			if undocumentedLegacyVars[name] {
 				t.Errorf("%s is now documented; remove it from undocumentedLegacyVars", name)
