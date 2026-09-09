@@ -384,6 +384,19 @@ make build-sidecar
 make build-full
 ```
 
+- **Release OCI image (Track B / clean-host)**: requires a BuildKit secret
+  for the private `git.sharegap.net/cascadia/*` modules. Full recipe in
+  [`docs/deploy/private-module-auth.md`](docs/deploy/private-module-auth.md).
+
+  ```bash
+  GRASP_IMAGE_TAG=nip34-live-$(git rev-parse --short HEAD)-full \
+    make docker-build-full
+  ```
+
+  Repository CI uses the same protected file input for `make selftest`; see
+  the linked document for the runner recipe. No credential value is accepted
+  through a build argument or environment variable.
+
 - Compose examples:
   - Sidecar mode: `docker-compose.phase1.yml`
   - Embedded relay mode (Mode A): `docker-compose.mode-a.yml`

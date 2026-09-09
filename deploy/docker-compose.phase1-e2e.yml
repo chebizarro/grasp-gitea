@@ -6,6 +6,8 @@ services:
     platform: linux/amd64
     build:
       context: ..
+      secrets:
+        - git-credentials
       args:
         BUILD_TAGS: full
         GOPROXY: ${E2E_GOPROXY:-}
@@ -67,6 +69,8 @@ services:
       - ${E2E_TLS_KEY:?set E2E_TLS_KEY}:/etc/nginx/tls/tls.key:ro
 
 secrets:
+  git-credentials:
+    file: ${GRASP_GIT_CREDENTIALS:?set GRASP_GIT_CREDENTIALS to a protected file outside the repository}
   grasp-admin-api-token:
     file: ${GRASP_ADMIN_TOKEN_FILE:?set GRASP_ADMIN_TOKEN_FILE}
   grasp-credential-keys:
