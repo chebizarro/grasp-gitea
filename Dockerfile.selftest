@@ -3,7 +3,7 @@ FROM golang:1.25-alpine
 ARG PRIVATE_MODULE_AUTH="required"
 ENV GOPRIVATE=git.sharegap.net/*
 WORKDIR /src
-RUN apk add --no-cache git build-base
+RUN apk add --no-cache git git-daemon build-base
 COPY . .
 RUN --mount=type=secret,id=git-credentials,target=/root/.git-credentials \
 	set -eu; \
