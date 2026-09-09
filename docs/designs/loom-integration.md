@@ -38,13 +38,13 @@ Non-goals for this design: building a Loom worker; a general Cashu wallet
 
 ## 2. Current baseline (verified against the tree)
 
-There are **two pre-existing, divergent CI code paths**, and neither speaks the
-canonical Loom protocol, and neither writes results back into Gitea:
+The original design found two divergent CI code paths. The canonical Loom path
+is now implemented and the dead-end ContextVM publisher has been retired:
 
 | Path | File | Kinds | Signed by | What it does |
 |---|---|---|---|---|
 | **Tier A local runner** | `internal/hiveci/runner.go` | consumes `30618`/`1617`/`1618`/`1619`; publishes `30315` (check result) + `4903` (CAS audit) | operator/server signer | Detects workflows at a commit, runs `act` locally in a worktree, publishes signed check + audit attestations **to Nostr only**. Just hardened to owner/maintainer-authored workflows only (`workflowAuthorAuthorized`). |
-| **ContextVM request publisher** | `internal/publisher/ci.go` | publishes `25910` (`CAS_INTENT`) `ci/workflow-run`, schema `hive.ci.workflow.v1` | bridge/server signer | On `30618` state (or webhook push), detects workflows and publishes a **cascadia CAS_INTENT** job request for a remote executor. Never consumes a result. |
+| **Loom dispatcher** | `internal/loom/dispatcher.go` | publishes fleet-local `5401` plus p-tag-targeted `5100` | ephemeral workflow signer | Detects accepted state and dispatches one canonical workflow attempt. |
 
 Key facts established during discovery:
 
@@ -67,7 +67,7 @@ Key facts established during discovery:
 - **Signer** is the Signet/NIP-46 `ServerSigner` (or `BRIDGE_NSEC` dev fallback),
   reused by both publisher and hiveci runner.
 
-### 2a. The central protocol-dialect problem (⚠️ decide first — see §12 Q1)
+### 2a. Protocol dialect resolution
 
 The two spec roots and the binding grasp-gitea already imports describe **two
 different protocols** for the same concepts:
@@ -82,29 +82,21 @@ different protocols** for the same concepts:
 | Workflow run | kind **5401** | legacy map `5401 → ci/workflow-run` (25910) |
 | Workflow result | kind **5402** | legacy map `5402 → ci` (25910) |
 
-So cascadia is a "next-gen" reframing where every command is a single
-`CAS_INTENT` (25910) JSON-RPC envelope, with a **partial** legacy translation
-table that notably **does not cover the canonical Loom job request/result
-(5100/5101)** — the very core of the Loom subprocess model. grasp-gitea's
-`publisher/ci.go` already emits the *cascadia* dialect (25910), **not** what
-`loom-protocol/SPECIFICATION.md` describes.
+The retired `publisher/ci.go` followed the older binding and emitted the
+*cascadia* dialect (25910), not what `loom-protocol/SPECIFICATION.md` describes.
+The corrected upstream binding describes `ci/workflow-run` as deprecated kind
+5100 loom transport, but grasp-gitea does not use that generic binding to
+dispatch CI.
 
 **This design targets the canonical Loom + Hive-CI spec kinds** (`5100/5101/30100/5102`
 + `5401/5402`) because (a) that is what the two authoritative spec roots and
 real-world Loom workers implement, and (b) the subprocess execution model
 (`cmd`/`args`/stdin/`secret`/`payment`) is fully specified there whereas the
 cascadia `cascadia.loom.v1` payload (`{job_id, worker_id, status}`) is a thin
-projection with no execution semantics. The existing cascadia `ci/workflow-run`
-path is treated as a **separate legacy dialect** to be bridged or deprecated
-(§11 Phase 4). **Maintainer must confirm** (Q1).
-
-Because cascadia cannot losslessly represent canonical `5100`/`5101` (payment,
-secret, artifact semantics), the two dialects are made **mutually exclusive** via
-a `CI_PROTOCOL=canonical|cascadia` switch (default `canonical` once this lands).
-Silently replacing `publisher/ci.go` would break existing cascadia consumers, and
-**dual-publishing the same trigger would execute every workflow twice** — so if a
-transition period needs both, they must be modeled as *distinct attempts* and only
-one may own the primary Gitea status context.
+projection with no execution semantics. Fleet consumer and deployment searches
+found no compatible consumer of grasp-gitea's owner-p-tagged kind 25910 events.
+The legacy publisher and `CI_PROTOCOL` selector were therefore removed rather
+than bridged, preventing duplicate production for a single push.
 
 ---
 
@@ -315,8 +307,7 @@ loom_jobs(
 )
 ```
 
-Bounded by TTL/row cap (reuse the sweep pattern from `hiveci` `markStarted` /
-`publisher` `ciDedup`).
+Bounded by TTL/row cap (reuse the sweep pattern from `hiveci` `markStarted`).
 
 ### 6c. Optional: Nostr check-run attestation
 
@@ -447,7 +438,6 @@ All new keys default OFF so existing deployments are unaffected. Reuse existing
 | `LOOM_CASHU_WALLET_PATH` | path | `<DB_PATH>.cashu-wallet` | Persistent owner-only gonuts wallet directory. |
 | `LOOM_CASHU_MAX_PAYMENT` | uint64 sats | – | Required in `cashu` mode; hard per-job spend ceiling after checked price × duration math. |
 | `LOOM_LOG_MAX_BYTES` | bytes | `1048576` | Maximum guarded Blossom log response size. |
-| `CI_PROTOCOL` | enum | `canonical` | `canonical` (Loom/Hive 5x00 kinds) or `cascadia` (legacy 25910 `ci/workflow-run`). Mutually exclusive — never both for one trigger (§2a). |
 
 `internal/config/config.go` gains a `Loom*` block loaded with the same helpers
 (`boolEnv`, `csvEnv`, `boundedDurationEnv`) and a `Config.LoomEnabled()` guard,
@@ -497,12 +487,11 @@ if loomSvc != nil {
 → inbound status mapping; and (if `LOOM_DISPATCH_MODE` includes remote) it also
 receives the `30618`/PR trigger to submit jobs — OR, to keep the outbound trigger
 next to the existing CI trigger, `main.go` calls `loomSvc.MaybeDispatch(...)`
-inside the existing per-repo-locked `KindRepositoryState` block right where
-`publisherSvc.HandleStateEventCI` is called today.
+inside the existing per-repo-locked `KindRepositoryState` block.
 
 **Publication** — reuse the runner's proven `publishToRelays` pattern (connect,
 `Publish`, count successes, error if all fail) or factor it into a small shared
-`internal/relay` publish helper so `hiveci`, `publisher`, and `loom` don't each
+`internal/relay` publish helper so `hiveci` and `loom` don't each
 re-implement it (optional cleanup).
 
 **Composition root wiring** (new, in `main.go`):
@@ -558,29 +547,22 @@ file them as children of `phase1-yk8`.
 - **Add** `5102` cancellation on superseded runs.
 - **Tests:** payment math, change redemption, egress guard.
 
-### Phase 4 — Dialect reconciliation (pending Q1)
-- Decide the fate of `publisher/ci.go`'s cascadia `ci/workflow-run` (25910) path:
-  deprecate, or bridge canonical `5401` ⇄ cascadia via its legacy map. Only after
-  maintainer resolves Q1.
+### Phase 4 — Dialect reconciliation (complete)
+- The dead-end `publisher/ci.go` kind-25910 path and its selector were retired.
+  Canonical Loom dispatch is the only remote workflow producer.
 
-Dependency order: **Phase 1 → 2 → 3**; Phase 4 is independent and gated on Q1.
+Dependency order: **Phase 1 → 2 → 3**.
 
 ---
 
 ## 12. Open questions for the maintainer
 
-1. **Protocol dialect (blocking Phase 2/4).** Should grasp-gitea speak the
-   **canonical Loom/Hive-CI kinds** (`5100/5101/30100/5102/5401/5402`, this
-   design's assumption) or the **cascadia `CAS_INTENT` (25910) dialect** its
-   `publisher/ci.go` already emits — or bridge both? cascadia has **no legacy
-   mapping for the canonical Loom `5100`/`5101`**, so the two cannot fully
-   interoperate today. Which do real target workers consume?
-2. **grasp-gitea's role.** Confirm grasp-gitea is a **client/orchestrator only**
+1. **grasp-gitea's role.** Confirm grasp-gitea is a **client/orchestrator only**
    and will not advertise as a Loom worker (`10100`). (Assumed yes.)
-3. **Worker command contract.** What `cmd`/`args`/container image do published
+2. **Worker command contract.** What `cmd`/`args`/container image do published
    Hive-CI Loom workers expect for "clone ngit repo at commit + run act"? This
    determines `LOOM_JOB_CMD_TEMPLATE`. Is there a reference worker image?
-4. **Payment posture.** Is a **trusted-fleet, free/static-token** mode (Phase 2)
+3. **Payment posture.** Is a **trusted-fleet, free/static-token** mode (Phase 2)
    acceptable for the first release, deferring a real Cashu wallet (Phase 3)? Any
    existing mint/wallet the bridge should reuse?
 5. **Local vs remote default.** Should the default `LOOM_DISPATCH_MODE` be `local`
@@ -649,7 +631,7 @@ interop cases with **canonical wire-event fixtures**:
 - Missing commit (`awaiting_git_object`) then release after sync.
 - Blossom SSRF / oversize download (guarded, Phase 3).
 - Embedded-relay admission of Loom kinds; confirm **no self-echo loop**.
-- Confirm no cascadia `25910` translation is required in `canonical` mode.
+- Confirm retired `CI_PROTOCOL`/`CI_ENABLED` deployment variables are absent.
 
 ---
 

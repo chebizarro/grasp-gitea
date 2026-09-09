@@ -76,9 +76,7 @@ type Config struct {
 	GitBackendUser     string
 	GitBackendPassword string
 
-	// CI workflow run publishing: emit ContextVM ci/workflow-run requests when state events arrive
-	// for repos that have CI workflows configured.
-	CIEnabled      bool
+	// CI execution allowlist shared by the local Hive-CI runner and remote Loom dispatcher.
 	CITriggerRepos []string // ["*"] or ["owner/repo-id", ...]
 
 	// Hive-CI Tier A runs act locally and publishes signed check/audit results.
@@ -110,7 +108,6 @@ type Config struct {
 	LoomMaxJobs             int
 	LoomFutureSkew          time.Duration
 	LoomResultGrace         time.Duration
-	CIProtocol              string
 
 	// NIP34StatusSyncEnabled updates Gitea issue state from inbound NIP-34 status events.
 	NIP34StatusSyncEnabled bool
@@ -164,6 +161,12 @@ type CredentialKey struct {
 const minEdgeSecretLength = 43
 
 func Load() (Config, error) {
+	for _, name := range []string{"CI_PROTOCOL", "CI_ENABLED"} {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			return Config{}, fmt.Errorf("%s is retired (got %q); remove it and select CI execution with HIVE_CI_ENABLED and LOOM_ENABLED/LOOM_DISPATCH_MODE", name, value)
+		}
+	}
+
 	cfg := Config{
 		GiteaURL:             envOrDefault("GITEA_URL", "http://gitea:3000"),
 		PolicyPath:           envOrDefault("GRASP_CONFIG_PATH", "/data/config.json"),
@@ -208,7 +211,6 @@ func Load() (Config, error) {
 		GraspRelayURL:               strings.TrimRight(strings.TrimSpace(os.Getenv("GRASP_RELAY_URL")), "/"),
 		GitBackendUser:              strings.TrimSpace(os.Getenv("GIT_BACKEND_USER")),
 		GitBackendPassword:          strings.TrimSpace(os.Getenv("GIT_BACKEND_PASSWORD")),
-		CIEnabled:                   boolEnv("CI_ENABLED", false),
 		CITriggerRepos:              csvEnv("CI_TRIGGER_REPOS"),
 		HiveCIEnabled:               boolEnv("HIVE_CI_ENABLED", false),
 		HiveCIActPath:               envOrDefault("HIVE_CI_ACT_PATH", "/usr/bin/act"),
@@ -236,7 +238,6 @@ func Load() (Config, error) {
 		LoomMaxJobs:                 boundedIntEnv("LOOM_MAX_JOBS", 4096, 1, 100000),
 		LoomFutureSkew:              boundedDurationEnv("LOOM_FUTURE_SKEW", 5*time.Minute, time.Second, time.Hour),
 		LoomResultGrace:             boundedDurationEnv("LOOM_RESULT_GRACE", 30*time.Second, time.Second, 10*time.Minute),
-		CIProtocol:                  strings.ToLower(envOrDefault("CI_PROTOCOL", "canonical")),
 		NIP34StatusSyncEnabled:      boolEnv("NIP34_STATUS_SYNC_ENABLED", false),
 		BridgeTokensEnabled:         boolEnv("BRIDGE_TOKENS_ENABLED", false),
 		GiteaAdminUser:              strings.TrimSpace(os.Getenv("GITEA_ADMIN_USER")),
@@ -314,9 +315,6 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("CI_TRIGGER_REPOS is required when HIVE_CI_ENABLED=true")
 	}
 	if cfg.LoomEnabled && cfg.LoomDispatchMode != "local" {
-		if cfg.CIProtocol != "canonical" {
-			return Config{}, fmt.Errorf("remote Loom dispatch requires CI_PROTOCOL=canonical")
-		}
 		if !hasPersistedPolicy && len(cfg.CITriggerRepos) == 0 {
 			return Config{}, fmt.Errorf("CI_TRIGGER_REPOS is required for remote Loom dispatch")
 		}
@@ -331,10 +329,6 @@ func Load() (Config, error) {
 			cfg.LoomWorkerPubkeys[i] = pk.Hex()
 		}
 	}
-	if cfg.CIProtocol != "canonical" && cfg.CIProtocol != "cascadia" {
-		return Config{}, fmt.Errorf("CI_PROTOCOL must be canonical or cascadia")
-	}
-
 	if cfg.AuthEnabled && cfg.BridgePublicURL == "" {
 		return Config{}, fmt.Errorf("BRIDGE_PUBLIC_URL is required when AUTH_ENABLED=true")
 	}

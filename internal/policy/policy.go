@@ -28,8 +28,30 @@ type AccessPolicy struct {
 }
 
 type CIPolicy struct {
-	Enabled      bool     `json:"enabled"`
 	TriggerRepos []string `json:"trigger_repos"`
+
+	// retiredEnabled is populated only while decoding schema-v1 projections so
+	// Open can remove the obsolete legacy-publisher toggle without rejecting an
+	// otherwise valid persisted allowlist.
+	retiredEnabled *bool
+}
+
+func (p *CIPolicy) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Enabled      *bool    `json:"enabled"`
+		TriggerRepos []string `json:"trigger_repos"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&wire); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("multiple JSON values")
+	}
+	p.TriggerRepos = wire.TriggerRepos
+	p.retiredEnabled = wire.Enabled
+	return nil
 }
 
 type ProvisionPolicy struct {
@@ -112,7 +134,6 @@ type Document struct {
 type Snapshot struct {
 	PubkeyAllowlist        map[string]struct{}
 	CITriggerRepos         []string
-	CIEnabled              bool
 	ProvisionRateLimit     int
 	RelayURLs              []string
 	HookRelayURL           string
@@ -173,16 +194,25 @@ func Open(path string, cfg config.Config) (*Store, error) {
 		s.seeded = true
 	} else if err != nil {
 		return nil, err
-	} else if doc.ConfigFabric.Scope == "" {
-		doc.ConfigFabric.Scope = cfg.ConfigScope
+	} else {
+		if doc.CI.retiredEnabled != nil {
+			return nil, errors.New("ci.enabled is retired; remove it and select execution with HIVE_CI_ENABLED and LOOM_ENABLED/LOOM_DISPATCH_MODE")
+		}
+		migrated := false
 		if doc.ConfigFabric.Scope == "" {
-			doc.ConfigFabric.Scope = "prod"
+			doc.ConfigFabric.Scope = cfg.ConfigScope
+			if doc.ConfigFabric.Scope == "" {
+				doc.ConfigFabric.Scope = "prod"
+			}
+			if doc.ConfigFabric.Accepted == nil {
+				doc.ConfigFabric.Accepted = make(map[string]AcceptedConfig)
+			}
+			migrated = true
 		}
-		if doc.ConfigFabric.Accepted == nil {
-			doc.ConfigFabric.Accepted = make(map[string]AcceptedConfig)
-		}
-		if err := writeAtomic(path, doc); err != nil {
-			return nil, fmt.Errorf("persist config-fabric metadata migration: %w", err)
+		if migrated {
+			if err := writeAtomic(path, doc); err != nil {
+				return nil, fmt.Errorf("persist policy metadata migration: %w", err)
+			}
 		}
 	}
 	if err := s.validate(doc); err != nil {
@@ -192,7 +222,7 @@ func Open(path string, cfg config.Config) (*Store, error) {
 	return s, nil
 }
 
-var envSeedVariables = []string{"PUBKEY_ALLOWLIST", "CI_ENABLED", "CI_TRIGGER_REPOS", "PROVISION_RATE_LIMIT", "RELAY_URLS", "HOOK_RELAY_URL", "GRASP_RELAY_URL", "PROFILE_SYNC_ENABLED", "PROFILE_SYNC_INTERVAL", "PROFILE_SYNC_WORKERS", "GITEA_FULL_PROXY_ENABLED", "EMBEDDED_RELAY", "NOSTR_RELAYS", "CASHU_MINT_URL", "BLOSSOM_URL", "JOB_TIMEOUT_MINUTES", "HIVECI_CLONE_URL_TEMPLATE", "GRASP_CONFIG_TRUSTED_AUTHORS", "GRASP_CONFIG_SCOPE"}
+var envSeedVariables = []string{"PUBKEY_ALLOWLIST", "CI_TRIGGER_REPOS", "PROVISION_RATE_LIMIT", "RELAY_URLS", "HOOK_RELAY_URL", "GRASP_RELAY_URL", "PROFILE_SYNC_ENABLED", "PROFILE_SYNC_INTERVAL", "PROFILE_SYNC_WORKERS", "GITEA_FULL_PROXY_ENABLED", "EMBEDDED_RELAY", "NOSTR_RELAYS", "CASHU_MINT_URL", "BLOSSOM_URL", "JOB_TIMEOUT_MINUTES", "HIVECI_CLONE_URL_TEMPLATE", "GRASP_CONFIG_TRUSTED_AUTHORS", "GRASP_CONFIG_SCOPE"}
 
 func newEnvSeedImport(doc Document) EnvSeedImport {
 	doc.ConfigFabric.EnvSeed = nil
@@ -224,7 +254,7 @@ func seedDocument(cfg config.Config) Document {
 	return Document{
 		SchemaVersion: SchemaVersion,
 		Access:        AccessPolicy{PubkeyAllowlist: allowlist},
-		CI:            CIPolicy{Enabled: cfg.CIEnabled, TriggerRepos: append([]string(nil), cfg.CITriggerRepos...)},
+		CI:            CIPolicy{TriggerRepos: append([]string(nil), cfg.CITriggerRepos...)},
 		Provision:     ProvisionPolicy{RateLimitPerHour: cfg.ProvisionRateLimit},
 		Relays:        RelayPolicy{URLs: append([]string(nil), cfg.RelayURLs...), HookRelayURL: cfg.HookRelayURL, GraspRelayURL: cfg.GraspRelayURL},
 		ProfileSync:   ProfileSyncPolicy{Enabled: cfg.ProfileSyncEnabled, Interval: cfg.ProfileSyncInterval.String(), Workers: cfg.ProfileSyncWorkers},
@@ -425,7 +455,7 @@ func (s *Store) publish(doc Document) {
 		allowlist[strings.TrimSpace(pubkey)] = struct{}{}
 	}
 	s.current.Store(&Snapshot{
-		PubkeyAllowlist: allowlist, CITriggerRepos: append([]string(nil), doc.CI.TriggerRepos...), CIEnabled: doc.CI.Enabled,
+		PubkeyAllowlist: allowlist, CITriggerRepos: append([]string(nil), doc.CI.TriggerRepos...),
 		ProvisionRateLimit: doc.Provision.RateLimitPerHour, RelayURLs: append([]string(nil), doc.Relays.URLs...), HookRelayURL: doc.Relays.HookRelayURL, GraspRelayURL: doc.Relays.GraspRelayURL,
 		ProfileSyncEnabled: doc.ProfileSync.Enabled, ProfileSyncInterval: interval, ProfileSyncWorkers: doc.ProfileSync.Workers,
 		FullProxyEnabled: doc.FullProxy.Enabled, EmbeddedRelay: doc.EmbeddedRelay.Enabled,
@@ -465,6 +495,9 @@ func (s *Store) Reload() error {
 	doc, err := loadDocument(s.path)
 	if err != nil {
 		return err
+	}
+	if doc.CI.retiredEnabled != nil {
+		return errors.New("ci.enabled is retired; remove it and select execution with HIVE_CI_ENABLED and LOOM_ENABLED/LOOM_DISPATCH_MODE")
 	}
 	if err := s.validate(doc); err != nil {
 		return err
@@ -563,7 +596,13 @@ func (s *Store) UpdateGroup(name string, raw []byte) error {
 	case "access":
 		err = decode(&doc.Access)
 	case "ci":
-		err = decode(&doc.CI)
+		var ci CIPolicy
+		err = decode(&ci)
+		if err == nil && ci.retiredEnabled != nil {
+			err = errors.New("ci.enabled is retired; use HIVE_CI_ENABLED and LOOM_ENABLED/LOOM_DISPATCH_MODE")
+		} else if err == nil {
+			doc.CI = ci
+		}
 	case "provision":
 		err = decode(&doc.Provision)
 	case "relays":
@@ -611,7 +650,6 @@ func (s *Store) ApplyTo(cfg *config.Config) {
 	}
 	cfg.PubkeyAllowlist = v.PubkeyAllowlist
 	cfg.CITriggerRepos = append([]string(nil), v.CITriggerRepos...)
-	cfg.CIEnabled = v.CIEnabled
 	cfg.ProvisionRateLimit = v.ProvisionRateLimit
 	cfg.RelayURLs = append([]string(nil), v.RelayURLs...)
 	cfg.HookRelayURL = v.HookRelayURL
@@ -722,7 +760,13 @@ func decodeDesiredGroup(doc *Document, group string, raw []byte) error {
 	case "access":
 		err = decode(&doc.Access)
 	case "ci":
-		err = decode(&doc.CI)
+		var ci CIPolicy
+		err = decode(&ci)
+		if err == nil && ci.retiredEnabled != nil {
+			err = errors.New("ci.enabled is retired; use HIVE_CI_ENABLED and LOOM_ENABLED/LOOM_DISPATCH_MODE")
+		} else if err == nil {
+			doc.CI = ci
+		}
 	case "provision":
 		err = decode(&doc.Provision)
 	case "relays":

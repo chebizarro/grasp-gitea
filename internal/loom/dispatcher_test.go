@@ -102,7 +102,7 @@ func TestWorkerPoolAllowlistCanonicalLatestAndPaymentGate(t *testing.T) {
 	}
 }
 
-func TestDispatcherPersistsBeforePublishAndNIP44RoundTrip(t *testing.T) {
+func TestDispatcherPublishesExactlyOne5401AndOne5100(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "loom.db"))
 	if err != nil {

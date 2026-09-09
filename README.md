@@ -9,7 +9,9 @@ HTTP without ever holding Gitea credentials.
 > **full-proxy** mode; the previous topology moved to
 > `deploy/nginx/gitea-vhost.legacy.conf.example`.
 
-> **Protocol note:** this bridge speaks NIP-34 for repo state and emits canonical ContextVM `ci/workflow-run` requests. Compute dispatch belongs downstream of that canonical command boundary.
+> **Protocol note:** this bridge speaks NIP-34 for repository state. Hive-CI/Loom
+> turns accepted state into fleet-local kind `5401` workflow runs and kind `5100`
+> worker jobs; the retired ContextVM `ci/workflow-run` publisher is not used.
 
 - relay subscriber for NIP-34 repository announcements (kind `30617`)
 - automatic Gitea org/repo provisioning for clone URLs matching `CLONE_PREFIX`

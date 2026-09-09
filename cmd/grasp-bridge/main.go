@@ -339,7 +339,7 @@ func main() {
 					continue
 				}
 				current := policies.Current()
-				logger.Info("persisted policy reloaded", "pubkey_allowlist_entries", len(current.PubkeyAllowlist), "ci_enabled", current.CIEnabled, "ci_trigger_repos", current.CITriggerRepos)
+				logger.Info("persisted policy reloaded", "pubkey_allowlist_entries", len(current.PubkeyAllowlist), "ci_trigger_repos", current.CITriggerRepos)
 			}
 		}
 	}()
@@ -428,11 +428,6 @@ func main() {
 			logger.Warn("environment seed status publication deferred by relay/signer availability", "audit_id", seedImport.AuditID, "error", statusErr)
 		}
 	}
-	if cfg.CIEnabled && cfg.CIProtocol == "cascadia" && publisherSvc.Enabled() {
-		logger.Warn("legacy Cascadia CI workflow-run publishing enabled", "trigger_repos", cfg.CITriggerRepos)
-	} else if cfg.CIEnabled && cfg.CIProtocol == "canonical" {
-		logger.Info("canonical CI uses the Loom dispatcher; legacy CI_ENABLED publisher remains disabled")
-	}
 	statusSink := loom.NewDurableStatusSink(st, giteaClient, cfg.LoomJobTTL, cfg.LoomMaxJobs, logger)
 	if cfg.LoomEnabled || cfg.HiveCIEnabled {
 		go statusSink.Run(ctx)
@@ -446,7 +441,7 @@ func main() {
 	if candidate, ok := serverSigner.(loom.DispatchSigner); ok {
 		dispatchSigner = candidate
 	}
-	remoteRequested := cfg.LoomEnabled && cfg.CIProtocol == "canonical" &&
+	remoteRequested := cfg.LoomEnabled &&
 		(cfg.LoomDispatchMode == "remote" || cfg.LoomDispatchMode == "both")
 	var loomWallet cashuwallet.Wallet
 	if remoteRequested && cfg.LoomPaymentMode == "cashu" {
@@ -711,13 +706,6 @@ func main() {
 				return nil
 			}
 
-			// CI trigger runs before proactive sync so local refs
-			// still reflect the previous state for change detection.
-			if publisherSvc != nil && cfg.CIProtocol == "cascadia" {
-				if ciErr := publisherSvc.HandleStateEventCI(ctx, ev, sourceRelay); ciErr != nil {
-					logger.Warn("CI workflow-run trigger failed", "event", ev.ID, "error", ciErr)
-				}
-			}
 			if syncErr := proactiveSyncSvc.HandleStateEvent(ctx, ev); syncErr != nil {
 				logger.Warn("proactive sync failed", "event", ev.ID, "error", syncErr)
 			}

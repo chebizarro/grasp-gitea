@@ -46,10 +46,7 @@ type Service struct {
 	repoMu    sync.Mutex
 	repoLocks map[int64]*sync.Mutex
 
-	ciEnabled      bool
-	ciTriggerRepos []string
-	ciDedup        *ciDedup
-	policy         *policy.Store
+	policy *policy.Store
 }
 
 // StateSigner reports whether user grant signing is available.
@@ -480,6 +477,11 @@ func (s *Service) PublishSigned(ctx context.Context, ev *nostr.Event) error {
 
 func (s *Service) SetAdditionalRelayURLs(urls ...string) {
 	s.additionalRelayURLs = append([]string(nil), urls...)
+}
+
+// SetPolicyStore makes relay selection consult the live policy snapshot.
+func (s *Service) SetPolicyStore(store *policy.Store) {
+	s.policy = store
 }
 
 func (s *Service) currentRelayURLs() []string {
