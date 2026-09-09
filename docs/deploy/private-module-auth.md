@@ -13,6 +13,19 @@ Track B / operator rebuilds (the incident that filed
 The Dockerfile expects a **BuildKit secret** named `git-credentials`
 containing one line in the git credential-store format. The secret is
 mounted only for the `go mod download` step and never persisted to a layer.
+Git is configured for that step through an in-memory, read-only credential
+helper: it reads the mounted credential for `get` requests and ignores
+write/erase requests, so Git never tries to modify the secret mount.
+
+The generated Go module is a subdirectory of the `cascadia-nips` repository.
+Its Go import metadata maps
+`git.sharegap.net/cascadia/cascadia-nips/generated/go` to the repository root
+`git.sharegap.net/cascadia/cascadia-nips`, so the same host credential covers
+both the root repository lookup and the generated subdirectory module.
+That import metadata is currently served without authentication; the
+credential helper authenticates only the subsequent Git fetch. If the forge
+ever protects `?go-get=1` metadata, this path must move to a protected module
+proxy because Git credentials cannot authenticate Go's metadata request.
 
 ## One-time setup on the build host
 
@@ -44,7 +57,9 @@ GRASP_IMAGE_TAG=nip34-live-$(git rev-parse --short HEAD)-full \
 ```
 
 The target fails closed with an actionable message if `.git-credentials`
-is missing. To point at a non-default credential path:
+is missing, empty, or inside the repository's Docker build context. Keep the
+protected file outside the checkout. To point at a non-default credential
+path:
 
 ```sh
 GRASP_GIT_CREDENTIALS=/var/run/secrets/grasp/git-credentials \
@@ -60,6 +75,37 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg BUILD_TAGS=full \
   -t grasp-bridge:nip34-live-$(git rev-parse --short HEAD)-full .
 ```
+
+## CI and repository self-test
+
+This repository has no checked-in hosted-runner workflow. Its containerized
+CI entry point is `make selftest`, backed by `Dockerfile.selftest`. Configure
+the CI secret manager to supply the credential as a protected **file-type**
+secret, then pass only that file's path to Make:
+
+```sh
+GRASP_GIT_CREDENTIALS=/run/ci-secrets/grasp-git-credentials make selftest
+```
+
+`make selftest` validates that the file exists and passes it to the self-test
+image build as the same `git-credentials` BuildKit secret. The Dockerfile
+mounts it only while asserting `go mod tidy -diff` and running
+`go mod download all`; it then runs tests with module network access disabled.
+The subsequent test image does not contain the secret. CI must not convert
+the credential to a build argument, environment value, command-line value,
+or repository file. Both Make targets reject a credential file inside the
+Docker build context, and `.dockerignore` excludes conventional credential
+filenames as defense in depth.
+
+CI jobs that build the release image use the same file-type protected input
+with `GRASP_GIT_CREDENTIALS` and `make docker-build-full`.
+
+## Docker Compose builds
+
+Every checked-in Compose file that builds the bridge declares the same
+`git-credentials` build secret. Set `GRASP_GIT_CREDENTIALS` to a protected
+file outside the checkout before `docker compose build` or an E2E target that
+builds the image. Compose mounts it only for the Dockerfile download step.
 
 ## Optional: public/anonymous builds
 
@@ -86,6 +132,7 @@ Both should be empty.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `exit code 78` from build with `private module auth is required` | `.git-credentials` file empty or missing | Provide the secret per steps above |
+| `exit code 78` from `make selftest` | CI did not supply a non-empty protected credential file | Configure a file-type CI secret and set `GRASP_GIT_CREDENTIALS` to its path |
 | `go: 403 Forbidden` from `git.sharegap.net/...` | Bot user lacks read access | Grant the bot user repo access on both cascadia-go and cascadia-nips |
-| `fatal: could not read Username` mid-build | `credential.helper` not set for the RUN | Confirm the Dockerfile line `git config --global credential.helper store` ran (only fires when the secret is non-empty) |
+| `fatal: could not read Username` mid-build | Read-only credential helper not configured for the download RUN | Confirm the Dockerfile exports `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0`, and `GIT_CONFIG_VALUE_0` when the secret is non-empty |
 | Track B rollback with `grasp-gitea-clean-edge-build-private-module-auth-20260906` | Old build path assumed a host-level `.netrc` copied from a rollout folder | Use `make docker-build-full` from a clean checkout |

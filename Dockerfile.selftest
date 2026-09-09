@@ -1,7 +1,23 @@
+# syntax=docker/dockerfile:1.6
 FROM golang:1.25-alpine
+ARG PRIVATE_MODULE_AUTH="required"
+ENV GOPRIVATE=git.sharegap.net/*
 WORKDIR /src
 RUN apk add --no-cache git build-base
 COPY . .
-RUN go mod tidy
-RUN go mod download
+RUN --mount=type=secret,id=git-credentials,target=/root/.git-credentials \
+	set -eu; \
+	if [ -s /root/.git-credentials ]; then \
+	  export GIT_CONFIG_COUNT=1; \
+	  export GIT_CONFIG_KEY_0=credential.helper; \
+	  export GIT_CONFIG_VALUE_0='!f() { [ "$1" != get ] || git credential-store --file=/root/.git-credentials get; }; f'; \
+	elif [ "$PRIVATE_MODULE_AUTH" = "required" ]; then \
+	  echo "grasp-gitea selftest: private module auth is required but the 'git-credentials' BuildKit secret was empty or missing." >&2; \
+	  echo "Run 'make selftest' with GRASP_GIT_CREDENTIALS pointing to the protected credential file." >&2; \
+	  echo "See docs/deploy/private-module-auth.md for the exact CI recipe." >&2; \
+	  exit 78; \
+	fi; \
+	go mod tidy -diff; \
+	go mod download all
+ENV GOPROXY=off GONOPROXY=none
 CMD ["go", "test", "./...", "-count=1"]

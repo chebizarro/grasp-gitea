@@ -2,6 +2,8 @@ services:
   grasp-bridge:
     build:
       context: .
+      secrets:
+        - git-credentials
     image: grasp-bridge:local
     restart: unless-stopped
     environment:
@@ -21,6 +23,10 @@ services:
     volumes:
       - grasp-bridge-data:/data
       - gitea-data:/gitea-data
+
+secrets:
+  git-credentials:
+    file: ${GRASP_GIT_CREDENTIALS:?set GRASP_GIT_CREDENTIALS to a protected file outside the repository}
 
 volumes:
   grasp-bridge-data:

@@ -1,0 +1,7 @@
+.git
+.git-credentials
+**/.git-credentials
+*git-credentials*
+**/*git-credentials*
+.netrc
+**/.netrc

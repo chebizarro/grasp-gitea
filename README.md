@@ -393,6 +393,10 @@ make build-full
     make docker-build-full
   ```
 
+  Repository CI uses the same protected file input for `make selftest`; see
+  the linked document for the runner recipe. No credential value is accepted
+  through a build argument or environment variable.
+
 - Compose examples:
   - Sidecar mode: `docker-compose.phase1.yml`
   - Embedded relay mode (Mode A): `docker-compose.mode-a.yml`

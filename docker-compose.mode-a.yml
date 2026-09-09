@@ -2,6 +2,8 @@ services:
   grasp-bridge:
     build:
       context: .
+      secrets:
+        - git-credentials
       args:
         BUILD_TAGS: full
     image: grasp-bridge:local-full
@@ -23,6 +25,10 @@ services:
     volumes:
       - grasp-bridge-data:/data
       - gitea-data:/gitea-data
+
+secrets:
+  git-credentials:
+    file: ${GRASP_GIT_CREDENTIALS:?set GRASP_GIT_CREDENTIALS to a protected file outside the repository}
 
 volumes:
   grasp-bridge-data:

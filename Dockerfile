@@ -29,14 +29,16 @@ COPY go.mod go.sum ./
 RUN --mount=type=secret,id=git-credentials,target=/root/.git-credentials \
 	set -eu; \
 	if [ -s /root/.git-credentials ]; then \
-	  git config --global credential.helper store; \
+	  export GIT_CONFIG_COUNT=1; \
+	  export GIT_CONFIG_KEY_0=credential.helper; \
+	  export GIT_CONFIG_VALUE_0='!f() { [ "$1" != get ] || git credential-store --file=/root/.git-credentials get; }; f'; \
 	elif [ "$PRIVATE_MODULE_AUTH" = "required" ]; then \
 	  echo "grasp-gitea build: private module auth is required but the 'git-credentials' BuildKit secret was empty or missing." >&2; \
 	  echo "Pass '--secret id=git-credentials,src=<path-to-git-credentials>' to 'docker build'." >&2; \
 	  echo "See docs/deploy/private-module-auth.md for the exact recipe." >&2; \
 	  exit 78; \
 	fi; \
-	go mod download
+	go mod download all
 COPY . .
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -tags "${BUILD_TAGS}" -o /out/grasp-bridge ./cmd/grasp-bridge
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/grasp-pre-receive ./cmd/grasp-pre-receive

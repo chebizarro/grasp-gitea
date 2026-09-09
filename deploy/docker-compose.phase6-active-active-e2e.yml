@@ -24,6 +24,8 @@ services:
     platform: linux/amd64
     build:
       context: ..
+      secrets:
+        - git-credentials
       args:
         BUILD_TAGS: full
         GOPROXY: ${E2E_GOPROXY:-}
@@ -80,6 +82,10 @@ services:
       - "127.0.0.1:${E2E_NGINX_PORT:-58096}:8080"
     volumes:
       - ${E2E_NGINX_CONFIG:?set E2E_NGINX_CONFIG}:/etc/nginx/conf.d/default.conf:ro
+
+secrets:
+  git-credentials:
+    file: ${GRASP_GIT_CREDENTIALS:?set GRASP_GIT_CREDENTIALS to a protected file outside the repository}
 
 volumes:
   postgres-data:
