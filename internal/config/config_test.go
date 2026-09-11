@@ -21,6 +21,9 @@ func setEnvs(t *testing.T, vars map[string]string) {
 	if _, ok := vars["SIGNER_MASTER_KEY"]; !ok {
 		t.Setenv("SIGNER_MASTER_KEY", "")
 	}
+	if _, ok := vars["GITEA_ADMIN_TOKEN_FILE"]; !ok {
+		t.Setenv("GITEA_ADMIN_TOKEN_FILE", "")
+	}
 	for _, retired := range []string{"CI_PROTOCOL", "CI_ENABLED"} {
 		if _, ok := vars[retired]; !ok {
 			t.Setenv(retired, "")
@@ -29,6 +32,107 @@ func setEnvs(t *testing.T, vars map[string]string) {
 	for k, v := range vars {
 		t.Setenv(k, v)
 	}
+}
+
+func TestLoadGiteaAdminTokenFromProtectedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gitea-admin-token")
+	if err := os.WriteFile(path, []byte("file-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN":      "",
+		"GITEA_ADMIN_TOKEN_FILE": path,
+		"GITEA_ADMIN_USER":       "grasp-admin",
+		"CLONE_PREFIX":           "https://git.example.com",
+		"RELAY_URLS":             "wss://relay.example.com",
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.GiteaAdminToken != "file-token" {
+		t.Fatalf("loaded token = %q, want file-token", cfg.GiteaAdminToken)
+	}
+	if cfg.GiteaAdminTokenFile != path {
+		t.Fatalf("token file = %q, want %q", cfg.GiteaAdminTokenFile, path)
+	}
+}
+
+func TestLoadRejectsAmbiguousGiteaAdminTokenSources(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gitea-admin-token")
+	if err := os.WriteFile(path, []byte("file-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN":      "environment-token",
+		"GITEA_ADMIN_TOKEN_FILE": path,
+		"GITEA_ADMIN_USER":       "grasp-admin",
+		"CLONE_PREFIX":           "https://git.example.com",
+		"RELAY_URLS":             "wss://relay.example.com",
+	})
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted two Gitea administrator credential sources")
+	}
+}
+
+func TestLoadGiteaAdminTokenFileRequiresExpectedIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gitea-admin-token")
+	if err := os.WriteFile(path, []byte("file-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setEnvs(t, map[string]string{
+		"GITEA_ADMIN_TOKEN":      "",
+		"GITEA_ADMIN_TOKEN_FILE": path,
+		"GITEA_ADMIN_USER":       "",
+		"CLONE_PREFIX":           "https://git.example.com",
+		"RELAY_URLS":             "wss://relay.example.com",
+	})
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted reloadable credential without an expected administrator identity")
+	}
+}
+
+func TestLoadGiteaAdminTokenFileRejectsUnsafeFiles(t *testing.T) {
+	t.Run("relative path", func(t *testing.T) {
+		if _, err := LoadGiteaAdminTokenFile("token"); err == nil {
+			t.Fatal("relative credential path accepted")
+		}
+	})
+	t.Run("group readable", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "token")
+		if err := os.WriteFile(path, []byte("token"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadGiteaAdminTokenFile(path); err == nil {
+			t.Fatal("group-readable credential accepted")
+		}
+	})
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target")
+		link := filepath.Join(dir, "token")
+		if err := os.WriteFile(target, []byte("token"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadGiteaAdminTokenFile(link); err == nil {
+			t.Fatal("symlink credential accepted")
+		}
+	})
+	t.Run("embedded newline", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "token")
+		if err := os.WriteFile(path, []byte("token\nsecond"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadGiteaAdminTokenFile(path); err == nil {
+			t.Fatal("multi-line credential accepted")
+		}
+	})
 }
 
 func TestLoadMinimalValid(t *testing.T) {

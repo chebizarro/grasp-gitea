@@ -65,6 +65,30 @@ func TestProbeRecordsAcceptedLifetime(t *testing.T) {
 	}
 }
 
+func TestSetTokenAppliesToSubsequentProbe(t *testing.T) {
+	var seen atomic.Value
+	monitor, server := newTestMonitor(t, func(w http.ResponseWriter, r *http.Request) {
+		_, password, ok := r.BasicAuth()
+		if !ok {
+			t.Error("request did not use Basic auth")
+		}
+		seen.Store(password)
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": testJWT(t, 100, 400)})
+	}, 10*time.Minute, time.Hour)
+	defer server.Close()
+
+	if err := monitor.SetToken("replacement-token"); err != nil {
+		t.Fatalf("SetToken: %v", err)
+	}
+	monitor.probeAndRecord(context.Background())
+	if got, _ := seen.Load().(string); got != "replacement-token" {
+		t.Fatalf("probe token = %q, want replacement-token", got)
+	}
+	if err := monitor.SetToken("bad\ntoken"); err == nil {
+		t.Fatal("SetToken accepted a credential containing a newline")
+	}
+}
+
 func TestProbeSignalsExceededBound(t *testing.T) {
 	monitor, server := newTestMonitor(t, func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"access_token": testJWT(t, 100, 3701)})
