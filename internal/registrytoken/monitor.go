@@ -176,16 +176,24 @@ func jwtLifetime(token string) (time.Duration, error) {
 		return 0, fmt.Errorf("decode registry JWT payload: %w", err)
 	}
 	var claims struct {
-		IssuedAt int64 `json:"iat"`
-		Expires  int64 `json:"exp"`
+		IssuedAt  int64 `json:"iat"`
+		NotBefore int64 `json:"nbf"`
+		Expires   int64 `json:"exp"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return 0, fmt.Errorf("decode registry JWT claims: %w", err)
 	}
-	if claims.IssuedAt <= 0 || claims.Expires <= claims.IssuedAt {
-		return 0, errors.New("registry JWT has invalid exp/iat claims")
+	startsAt := claims.IssuedAt
+	if startsAt == 0 {
+		// Gitea 1.26 registry JWTs use nbf as the issuance boundary and do
+		// not include iat. Prefer iat when present for compatibility with
+		// older releases, and otherwise measure the bound from nbf.
+		startsAt = claims.NotBefore
 	}
-	seconds := claims.Expires - claims.IssuedAt
+	if startsAt <= 0 || claims.Expires <= startsAt {
+		return 0, errors.New("registry JWT has invalid exp/iat/nbf claims")
+	}
+	seconds := claims.Expires - startsAt
 	if seconds > math.MaxInt64/int64(time.Second) {
 		return 0, fmt.Errorf("registry JWT lifetime %d seconds overflows a duration", seconds)
 	}

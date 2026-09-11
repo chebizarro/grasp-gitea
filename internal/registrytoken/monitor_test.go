@@ -167,3 +167,15 @@ func TestJWTLifetimeOverflow(t *testing.T) {
 		t.Fatal("overflowing exp-iat accepted")
 	}
 }
+
+func TestJWTLifetimeAcceptsGiteaNotBeforeWithoutIssuedAt(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"nbf":100,"exp":400}`))
+	got, err := jwtLifetime(header + "." + payload + ".sig")
+	if err != nil {
+		t.Fatalf("jwtLifetime: %v", err)
+	}
+	if got != 5*time.Minute {
+		t.Fatalf("lifetime = %s, want 5m", got)
+	}
+}
