@@ -46,8 +46,11 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/grasp-pre-receive ./c
 FROM alpine:3.20
 # Hive-CI remains experimental: this runtime intentionally does not bundle
 # act or a privileged container runtime. See README.md before enabling it.
-RUN apk add --no-cache ca-certificates git sqlite-libs
+RUN apk add --no-cache ca-certificates git sqlite-libs su-exec
 WORKDIR /app
 COPY --from=build /out/grasp-bridge /usr/local/bin/grasp-bridge
 COPY --from=build /out/grasp-pre-receive /usr/local/bin/grasp-pre-receive
-ENTRYPOINT ["grasp-bridge"]
+COPY scripts/grasp-bridge-entrypoint.sh /usr/local/bin/grasp-bridge-entrypoint
+RUN chmod 0755 /usr/local/bin/grasp-bridge-entrypoint
+ENTRYPOINT ["/usr/local/bin/grasp-bridge-entrypoint"]
+CMD ["grasp-bridge"]
