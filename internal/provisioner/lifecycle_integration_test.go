@@ -188,8 +188,7 @@ func newTestGiteaServer(t *testing.T, reposDir string) (*httptest.Server, *testG
 			key := org + "/" + name
 			state.repos[key] = testRepo{ID: state.nextID, Name: name, Org: org}
 			state.nextID++
-			repoPath := filepath.Join(state.reposDir, org, name+".git", "hooks")
-			_ = os.MkdirAll(repoPath, 0o755)
+			initBareTestRepo(t, filepath.Join(state.reposDir, org, name+".git"))
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": state.repos[key].ID, "name": name,
@@ -497,10 +496,7 @@ func TestReconcileHooksReinstallsIncomplete(t *testing.T) {
 	repoID := "reconcile-test"
 
 	// Pre-create the repo directory so the hook installer has somewhere to write.
-	repoPath := filepath.Join(reposDir, orgName, repoID+".git", "hooks")
-	if err := os.MkdirAll(repoPath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	initBareTestRepo(t, filepath.Join(reposDir, orgName, repoID+".git"))
 
 	// Insert a mapping with hook_installed=false, simulating interrupted provisioning.
 	m := store.Mapping{

@@ -217,9 +217,7 @@ func TestReconcileHooksRestoresTenantOwnerCollaborator(t *testing.T) {
 	state.orgIDs[owner] = 77
 	state.repos[owner+"/"+repoName] = testRepo{ID: 41, Name: repoName, Org: owner}
 	state.mu.Unlock()
-	if err := os.MkdirAll(filepath.Join(reposDir, owner, repoName+".git", "hooks"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	initBareTestRepo(t, filepath.Join(reposDir, owner, repoName+".git"))
 	if err := svc.ReconcileHooks(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -242,9 +240,7 @@ func TestEnsureUploadPackCapabilitiesUsesPhysicalRepoName(t *testing.T) {
 	if err := st.UpsertMapping(t.Context(), store.Mapping{Npub: "npub", RepoID: "logical", Pubkey: "pub", Owner: owner, RepoName: physical, TenantHost: "example.com", GiteaRepoID: 41, HookInstalled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(reposDir, owner, physical+".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	initBareTestRepo(t, filepath.Join(reposDir, owner, physical+".git"))
 	if err := svc.EnsureUploadPackCapabilities(t.Context()); err != nil {
 		t.Fatal(err)
 	}

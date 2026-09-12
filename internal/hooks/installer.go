@@ -303,12 +303,27 @@ func (i *Installer) ConfigureUploadPack(orgName string, repoID string) error {
 }
 
 func configureUploadPack(repoGitDir string) error {
-	configPath := filepath.Join(repoGitDir, "config")
 	for _, kv := range uploadPackCapabilities {
-		cmd := exec.Command("git", "config", "--file", configPath, kv[0], kv[1])
+		cmd := exec.Command("git", "--git-dir="+repoGitDir, "config", "--local", kv[0], kv[1])
+		// Installation runs outside a receive process. Ignore any inherited Git
+		// repository context so an empty GIT_DIR/GIT_WORK_TREE cannot redirect or
+		// invalidate configuration of the explicit target file.
+		cmd.Env = gitConfigEnvironment()
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("git config %s: %s", kv[0], strings.TrimSpace(string(out)))
 		}
 	}
 	return nil
+}
+
+func gitConfigEnvironment() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env))
+	for _, item := range env {
+		if strings.HasPrefix(item, "GIT_DIR=") || strings.HasPrefix(item, "GIT_WORK_TREE=") || strings.HasPrefix(item, "GIT_COMMON_DIR=") {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }

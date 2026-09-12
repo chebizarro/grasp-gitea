@@ -153,6 +153,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/signer/authorize", method(http.MethodPost, s.requireAuth(s.signerAuthorize)))
 	mux.HandleFunc("/repository-state/propose", method(http.MethodPost, s.requireAuth(s.proposeRepositoryState)))
 	mux.HandleFunc("/repository-state/proposed", method(http.MethodGet, s.requireAuth(s.proposedRepositoryState)))
+	mux.HandleFunc("/admin/mappings/writable-upstream", method(http.MethodPost, s.requireAuth(s.migrateWritableUpstream)))
+	mux.HandleFunc("/admin/mappings/writable-upstream/rollback", method(http.MethodPost, s.requireAuth(s.rollbackWritableUpstream)))
 	mux.HandleFunc("/provision", method(http.MethodPost, s.requireAuth(s.manualProvision)))
 	mux.HandleFunc("/admin/policy", s.requireAuth(s.policyDocument))
 	mux.HandleFunc("/admin/policy/", s.requireAuth(s.policyGroup))

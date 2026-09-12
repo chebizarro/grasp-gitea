@@ -118,19 +118,22 @@ func TestDeleteUserAccessToken(t *testing.T) {
 	}
 }
 
-func TestParseRepoDecodesPrivate(t *testing.T) {
-	repo, err := parseRepo([]byte(`{"id":9,"name":"secret","private":true,"owner":{"username":"org"}}`))
+func TestParseRepoDecodesPrivateAndMirror(t *testing.T) {
+	repo, err := parseRepo([]byte(`{"id":9,"name":"secret","private":true,"mirror":true,"owner":{"username":"org"}}`))
 	if err != nil {
 		t.Fatalf("parseRepo: %v", err)
 	}
 	if !repo.Private {
 		t.Fatal("Private not decoded; anonymous npub proxying would expose private repos")
 	}
+	if !repo.Mirror {
+		t.Fatal("Mirror not decoded; topology migration could adopt a pull mirror as writable")
+	}
 	repo, err = parseRepo([]byte(`{"id":10,"name":"open","owner":{"username":"org"}}`))
 	if err != nil {
 		t.Fatalf("parseRepo public: %v", err)
 	}
-	if repo.Private {
-		t.Fatal("public repo decoded as private")
+	if repo.Private || repo.Mirror {
+		t.Fatal("public normal repo decoded as private or mirror")
 	}
 }

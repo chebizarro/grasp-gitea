@@ -88,8 +88,7 @@ func TestManualProvisionInstallsHookSelfContained(t *testing.T) {
 			key := org + "/" + name
 			repos[key] = repoRecord{ID: nextID, Name: name, Org: org}
 			nextID++
-			repoPath := filepath.Join(reposDir, org, name+".git", "hooks")
-			_ = os.MkdirAll(repoPath, 0o755)
+			initBareTestRepo(t, filepath.Join(reposDir, org, name+".git"))
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id":   repos[key].ID,

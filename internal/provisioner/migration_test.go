@@ -50,9 +50,7 @@ func seedExistingMigrationRepo(t *testing.T) (*Service, *store.SQLiteStore, *tes
 	state.orgIDs[mapping.Owner] = 22
 	state.repos[mapping.Owner+"/"+mapping.RepoName] = testRepo{ID: mapping.GiteaRepoID, Name: mapping.RepoName, Org: mapping.Owner}
 	state.mu.Unlock()
-	if err := os.MkdirAll(filepath.Join(reposDir, mapping.Owner, mapping.RepoName+".git", "hooks"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	initBareTestRepo(t, filepath.Join(reposDir, mapping.Owner, mapping.RepoName+".git"))
 	if err := svc.installer.InstallAt(mapping.Owner, mapping.RepoName, mapping.Npub, mapping.RepoID); err != nil {
 		t.Fatal(err)
 	}

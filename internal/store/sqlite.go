@@ -349,6 +349,13 @@ func Open(path string) (*SQLiteStore, error) {
 			created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
 			PRIMARY KEY(npub,repo_id), FOREIGN KEY(tenant_host) REFERENCES managed_tenants(host)
 		);`,
+		`CREATE TABLE IF NOT EXISTS writable_upstream_migrations (
+			npub TEXT NOT NULL, repo_id TEXT NOT NULL,
+			old_owner TEXT NOT NULL, old_repo_name TEXT NOT NULL, old_gitea_repo_id INTEGER NOT NULL, old_clone_url TEXT NOT NULL,
+			new_owner TEXT NOT NULL, new_repo_name TEXT NOT NULL, new_gitea_repo_id INTEGER NOT NULL, new_clone_url TEXT NOT NULL, target_marker TEXT NOT NULL,
+			active INTEGER NOT NULL DEFAULT 1, mapping_updated_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY(npub,repo_id)
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_tenant_memberships_host_granted ON tenant_memberships(host, granted);`,
 		`CREATE TABLE IF NOT EXISTS tenant_package_policies (
 			host TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0,

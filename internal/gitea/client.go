@@ -77,8 +77,20 @@ type Repository struct {
 	// Internal marks a non-private repository owned by a private
 	// organization. Gitea computes it as !IsPrivate && owner is private, so
 	// Private alone does not imply the repository is publicly readable.
-	Internal bool `json:"internal"`
-	Archived bool `json:"archived"`
+	Internal    bool   `json:"internal"`
+	Archived    bool   `json:"archived"`
+	Mirror      bool   `json:"mirror"`
+	Description string `json:"description"`
+}
+
+// MigrateRepoRequest describes a Gitea-native repository import. The caller
+// is responsible for proving that CloneAddr names the exact repository being
+// replaced and for validating every imported ref before activating it.
+type MigrateRepoRequest struct {
+	CloneAddr   string
+	Owner       string
+	Name        string
+	Description string
 }
 
 // PubliclyReadable reports whether unauthenticated users may read the
@@ -428,6 +440,65 @@ func (c *Client) CreateRepo(ctx context.Context, org string, repo string) (Repos
 	return out, nil
 }
 
+// MigrateRepo creates a normal (non-pull-mirror) repository by asking Gitea
+// to import the source repository through its supported migration API.
+func (c *Client) MigrateRepo(ctx context.Context, request MigrateRepoRequest) (Repository, error) {
+	if strings.TrimSpace(request.CloneAddr) == "" || strings.TrimSpace(request.Owner) == "" || strings.TrimSpace(request.Name) == "" {
+		return Repository{}, fmt.Errorf("clone address, owner, and repository name are required")
+	}
+	body := map[string]any{
+		"clone_addr": request.CloneAddr,
+		"repo_owner": request.Owner,
+		"repo_name":  request.Name,
+		"service":    "git",
+		"mirror":     false,
+		// Keep the imported target private until Grasp has verified every ref,
+		// installed the owner-state hook, and atomically activated the mapping.
+		"private":     true,
+		"description": request.Description,
+	}
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/repos/migrate", body)
+	if err != nil {
+		return Repository{}, fmt.Errorf("migrate repository %q/%q: %w", request.Owner, request.Name, err)
+	}
+	return parseRepo(resp)
+}
+
+// ListGitRefs returns every ref visible through Gitea's repository API.
+func (c *Client) ListGitRefs(ctx context.Context, owner, repo string) (map[string]string, error) {
+	const pageSize = 50
+	refs := make(map[string]string)
+	for page := 1; ; page++ {
+		path := fmt.Sprintf("/api/v1/repos/%s/%s/git/refs?limit=%d&page=%d", url.PathEscape(owner), url.PathEscape(repo), pageSize, page)
+		resp, err := c.doJSON(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return nil, err
+		}
+		var raw []struct {
+			Ref    string `json:"ref"`
+			Object struct {
+				SHA string `json:"sha"`
+			} `json:"object"`
+		}
+		if err := json.Unmarshal(resp, &raw); err != nil {
+			return nil, fmt.Errorf("decode Gitea refs: %w", err)
+		}
+		for _, item := range raw {
+			if item.Ref == "" || item.Object.SHA == "" {
+				return nil, fmt.Errorf("Gitea returned an incomplete ref")
+			}
+			if previous, exists := refs[item.Ref]; exists && previous != item.Object.SHA {
+				return nil, fmt.Errorf("Gitea returned conflicting values for ref %s", item.Ref)
+			}
+			refs[item.Ref] = item.Object.SHA
+		}
+		if len(raw) < pageSize {
+			break
+		}
+	}
+	return refs, nil
+}
+
 // EnsureRepo is idempotent and may accept an existing repository. Callers must
 // use it only after a durable ownership link has been established.
 func (c *Client) EnsureRepo(ctx context.Context, org string, repo string) (Repository, error) {
@@ -468,6 +539,11 @@ func (c *Client) ArchiveRepo(ctx context.Context, org string, repo string) error
 
 func (c *Client) SetRepoArchived(ctx context.Context, org, repo string, archived bool) error {
 	_, err := c.doJSON(ctx, http.MethodPatch, "/api/v1/repos/"+url.PathEscape(org)+"/"+url.PathEscape(repo), map[string]any{"archived": archived})
+	return err
+}
+
+func (c *Client) SetRepoPrivate(ctx context.Context, org, repo string, private bool) error {
+	_, err := c.doJSON(ctx, http.MethodPatch, "/api/v1/repos/"+url.PathEscape(org)+"/"+url.PathEscape(repo), map[string]any{"private": private})
 	return err
 }
 
@@ -705,15 +781,17 @@ func parseIssueComment(resp []byte) (IssueComment, error) {
 
 func parseRepo(resp []byte) (Repository, error) {
 	var raw struct {
-		ID       int64  `json:"id"`
-		Name     string `json:"name"`
-		CloneURL string `json:"clone_url"`
-		SSHURL   string `json:"ssh_url"`
-		HTMLURL  string `json:"html_url"`
-		Private  bool   `json:"private"`
-		Internal bool   `json:"internal"`
-		Archived bool   `json:"archived"`
-		Owner    struct {
+		ID          int64  `json:"id"`
+		Name        string `json:"name"`
+		CloneURL    string `json:"clone_url"`
+		SSHURL      string `json:"ssh_url"`
+		HTMLURL     string `json:"html_url"`
+		Private     bool   `json:"private"`
+		Internal    bool   `json:"internal"`
+		Archived    bool   `json:"archived"`
+		Mirror      bool   `json:"mirror"`
+		Description string `json:"description"`
+		Owner       struct {
 			UserName string `json:"username"`
 		} `json:"owner"`
 	}
@@ -721,15 +799,17 @@ func parseRepo(resp []byte) (Repository, error) {
 		return Repository{}, fmt.Errorf("decode gitea repo: %w", err)
 	}
 	return Repository{
-		ID:       raw.ID,
-		Owner:    raw.Owner.UserName,
-		Name:     raw.Name,
-		CloneURL: raw.CloneURL,
-		SSHURL:   raw.SSHURL,
-		HTMLURL:  raw.HTMLURL,
-		Private:  raw.Private,
-		Internal: raw.Internal,
-		Archived: raw.Archived,
+		ID:          raw.ID,
+		Owner:       raw.Owner.UserName,
+		Name:        raw.Name,
+		CloneURL:    raw.CloneURL,
+		SSHURL:      raw.SSHURL,
+		HTMLURL:     raw.HTMLURL,
+		Private:     raw.Private,
+		Internal:    raw.Internal,
+		Archived:    raw.Archived,
+		Mirror:      raw.Mirror,
+		Description: raw.Description,
 	}, nil
 }
 

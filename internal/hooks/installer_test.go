@@ -13,10 +13,9 @@ import (
 
 func TestInstallWritesHookScript(t *testing.T) {
 	dir := t.TempDir()
-	repoDir := filepath.Join(dir, "myorg", "myrepo.git", "hooks")
-	if err := os.MkdirAll(repoDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	bareDir := filepath.Join(dir, "myorg", "myrepo.git")
+	initBareRepo(t, bareDir)
+	repoDir := filepath.Join(bareDir, "hooks")
 
 	installer := NewInstaller(dir, "/usr/local/bin/grasp-pre-receive", "ws://localhost:3334")
 	if err := installer.Install("myorg", "npub1abc123", "myrepo"); err != nil {
@@ -74,10 +73,9 @@ func TestInstallRejectsUnsafeValues(t *testing.T) {
 
 func TestQuiesceRefusesUnmanagedReferenceTransactionHook(t *testing.T) {
 	reposDir := t.TempDir()
-	hooksDir := filepath.Join(reposDir, "org", "repo.git", "hooks")
-	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	bareDir := filepath.Join(reposDir, "org", "repo.git")
+	initBareRepo(t, bareDir)
+	hooksDir := filepath.Join(bareDir, "hooks")
 	path := filepath.Join(hooksDir, "reference-transaction")
 	const unmanaged = "#!/bin/sh\necho operator-hook\n"
 	if err := os.WriteFile(path, []byte(unmanaged), 0o755); err != nil {
@@ -109,9 +107,7 @@ func TestInstallRejectsNonexistentRepoPath(t *testing.T) {
 func TestInstallConfiguresUploadPackCapabilities(t *testing.T) {
 	reposDir := t.TempDir()
 	repoDir := filepath.Join(reposDir, "org1", "repo1.git")
-	if err := os.MkdirAll(filepath.Join(repoDir, "hooks"), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
+	initBareRepo(t, repoDir)
 
 	installer := NewInstaller(reposDir, "/usr/local/bin/grasp-pre-receive", "ws://relay:3334")
 	if err := installer.Install("org1", "npub1abc", "repo1"); err != nil {
@@ -119,7 +115,7 @@ func TestInstallConfiguresUploadPackCapabilities(t *testing.T) {
 	}
 
 	for _, key := range []string{"uploadpack.allowFilter", "uploadpack.allowTipSHA1InWant", "uploadpack.allowReachableSHA1InWant", "uploadpack.allowAnySHA1InWant"} {
-		out, err := exec.Command("git", "config", "--file", filepath.Join(repoDir, "config"), "--get", key).Output()
+		out, err := exec.Command("git", "--git-dir="+repoDir, "config", "--local", "--get", key).Output()
 		if err != nil {
 			t.Fatalf("read %s: %v", key, err)
 		}
@@ -132,20 +128,28 @@ func TestInstallConfiguresUploadPackCapabilities(t *testing.T) {
 func TestConfigureUploadPackMigratesExistingRepo(t *testing.T) {
 	reposDir := t.TempDir()
 	repoDir := filepath.Join(reposDir, "org1", "existing.git")
-	if err := os.MkdirAll(repoDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
+	initBareRepo(t, repoDir)
 
 	installer := NewInstaller(reposDir, "/usr/local/bin/grasp-pre-receive", "ws://relay:3334")
 	if err := installer.ConfigureUploadPack("org1", "existing"); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
-	out, err := exec.Command("git", "config", "--file", filepath.Join(repoDir, "config"), "--get", "uploadpack.allowReachableSHA1InWant").Output()
+	out, err := exec.Command("git", "--git-dir="+repoDir, "config", "--local", "--get", "uploadpack.allowReachableSHA1InWant").Output()
 	if err != nil || strings.TrimSpace(string(out)) != "true" {
 		t.Fatalf("expected capability set, got %q err %v", out, err)
 	}
 
 	if err := installer.ConfigureUploadPack("org1", "missing"); err == nil {
 		t.Fatalf("expected error for missing repository")
+	}
+}
+
+func initBareRepo(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "init", "--bare", path).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v: %s", err, out)
 	}
 }
