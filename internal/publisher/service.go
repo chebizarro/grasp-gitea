@@ -18,12 +18,14 @@ import (
 	"time"
 
 	"fiatjaf.com/nostr"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/nostrstate"
 	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/telemetry"
 )
 
 // Service republishes NIP-34 repository announcement and state events
@@ -234,7 +236,7 @@ func (s *Service) lockRepo(giteaRepoID int64) *sync.Mutex {
 // publishes a NIP-34 state event if the digest changed. State events prefer the
 // owner's signer grant via the outbox and fall back to bridge signing when the
 // signer path is unavailable or no owner grant exists yet.
-func (s *Service) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) error {
+func (s *Service) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) (retErr error) {
 	if !s.Enabled() && !s.ownerStateSigningConfigured() {
 		return nil
 	}
@@ -265,6 +267,12 @@ func (s *Service) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) 
 		}
 	}
 
+	ctx, stateSpan := telemetry.Start(ctx, "grasp.nip34.state.publish",
+		attribute.Int64("gitea.repository.id", giteaRepoID),
+		attribute.String("repo.id", mapping.RepoID),
+	)
+	defer func() { telemetry.End(stateSpan, retErr) }()
+
 	// Snapshot current repo refs from disk.
 	repoPath := filepath.Join(s.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
 	head, branches, tags, err := snapshotRefs(ctx, repoPath)
@@ -283,6 +291,7 @@ func (s *Service) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) 
 	if err != nil {
 		return fmt.Errorf("build state event: %w", err)
 	}
+	stampTraceContext(ctx, stateEvent)
 
 	enqueued, err := s.enqueueOwnerSignedState(ctx, &mapping, stateEvent, digest)
 	if err != nil {
@@ -370,7 +379,13 @@ func cloneStateEvent(ev *nostr.Event) *nostr.Event {
 }
 
 // republishAnnouncement publishes the cached owner-signed announcement event.
-func (s *Service) republishAnnouncement(ctx context.Context, mapping *store.Mapping, now time.Time) error {
+func (s *Service) republishAnnouncement(ctx context.Context, mapping *store.Mapping, now time.Time) (retErr error) {
+	ctx, span := telemetry.Start(ctx, "grasp.nip34.announcement.publish",
+		attribute.Int64("gitea.repository.id", mapping.GiteaRepoID),
+		attribute.String("repo.id", mapping.RepoID),
+	)
+	defer func() { telemetry.End(span, retErr) }()
+
 	var ev nostr.Event
 	if err := json.Unmarshal([]byte(mapping.AnnouncementEventJSON), &ev); err != nil {
 		return fmt.Errorf("unmarshal cached announcement: %w", err)
@@ -387,6 +402,19 @@ func (s *Service) republishAnnouncement(ctx context.Context, mapping *store.Mapp
 	s.logger.Info("republished owner-signed announcement",
 		"owner", mapping.Owner, "repo", mapping.RepoID, "event_id", ev.ID.Hex())
 	return nil
+}
+
+func stampTraceContext(ctx context.Context, ev *nostr.Event) {
+	if ev == nil {
+		return
+	}
+	traceparent, tracestate := telemetry.TraceTags(ctx)
+	if traceparent != "" {
+		ev.Tags = append(ev.Tags, nostr.Tag{"traceparent", traceparent})
+	}
+	if tracestate != "" {
+		ev.Tags = append(ev.Tags, nostr.Tag{"tracestate", tracestate})
+	}
 }
 
 // buildStateEvent creates a new unsigned owner-authored NIP-34 repository state event.

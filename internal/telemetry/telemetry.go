@@ -66,6 +66,10 @@ func (p *Provider) Shutdown(ctx context.Context) {
 func Start(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
 	return otel.Tracer("github.com/sharegap/grasp-gitea").Start(ctx, name, trace.WithAttributes(attrs...))
 }
+
+func StartRoot(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	return otel.Tracer("github.com/sharegap/grasp-gitea").Start(ctx, name, trace.WithNewRoot(), trace.WithAttributes(attrs...))
+}
 func End(span trace.Span, err error) {
 	if err != nil {
 		span.RecordError(err)
@@ -79,10 +83,24 @@ func TraceTags(ctx context.Context) (string, string) {
 	return c.Get("traceparent"), c.Get("tracestate")
 }
 
+func ContextWithTraceTags(ctx context.Context, traceparent, tracestate string) context.Context {
+	if strings.TrimSpace(traceparent) == "" {
+		return ctx
+	}
+	c := propagation.MapCarrier{"traceparent": traceparent}
+	if strings.TrimSpace(tracestate) != "" {
+		c.Set("tracestate", tracestate)
+	}
+	return propagation.TraceContext{}.Extract(ctx, c)
+}
+
 var meter = otel.Meter("github.com/sharegap/grasp-gitea")
 var triggers, _ = meter.Int64Counter("grasp.hiveci.triggers")
 var failures, _ = meter.Int64Counter("grasp.hiveci.failures")
 var latency, _ = meter.Float64Histogram("grasp.push_to_trigger.latency", metric.WithUnit("s"))
+var pushReceipts, _ = meter.Int64Counter("grasp.push.receipts")
+var pushFailures, _ = meter.Int64Counter("grasp.push.failures")
+var pushLatency, _ = meter.Float64Histogram("grasp.push.processing.latency", metric.WithUnit("s"))
 
 func RecordTrigger(ctx context.Context, start time.Time, err error) {
 	triggers.Add(ctx, 1)
@@ -91,5 +109,15 @@ func RecordTrigger(ctx context.Context, start time.Time, err error) {
 	}
 	if !start.IsZero() {
 		latency.Record(ctx, time.Since(start).Seconds())
+	}
+}
+
+func RecordPush(ctx context.Context, start time.Time, err error) {
+	pushReceipts.Add(ctx, 1)
+	if err != nil {
+		pushFailures.Add(ctx, 1)
+	}
+	if !start.IsZero() {
+		pushLatency.Record(ctx, time.Since(start).Seconds())
 	}
 }

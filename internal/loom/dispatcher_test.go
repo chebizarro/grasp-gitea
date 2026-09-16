@@ -458,13 +458,16 @@ func TestDispatcherCreatesTriggerSpanAndStampsTraceparent(t *testing.T) {
 	if run == nil || tagValue(run.Tags, "traceparent") == "" {
 		t.Fatalf("5401 traceparent tags = %#v", run)
 	}
-	found := false
+	var triggerSpan sdktrace.ReadOnlySpan
 	for _, span := range recorder.Ended() {
 		if span.Name() == "grasp.hiveci.trigger" {
-			found = true
+			triggerSpan = span
 		}
 	}
-	if !found {
+	if triggerSpan == nil {
 		t.Fatalf("trigger span not recorded: %#v", recorder.Ended())
+	}
+	if triggerSpan.Parent().SpanID() != parent.SpanContext().SpanID() || triggerSpan.SpanContext().TraceID() != parent.SpanContext().TraceID() {
+		t.Fatalf("trigger span parent/trace = %s/%s, want %s/%s", triggerSpan.Parent().SpanID(), triggerSpan.SpanContext().TraceID(), parent.SpanContext().SpanID(), parent.SpanContext().TraceID())
 	}
 }

@@ -21,13 +21,26 @@ import (
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/eventstore/slicestore"
 	"fiatjaf.com/nostr/khatru"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	relaypkg "github.com/sharegap/grasp-gitea/internal/relay"
 	appstore "github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/telemetry"
 )
 
 func TestRepublishForGiteaRepoPublishesStateAndSkipsUnchanged(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	old := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(old); _ = tp.Shutdown(context.Background()) })
+
+	baseCtx, parent := otel.Tracer("test").Start(context.Background(), "push")
+	defer parent.End()
+	ctx, cancel := context.WithTimeout(baseCtx, 10*time.Second)
 	defer cancel()
 
 	relay := newTestRelay(t)
@@ -81,6 +94,28 @@ func TestRepublishForGiteaRepoPublishesStateAndSkipsUnchanged(t *testing.T) {
 	}
 	if got, ok := firstVal(stateEvent, "p"); !ok || got != ownerPub {
 		t.Fatalf("state event p tag = %q (present %v), want owner pubkey", got, ok)
+	}
+	traceparent, ok := firstVal(stateEvent, "traceparent")
+	if !ok || traceparent == "" {
+		t.Fatalf("state event traceparent = %q (present %v)", traceparent, ok)
+	}
+	traceCtx := telemetry.ContextWithTraceTags(context.Background(), traceparent, "")
+	emittedContext := trace.SpanContextFromContext(traceCtx)
+	var stateSpan sdktrace.ReadOnlySpan
+	for _, span := range recorder.Ended() {
+		if span.Name() == "grasp.nip34.state.publish" {
+			stateSpan = span
+			break
+		}
+	}
+	if stateSpan == nil {
+		t.Fatalf("state publication span not recorded: %#v", recorder.Ended())
+	}
+	if stateSpan.Parent().SpanID() != parent.SpanContext().SpanID() {
+		t.Fatalf("state span parent = %s, want push %s", stateSpan.Parent().SpanID(), parent.SpanContext().SpanID())
+	}
+	if emittedContext.SpanID() != stateSpan.SpanContext().SpanID() || emittedContext.TraceID() != parent.SpanContext().TraceID() {
+		t.Fatalf("emitted trace context = %s/%s, want state span %s in trace %s", emittedContext.TraceID(), emittedContext.SpanID(), stateSpan.SpanContext().SpanID(), parent.SpanContext().TraceID())
 	}
 
 	head, branches, tags, err := snapshotRefs(ctx, repoPath)
