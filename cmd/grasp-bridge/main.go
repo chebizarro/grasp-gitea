@@ -43,6 +43,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/scim"
 	"github.com/sharegap/grasp-gitea/internal/signer"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/telemetry"
 	"github.com/sharegap/grasp-gitea/internal/tenant"
 	"github.com/sharegap/grasp-gitea/internal/webhook"
 )
@@ -246,6 +247,17 @@ func guardPostgresTakeover(ctx context.Context, sqliteStore, postgresStore authS
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	telemetryProvider, telemetryErr := telemetry.Init(context.Background())
+	if telemetryErr != nil {
+		logger.Warn("OpenTelemetry disabled after initialization failure", "error", telemetryErr)
+	}
+	defer func() {
+		if telemetryProvider != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			telemetryProvider.Shutdown(ctx)
+		}
+	}()
 
 	cfg, err := config.Load()
 	if err != nil {
