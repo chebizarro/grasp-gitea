@@ -24,6 +24,7 @@ type Config struct {
 	ConfigScope          string
 	GiteaURL             string
 	GiteaAdminToken      string
+	GiteaAdminTokenFile  string
 	ClonePrefix          string
 	RelayURLs            []string
 	Listen               string
@@ -173,6 +174,7 @@ func Load() (Config, error) {
 		ConfigTrustedAuthors: csvEnv("GRASP_CONFIG_TRUSTED_AUTHORS"),
 		ConfigScope:          strings.TrimSpace(envOrDefault("GRASP_CONFIG_SCOPE", "prod")),
 		GiteaAdminToken:      strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN")),
+		GiteaAdminTokenFile:  strings.TrimSpace(os.Getenv("GITEA_ADMIN_TOKEN_FILE")),
 		ClonePrefix:          strings.TrimRight(strings.TrimSpace(os.Getenv("CLONE_PREFIX")), "/"),
 		RelayURLs:            csvEnv("RELAY_URLS"),
 		Listen:               envOrDefault("LISTEN", ":8090"),
@@ -269,8 +271,21 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("LOOM_CASHU_WALLET_PATH must not equal DB_PATH")
 	}
 
+	if cfg.GiteaAdminTokenFile != "" {
+		if cfg.GiteaAdminToken != "" {
+			return Config{}, fmt.Errorf("configure only one of GITEA_ADMIN_TOKEN or GITEA_ADMIN_TOKEN_FILE")
+		}
+		if strings.TrimSpace(cfg.GiteaAdminUser) == "" {
+			return Config{}, fmt.Errorf("GITEA_ADMIN_USER is required with GITEA_ADMIN_TOKEN_FILE")
+		}
+		var err error
+		cfg.GiteaAdminToken, err = LoadGiteaAdminTokenFile(cfg.GiteaAdminTokenFile)
+		if err != nil {
+			return Config{}, err
+		}
+	}
 	if cfg.GiteaAdminToken == "" {
-		return Config{}, fmt.Errorf("GITEA_ADMIN_TOKEN is required")
+		return Config{}, fmt.Errorf("GITEA_ADMIN_TOKEN or GITEA_ADMIN_TOKEN_FILE is required")
 	}
 
 	if cfg.ClonePrefix == "" {
@@ -602,6 +617,38 @@ func parseSignerMasterKey(raw string) ([]byte, error) {
 		return nil, fmt.Errorf("SIGNER_MASTER_KEY must decode to 32 bytes (base64 or hex)")
 	}
 	return decoded, nil
+}
+
+// LoadGiteaAdminTokenFile reads a protected, absolute, regular file used for
+// the live-reloadable Gitea administrator credential. Errors intentionally do
+// not include file contents.
+func LoadGiteaAdminTokenFile(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("GITEA_ADMIN_TOKEN_FILE is empty")
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("GITEA_ADMIN_TOKEN_FILE must be absolute")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("inspect GITEA_ADMIN_TOKEN_FILE: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("GITEA_ADMIN_TOKEN_FILE must be a regular file")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("GITEA_ADMIN_TOKEN_FILE must not be accessible by group or others")
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read GITEA_ADMIN_TOKEN_FILE: %w", err)
+	}
+	token := strings.TrimSpace(string(payload))
+	if token == "" || strings.ContainsAny(token, "\x00\r\n") {
+		return "", fmt.Errorf("GITEA_ADMIN_TOKEN_FILE contains an invalid credential")
+	}
+	return token, nil
 }
 
 func durationEnv(key string, fallback time.Duration) time.Duration {

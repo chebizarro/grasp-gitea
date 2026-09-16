@@ -87,6 +87,33 @@ func relayEndpointsDiffer(current, next config.Config) bool {
 		current.EmbeddedRelayPort != next.EmbeddedRelayPort
 }
 
+type giteaAdminCredentialTarget interface {
+	ValidateAdminToken(context.Context, string, string) error
+	SetAdminToken(string) error
+}
+
+type registryCredentialTarget interface {
+	SetToken(string) error
+}
+
+func reloadGiteaAdminCredential(ctx context.Context, path, expectedLogin string, client giteaAdminCredentialTarget, monitor registryCredentialTarget) error {
+	candidate, err := config.LoadGiteaAdminTokenFile(path)
+	if err != nil {
+		return err
+	}
+	if err := client.ValidateAdminToken(ctx, candidate, expectedLogin); err != nil {
+		return err
+	}
+	// Both setters perform only the same syntactic checks already enforced by
+	// LoadGiteaAdminTokenFile, so neither can reject a validated candidate.
+	if monitor != nil {
+		if err := monitor.SetToken(candidate); err != nil {
+			return err
+		}
+	}
+	return client.SetAdminToken(candidate)
+}
+
 func liveRelayURLs(policies *policy.Store, embeddedURL string) []string {
 	snapshot := policies.Current()
 	if snapshot == nil {
@@ -328,21 +355,6 @@ func main() {
 	reloadSignals := make(chan os.Signal, 1)
 	signal.Notify(reloadSignals, syscall.SIGHUP)
 	defer signal.Stop(reloadSignals)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-reloadSignals:
-				if loadErr := policies.Reload(); loadErr != nil {
-					logger.Error("policy reload failed; keeping current policy", "error", loadErr)
-					continue
-				}
-				current := policies.Current()
-				logger.Info("persisted policy reloaded", "pubkey_allowlist_entries", len(current.PubkeyAllowlist), "ci_trigger_repos", current.CITriggerRepos)
-			}
-		}
-	}()
 
 	embeddedRelayURL, relayRootHandler, shutdownEmbedded, err := startEmbeddedRelay(ctx, cfg, policies, logger)
 	if err != nil {
@@ -527,8 +539,10 @@ func main() {
 	if postgresStore != nil {
 		apiServer.AddReadinessProbe(postgresStore)
 	}
+	var registryTokenMonitor *registrytoken.Monitor
 	if cfg.BridgeTokensEnabled {
-		registryTokenMonitor, monitorErr := registrytoken.New(
+		var monitorErr error
+		registryTokenMonitor, monitorErr = registrytoken.New(
 			cfg.GiteaURL, cfg.GiteaAdminUser, cfg.GiteaAdminToken,
 			cfg.RegistryTokenMaxTTL, cfg.RegistryTokenProbeEvery,
 			nil, logger,
@@ -541,6 +555,33 @@ func main() {
 		go registryTokenMonitor.Run(ctx)
 		logger.Info("registry token revocation-bound monitor enabled", "accepted_bound", cfg.RegistryTokenMaxTTL.String(), "interval", cfg.RegistryTokenProbeEvery.String())
 	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reloadSignals:
+				if loadErr := policies.Reload(); loadErr != nil {
+					logger.Error("policy reload failed; keeping current policy", "error", loadErr)
+				} else {
+					current := policies.Current()
+					logger.Info("persisted policy reloaded", "pubkey_allowlist_entries", len(current.PubkeyAllowlist), "ci_trigger_repos", current.CITriggerRepos)
+				}
+				if cfg.GiteaAdminTokenFile == "" {
+					continue
+				}
+				var registryCredential registryCredentialTarget
+				if registryTokenMonitor != nil {
+					registryCredential = registryTokenMonitor
+				}
+				if reloadErr := reloadGiteaAdminCredential(ctx, cfg.GiteaAdminTokenFile, cfg.GiteaAdminUser, giteaClient, registryCredential); reloadErr != nil {
+					logger.Error("Gitea administrator credential reload rejected; keeping current credential", "error", reloadErr)
+					continue
+				}
+				logger.Info("Gitea administrator credential reloaded")
+			}
+		}
+	}()
 	var bridgeTokenSvc *auth.TokenService
 	var proxyNostrVerifier *auth.ProxyNIP98Verifier
 	if relayRootHandler != nil {

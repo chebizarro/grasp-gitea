@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,8 +23,10 @@ var safeBareRefName = regexp.MustCompile(`^refs/[A-Za-z0-9._/\-]+$`)
 
 type Client struct {
 	baseURL string
-	token   string
 	http    *http.Client
+
+	credentialMu sync.RWMutex
+	token        string
 
 	// adminUser is the login owning the admin token. Gitea gates the
 	// user-token lifecycle endpoints behind Basic (or reverse-proxy) auth, so
@@ -37,6 +40,7 @@ type User struct {
 	Login    string `json:"login"`
 	FullName string `json:"full_name,omitempty"`
 	Email    string `json:"email"`
+	IsAdmin  bool   `json:"is_admin"`
 }
 
 type Organization struct {
@@ -140,6 +144,60 @@ func NewClient(baseURL string, token string) *Client {
 func (c *Client) WithAdminUser(login string) *Client {
 	c.adminUser = strings.TrimSpace(login)
 	return c
+}
+
+// SetAdminToken atomically replaces the credential used by subsequent Gitea
+// requests. Callers must validate the candidate before invoking this method.
+func (c *Client) SetAdminToken(token string) error {
+	token = strings.TrimSpace(token)
+	if token == "" || strings.ContainsAny(token, "\x00\r\n") {
+		return fmt.Errorf("gitea admin token is invalid")
+	}
+	c.credentialMu.Lock()
+	c.token = token
+	c.credentialMu.Unlock()
+	return nil
+}
+
+func (c *Client) adminToken() string {
+	c.credentialMu.RLock()
+	defer c.credentialMu.RUnlock()
+	return c.token
+}
+
+// ValidateAdminToken proves that a candidate token authenticates as the
+// configured administrator without changing the live credential.
+func (c *Client) ValidateAdminToken(ctx context.Context, token, expectedLogin string) error {
+	token = strings.TrimSpace(token)
+	if token == "" || strings.ContainsAny(token, "\x00\r\n") {
+		return fmt.Errorf("gitea admin token is invalid")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/user", nil)
+	if err != nil {
+		return fmt.Errorf("build Gitea credential validation request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "token "+token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("validate Gitea admin credential: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseSize))
+		return fmt.Errorf("validate Gitea admin credential: status %d", resp.StatusCode)
+	}
+	var user User
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseSize)).Decode(&user); err != nil {
+		return fmt.Errorf("decode Gitea credential identity: %w", err)
+	}
+	if expectedLogin = strings.TrimSpace(expectedLogin); expectedLogin != "" && user.Login != expectedLogin {
+		return fmt.Errorf("Gitea credential identity mismatch: got %q, want %q", user.Login, expectedLogin)
+	}
+	if !user.IsAdmin {
+		return fmt.Errorf("Gitea credential identity %q is not an administrator", user.Login)
+	}
+	return nil
 }
 
 // PATAdministrationEnabled reports whether admin Basic-auth PAT lifecycle
@@ -635,9 +693,9 @@ func (c *Client) do(ctx context.Context, method string, path string, body any, b
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if basicAuth {
-		req.SetBasicAuth(c.adminUser, c.token)
+		req.SetBasicAuth(c.adminUser, c.adminToken())
 	} else {
-		req.Header.Set("Authorization", "token "+c.token)
+		req.Header.Set("Authorization", "token "+c.adminToken())
 	}
 
 	resp, err := c.http.Do(req)

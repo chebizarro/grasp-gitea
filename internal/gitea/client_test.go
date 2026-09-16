@@ -272,6 +272,87 @@ func TestEnsureOrgCreatesNew(t *testing.T) {
 	}
 }
 
+func TestValidateAndReplaceAdminToken(t *testing.T) {
+	var mu sync.Mutex
+	requests := make([]string, 0, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		requests = append(requests, auth)
+		mu.Unlock()
+		switch {
+		case r.URL.Path == "/api/v1/user" && auth == "token replacement-token":
+			_ = json.NewEncoder(w).Encode(User{Login: "grasp-admin", IsAdmin: true})
+		case r.URL.Path == "/api/v1/user":
+			http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
+		case r.URL.Path == "/api/v1/orgs/test-org" && auth == "token replacement-token":
+			_ = json.NewEncoder(w).Encode(map[string]any{"username": "test-org"})
+		default:
+			http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "original-token")
+	if err := client.ValidateAdminToken(context.Background(), "replacement-token", "grasp-admin"); err != nil {
+		t.Fatalf("ValidateAdminToken: %v", err)
+	}
+	if err := client.SetAdminToken("replacement-token"); err != nil {
+		t.Fatalf("SetAdminToken: %v", err)
+	}
+	if err := client.EnsureOrg(context.Background(), "test-org"); err != nil {
+		t.Fatalf("EnsureOrg after replacement: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("requests = %v, want validation and post-swap request", requests)
+	}
+	for _, auth := range requests {
+		if auth != "token replacement-token" {
+			t.Fatalf("request used unexpected authorization header %q", auth)
+		}
+	}
+}
+
+func TestValidateAdminTokenRejectsWrongIdentityWithoutReplacing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/user":
+			_ = json.NewEncoder(w).Encode(User{Login: "different-admin", IsAdmin: true})
+		case "/api/v1/orgs/test-org":
+			if got := r.Header.Get("Authorization"); got != "token original-token" {
+				t.Fatalf("authorization = %q, want original token", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"username": "test-org"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "original-token")
+	if err := client.ValidateAdminToken(context.Background(), "candidate-token", "grasp-admin"); err == nil {
+		t.Fatal("ValidateAdminToken accepted the wrong identity")
+	}
+	if err := client.EnsureOrg(context.Background(), "test-org"); err != nil {
+		t.Fatalf("original credential was not retained: %v", err)
+	}
+}
+
+func TestValidateAdminTokenRejectsNonAdminIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(User{Login: "grasp-admin", IsAdmin: false})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "original-token")
+	if err := client.ValidateAdminToken(context.Background(), "candidate-token", "grasp-admin"); err == nil {
+		t.Fatal("ValidateAdminToken accepted a non-administrator identity")
+	}
+}
+
 func TestEnsureOrgIdempotent(t *testing.T) {
 	fake := newFakeGitea()
 	fake.orgs["existing"] = true

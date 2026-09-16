@@ -84,6 +84,18 @@ func (m *Monitor) Check(context.Context) error {
 	return m.lastErr
 }
 
+// SetToken atomically replaces the credential used by subsequent probes.
+func (m *Monitor) SetToken(token string) error {
+	token = strings.TrimSpace(token)
+	if token == "" || strings.ContainsAny(token, "\x00\r\n") {
+		return errors.New("Gitea admin token is invalid")
+	}
+	m.mu.Lock()
+	m.token = token
+	m.mu.Unlock()
+	return nil
+}
+
 // Run probes immediately, then repeats until ctx is canceled.
 func (m *Monitor) Run(ctx context.Context) {
 	m.probeAndRecord(ctx)
@@ -121,11 +133,14 @@ func (m *Monitor) probeAndRecord(ctx context.Context) {
 }
 
 func (m *Monitor) probe(ctx context.Context) (time.Duration, error) {
+	m.mu.RLock()
+	token := m.token
+	m.mu.RUnlock()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.endpoint, nil)
 	if err != nil {
 		return 0, err
 	}
-	req.SetBasicAuth(m.username, m.token)
+	req.SetBasicAuth(m.username, token)
 	resp, err := m.client.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("request registry token: %w", err)
@@ -161,16 +176,24 @@ func jwtLifetime(token string) (time.Duration, error) {
 		return 0, fmt.Errorf("decode registry JWT payload: %w", err)
 	}
 	var claims struct {
-		IssuedAt int64 `json:"iat"`
-		Expires  int64 `json:"exp"`
+		IssuedAt  int64 `json:"iat"`
+		NotBefore int64 `json:"nbf"`
+		Expires   int64 `json:"exp"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return 0, fmt.Errorf("decode registry JWT claims: %w", err)
 	}
-	if claims.IssuedAt <= 0 || claims.Expires <= claims.IssuedAt {
-		return 0, errors.New("registry JWT has invalid exp/iat claims")
+	startsAt := claims.IssuedAt
+	if startsAt == 0 {
+		// Gitea 1.26 registry JWTs use nbf as the issuance boundary and do
+		// not include iat. Prefer iat when present for compatibility with
+		// older releases, and otherwise measure the bound from nbf.
+		startsAt = claims.NotBefore
 	}
-	seconds := claims.Expires - claims.IssuedAt
+	if startsAt <= 0 || claims.Expires <= startsAt {
+		return 0, errors.New("registry JWT has invalid exp/iat/nbf claims")
+	}
+	seconds := claims.Expires - startsAt
 	if seconds > math.MaxInt64/int64(time.Second) {
 		return 0, fmt.Errorf("registry JWT lifetime %d seconds overflows a duration", seconds)
 	}

@@ -61,6 +61,10 @@ make build
 
 ```bash
 GITEA_URL=http://gitea:3000
+# Prefer the file form in production. The file must be absolute, regular,
+# owner-only, and may be atomically replaced before sending SIGHUP.
+GITEA_ADMIN_TOKEN_FILE=/run/secrets/gitea-admin-token
+# Development-only alternative; do not set both forms.
 GITEA_ADMIN_TOKEN=<token>
 CLONE_PREFIX=https://git.sharegap.net
 RELAY_URLS=ws://gastown-relay:3334
@@ -134,6 +138,14 @@ Mutable bridge and Hive-CI policy is persisted at `GRASP_CONFIG_PATH` (default
 it does not exist; they never override an existing projection. Send `SIGHUP` to
 validate and atomically hot-apply an externally edited file. Invalid policy
 leaves the current snapshot active.
+
+When `GITEA_ADMIN_TOKEN_FILE` is configured, `SIGHUP` also validates the file's
+candidate credential against Gitea and verifies that it belongs to
+the administrator named by the required `GITEA_ADMIN_USER` before switching
+subsequent API and registry-token probe requests. An unreadable file, unsafe
+mode, failed authentication, or identity mismatch leaves the active credential
+unchanged. The environment-token form is startup-only and cannot be
+hot-reloaded.
 
 Authenticated administrators can inspect the complete effective document with
 `GET /admin/policy`, or get/replace one group at
