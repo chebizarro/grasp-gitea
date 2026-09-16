@@ -606,25 +606,14 @@ func Open(path string) (*SQLiteStore, error) {
 	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_armed_at TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE reflected_events ADD COLUMN echo_fingerprint TEXT NOT NULL DEFAULT ''`)
 
-	// Migration: the original identity-link table used gitea_username and did
-	// not track updated_at. Preserve existing links while adopting the canonical
-	// column names used by the authentication service.
-	_, _ = db.Exec(`ALTER TABLE nostr_identity_links ADD COLUMN gitea_user TEXT NOT NULL DEFAULT ''`)
-	_, _ = db.Exec(`ALTER TABLE nostr_identity_links ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`)
-	_, _ = db.Exec(`UPDATE nostr_identity_links SET gitea_user = gitea_username WHERE gitea_user = ''`)
-	_, _ = db.Exec(`UPDATE nostr_identity_links SET updated_at = created_at WHERE updated_at = ''`)
-	var duplicateGiteaUserIDs string
-	if err := db.QueryRow(`SELECT COALESCE(group_concat(gitea_user_id, ', '), '') FROM (SELECT gitea_user_id FROM nostr_identity_links GROUP BY gitea_user_id HAVING COUNT(*) > 1 ORDER BY gitea_user_id)`).Scan(&duplicateGiteaUserIDs); err != nil {
+	// Migration: the original identity-link table used a required
+	// gitea_username column. Merely adding gitea_user leaves that legacy NOT
+	// NULL constraint active, so every new identity insert fails even though
+	// reads of migrated rows work. Rebuild the table transactionally into its
+	// canonical shape and remove the obsolete write constraint.
+	if err := migrateSQLiteIdentityLinks(db); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("check duplicate Gitea identity mappings: %w", err)
-	}
-	if duplicateGiteaUserIDs != "" {
-		_ = db.Close()
-		return nil, fmt.Errorf("duplicate Gitea identity mappings for user IDs %s; resolve them before restart", duplicateGiteaUserIDs)
-	}
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_nostr_identity_links_gitea_user_id ON nostr_identity_links(gitea_user_id)`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("enforce unique Gitea identity mapping: %w", err)
+		return nil, fmt.Errorf("migrate Nostr identity links: %w", err)
 	}
 
 	// Item E migration: persist Nostr created_at beside replaceable events. This
@@ -706,6 +695,95 @@ func ensureSQLiteColumn(db *sql.DB, table, column, definition string) error {
 	}
 	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
 	return err
+}
+
+func migrateSQLiteIdentityLinks(db *sql.DB) error {
+	if err := ensureSQLiteColumn(db, "nostr_identity_links", "gitea_user", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumn(db, "nostr_identity_links", "updated_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+
+	columns, err := sqliteColumns(db, "nostr_identity_links")
+	if err != nil {
+		return err
+	}
+	if columns["gitea_username"] {
+		if _, err := db.Exec(`UPDATE nostr_identity_links SET gitea_user = gitea_username WHERE gitea_user = ''`); err != nil {
+			return fmt.Errorf("backfill Gitea username: %w", err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE nostr_identity_links SET updated_at = created_at WHERE updated_at = ''`); err != nil {
+		return fmt.Errorf("backfill update timestamp: %w", err)
+	}
+
+	var duplicateGiteaUserIDs string
+	if err := db.QueryRow(`SELECT COALESCE(group_concat(gitea_user_id, ', '), '') FROM (SELECT gitea_user_id FROM nostr_identity_links GROUP BY gitea_user_id HAVING COUNT(*) > 1 ORDER BY gitea_user_id)`).Scan(&duplicateGiteaUserIDs); err != nil {
+		return fmt.Errorf("check duplicate Gitea identity mappings: %w", err)
+	}
+	if duplicateGiteaUserIDs != "" {
+		return fmt.Errorf("duplicate Gitea identity mappings for user IDs %s; resolve them before restart", duplicateGiteaUserIDs)
+	}
+
+	if columns["gitea_username"] {
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin legacy identity-link migration: %w", err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(`
+			CREATE TABLE nostr_identity_links_canonical (
+				pubkey TEXT PRIMARY KEY,
+				npub TEXT NOT NULL,
+				gitea_user_id INTEGER NOT NULL,
+				gitea_user TEXT NOT NULL,
+				nip05 TEXT NOT NULL DEFAULT '',
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				last_login_at TEXT NOT NULL DEFAULT '',
+				UNIQUE (gitea_user_id)
+			);
+			INSERT INTO nostr_identity_links_canonical(
+				pubkey, npub, gitea_user_id, gitea_user, nip05,
+				created_at, updated_at, last_login_at
+			)
+			SELECT pubkey, npub, gitea_user_id, gitea_user, nip05,
+				created_at, updated_at, COALESCE(last_login_at, '')
+			FROM nostr_identity_links;
+			DROP TABLE nostr_identity_links;
+			ALTER TABLE nostr_identity_links_canonical RENAME TO nostr_identity_links;
+		`); err != nil {
+			return fmt.Errorf("rebuild legacy identity-link table: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit legacy identity-link migration: %w", err)
+		}
+	}
+
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_nostr_identity_links_gitea_user_id ON nostr_identity_links(gitea_user_id)`); err != nil {
+		return fmt.Errorf("enforce unique Gitea identity mapping: %w", err)
+	}
+	return nil
+}
+
+func sqliteColumns(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	return columns, rows.Err()
 }
 
 // Ping verifies the database is reachable, for readiness probing.

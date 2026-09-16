@@ -64,6 +64,33 @@ func TestOpenMigratesLegacyIdentityLinks(t *testing.T) {
 	if link.UpdatedAt.IsZero() {
 		t.Fatal("migrated updated_at is zero")
 	}
+
+	columns, err := sqliteColumns(st.db, "nostr_identity_links")
+	if err != nil {
+		t.Fatalf("inspect migrated columns: %v", err)
+	}
+	if columns["gitea_username"] {
+		t.Fatal("legacy gitea_username constraint survived migration")
+	}
+	if err := st.UpsertIdentityLink(context.Background(), NostrIdentityLink{
+		Pubkey:      "new-pubkey",
+		Npub:        "new-npub",
+		GiteaUserID: 43,
+		GiteaUser:   "new-user",
+	}); err != nil {
+		t.Fatalf("insert identity after legacy migration: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	st, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer st.Close()
+	if _, err := st.GetIdentityLinkByPubkey(context.Background(), "new-pubkey"); err != nil {
+		t.Fatalf("read post-migration identity after reopen: %v", err)
+	}
 }
 
 func TestOpenMigratesLegacyNIP46Sessions(t *testing.T) {
