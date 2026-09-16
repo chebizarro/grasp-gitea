@@ -16,10 +16,10 @@ import (
 const usage = `grasp — nostr client for a GRASP Gitea bridge
 
 Usage:
-  grasp auth login   --server URL [--name N] [--scopes s1,s2] [--ttl DUR] [--signer-file F] [--no-keychain] [--show-token]
-  grasp auth list    --server URL [--signer-file F]
-  grasp auth revoke  --server URL --id TOKEN_ID [--signer-file F]
-  grasp auth rotate  --server URL --id TOKEN_ID [--name N] [--scopes s1,s2] [--ttl DUR] [--signer-file F] [--no-keychain] [--show-token]
+  grasp auth login   --server URL [--name N] [--scopes s1,s2] [--ttl DUR] [--signer-file F] [--bunker-client-key-file F] [--no-keychain] [--show-token]
+  grasp auth list    --server URL [--signer-file F] [--bunker-client-key-file F]
+  grasp auth revoke  --server URL --id TOKEN_ID [--signer-file F] [--bunker-client-key-file F]
+  grasp auth rotate  --server URL --id TOKEN_ID [--name N] [--scopes s1,s2] [--ttl DUR] [--signer-file F] [--bunker-client-key-file F] [--no-keychain] [--show-token]
   grasp auth status                       stored credentials (no secrets)
   grasp auth token   HOST                 print the stored token (for piping)
   grasp auth logout  HOST                 delete the stored credential
@@ -62,15 +62,16 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 }
 
 type authFlags struct {
-	server     string
-	name       string
-	scopes     string
-	ttl        time.Duration
-	id         string
-	signerFile string
-	noKeychain bool
-	showToken  bool
-	configDir  string
+	server              string
+	name                string
+	scopes              string
+	ttl                 time.Duration
+	id                  string
+	signerFile          string
+	bunkerClientKeyFile string
+	noKeychain          bool
+	showToken           bool
+	configDir           string
 }
 
 func bindAuthFlags(fs *flag.FlagSet) *authFlags {
@@ -81,6 +82,7 @@ func bindAuthFlags(fs *flag.FlagSet) *authFlags {
 	fs.DurationVar(&f.ttl, "ttl", 0, "token lifetime, e.g. 720h (default: server default)")
 	fs.StringVar(&f.id, "id", "", "token id (revoke/rotate)")
 	fs.StringVar(&f.signerFile, "signer-file", "", "0600 file holding the signer input")
+	fs.StringVar(&f.bunkerClientKeyFile, "bunker-client-key-file", "", "0600 file holding the NIP-46 client secret key")
 	fs.BoolVar(&f.noKeychain, "no-keychain", false, "store the token in the 0600 file instead of the OS keychain")
 	fs.BoolVar(&f.showToken, "show-token", false, "print the plaintext token to stdout")
 	fs.StringVar(&f.configDir, "config-dir", "", "override the grasp config directory")
@@ -109,7 +111,7 @@ func runAuth(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return fmt.Errorf("--server is required")
 	}
 
-	signer, err := ResolveSigner(ctx, f.signerFile, stderr)
+	signer, err := ResolveSignerWithClientKey(ctx, f.signerFile, f.bunkerClientKeyFile, stderr)
 	if err != nil {
 		return err
 	}

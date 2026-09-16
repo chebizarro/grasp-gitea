@@ -278,6 +278,10 @@ are stored in the OS keychain when available (explicit `--no-keychain` opts
 into the 0600 file instead; a *failing* keychain is an error, never a silent
 downgrade). Replacing or rotating a login revokes the prior token on the
 bridge; a token that cannot be stored is revoked rather than stranded.
+For the split NIP-46 form used by ngit/OpenClaw, pass the public bunker URI in
+`--signer-file` and the client's nsec/hex application key in a separate 0600
+`--bunker-client-key-file`. Signer construction errors are always redacted;
+they never echo either protected input.
 
 Git integration uses the credential-helper protocol with strict origin
 matching (an https credential is never disclosed over http):

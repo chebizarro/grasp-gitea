@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -411,5 +412,59 @@ func TestSignerFileRejectsLoosePermissions(t *testing.T) {
 	input, err := signerInput(path, &strings.Builder{})
 	if err != nil || input != "nsec1whatever" {
 		t.Fatalf("signer input = (%q, %v)", input, err)
+	}
+}
+
+func TestNormalizeSignerInputAcceptsNpubBunkerAuthority(t *testing.T) {
+	const hexPubkey = "6c3e45a62048ab5886adc4b85216f7eddd034693bf550b8fcfed15f1f2b0618f"
+	npub := encodeNpub(gonostr.MustPubKeyFromHex(hexPubkey))
+	input := "bunker://" + npub + "?relay=wss%3A%2F%2Frelay.example&secret=do-not-log"
+
+	got, err := normalizeSignerInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(got, "bunker://"+hexPubkey+"?") {
+		t.Fatalf("normalized bunker authority = %q", got)
+	}
+	if !strings.Contains(got, "secret=do-not-log") {
+		t.Fatal("normalization dropped the bunker client secret")
+	}
+}
+
+func TestResolveSignerRedactsRejectedSecretInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "signer")
+	secret := "bunker://not-a-valid-authority?secret=must-never-appear"
+	if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ResolveSigner(context.Background(), path, io.Discard)
+	if err == nil {
+		t.Fatal("invalid signer unexpectedly accepted")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "must-never-appear") {
+		t.Fatalf("signer error leaked protected input: %v", err)
+	}
+}
+
+func TestResolveSignerRedactsRejectedBunkerClientKey(t *testing.T) {
+	dir := t.TempDir()
+	signerPath := filepath.Join(dir, "signer")
+	clientKeyPath := filepath.Join(dir, "client-key")
+	if err := os.WriteFile(signerPath, []byte("bunker://6c3e45a62048ab5886adc4b85216f7eddd034693bf550b8fcfed15f1f2b0618f?relay=wss%3A%2F%2Frelay.example\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clientSecret := "not-a-key-must-never-appear"
+	if err := os.WriteFile(clientKeyPath, []byte(clientSecret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ResolveSignerWithClientKey(context.Background(), signerPath, clientKeyPath, io.Discard)
+	if err == nil {
+		t.Fatal("invalid bunker client key unexpectedly accepted")
+	}
+	if strings.Contains(err.Error(), clientSecret) {
+		t.Fatalf("client key error leaked protected input: %v", err)
 	}
 }
