@@ -444,11 +444,14 @@ func TestDispatcherCreatesTriggerSpanAndStampsTraceparent(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := NewDispatcher(DispatcherConfig{Enabled: true, RelayURLs: []string{"wss://relay.invalid"}}, pool, st, testDispatchSigner{operator}, nil)
-	var run *nostr.Event
+	var run, request *nostr.Event
 	d.publish = func(_ context.Context, ev *nostr.Event) error {
-		if ev.Kind == relay.KindHiveWorkflowRun {
-			copy := *ev
+		copy := *ev
+		switch ev.Kind {
+		case relay.KindHiveWorkflowRun:
 			run = &copy
+		case relay.KindLoomJobRequest:
+			request = &copy
 		}
 		return nil
 	}
@@ -457,6 +460,19 @@ func TestDispatcherCreatesTriggerSpanAndStampsTraceparent(t *testing.T) {
 	}
 	if run == nil || tagValue(run.Tags, "traceparent") == "" {
 		t.Fatalf("5401 traceparent tags = %#v", run)
+	}
+	// loom-worker reads its parent span context off the kind-5100 job request, so the
+	// 5100 must carry the same trace context as the 5401 or the trace breaks at loom.
+	if request == nil {
+		t.Fatal("no kind-5100 Loom job request published")
+	}
+	if got := tagValue(request.Tags, "traceparent"); got == "" {
+		t.Fatalf("5100 traceparent missing: tags = %#v", request.Tags)
+	} else if want := tagValue(run.Tags, "traceparent"); got != want {
+		t.Fatalf("5100 traceparent = %q, want %q (same as 5401)", got, want)
+	}
+	if got, want := tagValue(request.Tags, "tracestate"), tagValue(run.Tags, "tracestate"); got != want {
+		t.Fatalf("5100 tracestate = %q, want %q (same as 5401)", got, want)
 	}
 	var triggerSpan sdktrace.ReadOnlySpan
 	for _, span := range recorder.Ended() {
