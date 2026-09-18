@@ -321,6 +321,15 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key,
 	if d.paymentMode == "cashu" && d.wallet.ReceivePubkey() != "" {
 		tags = append(tags, nostr.Tag{"cashu_pubkey", d.wallet.ReceivePubkey()})
 	}
+	// TODO: use cascadia-go generated trace tag constants after its otelnostr release.
+	// loom-worker extracts its parent span context from this kind-5100 request, so it
+	// must carry the same trace context stamped on the kind-5401 workflow run above.
+	if traceparent != "" {
+		tags = append(tags, nostr.Tag{"traceparent", traceparent})
+	}
+	if tracestate != "" {
+		tags = append(tags, nostr.Tag{"tracestate", tracestate})
+	}
 	request := &nostr.Event{
 		PubKey: bridgePub, CreatedAt: nostr.Timestamp(now.Unix()), Kind: relay.KindLoomJobRequest,
 		Tags: tags, Content: "",
