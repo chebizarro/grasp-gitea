@@ -15,6 +15,10 @@ import (
 	"fiatjaf.com/nostr/nip19"
 	"fiatjaf.com/nostr/nip44"
 
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
 	"github.com/sharegap/grasp-gitea/internal/cashu"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
@@ -418,4 +422,52 @@ func stringsOf(ch byte, n int) string {
 		out[i] = ch
 	}
 	return string(out)
+}
+
+func TestDispatcherCreatesTriggerSpanAndStampsTraceparent(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	old := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(old); _ = tp.Shutdown(context.Background()) })
+
+	ctx, parent := otel.Tracer("test").Start(context.Background(), "push")
+	defer parent.End()
+	st, err := store.Open(filepath.Join(t.TempDir(), "trace.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	worker, operator := nostr.Generate(), nostr.Generate()
+	pool := NewWorkerPool(WorkerPoolConfig{Allowlist: []string{worker.Public().Hex()}, AdTTL: time.Hour})
+	if err := pool.HandleEvent(signedWorkerAd(t, worker, time.Now(), "act", "0"), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	d := NewDispatcher(DispatcherConfig{Enabled: true, RelayURLs: []string{"wss://relay.invalid"}}, pool, st, testDispatchSigner{operator}, nil)
+	var run *nostr.Event
+	d.publish = func(_ context.Context, ev *nostr.Event) error {
+		if ev.Kind == relay.KindHiveWorkflowRun {
+			copy := *ev
+			run = &copy
+		}
+		return nil
+	}
+	if handled, err := d.Dispatch(ctx, testDispatchRequest(operator.Public().Hex())); err != nil || !handled {
+		t.Fatalf("Dispatch = %v, %v", handled, err)
+	}
+	if run == nil || tagValue(run.Tags, "traceparent") == "" {
+		t.Fatalf("5401 traceparent tags = %#v", run)
+	}
+	var triggerSpan sdktrace.ReadOnlySpan
+	for _, span := range recorder.Ended() {
+		if span.Name() == "grasp.hiveci.trigger" {
+			triggerSpan = span
+		}
+	}
+	if triggerSpan == nil {
+		t.Fatalf("trigger span not recorded: %#v", recorder.Ended())
+	}
+	if triggerSpan.Parent().SpanID() != parent.SpanContext().SpanID() || triggerSpan.SpanContext().TraceID() != parent.SpanContext().TraceID() {
+		t.Fatalf("trigger span parent/trace = %s/%s, want %s/%s", triggerSpan.Parent().SpanID(), triggerSpan.SpanContext().TraceID(), parent.SpanContext().SpanID(), parent.SpanContext().TraceID())
+	}
 }

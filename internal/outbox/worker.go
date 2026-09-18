@@ -14,10 +14,12 @@ import (
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip19"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
 	"github.com/sharegap/grasp-gitea/internal/nostrstate"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/telemetry"
 )
 
 // Signer signs an event as the requested author pubkey using a stored grant.
@@ -246,7 +248,7 @@ func (w *Worker) DrainOnce(ctx context.Context) {
 	w.refreshDepth(ctx)
 }
 
-func (w *Worker) process(ctx context.Context, row store.OutboundEvent) error {
+func (w *Worker) process(ctx context.Context, row store.OutboundEvent) (retErr error) {
 	var ev nostr.Event
 	if err := json.Unmarshal([]byte(row.UnsignedJSON), &ev); err != nil {
 		return w.fail(ctx, row, fmt.Errorf("unmarshal unsigned event: %w", err))
@@ -257,6 +259,16 @@ func (w *Worker) process(ctx context.Context, row store.OutboundEvent) error {
 	}
 	ev.Kind = nostr.Kind(row.Kind)
 	ev.PubKey = authorPK
+	if ev.Kind == nostr.KindRepositoryState {
+		ctx = telemetry.ContextWithTraceTags(ctx, eventTagValue(ev.Tags, "traceparent"), eventTagValue(ev.Tags, "tracestate"))
+		spanCtx, span := telemetry.Start(ctx, "grasp.nip34.state.relay_publish",
+			attribute.Int64("outbox.id", row.ID),
+			attribute.String("nostr.author", row.AuthorPubkey),
+		)
+		ctx = spanCtx
+		defer func() { telemetry.End(span, retErr) }()
+		replaceTraceContext(ctx, &ev)
+	}
 
 	var stateNpub, stateRepoID, stateDigest string
 	if ev.Kind == nostr.KindRepositoryState {
@@ -296,6 +308,35 @@ func (w *Worker) process(ctx context.Context, row store.OutboundEvent) error {
 	}
 	metrics.IncOutboxPublished()
 	return nil
+}
+
+func eventTagValue(tags nostr.Tags, key string) string {
+	tag := tags.Find(key)
+	if tag == nil || len(tag) < 2 {
+		return ""
+	}
+	return tag[1]
+}
+
+func replaceTraceContext(ctx context.Context, ev *nostr.Event) {
+	if ev == nil {
+		return
+	}
+	tags := make(nostr.Tags, 0, len(ev.Tags)+2)
+	for _, tag := range ev.Tags {
+		if len(tag) > 0 && (tag[0] == "traceparent" || tag[0] == "tracestate") {
+			continue
+		}
+		tags = append(tags, tag)
+	}
+	traceparent, tracestate := telemetry.TraceTags(ctx)
+	if traceparent != "" {
+		tags = append(tags, nostr.Tag{"traceparent", traceparent})
+	}
+	if tracestate != "" {
+		tags = append(tags, nostr.Tag{"tracestate", tracestate})
+	}
+	ev.Tags = tags
 }
 
 func (w *Worker) fail(ctx context.Context, row store.OutboundEvent, cause error) error {
