@@ -17,12 +17,14 @@ import (
 	"time"
 
 	"fiatjaf.com/nostr"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sharegap/grasp-gitea/internal/config"
 	"github.com/sharegap/grasp-gitea/internal/loom"
 	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/telemetry"
 )
 
 type recordingStatusSink struct{ statuses []loom.Status }
@@ -165,12 +167,14 @@ func TestRunnerPublishesFailureResultWhenActFails(t *testing.T) {
 
 type recordingRemoteDispatcher struct {
 	requests []loom.DispatchRequest
+	contexts []trace.SpanContext
 	enabled  bool
 }
 
 func (d *recordingRemoteDispatcher) Enabled() bool { return d.enabled }
-func (d *recordingRemoteDispatcher) Dispatch(_ context.Context, req loom.DispatchRequest) (bool, error) {
+func (d *recordingRemoteDispatcher) Dispatch(ctx context.Context, req loom.DispatchRequest) (bool, error) {
 	d.requests = append(d.requests, req)
+	d.contexts = append(d.contexts, trace.SpanContextFromContext(ctx))
 	return true, nil
 }
 
@@ -187,8 +191,16 @@ func TestSinglePushProducesExactlyOneRemoteWorkflowDispatch(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r.SetRemoteDispatcher(remote, "remote")
 
+	upstream := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SpanID:     trace.SpanID{1, 2, 3, 4, 5, 6, 7, 8},
+		TraceFlags: trace.FlagsSampled,
+		Remote:     true,
+	})
+	traceparent, tracestate := telemetry.TraceTags(trace.ContextWithRemoteSpanContext(context.Background(), upstream))
 	authorized := signedHiveEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
 		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
+		{"traceparent", traceparent}, {"tracestate", tracestate},
 	}, "")
 	if err := r.HandleEvent(ctx, authorized, ""); err != nil {
 		t.Fatal(err)
@@ -202,6 +214,9 @@ func TestSinglePushProducesExactlyOneRemoteWorkflowDispatch(t *testing.T) {
 	}
 	if remote.requests[0].CloneURL != mapping.AnnouncedCloneURL {
 		t.Fatalf("remote clone URL = %q, want public %q", remote.requests[0].CloneURL, mapping.AnnouncedCloneURL)
+	}
+	if len(remote.contexts) != 1 || remote.contexts[0].TraceID() != upstream.TraceID() || remote.contexts[0].SpanID() != upstream.SpanID() || !remote.contexts[0].IsRemote() {
+		t.Fatalf("dispatch trace context = %#v, want upstream %#v", remote.contexts, upstream)
 	}
 
 	attacker := nostr.Generate()

@@ -19,6 +19,9 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/nostrverify"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/telemetry"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const defaultDispatchRetry = 5 * time.Second
@@ -145,7 +148,10 @@ func (d *Dispatcher) Enabled() bool { return d != nil && d.enabled }
 // Dispatch persists a single immutable attempt before publishing. The bool says
 // whether remote execution owns the workflow; once persisted it remains true
 // even if relay delivery needs retry, preventing local double execution.
-func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (bool, error) {
+func (d *Dispatcher) Dispatch(ctx context.Context, req DispatchRequest) (handled bool, retErr error) {
+	started := time.Now()
+	ctx, span := telemetry.Start(ctx, "grasp.hiveci.trigger", attribute.String("repo.id", req.RepoID), attribute.String("git.commit", req.CommitSHA))
+	defer func() { telemetry.RecordTrigger(ctx, started, retErr); telemetry.End(span, retErr) }()
 	if !d.Enabled() {
 		return false, nil
 	}
@@ -276,14 +282,23 @@ func (d *Dispatcher) buildAttempt(ctx context.Context, req DispatchRequest, key,
 	if err != nil {
 		return store.LoomJob{}, fmt.Errorf("NIP-44 encrypt HIVE_CI_NSEC: %w", err)
 	}
+	traceparent, tracestate := telemetry.TraceTags(ctx)
+	runTags := nostr.Tags{
+		{"a", fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement, req.OwnerPubkey, req.RepoID)},
+		{"commit", req.CommitSHA}, {"branch", req.Branch}, {"trigger", req.Trigger},
+		{"triggered-by", req.TriggeredBy}, {"workflow", req.WorkflowPath},
+		{"publisher", ephemeral.Public().Hex()}, {"t", "hive-ci"},
+	}
+	// TODO: use cascadia-go generated trace tag constants after its otelnostr release.
+	if traceparent != "" {
+		runTags = append(runTags, nostr.Tag{"traceparent", traceparent})
+	}
+	if tracestate != "" {
+		runTags = append(runTags, nostr.Tag{"tracestate", tracestate})
+	}
 	run := &nostr.Event{
 		PubKey: bridgePub, CreatedAt: nostr.Timestamp(now.Unix()), Kind: relay.KindHiveWorkflowRun,
-		Tags: nostr.Tags{
-			{"a", fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement, req.OwnerPubkey, req.RepoID)},
-			{"commit", req.CommitSHA}, {"branch", req.Branch}, {"trigger", req.Trigger},
-			{"triggered-by", req.TriggeredBy}, {"workflow", req.WorkflowPath},
-			{"publisher", ephemeral.Public().Hex()}, {"t", "hive-ci"},
-		},
+		Tags:    runTags,
 		Content: "",
 	}
 	if err := d.signer.SignEvent(ctx, run); err != nil {

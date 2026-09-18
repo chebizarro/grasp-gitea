@@ -32,6 +32,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/telemetry"
 )
 
 const (
@@ -222,6 +223,7 @@ func (r *Runner) HandleEvent(ctx context.Context, ev *nostr.Event, sourceRelay s
 		r.logger.Warn("HiveCI ignored event with invalid ID or signature", "event", ev.ID.Hex(), "kind", ev.Kind, "error", err)
 		return nil
 	}
+	ctx = telemetry.ContextWithTraceTags(ctx, tagValue(ev.Tags, "traceparent"), tagValue(ev.Tags, "tracestate"))
 	switch ev.Kind {
 	case relay.KindRepositoryState:
 		return r.handleRepositoryState(ctx, ev, sourceRelay)

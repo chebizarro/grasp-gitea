@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"fiatjaf.com/nostr"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/grasp"
@@ -29,6 +30,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/refsnostr"
 	"github.com/sharegap/grasp-gitea/internal/relay"
 	"github.com/sharegap/grasp-gitea/internal/store"
+	"github.com/sharegap/grasp-gitea/internal/telemetry"
 )
 
 const (
@@ -306,11 +308,22 @@ func (h *Handler) verifyHMAC(sig string, body []byte) bool {
 
 // handlePush publishes a kind:30618 repository state event, and for
 // refs/nostr/<event-id> pushes also handles kind:1617 patch acknowledgement.
-func (h *Handler) handlePush(ctx context.Context, body []byte) error {
+func (h *Handler) handlePush(ctx context.Context, body []byte) (retErr error) {
+	started := time.Now()
+	ctx, span := telemetry.StartRoot(ctx, "grasp.push.receive")
+	defer func() {
+		telemetry.RecordPush(ctx, started, retErr)
+		telemetry.End(span, retErr)
+	}()
+
 	var p PushPayload
 	if err := json.Unmarshal(body, &p); err != nil {
 		return fmt.Errorf("parse push payload: %w", err)
 	}
+	span.SetAttributes(
+		attribute.Int64("gitea.repository.id", p.Repository.ID),
+		attribute.String("git.ref", p.Ref),
+	)
 
 	mapping, err := h.store.GetMappingByGiteaRepoID(ctx, p.Repository.ID)
 	if err != nil {

@@ -26,6 +26,9 @@ import (
 	"time"
 
 	"fiatjaf.com/nostr"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/sharegap/grasp-gitea/internal/echofp"
 	"github.com/sharegap/grasp-gitea/internal/metrics"
@@ -56,6 +59,7 @@ type fakePublisher struct {
 	fetched     []string
 	fetchResult *nostr.Event
 	fetchErr    error
+	onRepublish func(context.Context)
 }
 
 type fakeActorSigner struct {
@@ -109,11 +113,52 @@ func (f *fakePublisher) PublishEvent(_ context.Context, ev *nostr.Event) error {
 	return nil
 }
 
-func (f *fakePublisher) RepublishForGiteaRepo(_ context.Context, giteaRepoID int64) error {
+func (f *fakePublisher) RepublishForGiteaRepo(ctx context.Context, giteaRepoID int64) error {
+	if f.onRepublish != nil {
+		f.onRepublish(ctx)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.republished = append(f.republished, giteaRepoID)
 	return nil
+}
+
+func TestPushRootSpanParentsRepositoryPublication(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	old := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(old); _ = tp.Shutdown(context.Background()) })
+
+	h, fake, st := newTestHandler(t, "")
+	seedMapping(t, st)
+	fake.onRepublish = func(ctx context.Context) {
+		_, span := otel.Tracer("test").Start(ctx, "test.repository.publish")
+		span.End()
+	}
+	payload := PushPayload{Ref: "refs/heads/main", After: "a1", Repository: Repository{ID: testGiteaID}}
+	if rr := post(t, h, "push", payload, ""); rr.Code != http.StatusOK {
+		t.Fatalf("push status = %d, want 200", rr.Code)
+	}
+
+	var root, downstream sdktrace.ReadOnlySpan
+	for _, span := range recorder.Ended() {
+		switch span.Name() {
+		case "grasp.push.receive":
+			root = span
+		case "test.repository.publish":
+			downstream = span
+		}
+	}
+	if root == nil || downstream == nil {
+		t.Fatalf("missing push/publish spans: %#v", recorder.Ended())
+	}
+	if root.Parent().IsValid() {
+		t.Fatalf("push span unexpectedly has parent %s", root.Parent().SpanID())
+	}
+	if downstream.Parent().SpanID() != root.SpanContext().SpanID() || downstream.SpanContext().TraceID() != root.SpanContext().TraceID() {
+		t.Fatalf("publish span parent/trace = %s/%s, want %s/%s", downstream.Parent().SpanID(), downstream.SpanContext().TraceID(), root.SpanContext().SpanID(), root.SpanContext().TraceID())
+	}
 }
 
 func (f *fakePublisher) FetchEvent(_ context.Context, id string) (*nostr.Event, error) {
