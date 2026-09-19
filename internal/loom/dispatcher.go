@@ -554,11 +554,24 @@ func dispatchKey(req DispatchRequest) (string, error) {
 	return "loom:" + hex.EncodeToString(sum[:]), nil
 }
 
+// loomCICommand is the Hive-CI profile that loom-workers advertise as
+// kind-10100 `S` software. Selecting it through loom-protocol's cmd/args
+// contract keeps the job spec-shaped while reusing the worker's hardened
+// clone/act script (credential handling, network policy, cleanup).
+const loomCICommand = "loom-ci"
+
 func buildWorkerCommand(template string, req DispatchRequest) (string, []string, error) {
 	if strings.TrimSpace(template) == "" {
-		return "sh", []string{"-c",
-			`git clone --no-checkout "$1" repo && git -C repo checkout --detach "$2" && cd repo && act "$3" -W "$4" --rm`,
-			"hive-ci", req.CloneURL, req.CommitSHA, req.Trigger, req.WorkflowPath}, nil
+		args := []string{"run", "--repo", req.CloneURL, "--ref", req.CommitSHA, "--workflow", req.WorkflowPath}
+		if trigger := strings.TrimSpace(req.Trigger); trigger != "" {
+			args = append(args, "--event", trigger)
+		}
+		if actor := strings.TrimSpace(req.TriggeredBy); actor != "" {
+			args = append(args, "--actor", actor)
+		}
+		// --run is omitted: loom-ci defaults it to the job's e tag, which
+		// already references the kind-5401 workflow run.
+		return loomCICommand, args, nil
 	}
 	var words []string
 	if strings.HasPrefix(strings.TrimSpace(template), "[") {

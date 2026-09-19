@@ -430,7 +430,7 @@ All new keys default OFF so existing deployments are unaffected. Reuse existing
 | `LOOM_WORKER_PUBKEYS` | csv | – | Allowlisted worker pubkeys (trust anchor for Phase 1/2; also validates inbound `5101`/`30100`). |
 | `LOOM_RELAY_URLS` | csv | merged relay set | Relays for Loom job publish/subscribe (default = the same merged set `main.go` already builds). |
 | `LOOM_JOB_MAX_DURATION` | duration | `15m` | Upper bound on a job (bounds payment/timeout; mirrors `HIVE_CI_RUN_TIMEOUT`). |
-| `LOOM_JOB_CMD_TEMPLATE` | string | (built-in) | Template for the worker `cmd`/`args` contract (Q3). |
+| `LOOM_JOB_CMD_TEMPLATE` | string | `loom-ci run --repo {clone_url} --ref {commit} --workflow {workflow} --event {trigger} --actor …` | Template for the worker `cmd`/`args` contract (Q3). The default selects the `loom-ci` executable that Hive-CI-capable loom-workers advertise as kind-10100 `S` software. |
 | `LOOM_STATUS_CONTEXT_PREFIX` | string | `hive-ci` | Prefix for the Gitea commit-status `context`. |
 | `LOOM_MINT_URL` | url | – | (Phase 3) Cashu mint. |
 | `LOOM_STATIC_PAYMENT_TOKEN` | string | – | (Phase 2) pre-funded trusted-fleet token. |

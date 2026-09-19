@@ -458,7 +458,7 @@ func main() {
 	}
 
 	workerPool := loom.NewWorkerPool(loom.WorkerPoolConfig{
-		Allowlist: cfg.LoomWorkerPubkeys, RequiredSoftware: []string{"act"},
+		Allowlist: cfg.LoomWorkerPubkeys, RequiredSoftware: loomRequiredSoftware(cfg.LoomJobCmdTemplate),
 		FutureSkew: cfg.LoomFutureSkew,
 	})
 	var dispatchSigner loom.DispatchSigner
@@ -851,4 +851,15 @@ func main() {
 		}
 	}
 	logger.Info("grasp-bridge stopped")
+}
+
+// loomRequiredSoftware returns the kind-10100 S software a worker must
+// advertise before Grasp dispatches to it. The default command is the
+// loom-ci executable (Hive-CI profile), so workers must advertise it; a
+// custom LOOM_JOB_CMD_TEMPLATE only needs act.
+func loomRequiredSoftware(cmdTemplate string) []string {
+	if strings.TrimSpace(cmdTemplate) == "" {
+		return []string{"loom-ci", "git", "act"}
+	}
+	return []string{"act"}
 }
