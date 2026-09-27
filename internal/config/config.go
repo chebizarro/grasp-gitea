@@ -150,6 +150,12 @@ type Config struct {
 	RegistryTokenProbeUser      string
 	RegistryTokenProbeToken     string
 	RegistryTokenProbeTokenFile string
+
+	// NostrMetricsEnabled turns on OTEL-via-Nostr metric emission. When true,
+	// subsystems like the registry-token monitor publish metric data points as
+	// signed kind-31420 parametric replaceable events to NostrMetricsRelayURLs.
+	NostrMetricsEnabled  bool
+	NostrMetricsRelayURLs []string
 	// ShutdownGrace bounds graceful HTTP shutdown; long enough for active
 	// streaming git/package uploads to complete.
 	ShutdownGrace time.Duration
@@ -259,12 +265,14 @@ func Load() (Config, error) {
 		TokenTTLMin:                 durationEnv("BRIDGE_TOKEN_TTL_MIN", time.Hour),
 		TokenTTLMax:                 durationEnv("BRIDGE_TOKEN_TTL_MAX", 90*24*time.Hour),
 		AuthAuditRetention:          boundedDurationEnv("AUTH_AUDIT_RETENTION", 90*24*time.Hour, 24*time.Hour, 365*24*time.Hour),
-		RegistryTokenMaxTTL:         durationEnv("REGISTRY_TOKEN_MAX_LIFETIME", 24*time.Hour),
-		RegistryTokenProbeEvery:     durationEnv("REGISTRY_TOKEN_PROBE_INTERVAL", 5*time.Minute),
+		RegistryTokenMaxTTL:         durationEnv("REGISTRY_TOKEN_MAX_LIFETIME", 36*time.Hour),
+		RegistryTokenProbeEvery:     durationEnv("REGISTRY_TOKEN_PROBE_INTERVAL", 6*time.Hour),
 		RegistryTokenMonitorMode:    envOrDefault("REGISTRY_TOKEN_MONITOR_MODE", "warn"),
 		RegistryTokenProbeURL:       strings.TrimSpace(os.Getenv("REGISTRY_TOKEN_PROBE_URL")),
 		RegistryTokenProbeUser:      strings.TrimSpace(os.Getenv("REGISTRY_TOKEN_PROBE_USER")),
 		RegistryTokenProbeTokenFile: strings.TrimSpace(os.Getenv("REGISTRY_TOKEN_PROBE_TOKEN_FILE")),
+		NostrMetricsEnabled:         boolEnv("NOSTR_METRICS_ENABLED", false),
+		NostrMetricsRelayURLs:       csvEnv("NOSTR_METRICS_RELAY_URLS"),
 		ShutdownGrace:               boundedDurationEnv("SHUTDOWN_GRACE", 5*time.Minute, time.Second, 30*time.Minute),
 	}
 	if cfg.RegistryTokenMonitorMode != "require" && cfg.RegistryTokenMonitorMode != "warn" && cfg.RegistryTokenMonitorMode != "disabled" {
@@ -275,10 +283,27 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.RegistryTokenProbeURL = probeURL
+	// Prefer the dedicated monitoring account; fall back to admin user.
+	monitorUser := strings.TrimSpace(os.Getenv("REGISTRY_TOKEN_MONITOR_USER"))
+	if monitorUser != "" {
+		cfg.RegistryTokenProbeUser = monitorUser
+	}
 	if cfg.RegistryTokenProbeUser == "" {
 		cfg.RegistryTokenProbeUser = cfg.GiteaAdminUser
 	}
-	cfg.RegistryTokenProbeToken = cfg.GiteaAdminToken
+	// Prefer the dedicated monitoring account token; fall back to admin token.
+	registryProbeToken := strings.TrimSpace(os.Getenv("REGISTRY_TOKEN_MONITOR_TOKEN"))
+	if registryProbeToken == "" {
+		registryProbeToken = cfg.GiteaAdminToken
+	}
+	cfg.RegistryTokenProbeToken = registryProbeToken
+
+	// Nostr metrics relay URLs default to the bridge relay URLs when not
+	// explicitly configured — metrics publish alongside other bridge events.
+	if cfg.NostrMetricsEnabled && len(cfg.NostrMetricsRelayURLs) == 0 {
+		cfg.NostrMetricsRelayURLs = cfg.RelayURLs
+	}
+
 	if cfg.RegistryTokenProbeTokenFile != "" {
 		token, resolvedPath, err := readRegistryTokenProbeToken(cfg.RegistryTokenProbeTokenFile)
 		if err != nil {

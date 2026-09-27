@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/sharegap/grasp-gitea/internal/metrics"
+	"github.com/sharegap/grasp-gitea/internal/nostrmetrics"
 )
 
 const (
@@ -50,8 +51,17 @@ type Monitor struct {
 	client      *http.Client
 	logger      *slog.Logger
 
+	nostrEmitter *nostrmetrics.Emitter
+
 	mu      sync.RWMutex
 	lastErr error
+}
+
+// SetNostrEmitter attaches an OTEL-via-Nostr metrics emitter. When set, each
+// probe cycle publishes metric data points as signed Nostr events in addition
+// to updating the local atomic counters.
+func (m *Monitor) SetNostrEmitter(e *nostrmetrics.Emitter) {
+	m.nostrEmitter = e
 }
 
 // New constructs a registry-token lifetime monitor.
@@ -135,6 +145,39 @@ func (m *Monitor) probeAndRecord(ctx context.Context) {
 		metrics.SetRegistryTokenLifetimeSeconds(int64(lifetime / time.Second))
 	}
 	metrics.SetRegistryTokenRevocationBoundExceeded(err != nil)
+
+	// Publish OTEL-via-Nostr metric events when an emitter is configured.
+	if m.nostrEmitter != nil && lifetime > 0 {
+		attrs := map[string]string{
+			"accepted_bound_seconds": fmt.Sprintf("%d", int64(m.maxLifetime/time.Second)),
+			"endpoint":              RedactedURL(m.endpoint),
+		}
+		if err != nil {
+			attrs["error"] = err.Error()
+		}
+		exceeded := float64(0)
+		if err != nil {
+			exceeded = 1
+		}
+		m.nostrEmitter.EmitBatch(ctx, []nostrmetrics.DataPoint{
+			{
+				Name:        "registry.token.lifetime",
+				Description: "Measured exp-iat lifetime of the most recently issued Gitea container-registry JWT",
+				Unit:        "s",
+				Type:        nostrmetrics.Gauge,
+				Value:       float64(lifetime / time.Second),
+				Attributes:  attrs,
+			},
+			{
+				Name:        "registry.token.revocation_bound_exceeded",
+				Description: "Whether the measured JWT lifetime exceeds the configured revocation bound (1=exceeded, 0=ok)",
+				Unit:        "1",
+				Type:        nostrmetrics.Gauge,
+				Value:       exceeded,
+				Attributes:  attrs,
+			},
+		})
+	}
 
 	m.mu.Lock()
 	m.lastErr = err

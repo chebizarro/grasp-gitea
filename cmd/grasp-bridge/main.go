@@ -29,6 +29,7 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/hooks"
 	"github.com/sharegap/grasp-gitea/internal/loom"
 	"github.com/sharegap/grasp-gitea/internal/nip05affiliation"
+	"github.com/sharegap/grasp-gitea/internal/nostrmetrics"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
 	"github.com/sharegap/grasp-gitea/internal/outbox"
 	"github.com/sharegap/grasp-gitea/internal/policy"
@@ -593,6 +594,24 @@ func main() {
 				logger.Error("failed to initialize registry token revocation-bound monitor", "error", monitorErr)
 				os.Exit(1)
 			}
+
+			// Attach OTEL-via-Nostr metrics emitter when configured. Uses the
+			// bridge signer so metric events are authored by the service identity.
+			if cfg.NostrMetricsEnabled && serverSigner != nil {
+				metricsEmitter := nostrmetrics.New(nostrmetrics.Config{
+					Signer:      serverSigner,
+					RelayURLs:   cfg.NostrMetricsRelayURLs,
+					ServiceName: "grasp-bridge",
+					Scope:       "registrytoken",
+					Logger:      logger,
+				})
+				registryTokenMonitor.SetNostrEmitter(metricsEmitter)
+				logger.Info("registry token OTEL-via-Nostr metrics enabled",
+					"relays", len(cfg.NostrMetricsRelayURLs),
+					"emitter", metricsEmitter.String(),
+				)
+			}
+
 			apiServer.AddReadinessProbe(registryTokenMonitor)
 			go registryTokenMonitor.Run(ctx)
 			logger.Info("registry token revocation-bound monitor enabled", "accepted_bound", cfg.RegistryTokenMaxTTL.String(), "interval", cfg.RegistryTokenProbeEvery.String())

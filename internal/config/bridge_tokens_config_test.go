@@ -33,6 +33,10 @@ func setBridgeBaseEnv(t *testing.T) {
 	t.Setenv("REGISTRY_TOKEN_PROBE_URL", "")
 	t.Setenv("REGISTRY_TOKEN_PROBE_USER", "")
 	t.Setenv("REGISTRY_TOKEN_PROBE_TOKEN_FILE", "")
+	t.Setenv("REGISTRY_TOKEN_MONITOR_USER", "")
+	t.Setenv("REGISTRY_TOKEN_MONITOR_TOKEN", "")
+	t.Setenv("NOSTR_METRICS_ENABLED", "")
+	t.Setenv("NOSTR_METRICS_RELAY_URLS", "")
 	t.Setenv("GRASP_ENV", "")
 	t.Setenv("AUTH_ENABLED", "")
 	t.Setenv("ADMIN_API_TOKEN", "")
@@ -121,7 +125,7 @@ func TestBridgeTokensConfigValidation(t *testing.T) {
 	if len(cfg.CredentialKeys) != 1 || cfg.CredentialKeys[0].ID != "current" {
 		t.Fatalf("credential keys = %+v", cfg.CredentialKeys)
 	}
-	if cfg.RegistryTokenMaxTTL != 24*time.Hour || cfg.RegistryTokenProbeEvery != 5*time.Minute {
+	if cfg.RegistryTokenMaxTTL != 36*time.Hour || cfg.RegistryTokenProbeEvery != 6*time.Hour {
 		t.Fatalf("registry monitor defaults = (%s, %s)", cfg.RegistryTokenMaxTTL, cfg.RegistryTokenProbeEvery)
 	}
 	if cfg.RegistryTokenMonitorMode != "warn" || cfg.RegistryTokenProbeURL != "http://gitea:3000/v2/token?service=container_registry" {
@@ -183,6 +187,71 @@ func TestRegistryTokenProbeOverridesAndValidation(t *testing.T) {
 	}
 	if cfg.RegistryTokenProbeUser != "probe-user" || cfg.RegistryTokenProbeToken != "probe-secret" || cfg.RegistryTokenProbeTokenFile != tokenFile {
 		t.Fatalf("registry probe override credentials = (%q, %q, %q)", cfg.RegistryTokenProbeUser, cfg.RegistryTokenProbeToken, cfg.RegistryTokenProbeTokenFile)
+	}
+}
+
+func TestDedicatedMonitoringAccountOverride(t *testing.T) {
+	setBridgeBaseEnv(t)
+	t.Setenv("REGISTRY_TOKEN_MONITOR_USER", "grasp-monitor")
+	t.Setenv("REGISTRY_TOKEN_MONITOR_TOKEN", "monitor-pat")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RegistryTokenProbeUser != "grasp-monitor" {
+		t.Fatalf("probe user = %q, want grasp-monitor", cfg.RegistryTokenProbeUser)
+	}
+	if cfg.RegistryTokenProbeToken != "monitor-pat" {
+		t.Fatalf("probe token = %q, want monitor-pat", cfg.RegistryTokenProbeToken)
+	}
+}
+
+func TestDedicatedMonitoringAccountFallback(t *testing.T) {
+	setBridgeBaseEnv(t)
+	t.Setenv("GITEA_ADMIN_USER", "admin")
+	// No REGISTRY_TOKEN_MONITOR_USER set — should fall back to admin.
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RegistryTokenProbeUser != "admin" {
+		t.Fatalf("probe user = %q, want admin (fallback)", cfg.RegistryTokenProbeUser)
+	}
+	if cfg.RegistryTokenProbeToken != "admin-token" {
+		t.Fatalf("probe token = %q, want admin-token (fallback)", cfg.RegistryTokenProbeToken)
+	}
+}
+
+func TestNostrMetricsRelayURLFallback(t *testing.T) {
+	setBridgeBaseEnv(t)
+	t.Setenv("NOSTR_METRICS_ENABLED", "true")
+	// No NOSTR_METRICS_RELAY_URLS — should fall back to RELAY_URLS.
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.NostrMetricsEnabled {
+		t.Fatal("NostrMetricsEnabled = false")
+	}
+	if len(cfg.NostrMetricsRelayURLs) != 1 || cfg.NostrMetricsRelayURLs[0] != "wss://relay.example.com" {
+		t.Fatalf("NostrMetricsRelayURLs = %v, want fallback to RELAY_URLS", cfg.NostrMetricsRelayURLs)
+	}
+}
+
+func TestNostrMetricsExplicitRelays(t *testing.T) {
+	setBridgeBaseEnv(t)
+	t.Setenv("NOSTR_METRICS_ENABLED", "true")
+	t.Setenv("NOSTR_METRICS_RELAY_URLS", "wss://metrics-relay.example.com,wss://metrics-relay2.example.com")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.NostrMetricsRelayURLs) != 2 {
+		t.Fatalf("NostrMetricsRelayURLs = %v", cfg.NostrMetricsRelayURLs)
+	}
+	if cfg.NostrMetricsRelayURLs[0] != "wss://metrics-relay.example.com" {
+		t.Fatalf("first relay = %q", cfg.NostrMetricsRelayURLs[0])
 	}
 }
 
