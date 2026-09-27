@@ -221,9 +221,43 @@ func TestNIP46StatusPending(t *testing.T) {
 	}
 }
 
+func waitNIP46Status(t *testing.T, env *testNIP46Env, token, want string) nip46StatusResponse {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, env.server.URL+"/auth/nip46/status?session="+token, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := env.server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var status nip46StatusResponse
+		err = json.NewDecoder(resp.Body).Decode(&status)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Status == want {
+			return status
+		}
+		if status.Status != "pending" {
+			t.Fatalf("NIP-46 status = %q (error: %s), want %q", status.Status, status.Error, want)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for NIP-46 status %q: %v", want, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 func TestNIP46StatusComplete(t *testing.T) {
-	// Use a very short delay so the session completes quickly.
-	mock := &mockGrantCreator{signerPubkey: testBunkerPubkey, delay: 10 * time.Millisecond}
+	mock := &mockGrantCreator{signerPubkey: testBunkerPubkey}
 	env := newTestNIP46Env(t, mock)
 
 	body := fmt.Sprintf(`{"bunker_uri":"%s","redirect_uri":"/repos"}`, testBunkerURI)
@@ -235,20 +269,7 @@ func TestNIP46StatusComplete(t *testing.T) {
 	json.NewDecoder(initResp.Body).Decode(&initResult)
 	initResp.Body.Close()
 
-	// Wait for the async flow to complete.
-	time.Sleep(100 * time.Millisecond)
-
-	statusResp, err := http.Get(env.server.URL + "/auth/nip46/status?session=" + initResult.SessionToken)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer statusResp.Body.Close()
-
-	var status nip46StatusResponse
-	json.NewDecoder(statusResp.Body).Decode(&status)
-	if status.Status != "complete" {
-		t.Errorf("expected 'complete', got %q (error: %s)", status.Status, status.Error)
-	}
+	status := waitNIP46Status(t, env, initResult.SessionToken, "complete")
 	if status.Identity == nil {
 		t.Error("expected non-nil identity")
 	}
@@ -304,19 +325,7 @@ func TestNIP46LoginPersistsReusableGrantAndIdentityLink(t *testing.T) {
 	json.NewDecoder(initResp.Body).Decode(&initResult)
 	initResp.Body.Close()
 
-	time.Sleep(100 * time.Millisecond)
-
-	statusResp, err := http.Get(env.server.URL + "/auth/nip46/status?session=" + initResult.SessionToken)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer statusResp.Body.Close()
-
-	var status nip46StatusResponse
-	json.NewDecoder(statusResp.Body).Decode(&status)
-	if status.Status != "complete" {
-		t.Fatalf("expected complete status, got %q error=%q", status.Status, status.Error)
-	}
+	status := waitNIP46Status(t, env, initResult.SessionToken, "complete")
 	if status.Identity == nil || status.Identity.Pubkey != testBunkerPubkey {
 		t.Fatalf("identity = %#v, want pubkey %s", status.Identity, testBunkerPubkey)
 	}
@@ -339,7 +348,7 @@ func TestNIP46LoginPersistsReusableGrantAndIdentityLink(t *testing.T) {
 
 func TestNIP46StatusError(t *testing.T) {
 	// Connector returns an error.
-	mock := &mockGrantCreator{err: fmt.Errorf("bunker connection refused"), delay: 10 * time.Millisecond}
+	mock := &mockGrantCreator{err: fmt.Errorf("bunker connection refused")}
 	env := newTestNIP46Env(t, mock)
 
 	body := fmt.Sprintf(`{"bunker_uri":"%s"}`, testBunkerURI)
@@ -351,20 +360,7 @@ func TestNIP46StatusError(t *testing.T) {
 	json.NewDecoder(initResp.Body).Decode(&initResult)
 	initResp.Body.Close()
 
-	// Wait for the async flow to fail.
-	time.Sleep(100 * time.Millisecond)
-
-	statusResp, err := http.Get(env.server.URL + "/auth/nip46/status?session=" + initResult.SessionToken)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer statusResp.Body.Close()
-
-	var status nip46StatusResponse
-	json.NewDecoder(statusResp.Body).Decode(&status)
-	if status.Status != "error" {
-		t.Errorf("expected 'error', got %q", status.Status)
-	}
+	status := waitNIP46Status(t, env, initResult.SessionToken, "error")
 	if status.Error == "" {
 		t.Error("expected non-empty error message")
 	}

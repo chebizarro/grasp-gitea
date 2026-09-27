@@ -1,10 +1,12 @@
 package relay
 
+import cascadia "git.sharegap.net/cascadia/cascadia-nips/generated/go"
+
 const (
 	KindRepositoryAnnouncement = 30617
 	KindRepositoryState        = 30618
-	KindCheckRunResult         = 30315
-	KindCASAudit               = 4903
+	KindCheckRunResult         = 30315 // Legacy Hive-CI check result; not NIP-38 user status.
+	KindCASAudit               = cascadia.CAS_AUDIT
 	KindPatch                  = 1617
 	KindPROpen                 = 1618
 	KindPRUpdate               = 1619
@@ -15,7 +17,7 @@ const (
 	KindStatusDraft            = 1633
 	KindNIP22Comment           = 1111
 	KindNIP32Label             = 1985
-	KindLoomWorkerAd           = 10100
+	KindLoomWorkerAd           = cascadia.CAS_WORKER_AD
 	KindLoomJobRequest         = 5100
 	KindLoomJobResult          = 5101
 	KindLoomJobCancel          = 5102
