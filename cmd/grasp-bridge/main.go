@@ -454,9 +454,7 @@ func main() {
 		}
 	}
 	statusSink := loom.NewDurableStatusSink(st, giteaClient, cfg.LoomJobTTL, cfg.LoomMaxJobs, logger)
-	if cfg.LoomEnabled || cfg.HiveCIEnabled {
-		go statusSink.Run(ctx)
-	}
+	go statusSink.Run(ctx)
 
 	workerPool := loom.NewWorkerPool(loom.WorkerPoolConfig{
 		Allowlist: cfg.LoomWorkerPubkeys, RequiredSoftware: []string{"act"},
@@ -512,6 +510,11 @@ func main() {
 	hiveRunner.SetStatusSink(statusSink, cfg.LoomStatusContextPrefix)
 	hiveRunner.SetWorkflowAuthorizer(proactiveSyncSvc)
 	hiveRunner.SetRemoteDispatcher(loomDispatcher, cfg.LoomDispatchMode)
+	if err := hiveRunner.RecoverInterruptedLocalRuns(ctx); err != nil {
+		logger.Error("failed to recover interrupted local HiveCI runs", "error", err)
+		os.Exit(1)
+	}
+	go hiveRunner.RunTerminalRetries(ctx)
 	loomSvc := loom.New(loom.Config{
 		Enabled: cfg.LoomEnabled, ContextPrefix: cfg.LoomStatusContextPrefix,
 		FutureSkew: cfg.LoomFutureSkew, ResultGrace: cfg.LoomResultGrace,
@@ -840,6 +843,9 @@ func main() {
 	<-configSubscriberDone
 	if loomSubscriber != nil {
 		loomSubscriber.Wait()
+	}
+	if err := hiveRunner.DrainTerminalRetries(shutdownCtx); err != nil {
+		logger.Warn("local HiveCI terminal status remains for startup recovery", "error", err)
 	}
 	select {
 	case <-proactiveSyncDone:

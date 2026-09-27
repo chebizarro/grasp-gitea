@@ -19,6 +19,7 @@ const (
 	LoomStatusError   = "error"
 
 	LoomSourceLocal          = "local"
+	LoomSourceLocalRecovery  = "local-recovery"
 	LoomSourceJobStatus      = "30100"
 	LoomSourceJobResult      = "5101"
 	LoomSourceWorkflowResult = "5402"
@@ -40,6 +41,7 @@ type LoomJob struct {
 	WorkflowRunEvent     string
 	JobRequestEvent      string
 	Status               string
+	StatusContext        string
 	TerminalSource       string
 	LastProtocolEventID  string
 	StatusEventCreatedAt int64
@@ -121,6 +123,7 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 			workflow_run_event TEXT NOT NULL DEFAULT '',
 			job_request_event TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'pending',
+			status_context TEXT NOT NULL DEFAULT '',
 			terminal_source TEXT NOT NULL DEFAULT '',
 			last_protocol_event_id TEXT NOT NULL DEFAULT '',
 			status_event_created_at INTEGER NOT NULL DEFAULT 0,
@@ -145,6 +148,9 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 			ON loom_jobs(job_request_id) WHERE job_request_id != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_loom_jobs_updated
 			ON loom_jobs(updated_at, workflow_run_id)`,
+		`CREATE TABLE IF NOT EXISTS loom_local_claims (
+			workflow_run_id TEXT PRIMARY KEY
+		)`,
 		`CREATE TABLE IF NOT EXISTS loom_job_events (
 			event_id TEXT PRIMARY KEY,
 			workflow_run_id TEXT NOT NULL,
@@ -201,6 +207,7 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 		"dispatch_last_error":      "TEXT NOT NULL DEFAULT ''",
 		"published_at":             "INTEGER NOT NULL DEFAULT 0",
 		"branch":                   "TEXT NOT NULL DEFAULT ''",
+		"status_context":           "TEXT NOT NULL DEFAULT ''",
 		"cancel_event":             "TEXT NOT NULL DEFAULT ''",
 		"cancel_event_id":          "TEXT NOT NULL DEFAULT ''",
 		"cancel_state":             "TEXT NOT NULL DEFAULT ''",
@@ -218,6 +225,10 @@ func (s *SQLiteStore) EnsureLoomTables(ctx context.Context) error {
 			!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 			return fmt.Errorf("migrate Loom %s: %w", column, err)
 		}
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO loom_local_claims(workflow_run_id)
+		SELECT workflow_run_id FROM loom_jobs WHERE workflow_run_id LIKE 'local:%'`); err != nil {
+		return fmt.Errorf("migrate local HiveCI claims: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_loom_jobs_dispatch
 		ON loom_jobs(dispatch_key) WHERE dispatch_key != ''`); err != nil {
@@ -298,6 +309,9 @@ func (s *SQLiteStore) ClaimLoomJobStatus(ctx context.Context, job LoomJob, updat
 	if err := validateLoomJob(job); err != nil {
 		return false, err
 	}
+	if !strings.HasPrefix(job.WorkflowRunID, "local:") {
+		return false, fmt.Errorf("local HiveCI workflow run ID is required")
+	}
 	if !validLoomState(update.State) || update.Context == "" {
 		return false, fmt.Errorf("complete initial Loom status is required")
 	}
@@ -317,10 +331,21 @@ func (s *SQLiteStore) ClaimLoomJobStatus(ctx context.Context, job LoomJob, updat
 	}
 	defer tx.Rollback()
 
+	var priorClaim string
+	err = tx.QueryRowContext(ctx, `SELECT workflow_run_id FROM loom_local_claims WHERE workflow_run_id = ?`, job.WorkflowRunID).Scan(&priorClaim)
+	if err == nil {
+		return false, tx.Commit()
+	}
+	if err != sql.ErrNoRows {
+		return false, err
+	}
 	existing, err := getLoomJobTx(ctx, tx, "workflow_run_id", job.WorkflowRunID)
 	if err == nil {
 		if !sameLoomIdentity(existing, job) {
 			return false, fmt.Errorf("Loom workflow run %q immutable identity mismatch", job.WorkflowRunID)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO loom_local_claims(workflow_run_id) VALUES(?)`, job.WorkflowRunID); err != nil {
+			return false, err
 		}
 		if err := tx.Commit(); err != nil {
 			return false, err
@@ -333,16 +358,23 @@ func (s *SQLiteStore) ClaimLoomJobStatus(ctx context.Context, job LoomJob, updat
 	if err := sweepLoomJobsTx(ctx, tx, now, ttl, maxRows-1); err != nil {
 		return false, err
 	}
+	count, err := loomJobCountTx(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	if count >= int64(maxRows) {
+		return false, fmt.Errorf("local HiveCI claim capacity reached; pending attempts must be recovered")
+	}
 
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO loom_jobs(
 			workflow_run_id, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
-			commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, terminal_source,
-			last_protocol_event_id, delivery_state, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+			commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, status_context,
+			terminal_source, last_protocol_event_id, delivery_state, created_at, updated_at
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
 	`, job.WorkflowRunID, job.JobRequestID, job.PublisherPub, job.WorkerPub, job.Owner, job.RepoName,
 		job.RepoID, job.CommitSHA, job.WorkflowPath, job.Branch, job.WorkflowRunEvent, job.JobRequestEvent,
-		update.State, "", update.ProtocolEventID, job.CreatedAt.UTC().Unix(), now.Unix())
+		update.State, update.Context, "", update.ProtocolEventID, job.CreatedAt.UTC().Unix(), now.Unix())
 	if err != nil {
 		return false, fmt.Errorf("claim Loom job: %w", err)
 	}
@@ -366,6 +398,9 @@ func (s *SQLiteStore) ClaimLoomJobStatus(ctx context.Context, job LoomJob, updat
 		) VALUES(?, ?, ?, ?, ?, ?, 0, ?, '', ?)
 	`, job.WorkflowRunID, update.State, update.Description, update.Context, update.TargetURL,
 		update.ProtocolEventID, update.AvailableAt.Unix(), now.Unix()); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO loom_local_claims(workflow_run_id) VALUES(?)`, job.WorkflowRunID); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -661,6 +696,28 @@ func (s *SQLiteStore) GetLoomJobByWorkflowRunID(ctx context.Context, id string) 
 		return LoomJob{}, err
 	}
 	return getLoomJobRow(s.db.QueryRowContext(ctx, loomJobSelectSQL()+" WHERE workflow_run_id = ?", strings.TrimSpace(id)))
+}
+
+// ListPendingLocalLoomJobs finds claims left pending by an earlier local runner.
+func (s *SQLiteStore) ListPendingLocalLoomJobs(ctx context.Context) ([]LoomJob, error) {
+	if err := s.EnsureLoomTables(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, loomJobSelectSQL()+
+		" WHERE workflow_run_id LIKE 'local:%' AND status = ? ORDER BY created_at, workflow_run_id", LoomStatusPending)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []LoomJob
+	for rows.Next() {
+		job, err := getLoomJobRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
 }
 
 // GetLoomJobByRequestID resolves a 30100/5101 job request.
@@ -1121,16 +1178,16 @@ func sweepLoomJobsTx(ctx context.Context, tx *sql.Tx, now time.Time, ttl time.Du
 		maxRows = 0
 	}
 	cutoff := now.Add(-ttl).Unix()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_status_deliveries WHERE workflow_run_id IN (SELECT workflow_run_id FROM loom_jobs WHERE updated_at < ?)`, cutoff); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_status_deliveries WHERE workflow_run_id IN (SELECT workflow_run_id FROM loom_jobs WHERE updated_at < ? AND NOT (workflow_run_id LIKE 'local:%' AND status = 'pending'))`, cutoff); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_job_events WHERE workflow_run_id IN (SELECT workflow_run_id FROM loom_jobs WHERE updated_at < ?)`, cutoff); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_job_events WHERE workflow_run_id IN (SELECT workflow_run_id FROM loom_jobs WHERE updated_at < ? AND NOT (workflow_run_id LIKE 'local:%' AND status = 'pending'))`, cutoff); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_cashu_spends WHERE updated_at < ?`, cutoff); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_jobs WHERE updated_at < ?`, cutoff); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_jobs WHERE updated_at < ? AND NOT (workflow_run_id LIKE 'local:%' AND status = 'pending')`, cutoff); err != nil {
 		return err
 	}
 	var count int
@@ -1142,30 +1199,30 @@ func sweepLoomJobsTx(ctx context.Context, tx *sql.Tx, now time.Time, ttl time.Du
 		return nil
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_status_deliveries WHERE workflow_run_id IN (
-		SELECT workflow_run_id FROM loom_jobs ORDER BY updated_at, workflow_run_id LIMIT ?
+		SELECT workflow_run_id FROM loom_jobs WHERE NOT (workflow_run_id LIKE 'local:%' AND status = 'pending') ORDER BY updated_at, workflow_run_id LIMIT ?
 	)`, excess); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_job_events WHERE workflow_run_id IN (
-		SELECT workflow_run_id FROM loom_jobs ORDER BY updated_at, workflow_run_id LIMIT ?
+		SELECT workflow_run_id FROM loom_jobs WHERE NOT (workflow_run_id LIKE 'local:%' AND status = 'pending') ORDER BY updated_at, workflow_run_id LIMIT ?
 	)`, excess); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM loom_cashu_spends WHERE workflow_run_id IN (
-		SELECT workflow_run_id FROM loom_jobs ORDER BY updated_at, workflow_run_id LIMIT ?
+		SELECT workflow_run_id FROM loom_jobs WHERE NOT (workflow_run_id LIKE 'local:%' AND status = 'pending') ORDER BY updated_at, workflow_run_id LIMIT ?
 	)`, excess); err != nil {
 		return err
 	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM loom_jobs WHERE workflow_run_id IN (
-		SELECT workflow_run_id FROM loom_jobs ORDER BY updated_at, workflow_run_id LIMIT ?
+		SELECT workflow_run_id FROM loom_jobs WHERE NOT (workflow_run_id LIKE 'local:%' AND status = 'pending') ORDER BY updated_at, workflow_run_id LIMIT ?
 	)`, excess)
 	return err
 }
 
 func loomJobSelectSQL() string {
 	return `SELECT dispatch_key, workflow_run_id, job_request_id, publisher_pub, worker_pub, owner, repo_name, repo_id,
-		commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, terminal_source,
-		last_protocol_event_id, status_event_created_at, status_event_id, delivery_state,
+		commit_sha, workflow_path, branch, workflow_run_event, job_request_event, status, status_context,
+		terminal_source, last_protocol_event_id, status_event_created_at, status_event_id, delivery_state,
 		dispatch_state, dispatch_attempts, dispatch_next_attempt_at, dispatch_last_error, published_at,
 		cancel_event, cancel_event_id, cancel_state, cancel_attempts, cancel_next_attempt_at,
 		cancel_last_error, cancelled_by, created_at, updated_at FROM loom_jobs`
@@ -1178,7 +1235,7 @@ func getLoomJobRow(row loomScanner) (LoomJob, error) {
 	var dispatchNext, published, cancelNext, created, updated int64
 	err := row.Scan(&job.DispatchKey, &job.WorkflowRunID, &job.JobRequestID, &job.PublisherPub, &job.WorkerPub,
 		&job.Owner, &job.RepoName, &job.RepoID, &job.CommitSHA, &job.WorkflowPath, &job.Branch,
-		&job.WorkflowRunEvent, &job.JobRequestEvent, &job.Status, &job.TerminalSource,
+		&job.WorkflowRunEvent, &job.JobRequestEvent, &job.Status, &job.StatusContext, &job.TerminalSource,
 		&job.LastProtocolEventID, &job.StatusEventCreatedAt, &job.StatusEventID,
 		&job.DeliveryState, &job.DispatchState, &job.DispatchAttempts, &dispatchNext,
 		&job.DispatchLastError, &published, &job.CancelEvent, &job.CancelEventID, &job.CancelState,
@@ -1327,6 +1384,8 @@ func loomTerminalRank(source string) int {
 		return 4
 	case LoomSourceLocal:
 		return 3
+	case LoomSourceLocalRecovery:
+		return 1
 	case LoomSourceJobResult:
 		return 2
 	case LoomSourceJobStatus:

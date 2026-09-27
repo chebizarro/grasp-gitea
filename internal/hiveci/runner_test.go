@@ -6,6 +6,7 @@ package hiveci
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -46,6 +47,184 @@ func (s *recordingStatusSink) Set(ctx context.Context, status loom.Status) error
 	}
 	s.statuses = append(s.statuses, status)
 	return nil
+}
+
+type failOnceApplyStore struct {
+	*store.SQLiteStore
+	failed          bool
+	failAfterCommit bool
+}
+
+func (s *failOnceApplyStore) ApplyLoomStatus(ctx context.Context, id string, update store.LoomStatusUpdate, now time.Time) (bool, error) {
+	if update.Source == store.LoomSourceLocal && !s.failed {
+		s.failed = true
+		if s.failAfterCommit {
+			if _, err := s.SQLiteStore.ApplyLoomStatus(ctx, id, update, now); err != nil {
+				return false, err
+			}
+		}
+		return false, errors.New("transient status store failure")
+	}
+	return s.SQLiteStore.ApplyLoomStatus(ctx, id, update, now)
+}
+
+func TestRunnerRetriesTerminalStatusWithoutReexecutingAct(t *testing.T) {
+	ctx := context.Background()
+	st, mapping, ownerPriv := newHiveTestStore(t)
+	repo := setupHiveRepo(t, mapping, ".gitea/workflows/ci.yml")
+	actPath, countPath := countingAct(t)
+	sink := loom.NewDurableStatusSink(&failOnceApplyStore{SQLiteStore: st}, nil, time.Hour, 10, nil)
+	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, repo.repositoriesDir, nil)
+	r.SetStatusSink(sink, "hive-ci")
+	ev := signedHiveEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
+	}, "")
+	if err := r.HandleEvent(ctx, ev); err == nil || !strings.Contains(err.Error(), "transient status store failure") {
+		t.Fatalf("first HandleEvent error = %v", err)
+	}
+	ref := localStatusRef(mapping, ev, "push", repo.commit, ".gitea/workflows/ci.yml")
+	job, err := st.GetLoomJobByWorkflowRunID(ctx, ref.WorkflowRunID)
+	if err != nil || job.Status != store.LoomStatusPending {
+		t.Fatalf("status before retry = %+v, %v", job, err)
+	}
+	r.retryTerminalStatuses(ctx)
+	job, err = st.GetLoomJobByWorkflowRunID(ctx, ref.WorkflowRunID)
+	if err != nil || job.Status != store.LoomStatusSuccess {
+		t.Fatalf("status after retry = %+v, %v", job, err)
+	}
+	if err := r.HandleEvent(ctx, ev); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	assertActCount(t, countPath, 1)
+}
+
+func TestRunnerRetriesAmbiguousCommittedTerminalWithoutReexecution(t *testing.T) {
+	ctx := context.Background()
+	st, mapping, ownerPriv := newHiveTestStore(t)
+	repo := setupHiveRepo(t, mapping, ".gitea/workflows/ci.yml")
+	actPath, countPath := countingAct(t)
+	sink := loom.NewDurableStatusSink(&failOnceApplyStore{SQLiteStore: st, failAfterCommit: true}, nil, time.Hour, 10, nil)
+	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, repo.repositoriesDir, nil)
+	r.SetStatusSink(sink, "hive-ci")
+	ev := signedHiveEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
+	}, "")
+	if err := r.HandleEvent(ctx, ev); err == nil {
+		t.Fatal("expected ambiguous terminal persistence error")
+	}
+	ref := localStatusRef(mapping, ev, "push", repo.commit, ".gitea/workflows/ci.yml")
+	job, err := st.GetLoomJobByWorkflowRunID(ctx, ref.WorkflowRunID)
+	if err != nil || job.Status != store.LoomStatusSuccess {
+		t.Fatalf("committed terminal status = %+v, %v", job, err)
+	}
+	if err := r.DrainTerminalRetries(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.HandleEvent(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+	assertActCount(t, countPath, 1)
+}
+
+func TestRunnerContinuesOtherWorkflowsAfterTerminalPersistenceFailure(t *testing.T) {
+	ctx := context.Background()
+	st, mapping, ownerPriv := newHiveTestStore(t)
+	repo := setupHiveRepo(t, mapping, ".gitea/workflows/ci.yml")
+	secondWorkflow := ".gitea/workflows/other.yml"
+	if err := os.WriteFile(filepath.Join(repo.workDir, secondWorkflow), []byte("name: other\non: push\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hiveGit(t, repo.workDir, "add", secondWorkflow)
+	hiveGit(t, repo.workDir, "commit", "-m", "second workflow")
+	commit := strings.TrimSpace(hiveGitOutput(t, repo.workDir, "rev-parse", "HEAD"))
+	hiveGit(t, repo.repoPath, "fetch", repo.workDir, "main:main")
+	actPath, countPath := countingAct(t)
+	sink := loom.NewDurableStatusSink(&failOnceApplyStore{SQLiteStore: st}, nil, time.Hour, 10, nil)
+	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, repo.repositoriesDir, nil)
+	r.SetStatusSink(sink, "hive-ci")
+	ev := signedHiveEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", commit},
+	}, "")
+	if err := r.HandleEvent(ctx, ev); err == nil {
+		t.Fatal("expected first terminal persistence failure")
+	}
+	assertActCount(t, countPath, 2)
+	r.retryTerminalStatuses(ctx)
+	for _, workflow := range []string{".gitea/workflows/ci.yml", secondWorkflow} {
+		ref := localStatusRef(mapping, ev, "push", commit, workflow)
+		job, err := st.GetLoomJobByWorkflowRunID(ctx, ref.WorkflowRunID)
+		if err != nil || job.Status != store.LoomStatusSuccess {
+			t.Fatalf("workflow %s status = %+v, %v", workflow, job, err)
+		}
+	}
+}
+
+func TestRunnerRestartRecoversUnknownOutcomeWithoutReexecution(t *testing.T) {
+	ctx := context.Background()
+	st, mapping, ownerPriv := newHiveTestStore(t)
+	repo := setupHiveRepo(t, mapping, ".gitea/workflows/ci.yml")
+	actPath, countPath := countingAct(t)
+	sink := loom.NewDurableStatusSink(&failOnceApplyStore{SQLiteStore: st}, nil, time.Hour, 10, nil)
+	first := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, repo.repositoriesDir, nil)
+	first.SetStatusSink(sink, "original-prefix")
+	ev := signedHiveEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
+	}, "")
+	if err := first.HandleEvent(ctx, ev); err == nil {
+		t.Fatal("expected terminal persistence failure")
+	}
+	ref := localStatusRef(mapping, ev, "push", repo.commit, ".gitea/workflows/ci.yml")
+	job, err := st.GetLoomJobByWorkflowRunID(ctx, ref.WorkflowRunID)
+	if err != nil || job.Status != store.LoomStatusPending {
+		t.Fatalf("pending claim = %+v, %v", job, err)
+	}
+	if err := st.MarkLoomStatusDelivered(ctx, ref.WorkflowRunID, ref.WorkflowRunID+":pending", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// The first runner is gone; its exact result never became durable, and
+	// Gitea's pending delivery has already been removed from the outbox.
+	second := New(Config{Enabled: false, ActPath: actPath, TriggerRepos: []string{"*"}}, st, repo.repositoriesDir, nil)
+	second.SetStatusSink(loom.NewDurableStatusSink(st, nil, time.Hour, 10, nil), "changed-prefix")
+	if err := second.RecoverInterruptedLocalRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	job, err = st.GetLoomJobByWorkflowRunID(ctx, ref.WorkflowRunID)
+	if err != nil || job.Status != store.LoomStatusError || job.TerminalSource != store.LoomSourceLocalRecovery {
+		t.Fatalf("recovered job = %+v, %v", job, err)
+	}
+	deliveries, err := st.ListDueLoomStatusDeliveries(ctx, time.Now().Add(time.Second), 10)
+	if err != nil || len(deliveries) != 1 || deliveries[0].Context != "original-prefix/.gitea/workflows/ci.yml" || deliveries[0].State != store.LoomStatusError {
+		t.Fatalf("recovered status delivery = %+v, %v", deliveries, err)
+	}
+	third := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, repo.repositoriesDir, nil)
+	third.SetStatusSink(loom.NewDurableStatusSink(st, nil, time.Hour, 10, nil), "changed-prefix")
+	if err := third.HandleEvent(ctx, ev); err != nil {
+		t.Fatalf("replay after restart: %v", err)
+	}
+	assertActCount(t, countPath, 1)
+}
+
+func countingAct(t *testing.T) (string, string) {
+	t.Helper()
+	actPath, _ := fakeAct(t, 0)
+	countPath := filepath.Join(t.TempDir(), "runs")
+	wrapper := filepath.Join(t.TempDir(), "counting-act")
+	script := "#!/bin/sh\necho run >> " + shellQuote(countPath) + "\nexec " + shellQuote(actPath) + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return wrapper, countPath
+}
+
+func assertActCount(t *testing.T, countPath string, want int) {
+	t.Helper()
+	b, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(b), "run\n"); got != want {
+		t.Fatalf("act executions = %d, want %d", got, want)
+	}
 }
 
 func TestRunnerRunsActForRepositoryStateAndRecordsCommitStatus(t *testing.T) {

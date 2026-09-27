@@ -50,7 +50,7 @@ func TestEnsureLoomTablesMigratesPhaseOneSchema(t *testing.T) {
 	}
 	for _, name := range []string{"dispatch_key", "dispatch_state", "dispatch_attempts",
 		"dispatch_next_attempt_at", "dispatch_last_error", "published_at", "branch",
-		"cancel_event", "cancel_state", "cancel_next_attempt_at"} {
+		"cancel_event", "cancel_state", "cancel_next_attempt_at", "status_context"} {
 		if !columns[name] {
 			t.Fatalf("migration did not add %s", name)
 		}
@@ -167,6 +167,91 @@ func TestClaimLoomJobStatusIsDurableAndExclusive(t *testing.T) {
 	}
 	if len(deliveries) != 1 || deliveries[0].CommitSHA != "abc" {
 		t.Fatalf("atomic pending outbox = %#v", deliveries)
+	}
+	pending, err := st.ListPendingLocalLoomJobs(ctx)
+	if err != nil || len(pending) != 1 || pending[0].StatusContext != update.Context {
+		t.Fatalf("pending local claim = %+v, %v", pending, err)
+	}
+	if _, err := st.ApplyLoomStatus(ctx, job.WorkflowRunID, LoomStatusUpdate{
+		State: LoomStatusError, Context: update.Context, Source: LoomSourceLocalRecovery,
+		ProtocolEventID: job.WorkflowRunID + ":recovery",
+	}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = st.ListPendingLocalLoomJobs(ctx)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("terminal local job still pending = %+v, %v", pending, err)
+	}
+	if ok, err := st.ApplyLoomStatus(ctx, job.WorkflowRunID, LoomStatusUpdate{
+		State: LoomStatusSuccess, Context: update.Context, Source: LoomSourceLocal,
+		ProtocolEventID: job.WorkflowRunID + ":terminal",
+	}, now.Add(2*time.Second)); err != nil || !ok {
+		t.Fatalf("exact terminal did not supersede recovery = %v, %v", ok, err)
+	}
+	if ok, err := st.ApplyLoomStatus(ctx, job.WorkflowRunID, LoomStatusUpdate{
+		State: LoomStatusError, Context: update.Context, Source: LoomSourceLocalRecovery,
+		ProtocolEventID: job.WorkflowRunID + ":late-recovery",
+	}, now.Add(3*time.Second)); err != nil || ok {
+		t.Fatalf("recovery overwrote exact terminal = %v, %v", ok, err)
+	}
+}
+
+func TestLocalClaimSurvivesTTLAndCapForRecoveryAndReplay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claims.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	base := time.Unix(1_800_000_000, 0).UTC()
+	job := LoomJob{WorkflowRunID: "local:pinned", Owner: "alice", RepoName: "repo", RepoID: "r",
+		CommitSHA: "abc", WorkflowPath: "ci.yml"}
+	pending := LoomStatusUpdate{State: LoomStatusPending, Context: "hive-ci/ci.yml", ProtocolEventID: "local:pinned:pending"}
+	if claimed, err := st.ClaimLoomJobStatus(ctx, job, pending, base, time.Hour, 2); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	for i, id := range []string{"old", "new", "newer"} {
+		other := LoomJob{WorkflowRunID: id, Owner: "alice", RepoName: "repo", RepoID: "r",
+			CommitSHA: "abc", WorkflowPath: "ci.yml"}
+		if err := st.SaveLoomJob(ctx, other, base.Add(time.Duration(i+2)*time.Hour), time.Hour, 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocked := LoomJob{WorkflowRunID: "local:blocked", Owner: "alice", RepoName: "repo", RepoID: "r",
+		CommitSHA: "def", WorkflowPath: "ci.yml"}
+	if claimed, err := st.ClaimLoomJobStatus(ctx, blocked, pending, base.Add(4*time.Hour), time.Hour, 1); err == nil || claimed {
+		t.Fatalf("capacity pressure acquired a second local execution claim: %v, %v", claimed, err)
+	}
+	claims, err := st.ListPendingLocalLoomJobs(ctx)
+	if err != nil || len(claims) != 1 || claims[0].WorkflowRunID != job.WorkflowRunID {
+		t.Fatalf("pending claim after sweep = %+v, %v", claims, err)
+	}
+	if claimed, err := st.ClaimLoomJobStatus(ctx, job, pending, base.Add(5*time.Hour), time.Hour, 2); err != nil || claimed {
+		t.Fatalf("replay of pending claim = %v, %v", claimed, err)
+	}
+	if _, err := st.ApplyLoomStatus(ctx, job.WorkflowRunID, LoomStatusUpdate{
+		State: LoomStatusError, Context: pending.Context, Source: LoomSourceLocalRecovery,
+		ProtocolEventID: "local:pinned:recovery",
+	}, base.Add(5*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SweepLoomJobs(ctx, base.Add(10*time.Hour), time.Hour, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetLoomJobByWorkflowRunID(ctx, job.WorkflowRunID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected detailed job to be swept, got %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if claimed, err := st.ClaimLoomJobStatus(ctx, job, pending, base.Add(11*time.Hour), time.Hour, 2); err != nil || claimed {
+		t.Fatalf("replay after detailed record eviction = %v, %v", claimed, err)
 	}
 }
 

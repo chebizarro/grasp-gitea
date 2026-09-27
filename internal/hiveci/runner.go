@@ -59,6 +59,7 @@ type Config struct {
 // Store resolves NIP-34 repository coordinates to local Gitea repositories.
 type Store interface {
 	GetProvisionedMappingByRepoAddr(ctx context.Context, pubkey string, repoID string) (store.Mapping, error)
+	ListPendingLocalLoomJobs(context.Context) ([]store.LoomJob, error)
 }
 
 // Runner executes act workflows for received NIP-34 push/PR events.
@@ -74,8 +75,9 @@ type Runner struct {
 	triggerRepos    []string
 	policy          *policy.Store
 
-	mu      sync.Mutex
-	started map[string]time.Time
+	mu              sync.Mutex
+	started         map[string]time.Time
+	terminalRetries map[string]loom.Status
 
 	statusSink   loom.StatusSink
 	statusPrefix string
@@ -136,6 +138,7 @@ func New(cfg Config, st Store, repositoriesDir string, logger *slog.Logger) *Run
 		runSlots:        make(chan struct{}, maxConcurrent),
 		triggerRepos:    append([]string(nil), cfg.TriggerRepos...),
 		started:         make(map[string]time.Time),
+		terminalRetries: make(map[string]loom.Status),
 	}
 	return r
 }
@@ -248,6 +251,7 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 		r.logger.Debug("HiveCI: no workflows for commit", "repo", mapping.RepoID, "commit", commit)
 		return nil
 	}
+	var terminalErrors error
 	for _, workflow := range workflows {
 		if r.remote != nil && r.remote.Enabled() && r.dispatchMode != "local" {
 			handled, dispatchErr := r.remote.Dispatch(ctx, loom.DispatchRequest{
@@ -299,15 +303,27 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 		if success {
 			terminalState = store.LoomStatusSuccess
 		}
+		terminal := loom.Status{
+			Ref: ref, State: terminalState, Description: "hive-ci: " + reason,
+			Context: loom.Context(r.statusPrefix, ref.WorkflowPath), Source: store.LoomSourceLocal,
+			ProtocolEventID: ref.WorkflowRunID + ":terminal",
+		}
+		r.mu.Lock()
+		r.terminalRetries[ref.WorkflowRunID] = terminal
+		r.mu.Unlock()
 		statusCtx, statusCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		statusErr := r.setCommitStatus(statusCtx, ref, terminalState, "hive-ci: "+reason, "terminal")
+		statusErr := r.statusSink.Set(statusCtx, terminal)
 		statusCancel()
 		if statusErr != nil {
-			return fmt.Errorf("persist HiveCI terminal status after local execution: %w", statusErr)
+			terminalErrors = errors.Join(terminalErrors, fmt.Errorf("persist HiveCI terminal status after local execution: %w", statusErr))
+			continue
 		}
+		r.mu.Lock()
+		delete(r.terminalRetries, ref.WorkflowRunID)
+		r.mu.Unlock()
 		r.logger.Info("HiveCI local workflow completed", "repo", mapping.RepoID, "branch", branch, "workflow", workflow, "commit", commit, "status", terminalState)
 	}
-	return nil
+	return terminalErrors
 }
 
 func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, trigger, commit, workflow string) (bool, string) {
@@ -599,15 +615,102 @@ func (r *Runner) claimCommitStatus(ctx context.Context, ref loom.Ref, descriptio
 	})
 }
 
-func (r *Runner) setCommitStatus(ctx context.Context, ref loom.Ref, state, description, phase string) error {
+// RecoverInterruptedLocalRuns marks prior-process pending claims with an unknown
+// outcome. It must run before this process accepts CI events or starts local work.
+func (r *Runner) RecoverInterruptedLocalRuns(ctx context.Context) error {
+	if r == nil || r.store == nil {
+		return nil
+	}
 	if r.statusSink == nil {
 		return fmt.Errorf("HiveCI status sink not configured")
 	}
-	return r.statusSink.Set(ctx, loom.Status{
-		Ref: ref, State: state, Description: description,
-		Context: loom.Context(r.statusPrefix, ref.WorkflowPath), Source: store.LoomSourceLocal,
-		ProtocolEventID: ref.WorkflowRunID + ":" + phase,
-	})
+	jobs, err := r.store.ListPendingLocalLoomJobs(ctx)
+	if err != nil {
+		return fmt.Errorf("list interrupted local HiveCI runs: %w", err)
+	}
+	for _, job := range jobs {
+		statusContext := job.StatusContext
+		if statusContext == "" {
+			statusContext = loom.Context(r.statusPrefix, job.WorkflowPath)
+		}
+		status := loom.Status{
+			Ref: loom.Ref{WorkflowRunID: job.WorkflowRunID, Owner: job.Owner, RepoName: job.RepoName,
+				RepoID: job.RepoID, CommitSHA: job.CommitSHA, WorkflowPath: job.WorkflowPath, Branch: job.Branch},
+			State: store.LoomStatusError, Description: "hive-ci: outcome unavailable after interrupted local execution",
+			Context: statusContext, Source: store.LoomSourceLocalRecovery,
+			ProtocolEventID: job.WorkflowRunID + ":recovery",
+		}
+		if err := r.statusSink.Set(ctx, status); err != nil {
+			return fmt.Errorf("recover interrupted local HiveCI run %s: %w", job.WorkflowRunID, err)
+		}
+	}
+	return nil
+}
+
+// RunTerminalRetries retains exact results while this process lives. It never
+// re-executes a workflow; the durable sink handles Gitea delivery separately.
+func (r *Runner) RunTerminalRetries(ctx context.Context) {
+	if r == nil || !r.localEnabled {
+		return
+	}
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.retryTerminalStatuses(ctx)
+		}
+	}
+}
+
+// DrainTerminalRetries gives completed local runs one final bounded chance to
+// persist their exact outcome during graceful shutdown.
+func (r *Runner) DrainTerminalRetries(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		r.retryTerminalStatuses(ctx)
+		r.mu.Lock()
+		remaining := len(r.terminalRetries)
+		r.mu.Unlock()
+		if remaining == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%d local HiveCI terminal statuses remain unpersisted: %w", remaining, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (r *Runner) retryTerminalStatuses(ctx context.Context) {
+	r.mu.Lock()
+	pending := make([]loom.Status, 0, len(r.terminalRetries))
+	for _, status := range r.terminalRetries {
+		pending = append(pending, status)
+	}
+	r.mu.Unlock()
+	for _, status := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := r.statusSink.Set(attemptCtx, status)
+		cancel()
+		if err != nil {
+			r.logger.Warn("HiveCI terminal status persistence retry failed", "run", status.Ref.WorkflowRunID, "error", err)
+			continue
+		}
+		r.mu.Lock()
+		delete(r.terminalRetries, status.Ref.WorkflowRunID)
+		r.mu.Unlock()
+	}
 }
 
 func stableRunID(eventID, commit, workflow, trigger string) string {

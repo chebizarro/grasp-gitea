@@ -126,6 +126,7 @@ func persistedStatus(status Status) (store.LoomJob, store.LoomStatusUpdate) {
 			PublisherPub: status.Ref.PublisherPub, WorkerPub: status.Ref.WorkerPub,
 			Owner: status.Ref.Owner, RepoName: status.Ref.RepoName, RepoID: status.Ref.RepoID,
 			CommitSHA: status.Ref.CommitSHA, WorkflowPath: status.Ref.WorkflowPath, Branch: status.Ref.Branch,
+			StatusContext:    status.Context,
 			WorkflowRunEvent: status.Ref.WorkflowRunEvent, JobRequestEvent: status.Ref.JobRequestEvent,
 		}, store.LoomStatusUpdate{
 			State: status.State, Description: bounded(status.Description, 255),
