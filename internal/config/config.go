@@ -138,6 +138,12 @@ type Config struct {
 	AuthAuditRetention      time.Duration
 	RegistryTokenMaxTTL     time.Duration
 	RegistryTokenProbeEvery time.Duration
+
+	// NostrMetricsEnabled turns on OTEL-via-Nostr metric emission. When true,
+	// subsystems like the registry-token monitor publish metric data points as
+	// signed kind-31420 parametric replaceable events to NostrMetricsRelayURLs.
+	NostrMetricsEnabled   bool
+	NostrMetricsRelayURLs []string
 	// ShutdownGrace bounds graceful HTTP shutdown; long enough for active
 	// streaming git/package uploads to complete.
 	ShutdownGrace time.Duration
@@ -249,10 +255,18 @@ func Load() (Config, error) {
 		TokenTTLMin:                 durationEnv("BRIDGE_TOKEN_TTL_MIN", time.Hour),
 		TokenTTLMax:                 durationEnv("BRIDGE_TOKEN_TTL_MAX", 90*24*time.Hour),
 		AuthAuditRetention:          boundedDurationEnv("AUTH_AUDIT_RETENTION", 90*24*time.Hour, 24*time.Hour, 365*24*time.Hour),
-		RegistryTokenMaxTTL:         durationEnv("REGISTRY_TOKEN_MAX_LIFETIME", 24*time.Hour),
-		RegistryTokenProbeEvery:     durationEnv("REGISTRY_TOKEN_PROBE_INTERVAL", 5*time.Minute),
+		RegistryTokenMaxTTL:         durationEnv("REGISTRY_TOKEN_MAX_LIFETIME", 36*time.Hour),
+		RegistryTokenProbeEvery:     durationEnv("REGISTRY_TOKEN_PROBE_INTERVAL", 6*time.Hour),
+		NostrMetricsEnabled:         boolEnv("NOSTR_METRICS_ENABLED", false),
+		NostrMetricsRelayURLs:       csvEnv("NOSTR_METRICS_RELAY_URLS"),
 		ShutdownGrace:               boundedDurationEnv("SHUTDOWN_GRACE", 5*time.Minute, time.Second, 30*time.Minute),
 	}
+	// Nostr metrics relay URLs default to the bridge relay URLs when not
+	// explicitly configured — metrics publish alongside other bridge events.
+	if cfg.NostrMetricsEnabled && len(cfg.NostrMetricsRelayURLs) == 0 {
+		cfg.NostrMetricsRelayURLs = cfg.RelayURLs
+	}
+
 	_, policyStatErr := os.Stat(cfg.PolicyPath)
 	hasPersistedPolicy := policyStatErr == nil
 	if policyStatErr != nil && !errors.Is(policyStatErr, os.ErrNotExist) {

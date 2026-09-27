@@ -27,6 +27,8 @@ func setBridgeBaseEnv(t *testing.T) {
 	t.Setenv("BRIDGE_TOKEN_TTL_MAX", "")
 	t.Setenv("REGISTRY_TOKEN_MAX_LIFETIME", "")
 	t.Setenv("REGISTRY_TOKEN_PROBE_INTERVAL", "")
+	t.Setenv("NOSTR_METRICS_ENABLED", "")
+	t.Setenv("NOSTR_METRICS_RELAY_URLS", "")
 	t.Setenv("GRASP_ENV", "")
 	t.Setenv("AUTH_ENABLED", "")
 	t.Setenv("ADMIN_API_TOKEN", "")
@@ -115,7 +117,7 @@ func TestBridgeTokensConfigValidation(t *testing.T) {
 	if len(cfg.CredentialKeys) != 1 || cfg.CredentialKeys[0].ID != "current" {
 		t.Fatalf("credential keys = %+v", cfg.CredentialKeys)
 	}
-	if cfg.RegistryTokenMaxTTL != 24*time.Hour || cfg.RegistryTokenProbeEvery != 5*time.Minute {
+	if cfg.RegistryTokenMaxTTL != 36*time.Hour || cfg.RegistryTokenProbeEvery != 6*time.Hour {
 		t.Fatalf("registry monitor defaults = (%s, %s)", cfg.RegistryTokenMaxTTL, cfg.RegistryTokenProbeEvery)
 	}
 }
@@ -132,6 +134,38 @@ func TestRegistryTokenMonitorConfigValidation(t *testing.T) {
 	t.Setenv("REGISTRY_TOKEN_PROBE_INTERVAL", "-1s")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REGISTRY_TOKEN_PROBE_INTERVAL") {
 		t.Fatalf("non-positive probe interval accepted: %v", err)
+	}
+}
+
+func TestNostrMetricsRelayURLFallback(t *testing.T) {
+	setBridgeBaseEnv(t)
+	t.Setenv("NOSTR_METRICS_ENABLED", "true")
+	// No NOSTR_METRICS_RELAY_URLS — should fall back to RELAY_URLS.
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.NostrMetricsEnabled {
+		t.Fatal("NostrMetricsEnabled = false")
+	}
+	if len(cfg.NostrMetricsRelayURLs) != 1 || cfg.NostrMetricsRelayURLs[0] != "wss://relay.example.com" {
+		t.Fatalf("NostrMetricsRelayURLs = %v, want fallback to RELAY_URLS", cfg.NostrMetricsRelayURLs)
+	}
+}
+
+func TestNostrMetricsExplicitRelays(t *testing.T) {
+	setBridgeBaseEnv(t)
+	t.Setenv("NOSTR_METRICS_ENABLED", "true")
+	t.Setenv("NOSTR_METRICS_RELAY_URLS", "wss://metrics-relay.example.com,wss://metrics-relay2.example.com")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.NostrMetricsRelayURLs) != 2 {
+		t.Fatalf("NostrMetricsRelayURLs = %v", cfg.NostrMetricsRelayURLs)
+	}
+	if cfg.NostrMetricsRelayURLs[0] != "wss://metrics-relay.example.com" {
+		t.Fatalf("first relay = %q", cfg.NostrMetricsRelayURLs[0])
 	}
 }
 
