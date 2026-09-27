@@ -26,7 +26,7 @@ Phases (see §9). Each is implemented by a dedicated agent, verified, and commit
 2. **Offline signer.** Publishing is **eventually-consistent** via the Phase-B queue
    (retry/backoff, TTL/dead-letter). When an owner/contributor signer is offline, the event is
    deferred and retried; it is never dropped silently (dead-letter is surfaced via metrics).
-3. **CI (5401)** stays operator-signed (executor attestation), not user-signed.
+3. **Hive-CI Workflow Run (5401)** is a bridge-signed workflow record, not user-authored content or an executor attestation. The result is kind 5402, signed by the declared ephemeral publisher.
 4. **Crypto.** Grants encrypted at rest with `golang.org/x/crypto/nacl/secretbox` using a
    32-byte master key from env (`SIGNER_MASTER_KEY`, base64/hex); plaintext keys never persisted.
 
@@ -54,7 +54,7 @@ Signing model today (`internal/publisher`, `internal/webhook`):
 | 1621 | issue | **bridge** | contributor ✗ |
 | 1630–1633 | status | **bridge** | actor ✗ |
 | 1985 | NIP-32 label | **bridge** | labeler ✗ |
-| 5401 | CI workflow run *(GRASP ext.)* | **bridge** | executor ✅ (attestation) |
+| 5401 | Hive-CI Workflow Run | **bridge** | bridge (workflow record) ✅ |
 | 10317 | user grasp list | (guardrailed, unimplemented) | owner |
 
 NIP-46 status: **authentication-only**. `auth.BunkerConnector` is an abstract interface,
@@ -86,7 +86,7 @@ architectural facts:
    events (30617 announcement, 30618 state). **Contributor-authored** events (1617 patch,
    1621 issue, status, labels) must be signed by the **acting user's** key, so each
    contributor who acts through Gitea needs their *own* signer grant. Operator
-   **attestations** (5401 CI) are legitimately signed by the executor and stay that way.
+   **workflow-run records** (5401) are signed by the bridge; workflow results (5402) are signed by the declared ephemeral publisher.
 
 ## 4. Target architecture
 
@@ -128,7 +128,7 @@ architectural facts:
   challenge), mapping Gitea user → pubkey → grant.
 
 The bridge keeps its own key only as (a) the NIP-46 *client* identity used to talk to bunkers
-and (b) the signer of operator attestations (5401). It can no longer forge user content — a
+and (b) the signer of bridge-authored workflow-run records (5401). It can no longer forge user content — a
 material security improvement (§8).
 
 ## 5. Event-by-event migration
@@ -142,7 +142,7 @@ material security improvement (§8).
 | 1621 issue | actor | queue → actor grant | fallback policy for unlinked actors (§9-D) |
 | 1630–1633 status | actor/maintainer | queue → actor grant; proper e/a/p/r markers | |
 | 1985 label | labeler/maintainer | queue → labeler grant | |
-| 5401 CI run | executor (bridge/CI key) | stays operator-signed | documented as attestation, not NIP-34 core |
+| 5401 Workflow Run | bridge | stays bridge-signed | Hive-CI protocol record, not NIP-34 core or an executor attestation |
 | 10317 grasp list | owner | owner-signed cache + rebroadcast | tracked by phase1-kyg |
 
 ## 6. Full NIP-34 compliance expansion

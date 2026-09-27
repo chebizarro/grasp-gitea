@@ -5,8 +5,6 @@ import cascadia "git.sharegap.net/cascadia/cascadia-nips/generated/go"
 const (
 	KindRepositoryAnnouncement = 30617
 	KindRepositoryState        = 30618
-	KindCheckRunResult         = 30315 // Legacy Hive-CI check result; not NIP-38 user status.
-	KindCASAudit               = cascadia.CAS_AUDIT
 	KindPatch                  = 1617
 	KindPROpen                 = 1618
 	KindPRUpdate               = 1619

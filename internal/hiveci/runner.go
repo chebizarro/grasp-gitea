@@ -1,8 +1,8 @@
 // Copyright 2026 Sharegap contributors. All rights reserved.
 // Use of this source code is governed by a BSD-style license.
 
-// Package hiveci runs fleet-local act-based checks for NIP-34 repository
-// activity and publishes signed check-run attestations back to Nostr.
+// Package hiveci runs local act-based checks for NIP-34 repository activity
+// and records their outcomes as durable Gitea commit statuses.
 package hiveci
 
 import (
@@ -37,10 +37,7 @@ import (
 
 const (
 	defaultActPath       = "/usr/bin/act"
-	checkResultSchema    = "hiveci.check_run.v1"
-	auditSchema          = "hiveci.audit.gate_decision.v1"
-	auditType            = "CAS_AUDIT"
-	maxPublishedLogBytes = 8192
+	maxRunOutputBytes    = 8192
 	defaultRunTimeout    = 15 * time.Minute
 	defaultMaxConcurrent = 2
 	maxStartedEntries    = 4096
@@ -64,21 +61,12 @@ type Store interface {
 	GetProvisionedMappingByRepoAddr(ctx context.Context, pubkey string, repoID string) (store.Mapping, error)
 }
 
-// Signer signs operator-authored check/audit events. In production this is the
-// Signet-backed server signer; BRIDGE_NSEC only reaches this interface in dev.
-type Signer interface {
-	PublicKey() string
-	SignEvent(ctx context.Context, ev *nostr.Event) error
-}
-
 // Runner executes act workflows for received NIP-34 push/PR events.
 type Runner struct {
 	enabled         bool
 	localEnabled    bool
 	actPath         string
 	store           Store
-	signer          Signer
-	relayURLs       []string
 	repositoriesDir string
 	logger          *slog.Logger
 	runTimeout      time.Duration
@@ -89,7 +77,6 @@ type Runner struct {
 	mu      sync.Mutex
 	started map[string]time.Time
 
-	publish      func(context.Context, *nostr.Event) error
 	statusSink   loom.StatusSink
 	statusPrefix string
 	remote       RemoteDispatcher
@@ -118,28 +105,8 @@ type branchTip struct {
 	Commit string
 }
 
-type runRecord struct {
-	SchemaVersion string `json:"schema_version"`
-	Project       string `json:"project"`
-	Repository    string `json:"repository"`
-	RepoID        string `json:"repo_id"`
-	OwnerPubkey   string `json:"owner_pubkey"`
-	SourceEventID string `json:"source_event_id"`
-	SourceRelay   string `json:"source_relay,omitempty"`
-	Trigger       string `json:"trigger"`
-	Branch        string `json:"branch,omitempty"`
-	Commit        string `json:"commit"`
-	Workflow      string `json:"workflow"`
-	Result        string `json:"result"`
-	Reason        string `json:"reason"`
-	BlocksMerge   bool   `json:"blocks_merge"`
-	ExitCode      int    `json:"exit_code"`
-	DurationMS    int64  `json:"duration_ms"`
-	OutputTail    string `json:"output_tail,omitempty"`
-}
-
 // New creates a runner. Disabled runners are safe no-ops.
-func New(cfg Config, st Store, signer Signer, relayURLs []string, repositoriesDir string, logger *slog.Logger) *Runner {
+func New(cfg Config, st Store, repositoriesDir string, logger *slog.Logger) *Runner {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -157,14 +124,12 @@ func New(cfg Config, st Store, signer Signer, relayURLs []string, repositoriesDi
 	} else if maxConcurrent > 16 {
 		maxConcurrent = 16
 	}
-	localEnabled := cfg.Enabled && st != nil && signer != nil && repositoriesDir != "" && actPath != ""
+	localEnabled := cfg.Enabled && st != nil && repositoriesDir != "" && actPath != ""
 	r := &Runner{
 		enabled:         localEnabled,
 		localEnabled:    localEnabled,
 		actPath:         actPath,
 		store:           st,
-		signer:          signer,
-		relayURLs:       append([]string(nil), relayURLs...),
 		repositoriesDir: repositoriesDir,
 		logger:          logger,
 		runTimeout:      runTimeout,
@@ -172,7 +137,6 @@ func New(cfg Config, st Store, signer Signer, relayURLs []string, repositoriesDi
 		triggerRepos:    append([]string(nil), cfg.TriggerRepos...),
 		started:         make(map[string]time.Time),
 	}
-	r.publish = r.publishToRelays
 	return r
 }
 
@@ -209,13 +173,13 @@ func (r *Runner) SetRemoteDispatcher(dispatcher RemoteDispatcher, mode string) {
 	}
 }
 
-// Enabled reports whether the runner can execute checks and publish results.
+// Enabled reports whether the runner can execute checks.
 func (r *Runner) Enabled() bool {
 	return r != nil && r.enabled
 }
 
 // HandleEvent consumes NIP-34 repository state (push) and PR/patch events.
-func (r *Runner) HandleEvent(ctx context.Context, ev *nostr.Event, sourceRelay string) error {
+func (r *Runner) HandleEvent(ctx context.Context, ev *nostr.Event) error {
 	if !r.Enabled() || ev == nil {
 		return nil
 	}
@@ -226,15 +190,15 @@ func (r *Runner) HandleEvent(ctx context.Context, ev *nostr.Event, sourceRelay s
 	ctx = telemetry.ContextWithTraceTags(ctx, tagValue(ev.Tags, "traceparent"), tagValue(ev.Tags, "tracestate"))
 	switch ev.Kind {
 	case relay.KindRepositoryState:
-		return r.handleRepositoryState(ctx, ev, sourceRelay)
+		return r.handleRepositoryState(ctx, ev)
 	case relay.KindPatch, relay.KindPROpen, relay.KindPRUpdate:
-		return r.handlePullRequestEvent(ctx, ev, sourceRelay)
+		return r.handlePullRequestEvent(ctx, ev)
 	default:
 		return nil
 	}
 }
 
-func (r *Runner) handleRepositoryState(ctx context.Context, ev *nostr.Event, sourceRelay string) error {
+func (r *Runner) handleRepositoryState(ctx context.Context, ev *nostr.Event) error {
 	repoID := tagValue(ev.Tags, "d")
 	if repoID == "" {
 		return nil
@@ -244,14 +208,14 @@ func (r *Runner) handleRepositoryState(ctx context.Context, ev *nostr.Event, sou
 		return err
 	}
 	for _, tip := range branchTips(ev.Tags) {
-		if err := r.runForCommit(ctx, mapping, ev, sourceRelay, "push", tip.Branch, tip.Commit); err != nil {
+		if err := r.runForCommit(ctx, mapping, ev, "push", tip.Branch, tip.Commit); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (r *Runner) handlePullRequestEvent(ctx context.Context, ev *nostr.Event, sourceRelay string) error {
+func (r *Runner) handlePullRequestEvent(ctx context.Context, ev *nostr.Event) error {
 	mapping, ok, err := r.mappingForAddress(ctx, ev)
 	if err != nil || !ok {
 		return err
@@ -262,10 +226,10 @@ func (r *Runner) handlePullRequestEvent(ctx context.Context, ev *nostr.Event, so
 		return nil
 	}
 	branch := firstNonEmpty(tagValue(ev.Tags, "branch-name"), tagValue(ev.Tags, "branch"), "pr")
-	return r.runForCommit(ctx, mapping, ev, sourceRelay, "pull_request", branch, commit)
+	return r.runForCommit(ctx, mapping, ev, "pull_request", branch, commit)
 }
 
-func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *nostr.Event, sourceRelay, trigger, branch, commit string) error {
+func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *nostr.Event, trigger, branch, commit string) error {
 	if !r.isRepoCIAllowed(mapping) {
 		return nil
 	}
@@ -330,51 +294,28 @@ func (r *Runner) runForCommit(ctx context.Context, mapping store.Mapping, ev *no
 			// Delivery retries must never acquire execution ownership.
 			continue
 		}
-		record := r.runWorkflow(ctx, mapping, ev, sourceRelay, trigger, branch, commit, workflow)
+		success, reason := r.runWorkflow(ctx, mapping, trigger, commit, workflow)
 		terminalState := store.LoomStatusFailure
-		if record.Result == "success" {
+		if success {
 			terminalState = store.LoomStatusSuccess
 		}
-		if err := r.setCommitStatus(ctx, ref, terminalState, "hive-ci: "+record.Reason, "terminal"); err != nil {
-			// Delivery persistence is deliberately outside the execution/retry path:
-			// a Gitea failure must never cause act to run again.
-			r.logger.Error("HiveCI terminal status enqueue failed", "repo", mapping.RepoID, "workflow", workflow, "error", err)
+		statusCtx, statusCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		statusErr := r.setCommitStatus(statusCtx, ref, terminalState, "hive-ci: "+reason, "terminal")
+		statusCancel()
+		if statusErr != nil {
+			return fmt.Errorf("persist HiveCI terminal status after local execution: %w", statusErr)
 		}
-		if err := r.publishRun(ctx, mapping, record); err != nil {
-			return err
-		}
-		r.logger.Info("HiveCI check run published", "repo", mapping.RepoID, "branch", branch, "workflow", workflow, "commit", commit, "result", record.Result)
+		r.logger.Info("HiveCI local workflow completed", "repo", mapping.RepoID, "branch", branch, "workflow", workflow, "commit", commit, "status", terminalState)
 	}
 	return nil
 }
 
-func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, ev *nostr.Event, sourceRelay, trigger, branch, commit, workflow string) runRecord {
-	start := time.Now()
-	rec := runRecord{
-		SchemaVersion: checkResultSchema,
-		Project:       mapping.Owner + "/" + mapping.RepoID,
-		Repository:    mapping.Owner + "/" + mapping.RepoName,
-		RepoID:        mapping.RepoID,
-		OwnerPubkey:   mapping.Pubkey,
-		SourceEventID: ev.ID.Hex(),
-		SourceRelay:   sourceRelay,
-		Trigger:       trigger,
-		Branch:        branch,
-		Commit:        commit,
-		Workflow:      workflow,
-		Result:        "failure",
-		Reason:        "act did not complete",
-		BlocksMerge:   true,
-		ExitCode:      -1,
-	}
-
+func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, trigger, commit, workflow string) (bool, string) {
 	select {
 	case r.runSlots <- struct{}{}:
 		defer func() { <-r.runSlots }()
 	case <-ctx.Done():
-		rec.Reason = "run cancelled while waiting for concurrency slot: " + ctx.Err().Error()
-		rec.DurationMS = time.Since(start).Milliseconds()
-		return rec
+		return false, "run cancelled while waiting for concurrency slot: " + ctx.Err().Error()
 	}
 
 	runTimeout := r.runTimeout
@@ -386,9 +327,7 @@ func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, ev *nos
 	repoPath := filepath.Join(r.repositoriesDir, mapping.Owner, mapping.RepoName+".git")
 	parent, err := os.MkdirTemp("", "hiveci-*")
 	if err != nil {
-		rec.Reason = "create temp dir: " + err.Error()
-		rec.DurationMS = time.Since(start).Milliseconds()
-		return rec
+		return false, "create temp dir: " + err.Error()
 	}
 	defer os.RemoveAll(parent)
 	worktree := filepath.Join(parent, "worktree")
@@ -403,163 +342,23 @@ func (r *Runner) runWorkflow(ctx context.Context, mapping store.Mapping, ev *nos
 
 	if out, err := exec.CommandContext(runCtx, "git", "--git-dir", repoPath, "worktree", "add", "--detach", worktree, commit).CombinedOutput(); err != nil {
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			rec.Reason = "HiveCI run timed out after " + runTimeout.String()
-		} else {
-			rec.Reason = commandError("git worktree add", err, out)
+			return false, "HiveCI run timed out after " + runTimeout.String()
 		}
-		rec.OutputTail = tailString(string(out), maxPublishedLogBytes)
-		rec.DurationMS = time.Since(start).Milliseconds()
-		return rec
+		return false, commandError("git worktree add", err, out)
 	}
 	added = true
 
 	cmd := exec.Command(r.actPath, trigger, "-W", workflow, "--rm")
 	cmd.Dir = worktree
 	cmd.Env = r.workflowEnvironment()
-	out, err := runBoundedCommand(runCtx, cmd, maxPublishedLogBytes)
-	rec.OutputTail = tailString(string(out), maxPublishedLogBytes)
-	rec.DurationMS = time.Since(start).Milliseconds()
+	out, err := runBoundedCommand(runCtx, cmd, maxRunOutputBytes)
 	if err != nil {
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			rec.Reason = "HiveCI run timed out after " + runTimeout.String()
-		} else {
-			rec.Reason = commandError("act", err, out)
+			return false, "HiveCI run timed out after " + runTimeout.String()
 		}
-		rec.ExitCode = exitCode(err)
-		return rec
+		return false, commandError("act", err, out)
 	}
-	rec.Result = "success"
-	rec.Reason = "act completed successfully"
-	rec.BlocksMerge = false
-	rec.ExitCode = 0
-	return rec
-}
-
-func (r *Runner) publishRun(ctx context.Context, mapping store.Mapping, rec runRecord) error {
-	statusEv, err := r.buildCheckResultEvent(mapping, rec)
-	if err != nil {
-		return err
-	}
-	if err := r.publish(ctx, statusEv); err != nil {
-		return fmt.Errorf("publish HiveCI check result: %w", err)
-	}
-	auditEv, err := r.buildAuditEvent(mapping, rec)
-	if err != nil {
-		return err
-	}
-	if err := r.publish(ctx, auditEv); err != nil {
-		return fmt.Errorf("publish HiveCI audit result: %w", err)
-	}
-	return nil
-}
-
-func (r *Runner) buildCheckResultEvent(mapping store.Mapping, rec runRecord) (*nostr.Event, error) {
-	content, err := json.Marshal(rec)
-	if err != nil {
-		return nil, err
-	}
-	tags := commonRunTags(mapping, rec)
-	tags = append(tags,
-		nostr.Tag{"d", "hiveci:check:" + stableRunID(rec)},
-		nostr.Tag{"status", rec.Result},
-	)
-	ev := &nostr.Event{CreatedAt: nostr.Now(), Kind: relay.KindCheckRunResult, Tags: tags, Content: string(content)}
-	return ev, r.sign(context.Background(), ev)
-}
-
-func (r *Runner) buildAuditEvent(mapping store.Mapping, rec runRecord) (*nostr.Event, error) {
-	audit := map[string]any{
-		"schema_version":  auditSchema,
-		"project":         rec.Project,
-		"repository":      rec.Repository,
-		"decision":        rec.Result,
-		"reason":          rec.Reason,
-		"blocks_merge":    rec.BlocksMerge,
-		"source_event_id": rec.SourceEventID,
-		"commit":          rec.Commit,
-		"branch":          rec.Branch,
-		"workflow":        rec.Workflow,
-		"duration_ms":     rec.DurationMS,
-		"exit_code":       rec.ExitCode,
-	}
-	content, err := json.Marshal(audit)
-	if err != nil {
-		return nil, err
-	}
-	tags := commonRunTags(mapping, rec)
-	tags = append(tags,
-		nostr.Tag{"d", "hiveci:audit:" + stableRunID(rec)},
-		nostr.Tag{"audit_type", auditType},
-		nostr.Tag{"decision", rec.Result},
-	)
-	ev := &nostr.Event{CreatedAt: nostr.Now(), Kind: relay.KindCASAudit, Tags: tags, Content: string(content)}
-	return ev, r.sign(context.Background(), ev)
-}
-
-func commonRunTags(mapping store.Mapping, rec runRecord) nostr.Tags {
-	aTag := fmt.Sprintf("%d:%s:%s", relay.KindRepositoryAnnouncement, mapping.Pubkey, mapping.RepoID)
-	tags := nostr.Tags{
-		{"project", rec.Project},
-		{"a", aTag},
-		{"p", mapping.Pubkey},
-		{"commit", rec.Commit},
-		{"workflow", rec.Workflow},
-		{"triggered-by", rec.Trigger},
-		{"event", rec.SourceEventID},
-	}
-	if rec.Branch != "" {
-		tags = append(tags, nostr.Tag{"branch", rec.Branch})
-	}
-	if rec.SourceRelay != "" {
-		tags = append(tags, nostr.Tag{"relay", rec.SourceRelay})
-	}
-	return tags
-}
-
-func (r *Runner) sign(ctx context.Context, ev *nostr.Event) error {
-	if r.signer == nil {
-		return fmt.Errorf("HiveCI signer not configured")
-	}
-	pk, err := nostr.PubKeyFromHex(r.signer.PublicKey())
-	if err != nil {
-		return fmt.Errorf("invalid HiveCI signer pubkey: %w", err)
-	}
-	ev.PubKey = pk
-	ev.ID = nostr.ID{}
-	ev.Sig = [64]byte{}
-	return r.signer.SignEvent(ctx, ev)
-}
-
-func (r *Runner) publishToRelays(ctx context.Context, ev *nostr.Event) error {
-	relayURLs := r.relayURLs
-	if snapshot := r.policy.Current(); snapshot != nil {
-		relayURLs = snapshot.HiveCINostrRelays
-	}
-	if len(relayURLs) == 0 {
-		return fmt.Errorf("no relay URLs configured")
-	}
-	var succeeded int
-	for _, url := range relayURLs {
-		pubCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		relayConn, err := nostr.RelayConnect(pubCtx, url, nostr.RelayOptions{})
-		if err != nil {
-			cancel()
-			r.logger.Warn("HiveCI relay connect failed", "relay", url, "error", err)
-			continue
-		}
-		err = relayConn.Publish(pubCtx, *ev)
-		relayConn.Close()
-		cancel()
-		if err != nil {
-			r.logger.Warn("HiveCI relay publish failed", "relay", url, "event", ev.ID.Hex(), "error", err)
-			continue
-		}
-		succeeded++
-	}
-	if succeeded == 0 {
-		return fmt.Errorf("event %s rejected by all %d relays", ev.ID.Hex(), len(relayURLs))
-	}
-	return nil
+	return true, "act completed successfully"
 }
 
 func (r *Runner) mappingForState(ctx context.Context, ev *nostr.Event, repoID string) (store.Mapping, bool, error) {
@@ -782,9 +581,8 @@ func runKey(eventID, commit, workflow string) string {
 }
 
 func localStatusRef(mapping store.Mapping, ev *nostr.Event, trigger, commit, workflow string) loom.Ref {
-	rec := runRecord{SourceEventID: ev.ID.Hex(), Commit: commit, Workflow: workflow, Trigger: trigger}
 	return loom.Ref{
-		WorkflowRunID: "local:" + stableRunID(rec), Owner: mapping.Owner,
+		WorkflowRunID: "local:" + stableRunID(ev.ID.Hex(), commit, workflow, trigger), Owner: mapping.Owner,
 		RepoName: mapping.RepoName, RepoID: mapping.RepoID, CommitSHA: commit,
 		WorkflowPath: workflow,
 	}
@@ -792,7 +590,7 @@ func localStatusRef(mapping store.Mapping, ev *nostr.Event, trigger, commit, wor
 
 func (r *Runner) claimCommitStatus(ctx context.Context, ref loom.Ref, description string) (bool, error) {
 	if r.statusSink == nil {
-		return true, nil
+		return false, fmt.Errorf("HiveCI status sink not configured")
 	}
 	return r.statusSink.Claim(ctx, loom.Status{
 		Ref: ref, State: store.LoomStatusPending, Description: description,
@@ -803,7 +601,7 @@ func (r *Runner) claimCommitStatus(ctx context.Context, ref loom.Ref, descriptio
 
 func (r *Runner) setCommitStatus(ctx context.Context, ref loom.Ref, state, description, phase string) error {
 	if r.statusSink == nil {
-		return nil
+		return fmt.Errorf("HiveCI status sink not configured")
 	}
 	return r.statusSink.Set(ctx, loom.Status{
 		Ref: ref, State: state, Description: description,
@@ -812,8 +610,8 @@ func (r *Runner) setCommitStatus(ctx context.Context, ref loom.Ref, state, descr
 	})
 }
 
-func stableRunID(rec runRecord) string {
-	sum := sha256.Sum256([]byte(rec.SourceEventID + "\x00" + rec.Commit + "\x00" + rec.Workflow + "\x00" + rec.Trigger))
+func stableRunID(eventID, commit, workflow, trigger string) string {
+	sum := sha256.Sum256([]byte(eventID + "\x00" + commit + "\x00" + workflow + "\x00" + trigger))
 	return hex.EncodeToString(sum[:12])
 }
 
@@ -890,14 +688,6 @@ func commandError(prefix string, err error, output []byte) string {
 		return fmt.Sprintf("%s: %v: %s", prefix, err, tailString(msg, 512))
 	}
 	return fmt.Sprintf("%s: %v", prefix, err)
-}
-
-func exitCode(err error) int {
-	var exitErr *exec.ExitError
-	if err != nil && errors.As(err, &exitErr) {
-		return exitErr.ExitCode()
-	}
-	return -1
 }
 
 func tailString(s string, max int) string {

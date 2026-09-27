@@ -4,7 +4,7 @@
 
 The webhook bridge converts Gitea activity into NIP-34/NIP-22 Nostr events. The current model is user-signed by default when the signer subsystem is enabled: webhook handlers build unsigned event templates, enqueue them in the outbound signing queue, and publish only after the relevant user's NIP-46 bunker grant signs the event.
 
-CI workflow-run events (`kind:5401`) are the exception: they remain operator-signed because they are executor attestations, but production signing goes through the Signet/NIP-46 `SIGNET_BUNKER_URL` path so the bridge holds no nsec.
+Hive-CI Workflow Run events (`kind:5401`) are bridge-authored workflow records, not user content or executor attestations. Production signing goes through the Signet/NIP-46 `SIGNET_BUNKER_URL` path so the bridge holds no nsec; the declared ephemeral publisher signs the corresponding `5402` result.
 
 ## Signing model
 
@@ -14,7 +14,7 @@ CI workflow-run events (`kind:5401`) are the exception: they remain operator-sig
 | `30618` repository state | Owner grant → outbound queue → NIP-46 signer → relay | If the signer subsystem is disabled, legacy bridge-signed transition fallback remains intentional. |
 | Contributor webhook events (`1617`, `1618`, `1619`, `1621`, `1630`-`1633`, `1985`) | Acting user's grant → outbound queue → NIP-46 signer → relay | Unlinked actors are skipped, not bridge-signed, and counted by `unlinked_actor_skipped`. |
 | NIP-22 comments (`1111`) | Acting user's grant → outbound queue → NIP-46 signer → relay | Used for comment/review threading. |
-| CI workflow run (`5401`) | Operator Signet bunker (`SIGNET_BUNKER_URL`) | GRASP extension / executor attestation; `BRIDGE_NSEC` is dev fallback only. |
+| Hive-CI Workflow Run (`5401`) | Operator Signet bunker (`SIGNET_BUNKER_URL`) | Bridge-signed Hive-CI protocol record; `BRIDGE_NSEC` is dev fallback only. |
 
 ## Configuration
 

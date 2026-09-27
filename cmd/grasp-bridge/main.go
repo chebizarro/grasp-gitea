@@ -28,8 +28,8 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/hooks"
 	"github.com/sharegap/grasp-gitea/internal/loom"
 	"github.com/sharegap/grasp-gitea/internal/nip05affiliation"
-	"github.com/sharegap/grasp-gitea/internal/nostrmetrics"
 	"github.com/sharegap/grasp-gitea/internal/nip05resolve"
+	"github.com/sharegap/grasp-gitea/internal/nostrmetrics"
 	"github.com/sharegap/grasp-gitea/internal/outbox"
 	"github.com/sharegap/grasp-gitea/internal/policy"
 	"github.com/sharegap/grasp-gitea/internal/proactivesync"
@@ -507,7 +507,7 @@ func main() {
 		TriggerRepos:  cfg.CITriggerRepos,
 		RunTimeout:    cfg.HiveCIRunTimeout,
 		MaxConcurrent: cfg.HiveCIMaxConcurrent,
-	}, st, serverSigner, relayURLs, cfg.GiteaRepositoriesDir, logger)
+	}, st, cfg.GiteaRepositoriesDir, logger)
 	hiveRunner.SetPolicyStore(policies)
 	hiveRunner.SetStatusSink(statusSink, cfg.LoomStatusContextPrefix)
 	hiveRunner.SetWorkflowAuthorizer(proactiveSyncSvc)
@@ -784,7 +784,7 @@ func main() {
 			unlock()
 		}
 		if hiveRunner != nil {
-			if hiveErr := hiveRunner.HandleEvent(ctx, ev, sourceRelay); hiveErr != nil {
+			if hiveErr := hiveRunner.HandleEvent(ctx, ev); hiveErr != nil {
 				logger.Warn("Hive-CI runner failed", "event", ev.ID, "kind", ev.Kind, "error", hiveErr)
 			}
 		}

@@ -41,19 +41,16 @@ Non-goals for this design: building a Loom worker; a general Cashu wallet
 The original design found two divergent CI code paths. The canonical Loom path
 is now implemented and the dead-end ContextVM publisher has been retired:
 
-| Path | File | Kinds | Signed by | What it does |
-|---|---|---|---|---|
-| **Tier A local runner** | `internal/hiveci/runner.go` | consumes `30618`/`1617`/`1618`/`1619`; publishes `30315` (check result) + `4903` (CAS audit) | operator/server signer | Detects workflows at a commit, runs `act` locally in a worktree, publishes signed check + audit attestations **to Nostr only**. Just hardened to owner/maintainer-authored workflows only (`workflowAuthorAuthorized`). |
-| **Loom dispatcher** | `internal/loom/dispatcher.go` | publishes fleet-local `5401` plus p-tag-targeted `5100` | ephemeral workflow signer | Detects accepted state and dispatches one canonical workflow attempt. |
+| Path | File | Wire kinds | Outcome |
+|---|---|---|---|
+| **Tier A local runner** | `internal/hiveci/runner.go` | consumes NIP-34 repository state and PR events; emits no CI result event | Runs authorized workflows with `act` locally and records pending/terminal results through the durable Gitea commit-status sink. |
+| **Loom dispatcher and inbound service** | `internal/loom/dispatcher.go`, `internal/loom/service.go` | publishes canonical Hive-CI `5401` and Loom `5100`; consumes `5402`/`5101` results | Dispatches one remote workflow attempt and records its result through the same status sink. |
 
 Key facts established during discovery:
 
-- **No Gitea commit-status/check-run writer exists.** `internal/gitea/client.go`
-  exposes `CreateIssue`, `CreatePullRequest`, `CreateIssueComment`, `SetIssueState`,
-  `AddIssueLabel`, `RemoveIssueLabel` — and **no** `POST /repos/{owner}/{repo}/statuses/{sha}`.
-  The reflector (`internal/reflector/reflector.go`) maps NIP-34 status kinds
-  `1630`–`1633` only to `SetIssueState` (open/closed issues). So today, **CI
-  results are never surfaced in the Gitea UI.**
+- **Both execution paths use durable Gitea commit statuses.** The local runner
+  claims a pending status before executing and records one terminal outcome;
+  remote Loom results use the same status sink.
 - **Authorization helper is ready.** `internal/nostrauthz.Resolver`
   (`NewResolver([]nostr.Event)`, `Resolve(coord)`, `IsAuthorized(pubkey, coord)`)
   resolves owner + recursive maintainer authority from cryptographically valid
@@ -64,8 +61,8 @@ Key facts established during discovery:
   provisioner → reflector → CI trigger → proactive sync → `hiveRunner`.
   The subscription kind set lives in `internal/relay/subscriber.go`
   (`subscriptionFilter()`), and kind constants in `internal/relay/kinds.go`.
-- **Signer** is the Signet/NIP-46 `ServerSigner` (or `BRIDGE_NSEC` dev fallback),
-  reused by both publisher and hiveci runner.
+- **Signer** is the Signet/NIP-46 `ServerSigner` (or `BRIDGE_NSEC` dev fallback)
+  for signed relay publications. The local `act` runner does not publish CI results to relays.
 
 ### 2a. Protocol dialect resolution
 
@@ -126,9 +123,6 @@ KindLoomJobCancel   = 5102
 KindHiveWorkflowRun    = 5401
 KindHiveWorkflowResult = 5402
 ```
-
-> Note `KindCheckRunResult` (`30315`) already exists for the Tier-A local-runner
-> attestation; it is orthogonal to the Loom kinds and is retained.
 
 ---
 
@@ -309,19 +303,10 @@ loom_jobs(
 
 Bounded by TTL/row cap (reuse the sweep pattern from `hiveci` `markStarted`).
 
-### 6c. Optional: Nostr check-run attestation
+### 6c. Local runner status
 
-To stay consistent with the Tier-A runner, the inbound consumer MAY also
-republish a signed `30315` check-run result + `4903` audit (reusing
-`hiveci`'s builders) so Nostr clients see the outcome too. This is optional and
-gated behind the same enable flag.
-
-### 6d. Also reflect the existing Tier-A local runner into Gitea
-
-Quick win, independent of remote Loom: route the local
-`hiveci/runner.go` result through the **same** `CreateCommitStatus` writer so
-that even without any Loom worker, CI results finally show up in the Gitea UI.
-This is the smallest shippable slice and de-risks §6a.
+The local `hiveci/runner.go` path records pending and terminal outcomes through
+`loom.DurableStatusSink`. It does not publish a second relay result event.
 
 ---
 
@@ -489,11 +474,6 @@ receives the `30618`/PR trigger to submit jobs — OR, to keep the outbound trig
 next to the existing CI trigger, `main.go` calls `loomSvc.MaybeDispatch(...)`
 inside the existing per-repo-locked `KindRepositoryState` block.
 
-**Publication** — reuse the runner's proven `publishToRelays` pattern (connect,
-`Publish`, count successes, error if all fail) or factor it into a small shared
-`internal/relay` publish helper so `hiveci` and `loom` don't each
-re-implement it (optional cleanup).
-
 **Composition root wiring** (new, in `main.go`):
 
 ```go
@@ -522,7 +502,7 @@ file them as children of `phase1-yk8`.
   and exactly one terminal state after, through a **neutral status-sink
   interface** (e.g. `type StatusSink interface { Set(ctx, ref, state, ...) }`)
   rather than importing `gitea.Client` directly — so the runner stays decoupled
-  and status delivery is independently retryable (§6d). *(Coordinate: this is
+  and status delivery is independently retryable (§6c). *(Coordinate: this is
   Item D-owned; land via the hook interface or with owner sign-off.)*
 - **Change** `internal/relay/kinds.go` (+ constants), `subscriber.go` (filter),
   `main.go` (wire `loomSvc`), `config.go` (`Loom*`).
@@ -542,8 +522,8 @@ file them as children of `phase1-yk8`.
 ### Phase 3 — Cashu payment, Blossom log ingestion, cancellation
 - **Add** `internal/cashu/` wallet (mint, pubkey-lock, change redemption from `5101`).
 - Compute payment/timeout from worker `price`/`max_duration`.
-- **Add** guarded Blossom log fetch (`internal/safefetch`) → attach tail to status
-  description / Nostr `30315`.
+- **Add** guarded Blossom log fetch (`internal/safefetch`) → attach tail to the
+  durable Gitea status description.
 - **Add** `5102` cancellation on superseded runs.
 - **Tests:** payment math, change redemption, egress guard.
 

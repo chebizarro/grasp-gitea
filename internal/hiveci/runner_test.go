@@ -27,73 +27,45 @@ import (
 	"github.com/sharegap/grasp-gitea/internal/telemetry"
 )
 
-type recordingStatusSink struct{ statuses []loom.Status }
+type recordingStatusSink struct {
+	statuses      []loom.Status
+	cancelOnClaim context.CancelFunc
+}
 
 func (s *recordingStatusSink) Claim(_ context.Context, status loom.Status) (bool, error) {
 	s.statuses = append(s.statuses, status)
+	if s.cancelOnClaim != nil {
+		s.cancelOnClaim()
+	}
 	return true, nil
 }
 
-func (s *recordingStatusSink) Set(_ context.Context, status loom.Status) error {
+func (s *recordingStatusSink) Set(ctx context.Context, status loom.Status) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.statuses = append(s.statuses, status)
 	return nil
 }
 
-type fakeSigner struct {
-	priv string
-	pub  string
-}
-
-func newFakeSigner(t *testing.T) fakeSigner {
-	t.Helper()
-	priv := nostr.Generate().Hex()
-	pub, err := derivePubHex(priv)
-	if err != nil {
-		t.Fatalf("pubkey: %v", err)
-	}
-	return fakeSigner{priv: priv, pub: pub}
-}
-
-func (s fakeSigner) PublicKey() string { return s.pub }
-func (s fakeSigner) SignEvent(ctx context.Context, ev *nostr.Event) error {
-	pk, err := nostr.PubKeyFromHex(s.pub)
-	if err != nil {
-		return err
-	}
-	ev.PubKey = pk
-	return ev.Sign(mustSK(s.priv))
-}
-
-func TestRunnerRunsActForRepositoryStateAndPublishesCheckAndAudit(t *testing.T) {
+func TestRunnerRunsActForRepositoryStateAndRecordsCommitStatus(t *testing.T) {
 	ctx := context.Background()
 	st, mapping, ownerPriv := newHiveTestStore(t)
 	repo := setupHiveRepo(t, mapping, ".gitea/workflows/ci.yml")
 	actPath, argsPath := fakeAct(t, 0)
-	signer := newFakeSigner(t)
-
-	var published []*nostr.Event
-	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, signer, []string{"wss://relay.invalid"}, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	statusSink := &recordingStatusSink{}
 	r.SetStatusSink(statusSink, "hive-ci")
-	r.publish = func(ctx context.Context, ev *nostr.Event) error {
-		clone := *ev
-		clone.Tags = append(nostr.Tags(nil), ev.Tags...)
-		published = append(published, &clone)
-		return nil
-	}
 
 	ev := signedHiveEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
 		{"d", mapping.RepoID},
 		{"p", mapping.Pubkey},
 		{"refs/heads/main", repo.commit},
 	}, "")
-	if err := r.HandleEvent(ctx, ev, "wss://fleet-relay.test"); err != nil {
+	if err := r.HandleEvent(ctx, ev); err != nil {
 		t.Fatalf("HandleEvent: %v", err)
 	}
 
-	if len(published) != 2 {
-		t.Fatalf("published events = %d, want 2", len(published))
-	}
 	if len(statusSink.statuses) != 2 || statusSink.statuses[0].State != store.LoomStatusPending ||
 		statusSink.statuses[1].State != store.LoomStatusSuccess {
 		t.Fatalf("commit statuses = %#v, want pending -> success", statusSink.statuses)
@@ -102,21 +74,6 @@ func TestRunnerRunsActForRepositoryStateAndPublishesCheckAndAudit(t *testing.T) 
 		if status.Ref.CommitSHA != repo.commit || status.Ref.Owner != mapping.Owner || status.Ref.RepoName != mapping.RepoName {
 			t.Fatalf("status not anchored to local dispatch record: %#v", status)
 		}
-	}
-	if published[0].Kind != relay.KindCheckRunResult || published[1].Kind != relay.KindCASAudit {
-		t.Fatalf("published kinds = %d/%d", published[0].Kind, published[1].Kind)
-	}
-	for _, ev := range published {
-		if ev.PubKey.Hex() != signer.pub || ev.ID == (nostr.ID{}) || ev.Sig == [64]byte{} {
-			t.Fatalf("event not signed by HiveCI signer: %+v", ev)
-		}
-	}
-	var rec runRecord
-	if err := json.Unmarshal([]byte(published[0].Content), &rec); err != nil {
-		t.Fatalf("unmarshal result: %v", err)
-	}
-	if rec.SchemaVersion != checkResultSchema || rec.Result != "success" || rec.Workflow != ".gitea/workflows/ci.yml" || rec.Commit != repo.commit || rec.Trigger != "push" || rec.BlocksMerge {
-		t.Fatalf("unexpected check record: %+v", rec)
 	}
 	args, err := os.ReadFile(argsPath)
 	if err != nil {
@@ -127,41 +84,67 @@ func TestRunnerRunsActForRepositoryStateAndPublishesCheckAndAudit(t *testing.T) 
 	}
 }
 
-func TestRunnerPublishesFailureResultWhenActFails(t *testing.T) {
+func TestRunnerRecordsFailureStatusWhenActFails(t *testing.T) {
 	ctx := context.Background()
 	st, mapping, ownerPriv := newHiveTestStore(t)
 	repo := setupHiveRepo(t, mapping, ".github/workflows/ci.yml")
 	actPath, _ := fakeAct(t, 7)
-	signer := newFakeSigner(t)
-
-	var published []*nostr.Event
-	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, signer, nil, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	r.publish = func(ctx context.Context, ev *nostr.Event) error {
-		clone := *ev
-		published = append(published, &clone)
-		return nil
-	}
+	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statusSink := &recordingStatusSink{}
+	r.SetStatusSink(statusSink, "hive-ci")
 
 	ev := signedHiveEvent(t, ownerPriv, relay.KindPROpen, nostr.Tags{
 		{"a", "30617:" + mapping.Pubkey + ":" + mapping.RepoID},
 		{"c", repo.commit},
 		{"branch-name", "feature"},
 	}, "")
-	if err := r.HandleEvent(ctx, ev, ""); err != nil {
+	if err := r.HandleEvent(ctx, ev); err != nil {
 		t.Fatalf("HandleEvent: %v", err)
 	}
-	if len(published) != 2 {
-		t.Fatalf("published events = %d, want 2", len(published))
+	if len(statusSink.statuses) != 2 || statusSink.statuses[0].State != store.LoomStatusPending ||
+		statusSink.statuses[1].State != store.LoomStatusFailure ||
+		!strings.Contains(statusSink.statuses[1].Description, "act") {
+		t.Fatalf("commit statuses = %#v, want pending -> act failure", statusSink.statuses)
 	}
-	var rec runRecord
-	if err := json.Unmarshal([]byte(published[0].Content), &rec); err != nil {
-		t.Fatalf("unmarshal result: %v", err)
+}
+
+func TestRunnerWithoutStatusSinkDoesNotExecuteLocalWorkflow(t *testing.T) {
+	st, mapping, ownerPriv := newHiveTestStore(t)
+	repo := setupHiveRepo(t, mapping, ".gitea/workflows/ci.yml")
+	actPath, argsPath := fakeAct(t, 0)
+	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, repo.repositoriesDir, nil)
+	ev := signedHiveEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
+	}, "")
+	if err := r.HandleEvent(context.Background(), ev); err == nil || !strings.Contains(err.Error(), "status sink not configured") {
+		t.Fatalf("HandleEvent error = %v, want missing status sink", err)
 	}
-	if rec.Result != "failure" || !rec.BlocksMerge || rec.ExitCode != 7 || rec.Trigger != "pull_request" {
-		t.Fatalf("unexpected failure record: %+v", rec)
+	if _, err := os.Stat(argsPath); !os.IsNotExist(err) {
+		t.Fatal("local workflow ran without a durable status sink")
 	}
-	if tagValue(published[1].Tags, "decision") != "failure" || tagValue(published[1].Tags, "audit_type") != auditType {
-		t.Fatalf("unexpected audit tags: %#v", published[1].Tags)
+}
+
+func TestRunnerPersistsTerminalStatusAfterInputCancellation(t *testing.T) {
+	st, mapping, ownerPriv := newHiveTestStore(t)
+	repo := setupHiveRepo(t, mapping, ".gitea/workflows/ci.yml")
+	actPath, argsPath := fakeAct(t, 0)
+	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}}, st, repo.repositoriesDir, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	statusSink := &recordingStatusSink{cancelOnClaim: cancel}
+	r.SetStatusSink(statusSink, "hive-ci")
+	ev := signedHiveEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
+		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
+	}, "")
+	if err := r.HandleEvent(ctx, ev); err != nil {
+		t.Fatalf("HandleEvent after cancellation: %v", err)
+	}
+	if len(statusSink.statuses) != 2 || statusSink.statuses[1].State != store.LoomStatusFailure ||
+		!strings.Contains(statusSink.statuses[1].Description, "cancel") {
+		t.Fatalf("commit statuses = %#v, want pending -> cancelled failure", statusSink.statuses)
+	}
+	if _, err := os.Stat(argsPath); !os.IsNotExist(err) {
+		t.Fatal("local workflow ran after input context cancellation")
 	}
 }
 
@@ -187,7 +170,7 @@ func TestSinglePushProducesExactlyOneRemoteWorkflowDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	remote := &recordingRemoteDispatcher{enabled: true}
-	r := New(Config{Enabled: false, TriggerRepos: []string{"*"}}, st, nil, nil, repo.repositoriesDir,
+	r := New(Config{Enabled: false, TriggerRepos: []string{"*"}}, st, repo.repositoriesDir,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r.SetRemoteDispatcher(remote, "remote")
 
@@ -202,7 +185,7 @@ func TestSinglePushProducesExactlyOneRemoteWorkflowDispatch(t *testing.T) {
 		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
 		{"traceparent", traceparent}, {"tracestate", tracestate},
 	}, "")
-	if err := r.HandleEvent(ctx, authorized, ""); err != nil {
+	if err := r.HandleEvent(ctx, authorized); err != nil {
 		t.Fatal(err)
 	}
 	if len(remote.requests) != 1 {
@@ -223,7 +206,7 @@ func TestSinglePushProducesExactlyOneRemoteWorkflowDispatch(t *testing.T) {
 	unauthorized := signedHiveEvent(t, attacker.Hex(), relay.KindRepositoryState, nostr.Tags{
 		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
 	}, "")
-	if err := r.HandleEvent(ctx, unauthorized, ""); err != nil {
+	if err := r.HandleEvent(ctx, unauthorized); err != nil {
 		t.Fatal(err)
 	}
 	if len(remote.requests) != 1 {
@@ -236,14 +219,13 @@ func TestRunnerRemoteOnlyNeverFallsBackToLocal(t *testing.T) {
 	st, mapping, ownerPriv := newHiveTestStore(t)
 	repo := setupHiveRepo(t, mapping, ".gitea/workflows/ci.yml")
 	actPath, argsPath := fakeAct(t, 0)
-	signer := newFakeSigner(t)
 	r := New(Config{Enabled: true, ActPath: actPath, TriggerRepos: []string{"*"}},
-		st, signer, nil, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		st, repo.repositoriesDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r.SetRemoteDispatcher(&recordingRemoteDispatcher{enabled: false}, "remote")
 	ev := signedHiveEvent(t, ownerPriv, relay.KindRepositoryState, nostr.Tags{
 		{"d", mapping.RepoID}, {"p", mapping.Pubkey}, {"refs/heads/main", repo.commit},
 	}, "")
-	if err := r.HandleEvent(ctx, ev, ""); err != nil {
+	if err := r.HandleEvent(ctx, ev); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(argsPath); !os.IsNotExist(err) {
@@ -259,7 +241,7 @@ func TestRunnerUsesLivePersistedHivePolicy(t *testing.T) {
 		HiveCIBlossomURL: "https://blossom.example", HiveCIJobTimeoutMinutes: 23,
 		HiveCICloneURLTemplate: "https://git.example/{owner}/{repo_id}.git",
 	})
-	runner := New(Config{}, nil, nil, nil, "", nil)
+	runner := New(Config{}, nil, "", nil)
 	runner.SetPolicyStore(policies)
 	mapping := store.Mapping{Owner: "alice", RepoName: "repository", RepoID: "stable-id", AnnouncedCloneURL: "https://old.invalid/repo.git"}
 	if got := runner.cloneURL(mapping); got != "https://git.example/alice/stable-id.git" {
