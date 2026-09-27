@@ -184,9 +184,8 @@ func (r *Reflector) HandleEvent(ctx context.Context, ev *nostr.Event, relayURL s
 }
 
 func (r *Reflector) mappingForEvent(ctx context.Context, ev *nostr.Event) (store.Mapping, bool, error) {
-	addr := tagValue(ev.Tags, "a")
-	pubkey, repoID, ok := parseRepoAddr(addr)
-	if !ok {
+	coord, coordErr := nostrauthz.ParseRepositoryCoordinate(tagValue(ev.Tags, "a"))
+	if coordErr != nil {
 		if ev.Kind != relay.KindNIP22Comment && ev.Kind != relay.KindNIP32Label {
 			return store.Mapping{}, false, nil
 		}
@@ -210,12 +209,12 @@ func (r *Reflector) mappingForEvent(ctx context.Context, ev *nostr.Event) (store
 		}
 		return mapping, true, nil
 	}
-	mapping, err := r.store.GetProvisionedMappingByRepoAddr(ctx, pubkey, repoID)
+	mapping, err := r.store.GetProvisionedMappingByRepoAddr(ctx, coord.OwnerPubkey, coord.RepoID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return store.Mapping{}, false, nil
 	}
 	if err != nil {
-		return store.Mapping{}, false, fmt.Errorf("lookup repo mapping for %s: %w", addr, err)
+		return store.Mapping{}, false, fmt.Errorf("lookup repo mapping for %s: %w", coord.String(), err)
 	}
 	return mapping, true, nil
 }
@@ -985,14 +984,6 @@ func isCollaborationKind(kind int) bool {
 	default:
 		return false
 	}
-}
-
-func parseRepoAddr(addr string) (pubkey string, repoID string, ok bool) {
-	parts := strings.SplitN(addr, ":", 3)
-	if len(parts) != 3 || parts[0] != fmt.Sprint(relay.KindRepositoryAnnouncement) || parts[1] == "" || parts[2] == "" {
-		return "", "", false
-	}
-	return parts[1], parts[2], true
 }
 
 func rootEventID(tags nostr.Tags) string {

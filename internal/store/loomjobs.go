@@ -546,7 +546,11 @@ func (s *SQLiteStore) CompleteLoomCashuSpend(ctx context.Context, dispatchKey, q
 	if err != nil {
 		return LoomCashuSpend{}, err
 	}
-	if n, _ := res.RowsAffected(); n == 0 && (stored.State != "ready" || stored.QuoteID != quoteID || stored.Token != token) {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return LoomCashuSpend{}, fmt.Errorf("count completed Loom Cashu spends: %w", err)
+	}
+	if n == 0 && (stored.State != "ready" || stored.QuoteID != quoteID || stored.Token != token) {
 		return LoomCashuSpend{}, fmt.Errorf("Loom Cashu spend was not in a completable state")
 	}
 	if err := tx.Commit(); err != nil {
@@ -572,7 +576,11 @@ func (s *SQLiteStore) AttachLoomCashuSpend(ctx context.Context, dispatchKey, wor
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count attached Loom Cashu spends: %w", err)
+	}
+	if n == 0 {
 		return fmt.Errorf("ready Loom Cashu spend not found")
 	}
 	return nil
@@ -637,7 +645,11 @@ func (s *SQLiteStore) MarkLoomCashuChangeRedeemed(ctx context.Context, dispatchK
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count redeemed Loom Cashu changes: %w", err)
+	}
+	if n == 0 {
 		return fmt.Errorf("redeeming Loom Cashu change not found")
 	}
 	return nil
@@ -1025,7 +1037,11 @@ func (s *SQLiteStore) MarkLoomStatusDelivered(ctx context.Context, workflowRunID
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count deleted Loom status deliveries: %w", err)
+	}
+	if n > 0 {
 		_, err = tx.ExecContext(ctx, `UPDATE loom_jobs SET delivery_state = 'delivered', updated_at = ? WHERE workflow_run_id = ?`,
 			now.Unix(), workflowRunID)
 		if err != nil {
@@ -1058,7 +1074,11 @@ func (s *SQLiteStore) MarkLoomStatusRetry(ctx context.Context, workflowRunID, ev
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count retried Loom status deliveries: %w", err)
+	}
+	if n > 0 {
 		state := "retrying"
 		if awaitingGitObject {
 			state = "awaiting_git_object"

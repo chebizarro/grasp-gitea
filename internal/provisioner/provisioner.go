@@ -228,7 +228,10 @@ func (s *Service) ManualProvision(ctx context.Context, npub string, pubkey strin
 	}
 
 	// Fetch final org name from the stored mapping.
-	m, _ := s.store.GetMapping(ctx, npub, repoID)
+	m, err := s.store.GetMapping(ctx, npub, repoID)
+	if err != nil {
+		return Result{}, fmt.Errorf("read provisioned repository mapping: %w", err)
+	}
 	orgName := m.Owner
 	if orgName == "" {
 		orgName = npub

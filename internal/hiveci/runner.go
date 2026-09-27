@@ -586,11 +586,11 @@ func (r *Runner) mappingForState(ctx context.Context, ev *nostr.Event, repoID st
 }
 
 func (r *Runner) mappingForAddress(ctx context.Context, ev *nostr.Event) (store.Mapping, bool, error) {
-	pubkey, repoID, ok := parseRepoAddr(tagValue(ev.Tags, "a"))
-	if !ok {
+	coord, err := nostrauthz.ParseRepositoryCoordinate(tagValue(ev.Tags, "a"))
+	if err != nil {
 		return store.Mapping{}, false, nil
 	}
-	mapping, err := r.store.GetProvisionedMappingByRepoAddr(ctx, pubkey, repoID)
+	mapping, err := r.store.GetProvisionedMappingByRepoAddr(ctx, coord.OwnerPubkey, coord.RepoID)
 	if err == sql.ErrNoRows {
 		return store.Mapping{}, false, nil
 	}
@@ -815,14 +815,6 @@ func (r *Runner) setCommitStatus(ctx context.Context, ref loom.Ref, state, descr
 func stableRunID(rec runRecord) string {
 	sum := sha256.Sum256([]byte(rec.SourceEventID + "\x00" + rec.Commit + "\x00" + rec.Workflow + "\x00" + rec.Trigger))
 	return hex.EncodeToString(sum[:12])
-}
-
-func parseRepoAddr(addr string) (pubkey string, repoID string, ok bool) {
-	parts := strings.SplitN(addr, ":", 3)
-	if len(parts) != 3 || parts[0] != fmt.Sprint(relay.KindRepositoryAnnouncement) || parts[1] == "" || parts[2] == "" {
-		return "", "", false
-	}
-	return parts[1], parts[2], true
 }
 
 func tagValue(tags nostr.Tags, key string) string {

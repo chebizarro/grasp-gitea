@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -516,9 +518,15 @@ func (s *Store) Document() Document {
 }
 
 func cloneDocument(doc Document) Document {
-	b, _ := json.Marshal(doc)
-	var out Document
-	_ = json.Unmarshal(b, &out)
+	out := doc
+	out.Access.PubkeyAllowlist = slices.Clone(doc.Access.PubkeyAllowlist)
+	out.CI.TriggerRepos = slices.Clone(doc.CI.TriggerRepos)
+	out.CI.retiredEnabled = nil
+	out.Relays.URLs = slices.Clone(doc.Relays.URLs)
+	out.HiveCI.NostrRelays = slices.Clone(doc.HiveCI.NostrRelays)
+	out.ConfigFabric.TrustedAuthors = slices.Clone(doc.ConfigFabric.TrustedAuthors)
+	out.ConfigFabric.Accepted = maps.Clone(doc.ConfigFabric.Accepted)
+	out.ConfigFabric.EnvSeed = cloneEnvSeed(doc.ConfigFabric.EnvSeed)
 	return out
 }
 
@@ -535,7 +543,7 @@ func cloneEnvSeed(in *EnvSeedImport) *EnvSeedImport {
 		return nil
 	}
 	out := *in
-	out.ConsideredVariables = append([]string(nil), in.ConsideredVariables...)
+	out.ConsideredVariables = slices.Clone(in.ConsideredVariables)
 	return &out
 }
 

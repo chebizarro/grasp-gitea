@@ -308,7 +308,10 @@ func runAuthLocal(sub string, args []string, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
-		cred, found, _ := store.Get(host)
+		cred, found, err := store.Get(host)
+		if err != nil {
+			return err
+		}
 		if err := store.Delete(host); err != nil {
 			return err
 		}
